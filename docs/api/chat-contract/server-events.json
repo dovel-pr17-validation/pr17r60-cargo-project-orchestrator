@@ -1,0 +1,1710 @@
+{
+  "contract_version": 1,
+  "events": {
+    "active_tasks_update": {
+      "examples": {
+        "full": {
+          "tasks": [
+            {
+              "description": "watch deploy.log for errors",
+              "id": "toolu_01Example0000000000000",
+              "kind": "monitor",
+              "last_seen_at": "2026-01-15T10:31:12Z",
+              "parent_tool_use_id": "toolu_01Example0000000000000",
+              "pid": 48300,
+              "started_at": "2026-01-15T10:30:00Z"
+            },
+            {
+              "description": "cargo watch",
+              "id": "recovered-48301",
+              "kind": "bash_background",
+              "last_seen_at": "2026-01-15T10:30:30Z",
+              "parent_tool_use_id": null,
+              "pid": null,
+              "started_at": "2026-01-15T10:30:30Z"
+            }
+          ],
+          "type": "active_tasks_update"
+        },
+        "minimal": {
+          "tasks": [],
+          "type": "active_tasks_update"
+        }
+      },
+      "fields": {
+        "tasks": {
+          "required": true,
+          "type": "array"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "ask_user_question": {
+      "examples": {
+        "full": {
+          "id": "ctrl_0001",
+          "input": {
+            "questions": [
+              {
+                "header": "Backoff",
+                "multiSelect": false,
+                "options": [
+                  {
+                    "description": "Doubles after each attempt",
+                    "label": "Exponential"
+                  },
+                  {
+                    "description": "Same delay every time",
+                    "label": "Fixed"
+                  }
+                ],
+                "question": "Which backoff should the retry use?"
+              }
+            ]
+          },
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "questions": [
+            {
+              "header": "Backoff",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "Doubles after each attempt",
+                  "label": "Exponential"
+                },
+                {
+                  "description": "Same delay every time",
+                  "label": "Fixed"
+                }
+              ],
+              "question": "Which backoff should the retry use?"
+            }
+          ],
+          "synthetic": true,
+          "tool_call_id": "toolu_01Example0000000000000",
+          "type": "ask_user_question"
+        },
+        "minimal": {
+          "id": "ctrl_0001",
+          "input": {},
+          "questions": [],
+          "tool_call_id": "toolu_01Example0000000000000",
+          "type": "ask_user_question"
+        }
+      },
+      "fields": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "input": {
+          "required": true,
+          "type": "object"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "questions": {
+          "required": true,
+          "type": "array"
+        },
+        "synthetic": {
+          "required": false,
+          "type": "boolean"
+        },
+        "tool_call_id": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "assistant_text": {
+      "examples": {
+        "full": {
+          "content": "I will start by reading the upload client.",
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "type": "assistant_text"
+        },
+        "minimal": {
+          "content": "I will start by reading the upload client.",
+          "type": "assistant_text"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "auto_continue": {
+      "examples": {
+        "full": {
+          "delay_ms": 3000,
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "type": "auto_continue"
+        },
+        "minimal": {
+          "delay_ms": 3000,
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "type": "auto_continue"
+        }
+      },
+      "fields": {
+        "delay_ms": {
+          "required": true,
+          "type": "number"
+        },
+        "session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "auto_continue_state_changed": {
+      "examples": {
+        "full": {
+          "enabled": true,
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "type": "auto_continue_state_changed"
+        },
+        "minimal": {
+          "enabled": true,
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "type": "auto_continue_state_changed"
+        }
+      },
+      "fields": {
+        "enabled": {
+          "required": true,
+          "type": "boolean"
+        },
+        "session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "background_output": {
+      "examples": {
+        "full": {
+          "content": "[tool_use: Read]",
+          "correlation_id": "toolu_01Example0000000000000",
+          "received_at": "2026-01-15T10:31:12Z",
+          "source": "tool",
+          "tool": {
+            "input": {
+              "file_path": "src/chat/manager.rs"
+            },
+            "name": "Read"
+          },
+          "type": "background_output"
+        },
+        "minimal": {
+          "content": "ERROR upload failed: connection reset",
+          "received_at": "2026-01-15T10:31:12Z",
+          "source": "system",
+          "type": "background_output"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "correlation_id": {
+          "required": false,
+          "type": "string"
+        },
+        "received_at": {
+          "required": true,
+          "type": "string"
+        },
+        "source": {
+          "required": true,
+          "type": "string"
+        },
+        "tool": {
+          "required": false,
+          "type": "object"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "cites_resolved": {
+      "examples": {
+        "full": {
+          "refs": [
+            {
+              "entity_status": "in_progress",
+              "id": "3adeffc9-c8b0-4e2f-a674-55bfcb293433",
+              "kind": "task",
+              "label": "PR 1 — backend",
+              "project": {
+                "id": "00333b5f-2d0a-4467-9c98-155e55d2b7e5",
+                "name": "Project Orchestrator",
+                "slug": "project-orchestrator"
+              },
+              "status": "ok",
+              "subtitle": "in_progress"
+            },
+            {
+              "id": "9f1e0a10-0000-4000-8000-00000000dead",
+              "kind": "plan",
+              "status": "not_found"
+            }
+          ],
+          "type": "cites_resolved"
+        },
+        "minimal": {
+          "refs": [
+            {
+              "id": "9f1e0a10-0000-4000-8000-00000000dead",
+              "kind": "plan",
+              "status": "not_found"
+            }
+          ],
+          "type": "cites_resolved"
+        }
+      },
+      "fields": {
+        "refs": {
+          "required": true,
+          "type": "array"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "compact_boundary": {
+      "examples": {
+        "full": {
+          "pre_tokens": 168000,
+          "trigger": "auto",
+          "type": "compact_boundary"
+        },
+        "minimal": {
+          "trigger": "manual",
+          "type": "compact_boundary"
+        }
+      },
+      "fields": {
+        "pre_tokens": {
+          "required": false,
+          "type": "number"
+        },
+        "trigger": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "compaction_recovery": {
+      "examples": {
+        "full": {
+          "build_latency_ms": 240,
+          "hint_tokens": 1850,
+          "recovery_success": true,
+          "type": "compaction_recovery"
+        },
+        "minimal": {
+          "build_latency_ms": 240,
+          "hint_tokens": 1850,
+          "recovery_success": true,
+          "type": "compaction_recovery"
+        }
+      },
+      "fields": {
+        "build_latency_ms": {
+          "required": true,
+          "type": "number"
+        },
+        "hint_tokens": {
+          "required": true,
+          "type": "number"
+        },
+        "recovery_success": {
+          "required": true,
+          "type": "boolean"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "compaction_started": {
+      "examples": {
+        "full": {
+          "trigger": "auto",
+          "type": "compaction_started"
+        },
+        "minimal": {
+          "trigger": "auto",
+          "type": "compaction_started"
+        }
+      },
+      "fields": {
+        "trigger": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "conversation_relayed": {
+      "examples": {
+        "full": {
+          "conversation_id": "conv-7f1c2a30",
+          "from_provider": "claude-code",
+          "from_session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "moved_by": "user",
+          "omitted_entries": 3,
+          "relayed_entries": 12,
+          "to_provider": "local",
+          "to_session_id": "7f1c2a30-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+          "type": "conversation_relayed"
+        },
+        "minimal": {
+          "from_provider": "claude-code",
+          "from_session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "moved_by": "user",
+          "omitted_entries": 0,
+          "relayed_entries": 0,
+          "to_provider": "local",
+          "to_session_id": "7f1c2a30-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+          "type": "conversation_relayed"
+        }
+      },
+      "fields": {
+        "conversation_id": {
+          "required": false,
+          "type": "string"
+        },
+        "from_provider": {
+          "required": true,
+          "type": "string"
+        },
+        "from_session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "moved_by": {
+          "required": true,
+          "type": "string"
+        },
+        "omitted_entries": {
+          "required": true,
+          "type": "number"
+        },
+        "relayed_entries": {
+          "required": true,
+          "type": "number"
+        },
+        "to_provider": {
+          "required": true,
+          "type": "string"
+        },
+        "to_session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "error": {
+      "examples": {
+        "full": {
+          "code": "refs_invalid",
+          "index": 2,
+          "message": "Tool execution failed: permission denied",
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "reason": "unknown_kind",
+          "request_id": "pr_1",
+          "type": "error"
+        },
+        "minimal": {
+          "message": "Tool execution failed: permission denied",
+          "type": "error"
+        }
+      },
+      "fields": {
+        "code": {
+          "required": false,
+          "type": "string"
+        },
+        "index": {
+          "required": false,
+          "type": "number"
+        },
+        "message": {
+          "required": true,
+          "type": "string"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "reason": {
+          "required": false,
+          "type": "string"
+        },
+        "request_id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "model_changed": {
+      "examples": {
+        "full": {
+          "model": "example-model-large",
+          "type": "model_changed"
+        },
+        "minimal": {
+          "model": "example-model-large",
+          "type": "model_changed"
+        }
+      },
+      "fields": {
+        "model": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "pending_queue": {
+      "examples": {
+        "full": {
+          "messages": [
+            {
+              "attachments": [
+                {
+                  "filename": "release-notes.pdf",
+                  "id": "9f8e7d6c-5b4a-4c3d-9e2f-1a0b9c8d7e6f",
+                  "mime_type": "application/pdf",
+                  "size_bytes": 182044
+                }
+              ],
+              "content": "Then update the changelog.",
+              "id": "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+              "prioritized": true,
+              "queued_at": "2026-01-15T10:30:00Z",
+              "refs": [
+                {
+                  "id": "57cf05c9-25b6-495d-ab07-de4b11d64736",
+                  "kind": "plan"
+                },
+                {
+                  "id": "2191fcb0-e07c-49c1-9f29-cb9f7441f914",
+                  "kind": "rfc"
+                }
+              ]
+            }
+          ],
+          "type": "pending_queue"
+        },
+        "minimal": {
+          "messages": [],
+          "type": "pending_queue"
+        }
+      },
+      "fields": {
+        "messages": {
+          "required": true,
+          "type": "array"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "permission_decision": {
+      "examples": {
+        "full": {
+          "allow": true,
+          "id": "perm_0001",
+          "rule": "Bash: git status",
+          "scope": "session",
+          "type": "permission_decision"
+        },
+        "minimal": {
+          "allow": true,
+          "id": "perm_0001",
+          "type": "permission_decision"
+        }
+      },
+      "fields": {
+        "allow": {
+          "required": true,
+          "type": "boolean"
+        },
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "rule": {
+          "required": false,
+          "type": "string"
+        },
+        "scope": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "permission_mode_changed": {
+      "examples": {
+        "full": {
+          "mode": "acceptEdits",
+          "policy_mode": "auto_edits",
+          "type": "permission_mode_changed"
+        },
+        "minimal": {
+          "mode": "acceptEdits",
+          "type": "permission_mode_changed"
+        }
+      },
+      "fields": {
+        "mode": {
+          "required": true,
+          "type": "string"
+        },
+        "policy_mode": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "permission_request": {
+      "examples": {
+        "full": {
+          "always": true,
+          "canonical": "read_file",
+          "category": "read",
+          "consent": {
+            "destinations": [
+              "http://docs.rs",
+              "https://docs.rs"
+            ],
+            "subject": "https://docs.rs"
+          },
+          "id": "perm_0001",
+          "input": {
+            "command": "cargo fmt",
+            "description": "Format the crate"
+          },
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "tool": "Bash",
+          "tool_use_id": "toolu_01Example0000000000000",
+          "type": "permission_request"
+        },
+        "minimal": {
+          "id": "perm_0001",
+          "input": {},
+          "tool": "Bash",
+          "type": "permission_request"
+        }
+      },
+      "fields": {
+        "always": {
+          "required": false,
+          "type": "boolean"
+        },
+        "canonical": {
+          "required": false,
+          "type": "string"
+        },
+        "category": {
+          "required": false,
+          "type": "string"
+        },
+        "consent": {
+          "required": false,
+          "type": "object"
+        },
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "input": {
+          "required": true,
+          "type": "object"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "tool": {
+          "required": true,
+          "type": "string"
+        },
+        "tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "provider_notice": {
+      "examples": {
+        "full": {
+          "code": "credentials_locked",
+          "data": {
+            "provider": "native",
+            "waited_ms": 372000
+          },
+          "kind": "credentials_locked",
+          "message": "the credential vault is locked: the turn resumes when it is unlocked",
+          "severity": "action_required",
+          "type": "provider_notice"
+        },
+        "minimal": {
+          "kind": "model_recovered",
+          "message": "The model answers again.",
+          "severity": "latency",
+          "type": "provider_notice"
+        }
+      },
+      "fields": {
+        "code": {
+          "required": false,
+          "type": "string"
+        },
+        "data": {
+          "required": false,
+          "type": "object"
+        },
+        "kind": {
+          "required": true,
+          "type": "string"
+        },
+        "message": {
+          "required": true,
+          "type": "string"
+        },
+        "severity": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "provider_outage": {
+      "examples": {
+        "full": {
+          "cause": "connection failed: Connection refused (os error 61)",
+          "duration_ms": 4200,
+          "failures": 0,
+          "phase": "up",
+          "provider_id": "deepseek-prod",
+          "started_at": "2026-10-16T14:05:29Z",
+          "type": "provider_outage"
+        },
+        "minimal": {
+          "failures": 3,
+          "phase": "down",
+          "provider_id": "deepseek-prod",
+          "started_at": "2026-10-16T14:05:29Z",
+          "type": "provider_outage"
+        }
+      },
+      "fields": {
+        "cause": {
+          "required": false,
+          "type": "string"
+        },
+        "duration_ms": {
+          "required": false,
+          "type": "number"
+        },
+        "failures": {
+          "required": true,
+          "type": "number"
+        },
+        "phase": {
+          "required": true,
+          "type": "string"
+        },
+        "provider_id": {
+          "required": true,
+          "type": "string"
+        },
+        "started_at": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "provider_switched": {
+      "examples": {
+        "full": {
+          "from_provider": "claude-code",
+          "model": "example-model-large",
+          "omitted_entries": 3,
+          "relayed_entries": 12,
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "to_provider": "local",
+          "type": "provider_switched"
+        },
+        "minimal": {
+          "from_provider": "claude-code",
+          "model": "example-model-large",
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "to_provider": "local",
+          "type": "provider_switched"
+        }
+      },
+      "fields": {
+        "from_provider": {
+          "required": true,
+          "type": "string"
+        },
+        "model": {
+          "required": true,
+          "type": "string"
+        },
+        "omitted_entries": {
+          "required": false,
+          "type": "number"
+        },
+        "relayed_entries": {
+          "required": false,
+          "type": "number"
+        },
+        "session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "to_provider": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "refs_resolved": {
+      "examples": {
+        "full": {
+          "refs": [
+            {
+              "entity_status": "in_progress",
+              "id": "57cf05c9-25b6-495d-ab07-de4b11d64736",
+              "kind": "plan",
+              "label": "Chat : références #/@",
+              "project": {
+                "id": "00333b5f-2d0a-4467-9c98-155e55d2b7e5",
+                "name": "Project Orchestrator",
+                "slug": "project-orchestrator"
+              },
+              "status": "ok",
+              "subtitle": "12 tâches"
+            },
+            {
+              "id": "3adeffc9-c8b0-4e2f-a674-55bfcb293433",
+              "kind": "task",
+              "status": "not_found"
+            }
+          ],
+          "type": "refs_resolved"
+        },
+        "minimal": {
+          "refs": [],
+          "type": "refs_resolved"
+        }
+      },
+      "fields": {
+        "refs": {
+          "required": true,
+          "type": "array"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "result": {
+      "examples": {
+        "full": {
+          "cost": {
+            "basis": "reported",
+            "usd": 0.25
+          },
+          "cost_usd": 0.25,
+          "duration_ms": 48210,
+          "error_code": "endpoint_unreachable",
+          "error_message": "The provider endpoint could not be reached.",
+          "is_error": false,
+          "model": "example-model-large",
+          "num_turns": 7,
+          "result_text": "The retry is in place and covered by a test.",
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "stop_reason": "completed",
+          "subtype": "success",
+          "type": "result",
+          "usage": {
+            "cache_read_tokens": 800,
+            "input_tokens": 1200,
+            "output_tokens": 340
+          }
+        },
+        "minimal": {
+          "cost_usd": null,
+          "duration_ms": 0,
+          "is_error": false,
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "subtype": "",
+          "type": "result"
+        }
+      },
+      "fields": {
+        "cost": {
+          "required": false,
+          "type": "object"
+        },
+        "cost_usd": {
+          "nullable": true,
+          "required": true,
+          "type": "number"
+        },
+        "duration_ms": {
+          "required": true,
+          "type": "number"
+        },
+        "error_code": {
+          "required": false,
+          "type": "string"
+        },
+        "error_message": {
+          "required": false,
+          "type": "string"
+        },
+        "is_error": {
+          "required": true,
+          "type": "boolean"
+        },
+        "model": {
+          "required": false,
+          "type": "string"
+        },
+        "num_turns": {
+          "required": false,
+          "type": "number"
+        },
+        "result_text": {
+          "required": false,
+          "type": "string"
+        },
+        "session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "stop_reason": {
+          "required": false,
+          "type": "string"
+        },
+        "subtype": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        },
+        "usage": {
+          "required": false,
+          "type": "object"
+        }
+      }
+    },
+    "retrying": {
+      "examples": {
+        "full": {
+          "attempt": 1,
+          "delay_ms": 2000,
+          "error_message": "API Error: 529 Overloaded",
+          "max_attempts": 3,
+          "type": "retrying"
+        },
+        "minimal": {
+          "attempt": 1,
+          "delay_ms": 2000,
+          "error_message": "API Error: 529 Overloaded",
+          "max_attempts": 3,
+          "type": "retrying"
+        }
+      },
+      "fields": {
+        "attempt": {
+          "required": true,
+          "type": "number"
+        },
+        "delay_ms": {
+          "required": true,
+          "type": "number"
+        },
+        "error_message": {
+          "required": true,
+          "type": "string"
+        },
+        "max_attempts": {
+          "required": true,
+          "type": "number"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "secret_request": {
+      "examples": {
+        "full": {
+          "exists": false,
+          "id": "secret_req_0001",
+          "name": "REGISTRY_TOKEN",
+          "reason": "Needed to publish the package.",
+          "type": "secret_request"
+        },
+        "minimal": {
+          "exists": false,
+          "id": "secret_req_0001",
+          "name": "REGISTRY_TOKEN",
+          "reason": "Needed to publish the package.",
+          "type": "secret_request"
+        }
+      },
+      "fields": {
+        "exists": {
+          "required": true,
+          "type": "boolean"
+        },
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "name": {
+          "required": true,
+          "type": "string"
+        },
+        "reason": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "secret_request_resolved": {
+      "examples": {
+        "full": {
+          "id": "secret_req_0001",
+          "outcome": "provided",
+          "type": "secret_request_resolved"
+        },
+        "minimal": {
+          "id": "secret_req_0001",
+          "outcome": "provided",
+          "type": "secret_request_resolved"
+        }
+      },
+      "fields": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "outcome": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "session_closed": {
+      "examples": {
+        "full": {
+          "reason": "closed",
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "type": "session_closed"
+        },
+        "minimal": {
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "type": "session_closed"
+        }
+      },
+      "fields": {
+        "reason": {
+          "required": false,
+          "type": "string"
+        },
+        "session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "session_error": {
+      "examples": {
+        "full": {
+          "message": "The agent process stopped. Send a message to restart the session.",
+          "reason": "subprocess_exited",
+          "received_at": "2026-01-15T10:32:00Z",
+          "type": "session_error"
+        },
+        "minimal": {
+          "message": "The agent process stopped. Send a message to restart the session.",
+          "reason": "subprocess_exited",
+          "received_at": "2026-01-15T10:32:00Z",
+          "type": "session_error"
+        }
+      },
+      "fields": {
+        "message": {
+          "required": true,
+          "type": "string"
+        },
+        "reason": {
+          "required": true,
+          "type": "string"
+        },
+        "received_at": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "stream_delta": {
+      "examples": {
+        "full": {
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "text": "I will ",
+          "type": "stream_delta"
+        },
+        "minimal": {
+          "text": "I will ",
+          "type": "stream_delta"
+        }
+      },
+      "fields": {
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "text": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "streaming_status": {
+      "examples": {
+        "full": {
+          "is_streaming": true,
+          "type": "streaming_status"
+        },
+        "minimal": {
+          "is_streaming": true,
+          "type": "streaming_status"
+        }
+      },
+      "fields": {
+        "is_streaming": {
+          "required": true,
+          "type": "boolean"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "system_hint": {
+      "examples": {
+        "full": {
+          "content": "Context was compacted; the current task is restated below.",
+          "type": "system_hint"
+        },
+        "minimal": {
+          "content": "Context was compacted; the current task is restated below.",
+          "type": "system_hint"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "system_init": {
+      "examples": {
+        "full": {
+          "capabilities": {
+            "images": false,
+            "interactive_permissions": true
+          },
+          "cli_session_id": "cli-session-0001",
+          "degraded_features": [
+            "hooks",
+            "subagents"
+          ],
+          "engine": "agent",
+          "mcp_servers": [
+            {
+              "name": "project-orchestrator",
+              "status": "connected"
+            }
+          ],
+          "model": "example-model-large",
+          "permission_mode": "default",
+          "policy_mode": "ask",
+          "provider": {
+            "id": "claude-code",
+            "kind": "claude_code"
+          },
+          "tool_policy": {
+            "allow": [],
+            "deny": [],
+            "mode": "ask",
+            "native_mode": "default"
+          },
+          "tools": [
+            "Bash",
+            "Read",
+            "Edit"
+          ],
+          "type": "system_init"
+        },
+        "minimal": {
+          "cli_session_id": "cli-session-0001",
+          "type": "system_init"
+        }
+      },
+      "fields": {
+        "capabilities": {
+          "required": false,
+          "type": "object"
+        },
+        "cli_session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "degraded_features": {
+          "required": false,
+          "type": "array"
+        },
+        "engine": {
+          "required": false,
+          "type": "string"
+        },
+        "mcp_servers": {
+          "required": false,
+          "type": "array"
+        },
+        "model": {
+          "required": false,
+          "type": "string"
+        },
+        "permission_mode": {
+          "required": false,
+          "type": "string"
+        },
+        "policy_mode": {
+          "required": false,
+          "type": "string"
+        },
+        "provider": {
+          "required": false,
+          "type": "object"
+        },
+        "tool_policy": {
+          "required": false,
+          "type": "object"
+        },
+        "tools": {
+          "required": false,
+          "type": "array"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "team_message": {
+      "examples": {
+        "full": {
+          "content": "task complete — ready for review",
+          "from_name": "agent-alpha",
+          "from_session_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+          "type": "team_message"
+        },
+        "minimal": {
+          "content": "task complete — ready for review",
+          "from_name": "agent-alpha",
+          "from_session_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+          "type": "team_message"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "from_name": {
+          "required": true,
+          "type": "string"
+        },
+        "from_session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "thinking": {
+      "examples": {
+        "full": {
+          "content": "The retry must not replay a non-idempotent request.",
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "type": "thinking"
+        },
+        "minimal": {
+          "content": "The retry must not replay a non-idempotent request.",
+          "type": "thinking"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "tool_cancelled": {
+      "examples": {
+        "full": {
+          "id": "toolu_01Example0000000000000",
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "type": "tool_cancelled"
+        },
+        "minimal": {
+          "id": "toolu_01Example0000000000000",
+          "type": "tool_cancelled"
+        }
+      },
+      "fields": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "tool_result": {
+      "examples": {
+        "full": {
+          "id": "toolu_01Example0000000000000",
+          "is_error": true,
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "result": "pub struct UploadClient { /* ... */ }",
+          "type": "tool_result"
+        },
+        "minimal": {
+          "id": "toolu_01Example0000000000000",
+          "is_error": false,
+          "result": "",
+          "type": "tool_result"
+        }
+      },
+      "fields": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "is_error": {
+          "required": true,
+          "type": "boolean"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "result": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "tool_timing": {
+      "examples": {
+        "full": {
+          "called_at": 1760099990.012,
+          "cancelled": true,
+          "ended_at": 1760099999.123,
+          "id": "toolu_01Example0000000000000",
+          "incomplete": true,
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "permission_outcome": "allowed",
+          "permission_requested_at": 1760099990.461,
+          "permission_resolved_at": 1760099996.208,
+          "run_started_at": 1760099996.208,
+          "started_at": 1760099990.457,
+          "type": "tool_timing"
+        },
+        "minimal": {
+          "ended_at": 1760099999.123,
+          "id": "toolu_01Example0000000000000",
+          "type": "tool_timing"
+        }
+      },
+      "fields": {
+        "called_at": {
+          "required": false,
+          "type": "number"
+        },
+        "cancelled": {
+          "required": false,
+          "type": "boolean"
+        },
+        "ended_at": {
+          "required": true,
+          "type": "number"
+        },
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "incomplete": {
+          "required": false,
+          "type": "boolean"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "permission_outcome": {
+          "required": false,
+          "type": "string"
+        },
+        "permission_requested_at": {
+          "required": false,
+          "type": "number"
+        },
+        "permission_resolved_at": {
+          "required": false,
+          "type": "number"
+        },
+        "run_started_at": {
+          "required": false,
+          "type": "number"
+        },
+        "started_at": {
+          "required": false,
+          "type": "number"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "tool_use": {
+      "examples": {
+        "full": {
+          "canonical": "read_file",
+          "category": "read",
+          "id": "toolu_01Example0000000000000",
+          "input": {
+            "file_path": "src/upload/client.rs"
+          },
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "tool": "Read",
+          "type": "tool_use"
+        },
+        "minimal": {
+          "id": "toolu_01Example0000000000000",
+          "input": {},
+          "tool": "Read",
+          "type": "tool_use"
+        }
+      },
+      "fields": {
+        "canonical": {
+          "required": false,
+          "type": "string"
+        },
+        "category": {
+          "required": false,
+          "type": "string"
+        },
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "input": {
+          "required": true,
+          "type": "object"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "tool": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "tool_use_input_resolved": {
+      "examples": {
+        "full": {
+          "id": "toolu_01Example0000000000000",
+          "input": {
+            "file_path": "src/upload/client.rs"
+          },
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "type": "tool_use_input_resolved"
+        },
+        "minimal": {
+          "id": "toolu_01Example0000000000000",
+          "input": {},
+          "type": "tool_use_input_resolved"
+        }
+      },
+      "fields": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "input": {
+          "required": true,
+          "type": "object"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "tools_cancelled": {
+      "examples": {
+        "full": {
+          "cli_pid": 48211,
+          "killed_count": 2,
+          "requested_by": "user",
+          "type": "tools_cancelled"
+        },
+        "minimal": {
+          "killed_count": 0,
+          "requested_by": "user",
+          "type": "tools_cancelled"
+        }
+      },
+      "fields": {
+        "cli_pid": {
+          "required": false,
+          "type": "number"
+        },
+        "killed_count": {
+          "required": true,
+          "type": "number"
+        },
+        "requested_by": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "user_message": {
+      "examples": {
+        "full": {
+          "content": "Add a retry to the upload client.",
+          "type": "user_message"
+        },
+        "minimal": {
+          "content": "Add a retry to the upload client.",
+          "type": "user_message"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "workflow": {
+      "examples": {
+        "full": {
+          "data": {
+            "status": "running",
+            "task_id": "wf_task_0001",
+            "uuid": "3c2b1a09-8f7e-4d6c-8b5a-4c3d2e1f0a9b",
+            "workflow_name": "review",
+            "workflow_progress": [
+              {
+                "agent": "reviewer-1",
+                "status": "running"
+              },
+              {
+                "agent": "reviewer-2",
+                "status": "completed"
+              }
+            ]
+          },
+          "subtype": "task_progress",
+          "type": "workflow"
+        },
+        "minimal": {
+          "data": {},
+          "subtype": "task_started",
+          "type": "workflow"
+        }
+      },
+      "fields": {
+        "data": {
+          "required": true,
+          "type": "object"
+        },
+        "subtype": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    }
+  }
+}

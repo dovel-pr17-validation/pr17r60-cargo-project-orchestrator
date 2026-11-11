@@ -1,0 +1,3188 @@
+//! API route definitions
+//!
+//! Routes are split into public (no auth) and protected (require valid JWT).
+//! The `require_auth` middleware is applied only to protected routes.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use super::auth_handlers;
+use super::chat_handlers;
+use super::code_handlers;
+use super::document_handlers;
+use super::environment_handlers;
+use super::episode_handlers;
+use super::feedback_handlers;
+use super::graph_handlers;
+use super::handlers::{self, OrchestratorState};
+use super::hook_handlers;
+use super::mcp_federation_handlers;
+use super::network_tools_handlers;
+use super::neural_routing_handlers;
+use super::note_handlers;
+use super::persona_handlers;
+use super::profile_handlers;
+use super::project_handlers;
+use super::protocol_handlers;
+use super::provider_handlers;
+use super::quota_handlers;
+use super::reason_handlers;
+use super::refs_handlers;
+use super::registry_handlers;
+use super::rfc_handlers;
+use super::routing_handlers;
+use super::sharing_handlers;
+use super::skill_handlers;
+use super::team_handlers;
+use super::trajectory_handlers;
+use super::trigger_handlers;
+use super::update_handlers;
+use super::vault_handlers;
+use super::workspace_handlers;
+use super::ws_activity_handler;
+use super::ws_chat_handler;
+use super::ws_handlers;
+use super::ws_run_handler;
+use crate::auth::middleware::require_auth;
+use axum::extract::DefaultBodyLimit;
+use axum::http::{header, Method};
+use axum::{
+    middleware::from_fn_with_state,
+    routing::{delete, get, patch, post, put},
+    Router,
+};
+use tower_http::cors::CorsLayer;
+#[cfg(not(feature = "embedded-frontend"))]
+use tower_http::services::ServeDir;
+use tower_http::trace::TraceLayer;
+
+/// Create the API router with public + protected route groups.
+///
+/// Frontend serving behavior depends on the build:
+/// - **`embedded-frontend` feature ON**: The SPA is baked into the binary via
+///   rust-embed; `serve_frontend` and `frontend_path` are ignored.
+/// - **`embedded-frontend` feature OFF** (default): When `serve_frontend` is true,
+///   a `ServeDir` fallback serves files from `frontend_path` with SPA routing.
+///
+/// In both cases, Axum's explicit routes (/api/*, /auth/*, /ws/*, /health,
+/// /hooks/*, /internal/*) always take priority — only unmatched paths hit the fallback.
+pub fn create_router(state: OrchestratorState) -> Router {
+    let cors = build_cors(&state);
+
+    // Remote MCP is opt-in: the /mcp transport and OAuth 2.1 AS routes are only
+    // mounted when explicitly enabled in config. When disabled, requests to /mcp
+    // and /oauth/* fall through to the 404/SPA fallback — no exposure by default.
+    let remote_mcp_enabled = state.remote_mcp.enabled;
+
+    let public = public_routes();
+    // External events ingestion is opt-in too (`ingress.enabled`, off by default):
+    // when off, the route is not mounted and answers exactly like an unknown path.
+    // It joins the bounded group: it writes to Neo4j and needs a deadline too.
+    let mut bounded_public = bounded_public_routes();
+    if remote_mcp_enabled {
+        bounded_public = bounded_public.merge(remote_mcp_public_routes());
+    }
+    if state.ingress.config.enabled {
+        bounded_public = bounded_public.merge(ingress_routes());
+    }
+
+    // Public routes that reach Neo4j get their own deadline: they are unauthenticated,
+    // so nothing else bounded them, and a saturated pool turned them into multi-minute
+    // waits (see `bounded_public_routes`). WebSocket upgrades stay untimed, so they are
+    // merged separately. Generous enough for an OAuth handshake, short enough to fail
+    // while the user is still looking at the screen.
+    //
+    // 503, not 408: the client was not slow, the server is out of Neo4j connections.
+    let public_timeout_secs = std::env::var("PUBLIC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(20);
+    let bounded_public = bounded_public.layer(tower_http::timeout::TimeoutLayer::with_status_code(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        std::time::Duration::from_secs(public_timeout_secs),
+    ));
+
+    // Request timeout on protected REST routes. Hung requests (e.g. a handler
+    // blocked waiting for a saturated Neo4j pool) return 408 instead of freezing
+    // the tab forever. WS routes are NOT wrapped — a blanket timeout would kill
+    // long-lived sockets.
+    // Heavy admin/sync ops spawn background work and return fast, so the
+    // generous default (60s) does not clip them. Tune via env if needed.
+    let timeout_secs = std::env::var("HTTP_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(60);
+    let mut protected = protected_routes();
+    if remote_mcp_enabled {
+        // Merge BEFORE the require_auth layer so /mcp stays authenticated.
+        protected = protected.merge(remote_mcp_protected_routes());
+    }
+    let protected = protected
+        .layer(from_fn_with_state(state.clone(), require_auth))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(timeout_secs),
+        ));
+
+    let router = public
+        .merge(bounded_public)
+        .merge(websocket_routes())
+        .merge(protected)
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
+        .with_state(state.clone());
+
+    attach_frontend(router, &state)
+}
+
+/// Attach frontend serving to the router.
+///
+/// When the `embedded-frontend` feature is active, the SPA is served from
+/// memory (rust-embed). Otherwise, it's served from the filesystem via ServeDir.
+#[cfg(feature = "embedded-frontend")]
+fn attach_frontend(router: Router, _state: &OrchestratorState) -> Router {
+    tracing::info!("Frontend serving: embedded (rust-embed, compiled into binary)");
+    router.fallback(super::embedded_frontend::serve_embedded)
+}
+
+#[cfg(not(feature = "embedded-frontend"))]
+fn attach_frontend(router: Router, state: &OrchestratorState) -> Router {
+    if state.serve_frontend {
+        // Uses `fallback()` (not `not_found_service()`) to preserve 200 status
+        // on SPA routes — `not_found_service` would force 404 on every fallback.
+        let index_path = format!("{}/index.html", state.frontend_path);
+
+        // SPA fallback: serve index.html for client-side routes, but 404 for a
+        // missing static asset. Serving index.html (text/html) for a *.js/*.css
+        // request makes the browser fail module loading with a cryptic "MIME type
+        // text/html" error that hides the real "frontend out of sync" cause.
+        let fallback = tower::service_fn(move |req: axum::http::Request<axum::body::Body>| {
+            let index_path = index_path.clone();
+            async move {
+                use axum::response::IntoResponse;
+                let path = req.uri().path().trim_start_matches('/').to_string();
+                if is_static_asset(&path) {
+                    return Ok::<_, std::convert::Infallible>(
+                        (axum::http::StatusCode::NOT_FOUND, "Not found").into_response(),
+                    );
+                }
+                match tokio::fs::read(&index_path).await {
+                    Ok(data) => Ok::<_, std::convert::Infallible>(
+                        axum::response::Response::builder()
+                            .status(axum::http::StatusCode::OK)
+                            .header(axum::http::header::CONTENT_TYPE, "text/html")
+                            .body(axum::body::Body::from(data))
+                            .unwrap(),
+                    ),
+                    Err(_) => Ok::<_, std::convert::Infallible>(
+                        (axum::http::StatusCode::NOT_FOUND, "Frontend not found").into_response(),
+                    ),
+                }
+            }
+        });
+
+        let serve_dir = ServeDir::new(&state.frontend_path).fallback(fallback);
+
+        // Prevent stale caching: WKWebView (Tauri desktop) aggressively caches
+        // HTTP responses using heuristic expiration when no Cache-Control is set.
+        // Without this, index.html can be served from a previous app version even
+        // after reinstalling — the WebKit cache lives in ~/Library/WebKit/ and
+        // ~/Library/Caches/<bundle-id>/, NOT inside the .app bundle.
+        let service = tower::ServiceBuilder::new()
+            .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+            ))
+            .service(serve_dir);
+
+        router.fallback_service(service)
+    } else {
+        router
+    }
+}
+
+/// True when a request path targets a static file (JS/CSS/font/image/manifest…)
+/// rather than a client-side SPA route. Missing static assets must return 404,
+/// not the index.html SPA fallback: serving index.html (text/html) for a
+/// `*.js`/`*.css` request makes the browser fail module loading with a cryptic
+/// "MIME type text/html" error that hides the real "frontend out of sync" cause.
+pub(crate) fn is_static_asset(path: &str) -> bool {
+    if path.starts_with("assets/") {
+        return true;
+    }
+    // Known static file extensions (favicon, manifest, fonts, images, wasm…).
+    // Deliberately NOT "any extension": SPA routes can legitimately contain dots
+    // (e.g. /projects/my.repo, /user/john.doe) and must fall back to index.html,
+    // not 404.
+    const STATIC_EXT: &[&str] = &[
+        "js",
+        "mjs",
+        "css",
+        "map",
+        "wasm",
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "svg",
+        "ico",
+        "webp",
+        "avif",
+        "woff",
+        "woff2",
+        "ttf",
+        "otf",
+        "eot",
+        "webmanifest",
+        "xml",
+        "txt",
+        "json",
+    ];
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| STATIC_EXT.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Build CORS layer with credentials support for cookie-based auth.
+///
+/// `allow_credentials(true)` is required for browsers to send the `refresh_token`
+/// HttpOnly cookie on cross-origin requests (including WebSocket upgrades).
+///
+/// CORS spec requires that when `credentials: true`:
+/// - Origins MUST be explicit (not `*`)
+/// - Methods MUST be explicit (not `*`)
+/// - Headers MUST be explicit (not `*`)
+fn build_cors(state: &OrchestratorState) -> CorsLayer {
+    // Build allowed origins from ServerState (localhost:{port}, tauri://localhost, public_url)
+    let origin_strings = state.allowed_origins();
+
+    let origins: Vec<axum::http::HeaderValue> = origin_strings
+        .iter()
+        .filter_map(|s| s.parse::<axum::http::HeaderValue>().ok())
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            header::COOKIE,
+            // optimistic concurrency of the anchors API
+            header::IF_MATCH,
+        ])
+        .expose_headers([header::ETAG])
+        .allow_credentials(true)
+}
+
+// ============================================================================
+// Public routes (no authentication required)
+// ============================================================================
+
+/// Routes accessible without authentication.
+///
+/// Includes: health check, OAuth login/callback, webhook endpoints, internal events.
+/// Remote MCP public routes — OAuth 2.1 Authorization Server + discovery.
+///
+/// Mounted only when `remote_mcp.enabled` is true (see `create_router`). Public
+/// per the OAuth/MCP spec: discovery metadata, Dynamic Client Registration,
+/// authorize (user auth happens via the refresh cookie inside), token exchange
+/// (PKCE). See src/auth/oauth_server.rs.
+fn remote_mcp_public_routes() -> Router<OrchestratorState> {
+    Router::new()
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(crate::auth::oauth_server::authorization_server_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(crate::auth::oauth_server::protected_resource_metadata),
+        )
+        .route(
+            "/oauth/register",
+            post(crate::auth::oauth_server::register_client),
+        )
+        .route(
+            "/oauth/authorize",
+            get(crate::auth::oauth_server::authorize)
+                .post(crate::auth::oauth_server::authorize_consent),
+        )
+        .route("/oauth/token", post(crate::auth::oauth_server::token))
+}
+
+/// Remote MCP protected routes — the Streamable HTTP transport itself.
+///
+/// Mounted only when `remote_mcp.enabled` is true (see `create_router`) and kept
+/// UNDER the `require_auth` layer. POST = JSON-RPC messages, GET = SSE stream,
+/// DELETE = session termination. See src/mcp/http_transport.rs.
+fn remote_mcp_protected_routes() -> Router<OrchestratorState> {
+    Router::new().route(
+        "/mcp",
+        post(crate::mcp::http_transport::mcp_post)
+            .get(crate::mcp::http_transport::mcp_get)
+            .delete(crate::mcp::http_transport::mcp_delete),
+    )
+}
+
+/// The public ingress route: guarded by the trigger's HMAC secret, never behind
+/// `require_auth`, with its own limits (see `src/api/ingress_handlers.rs`).
+fn ingress_routes() -> Router<OrchestratorState> {
+    Router::new().route(
+        "/hooks/events/{source}/{trigger_id}",
+        post(crate::api::ingress_handlers::receive_external_event),
+    )
+}
+
+fn public_routes() -> Router<OrchestratorState> {
+    Router::new()
+        // Health check, version & setup status
+        .route("/health", get(handlers::health))
+        .route("/api/version", get(handlers::get_version))
+        .route("/api/setup-status", get(handlers::setup_status))
+        // Live Claude model catalog (Anthropic Models API + local curation, cached).
+        // PUBLIC on purpose: the setup wizard at /setup runs before login and
+        // needs the real list — while it was authenticated, that screen could
+        // only ever render the frontend's hardcoded fallback. The payload is
+        // the public Claude catalog plus UI labels: no user data, no API key,
+        // and the 12h server-side cache means an anonymous caller cannot
+        // amplify traffic to Anthropic.
+        .route("/api/chat/models", get(chat_handlers::get_model_catalog))
+}
+
+/// Public routes that reach Neo4j, and must therefore be bounded in time.
+///
+/// The protected routes have had a `TimeoutLayer` for a while (see
+/// `create_router`); these ones did not, because they are public. That gap is
+/// how `/auth/refresh` ended up waiting 57 s for a Neo4j connection while the
+/// workspace fan-out was draining the pool (measured 2026-10-31): the request
+/// was neither authenticated nor bounded, so nothing ever interrupted it.
+///
+/// A saturated pool is a server-side condition, hence `503 Service Unavailable`
+/// rather than `408 Request Timeout` — the client was not slow, the server was
+/// out of connections.
+fn bounded_public_routes() -> Router<OrchestratorState> {
+    Router::new()
+        // ================================================================
+        // Auth (public — login flow + discovery)
+        // ================================================================
+        .route("/auth/providers", get(auth_handlers::get_auth_providers))
+        .route("/auth/login", post(auth_handlers::password_login))
+        .route("/auth/register", post(auth_handlers::register))
+        // NOTE: the OAuth 2.1 Authorization Server routes (discovery metadata,
+        // DCR, authorize, token) are gated behind remote_mcp.enabled and mounted
+        // separately in `create_router` via `remote_mcp_public_routes()`.
+        // OIDC generic routes
+        .route("/auth/oidc", get(auth_handlers::oidc_login))
+        .route("/auth/oidc/callback", post(auth_handlers::oidc_callback))
+        // Legacy Google routes (alias → same underlying OIDC flow for google_login,
+        // google_callback kept for direct Google OAuth backward compat)
+        .route("/auth/google", get(auth_handlers::google_login))
+        .route(
+            "/auth/google/callback",
+            post(auth_handlers::google_callback),
+        )
+        // Token refresh (public — reads cookie, not Bearer. Allows refresh with expired JWT)
+        .route("/auth/refresh", post(auth_handlers::refresh_token))
+        // Logout (public — revokes refresh token cookie, works with expired JWT)
+        .route("/auth/logout", post(auth_handlers::logout))
+        // WS ticket (public — reads cookie to issue a short-lived WS auth ticket.
+        // Workaround for WKWebView not sending cookies on WebSocket upgrades.)
+        .route("/auth/ws-ticket", post(auth_handlers::ws_ticket))
+        // NOTE: `/hooks/wake` and `/internal/events` are NOT public. They mutate
+        // state (complete a task, inject an event into the bus), so they live in
+        // `protected_routes` behind `require_auth`.
+        // ================================================================
+        // Hook activation (public — called from Claude Code hooks, rate limited)
+        // ================================================================
+        .route("/api/hooks/activate", post(hook_handlers::activate_hook))
+        .route("/api/hooks/health", get(hook_handlers::hooks_health))
+        .route(
+            "/api/hooks/session-context",
+            get(hook_handlers::session_context),
+        )
+        .route(
+            "/api/hooks/resolve-project",
+            get(hook_handlers::resolve_project),
+        )
+}
+
+/// Public WebSocket upgrades.
+///
+/// Deliberately NOT under any request timeout: a blanket timeout kills a
+/// long-lived socket mid-conversation. These authenticate themselves inside the
+/// handler (cookie, or the one-time ticket from `/auth/ws-ticket`).
+fn websocket_routes() -> Router<OrchestratorState> {
+    Router::new()
+        .route("/ws/events", get(ws_handlers::ws_events))
+        .route("/ws/activity", get(ws_activity_handler::ws_activity))
+        .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
+        .route("/ws/run/{run_id}", get(ws_run_handler::ws_run))
+}
+
+// ============================================================================
+// Protected routes (require valid JWT)
+// ============================================================================
+
+/// Routes that require a valid Bearer JWT token.
+///
+/// The `require_auth` middleware layer is applied by `create_router`.
+fn protected_routes() -> Router<OrchestratorState> {
+    Router::new()
+        // ================================================================
+        // Auth (protected — user info)
+        // ================================================================
+        .route("/auth/me", get(auth_handlers::get_me))
+        // ================================================================
+        // MCP tokens (issue/list/revoke/purge — auth for the remote MCP transport)
+        // ================================================================
+        .route(
+            "/auth/mcp-tokens",
+            get(auth_handlers::list_mcp_tokens)
+                .post(auth_handlers::create_mcp_token)
+                // DELETE without a {jti} = purge the dead records (revoked or
+                // expired). Revoking ONE token keeps its record, on purpose.
+                .delete(auth_handlers::purge_mcp_tokens),
+        )
+        .route(
+            "/auth/mcp-tokens/{jti}",
+            axum::routing::delete(auth_handlers::revoke_mcp_token),
+        )
+        // NOTE: the `/mcp` Streamable HTTP transport route is gated behind
+        // remote_mcp.enabled and mounted separately in `create_router` via
+        // `remote_mcp_protected_routes()` (still under `require_auth`).
+        // ================================================================
+        // Projects (multi-project support)
+        // ================================================================
+        .route(
+            "/api/projects",
+            get(project_handlers::list_projects).post(project_handlers::create_project),
+        )
+        .route(
+            "/api/projects/{slug}",
+            get(project_handlers::get_project)
+                .patch(project_handlers::update_project)
+                .delete(project_handlers::delete_project),
+        )
+        .route(
+            "/api/projects/{slug}/sync",
+            post(project_handlers::sync_project),
+        )
+        .route(
+            "/api/projects/{slug}/plans",
+            get(project_handlers::list_project_plans),
+        )
+        .route(
+            "/api/projects/{slug}/code/search",
+            get(project_handlers::search_project_code),
+        )
+        .route(
+            "/api/projects/{slug}/graph",
+            get(project_handlers::get_project_graph),
+        )
+        .route(
+            "/api/projects/{slug}/intelligence/summary",
+            get(project_handlers::get_intelligence_summary),
+        )
+        .route(
+            "/api/projects/{slug}/embeddings/projection",
+            get(project_handlers::get_embeddings_projection),
+        )
+        .route(
+            "/api/projects/{slug}/health-dashboard",
+            get(project_handlers::get_health_dashboard),
+        )
+        .route(
+            "/api/projects/{slug}/auto-roadmap",
+            get(project_handlers::get_auto_roadmap),
+        )
+        .route(
+            "/api/projects/{slug}/scaffolding",
+            get(project_handlers::get_scaffolding_level)
+                .put(project_handlers::set_scaffolding_level),
+        )
+        // ================================================================
+        // Sharing & Privacy (Privacy MVP)
+        // ================================================================
+        .route(
+            "/api/projects/{slug}/sharing",
+            get(sharing_handlers::get_sharing_status),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/enable",
+            post(sharing_handlers::enable_sharing),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/disable",
+            post(sharing_handlers::disable_sharing),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/policy",
+            get(sharing_handlers::get_sharing_policy).put(sharing_handlers::set_sharing_policy),
+        )
+        .route(
+            "/api/notes/{note_id}/sharing/consent",
+            axum::routing::put(sharing_handlers::set_sharing_consent),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/history",
+            get(sharing_handlers::get_sharing_history),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/preview",
+            get(sharing_handlers::preview_sharing),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/suggest",
+            get(sharing_handlers::suggest_sharing),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/retract",
+            post(sharing_handlers::retract_sharing),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/tombstones",
+            get(sharing_handlers::list_tombstones),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/last-report",
+            get(sharing_handlers::get_last_privacy_report),
+        )
+        // ================================================================
+        // Neural Routing
+        // ================================================================
+        .route(
+            "/api/neural-routing/status",
+            get(neural_routing_handlers::get_status),
+        )
+        .route(
+            "/api/neural-routing/config",
+            get(neural_routing_handlers::get_config).put(neural_routing_handlers::update_config),
+        )
+        .route(
+            "/api/neural-routing/enable",
+            post(neural_routing_handlers::enable),
+        )
+        .route(
+            "/api/neural-routing/disable",
+            post(neural_routing_handlers::disable),
+        )
+        .route(
+            "/api/neural-routing/mode",
+            axum::routing::put(neural_routing_handlers::set_mode),
+        )
+        // ================================================================
+        // Trajectories
+        // ================================================================
+        .route(
+            "/api/trajectories",
+            get(trajectory_handlers::list_trajectories),
+        )
+        .route(
+            "/api/trajectories/stats",
+            get(trajectory_handlers::get_stats),
+        )
+        .route(
+            "/api/trajectories/similar",
+            post(trajectory_handlers::search_similar),
+        )
+        .route(
+            "/api/trajectories/{id}",
+            get(trajectory_handlers::get_trajectory),
+        )
+        // Releases (by project_id)
+        .route(
+            "/api/projects/{project_id}/releases",
+            get(handlers::list_releases).post(handlers::create_release),
+        )
+        // Self-update actions (status is public, in GET /api/version → `update`).
+        // Human sessions only: install swaps the binary, restart ends every session.
+        .route("/api/update/check", post(update_handlers::check_update))
+        .route("/api/update/install", post(update_handlers::install_update))
+        .route("/api/update/restart", post(update_handlers::restart_update))
+        // Secrets vault (user side: a person's token; agent side: vault token)
+        .route("/api/vault", get(vault_handlers::get_vault))
+        .route("/api/vault/init", post(vault_handlers::init_vault))
+        .route("/api/vault/unlock", post(vault_handlers::unlock_vault))
+        .route("/api/vault/lock", post(vault_handlers::lock_vault))
+        .route(
+            "/api/vault/secrets/{name}",
+            axum::routing::put(vault_handlers::put_secret).delete(vault_handlers::delete_secret),
+        )
+        .route("/api/vault/grants", post(vault_handlers::create_grant))
+        .route(
+            "/api/vault/grants/{id}",
+            delete(vault_handlers::revoke_grant),
+        )
+        .route(
+            "/api/vault/requests/{id}/answer",
+            post(vault_handlers::answer_request),
+        )
+        .route("/api/vault/agent/read", post(vault_handlers::agent_read))
+        .route(
+            "/api/vault/agent/requests",
+            post(vault_handlers::agent_request),
+        )
+        .route(
+            "/api/vault/agent/available",
+            get(vault_handlers::agent_available),
+        )
+        // Environments & deployments
+        .route(
+            "/api/projects/{project_id}/environments",
+            get(environment_handlers::list_environments)
+                .post(environment_handlers::create_environment),
+        )
+        .route(
+            "/api/projects/{project_id}/deployment-matrix",
+            get(environment_handlers::get_deployment_matrix),
+        )
+        .route(
+            "/api/environments/{id}",
+            get(environment_handlers::get_environment)
+                .patch(environment_handlers::update_environment)
+                .delete(environment_handlers::delete_environment),
+        )
+        .route(
+            "/api/environments/{id}/deployments",
+            get(environment_handlers::list_deployments)
+                .post(environment_handlers::create_deployment),
+        )
+        .route(
+            "/api/deployments/{id}",
+            axum::routing::patch(environment_handlers::update_deployment),
+        )
+        // Milestones (by project_id)
+        .route(
+            "/api/projects/{project_id}/milestones",
+            get(handlers::list_milestones).post(handlers::create_milestone),
+        )
+        // Roadmap (aggregated view)
+        .route(
+            "/api/projects/{project_id}/roadmap",
+            get(handlers::get_project_roadmap),
+        )
+        // ================================================================
+        // Plans (global or legacy)
+        // ================================================================
+        .route(
+            "/api/plans",
+            get(handlers::list_plans).post(handlers::create_plan),
+        )
+        .route(
+            "/api/plans/{plan_id}",
+            get(handlers::get_plan)
+                .patch(handlers::update_plan_status)
+                .delete(handlers::delete_plan),
+        )
+        .route(
+            "/api/plans/{plan_id}/project",
+            axum::routing::put(handlers::link_plan_to_project)
+                .delete(handlers::unlink_plan_from_project),
+        )
+        .route(
+            "/api/plans/{plan_id}/next-task",
+            get(handlers::get_next_task),
+        )
+        .route(
+            "/api/plans/{plan_id}/dependency-graph",
+            get(handlers::get_plan_dependency_graph),
+        )
+        .route(
+            "/api/plans/{plan_id}/critical-path",
+            get(handlers::get_plan_critical_path),
+        )
+        .route("/api/plans/{plan_id}/waves", get(handlers::get_plan_waves))
+        // Runner
+        .route("/api/plans/{plan_id}/run", post(handlers::run_plan))
+        .route(
+            "/api/plans/{plan_id}/run/status",
+            get(handlers::get_run_status),
+        )
+        .route(
+            "/api/plans/{plan_id}/run/cancel",
+            post(handlers::cancel_run),
+        )
+        .route(
+            "/api/plans/{plan_id}/run/force-cancel",
+            post(handlers::force_cancel_run),
+        )
+        .route(
+            "/api/plans/{plan_id}/run/budget",
+            axum::routing::patch(handlers::update_run_budget),
+        )
+        // Cost aggregates of every run (B35): two counters, never summed together.
+        .route(
+            "/api/runner/cost-breakdown",
+            get(handlers::get_runner_cost_breakdown),
+        )
+        .route(
+            "/api/plans/{plan_id}/run/auto-pr",
+            post(handlers::create_auto_pr),
+        )
+        .route(
+            "/api/plans/{plan_id}/run/tasks/{task_id}/retry",
+            post(handlers::retry_plan_task),
+        )
+        // Plan Runs
+        .route("/api/runs", get(handlers::list_all_plan_runs))
+        .route("/api/plans/{plan_id}/runs", get(handlers::list_plan_runs))
+        .route("/api/runs/{run_id}", get(handlers::get_plan_run))
+        .route(
+            "/api/runs/{run_id}/agent-executions",
+            get(handlers::get_run_agent_executions),
+        )
+        .route(
+            "/api/plans/{plan_id}/runs/compare",
+            post(handlers::compare_plan_runs),
+        )
+        .route(
+            "/api/plans/{plan_id}/runs/predict",
+            post(handlers::predict_plan_run),
+        )
+        // Pipeline — Gate Results & Progress
+        .route("/api/runs/{run_id}/gates", get(handlers::get_run_gates))
+        .route(
+            "/api/runs/{run_id}/progress",
+            get(handlers::get_run_progress),
+        )
+        // Triggers
+        .route(
+            "/api/plans/{plan_id}/triggers",
+            get(handlers::list_triggers).post(handlers::create_trigger),
+        )
+        .route(
+            "/api/triggers/{trigger_id}",
+            delete(handlers::delete_trigger),
+        )
+        .route(
+            "/api/triggers/{trigger_id}/enable",
+            post(handlers::enable_trigger),
+        )
+        .route(
+            "/api/triggers/{trigger_id}/disable",
+            post(handlers::disable_trigger),
+        )
+        .route(
+            "/api/triggers/{trigger_id}/firings",
+            get(handlers::list_trigger_firings),
+        )
+        // Webhooks
+        .route(
+            "/api/webhooks/{trigger_id}",
+            post(handlers::receive_webhook),
+        )
+        // Constraints
+        .route(
+            "/api/plans/{plan_id}/constraints",
+            get(handlers::get_plan_constraints).post(handlers::add_constraint),
+        )
+        .route(
+            "/api/constraints/{constraint_id}",
+            get(handlers::get_constraint)
+                .patch(handlers::update_constraint)
+                .delete(handlers::delete_constraint),
+        )
+        // Lifecycle Hooks
+        .route(
+            "/api/lifecycle-hooks",
+            get(handlers::list_lifecycle_hooks).post(handlers::create_lifecycle_hook),
+        )
+        .route(
+            "/api/lifecycle-hooks/{hook_id}",
+            get(handlers::get_lifecycle_hook)
+                .patch(handlers::update_lifecycle_hook)
+                .delete(handlers::delete_lifecycle_hook),
+        )
+        // Plan ↔ Session linking
+        .route(
+            "/api/plans/{plan_id}/sessions",
+            get(chat_handlers::get_plan_sessions),
+        )
+        // Tasks (global listing)
+        .route("/api/tasks", get(handlers::list_all_tasks))
+        // Tasks (plan-scoped)
+        .route("/api/plans/{plan_id}/tasks", post(handlers::add_task))
+        .route(
+            "/api/tasks/{task_id}",
+            get(handlers::get_task)
+                .patch(handlers::update_task)
+                .delete(handlers::delete_task),
+        )
+        // Day plan — a user's ordered per-day task list, server-side and shared.
+        .route(
+            "/api/day-plan",
+            get(handlers::get_day_plan).put(handlers::set_day_plan),
+        )
+        .route(
+            "/api/day-plan/tasks/{task_id}",
+            post(handlers::add_to_day).delete(handlers::remove_from_day),
+        )
+        // Task ↔ Session linking
+        .route(
+            "/api/tasks/{task_id}/sessions",
+            get(chat_handlers::get_task_sessions),
+        )
+        // Task dependencies
+        .route(
+            "/api/tasks/{task_id}/dependencies",
+            post(handlers::add_task_dependencies),
+        )
+        .route(
+            "/api/tasks/{task_id}/dependencies/{dep_id}",
+            axum::routing::delete(handlers::remove_task_dependency),
+        )
+        .route(
+            "/api/tasks/{task_id}/blockers",
+            get(handlers::get_task_blockers),
+        )
+        .route(
+            "/api/tasks/{task_id}/blocking",
+            get(handlers::get_tasks_blocked_by),
+        )
+        // Steps
+        .route(
+            "/api/tasks/{task_id}/steps",
+            get(handlers::get_task_steps).post(handlers::add_step),
+        )
+        .route(
+            "/api/tasks/{task_id}/steps/progress",
+            get(handlers::get_step_progress),
+        )
+        .route(
+            "/api/steps/{step_id}",
+            get(handlers::get_step)
+                .patch(handlers::update_step)
+                .delete(handlers::delete_step),
+        )
+        // Context
+        .route(
+            "/api/plans/{plan_id}/tasks/{task_id}/context",
+            get(handlers::get_task_context),
+        )
+        .route(
+            "/api/plans/{plan_id}/tasks/{task_id}/prompt",
+            get(handlers::get_task_prompt),
+        )
+        .route(
+            "/api/plans/{plan_id}/tasks/{task_id}/build_prompt",
+            post(handlers::build_task_prompt),
+        )
+        // Task delegation — sub-agent orchestration
+        .route(
+            "/api/plans/{plan_id}/tasks/{task_id}/delegate",
+            post(handlers::delegate_task),
+        )
+        // T5: a delegated task in an ephemeral worktree waits for a person to confirm its place.
+        .route(
+            "/api/execution-places",
+            get(super::execution_place_handlers::list_pending_execution_places),
+        )
+        .route(
+            "/api/execution-places/{placement_id}",
+            get(super::execution_place_handlers::get_execution_place),
+        )
+        .route(
+            "/api/execution-places/{placement_id}/confirm",
+            post(super::execution_place_handlers::confirm_execution_place),
+        )
+        .route(
+            "/api/execution-places/{placement_id}/reject",
+            post(super::execution_place_handlers::reject_execution_place),
+        )
+        .route(
+            "/api/tasks/{task_id}/execution-places",
+            get(super::execution_place_handlers::list_execution_place_events),
+        )
+        // Pre-enrichment pipeline
+        .route("/api/plans/{plan_id}/enrich", post(handlers::enrich_plan))
+        .route(
+            "/api/plans/{plan_id}/tasks/{task_id}/enrich",
+            post(handlers::enrich_task),
+        )
+        // Decisions
+        .route(
+            "/api/tasks/{task_id}/decisions",
+            post(handlers::add_decision),
+        )
+        // The cross-workspace "Today" cockpit: one request, every source.
+        .route(
+            "/api/attention",
+            get(super::attention_aggregate::get_attention),
+        )
+        // Live Activity Hub: what every run of the scope is doing, in one
+        // request, plus the sequence number the live feed resumes from.
+        .route(
+            "/api/activity/snapshot",
+            get(super::activity_handlers::get_activity_snapshot),
+        )
+        // Every agent whose CLI is running right now, whatever started it.
+        .route(
+            "/api/agents/live",
+            get(super::attention_aggregate::get_live_agents),
+        )
+        .route("/api/retrieval-ledger", get(handlers::get_retrieval_ledger))
+        .route(
+            "/api/decisions",
+            get(handlers::list_decisions).post(handlers::add_decision_global),
+        )
+        .route(
+            "/api/decisions/affecting",
+            get(handlers::get_decisions_affecting),
+        )
+        .route(
+            "/api/decisions/timeline",
+            get(handlers::get_decision_timeline),
+        )
+        .route(
+            "/api/decisions/{decision_id}",
+            get(handlers::get_decision)
+                .patch(handlers::update_decision)
+                .delete(handlers::delete_decision),
+        )
+        .route("/api/decisions/search", get(handlers::search_decisions))
+        .route(
+            "/api/decisions/search-semantic",
+            get(handlers::search_decisions_semantic),
+        )
+        // Decision Affects
+        .route(
+            "/api/decisions/{decision_id}/affects",
+            post(handlers::add_decision_affects)
+                .get(handlers::list_decision_affects)
+                .delete(handlers::remove_decision_affects_query),
+        )
+        .route(
+            "/api/decisions/{decision_id}/affects/{entity_type}/{entity_id}",
+            delete(handlers::remove_decision_affects),
+        )
+        // Decision Supersedes
+        .route(
+            "/api/decisions/{new_id}/supersedes/{old_id}",
+            post(handlers::supersede_decision),
+        )
+        // Sync
+        .route("/api/sync", post(handlers::sync_directory))
+        // Releases
+        .route(
+            "/api/releases/{release_id}",
+            get(handlers::get_release)
+                .patch(handlers::update_release)
+                .delete(handlers::delete_release),
+        )
+        .route(
+            "/api/releases/{release_id}/tasks",
+            post(handlers::add_task_to_release),
+        )
+        .route(
+            "/api/releases/{release_id}/commits",
+            post(handlers::add_commit_to_release),
+        )
+        .route(
+            "/api/releases/{release_id}/commits/{commit_sha}",
+            delete(handlers::remove_commit_from_release),
+        )
+        // Milestones
+        .route(
+            "/api/milestones/{milestone_id}",
+            get(handlers::get_milestone)
+                .patch(handlers::update_milestone)
+                .delete(handlers::delete_milestone),
+        )
+        .route(
+            "/api/milestones/{milestone_id}/tasks",
+            post(handlers::add_task_to_milestone),
+        )
+        .route(
+            "/api/milestones/{milestone_id}/plans",
+            post(handlers::link_plan_to_milestone),
+        )
+        .route(
+            "/api/milestones/{milestone_id}/plans/{plan_id}",
+            delete(handlers::unlink_plan_from_milestone),
+        )
+        .route("/api/progress", get(handlers::get_progress_batch))
+        .route(
+            "/api/milestones/{milestone_id}/progress",
+            get(handlers::get_milestone_progress),
+        )
+        // Commits
+        .route("/api/commits", post(handlers::create_commit))
+        .route(
+            "/api/tasks/{task_id}/commits",
+            get(handlers::get_task_commits).post(handlers::link_commit_to_task),
+        )
+        .route(
+            "/api/plans/{plan_id}/commits",
+            get(handlers::get_plan_commits).post(handlers::link_commit_to_plan),
+        )
+        // TOUCHES — Commit ↔ File queries
+        .route(
+            "/api/commits/{commit_sha}/files",
+            get(handlers::get_commit_files),
+        )
+        .route("/api/files/history", get(handlers::get_file_history))
+        // CO_CHANGED — File coupling queries
+        .route(
+            "/api/projects/{project_id}/co-changes",
+            get(handlers::get_co_change_graph),
+        )
+        .route(
+            "/api/files/co-changers",
+            get(handlers::get_file_co_changers),
+        )
+        // Backfill TOUCHES from git history
+        .route(
+            "/api/projects/{project_slug}/backfill-touches",
+            post(handlers::backfill_commit_touches),
+        )
+        // Webhooks (protected — /api prefix)
+        .route("/api/wake", post(handlers::wake))
+        // Same handler under its historical path (agent webhook). Protected: it
+        // marks a task completed.
+        .route("/hooks/wake", post(handlers::wake))
+        // DEPRECATED: Use NATS for inter-process events. Kept for backward
+        // compatibility. Protected: it injects events into the bus.
+        .route("/internal/events", post(handlers::receive_event))
+        // ================================================================
+        // File Watcher (auto-sync on file changes)
+        // ================================================================
+        .route(
+            "/api/watch",
+            get(handlers::watch_status)
+                .post(handlers::start_watch)
+                .delete(handlers::stop_watch),
+        )
+        // EventReactor status
+        .route("/api/reactor/status", get(handlers::reactor_status))
+        // ================================================================
+        // Code Exploration (Graph + Search powered)
+        // ================================================================
+        // Search code semantically (Meilisearch)
+        .route("/api/code/search", get(code_handlers::search_code))
+        // Get symbols in a file (Neo4j)
+        .route(
+            "/api/code/symbols/{*file_path}",
+            get(code_handlers::get_file_symbols),
+        )
+        // Find all references to a symbol
+        .route("/api/code/references", get(code_handlers::find_references))
+        // Get file dependencies (imports + dependents)
+        .route(
+            "/api/code/dependencies/{*file_path}",
+            get(code_handlers::get_file_dependencies),
+        )
+        // Get call graph for a function
+        .route("/api/code/callgraph", get(code_handlers::get_call_graph))
+        // Analyze impact of changes
+        .route("/api/code/impact", get(code_handlers::analyze_impact))
+        // Multi-signal impact fusion (Plan 4)
+        .route(
+            "/api/code/impact/multi",
+            get(code_handlers::analyze_impact_v2),
+        )
+        // Get architecture overview
+        .route(
+            "/api/code/architecture",
+            get(code_handlers::get_architecture),
+        )
+        // Find similar code (POST because of body)
+        .route("/api/code/similar", post(code_handlers::find_similar_code))
+        // Trait implementation exploration
+        .route(
+            "/api/code/trait-impls",
+            get(code_handlers::find_trait_implementations),
+        )
+        .route(
+            "/api/code/type-traits",
+            get(code_handlers::find_type_traits),
+        )
+        .route("/api/code/impl-blocks", get(code_handlers::get_impl_blocks))
+        // ================================================================
+        // Feature Graphs
+        // ================================================================
+        .route(
+            "/api/feature-graphs",
+            get(code_handlers::list_feature_graphs).post(code_handlers::create_feature_graph),
+        )
+        .route(
+            "/api/feature-graphs/auto-build",
+            post(code_handlers::auto_build_feature_graph),
+        )
+        .route(
+            "/api/feature-graphs/{id}",
+            get(code_handlers::get_feature_graph).delete(code_handlers::delete_feature_graph),
+        )
+        .route(
+            "/api/feature-graphs/{id}/entities",
+            post(code_handlers::add_entity_to_feature_graph),
+        )
+        .route(
+            "/api/feature-graphs/{id}/statistics",
+            get(code_handlers::get_feature_graph_statistics),
+        )
+        .route(
+            "/api/feature-graphs/{id}/overlapping",
+            get(code_handlers::find_overlapping_feature_graphs),
+        )
+        .route(
+            "/api/feature-graphs/compare",
+            get(code_handlers::compare_feature_graphs),
+        )
+        // ================================================================
+        // Structural Analytics
+        // ================================================================
+        .route(
+            "/api/code/communities",
+            get(code_handlers::get_code_communities),
+        )
+        .route("/api/code/health", get(code_handlers::get_code_health))
+        .route(
+            "/api/code/node-importance",
+            get(code_handlers::get_node_importance),
+        )
+        // Churn hotspots, knowledge gaps, risk assessment (T5.5, T5.6, T5.7)
+        .route(
+            "/api/code/hotspots",
+            get(code_handlers::get_change_hotspots),
+        )
+        .route(
+            "/api/code/knowledge-gaps",
+            get(code_handlers::get_knowledge_gaps),
+        )
+        .route(
+            "/api/code/risk-assessment",
+            get(code_handlers::get_risk_assessment),
+        )
+        .route("/api/code/homeostasis", get(code_handlers::get_homeostasis))
+        .route(
+            "/api/code/structural-drift",
+            get(code_handlers::get_structural_drift),
+        )
+        // ================================================================
+        // Heritage Navigation
+        // ================================================================
+        .route(
+            "/api/code/class-hierarchy",
+            get(code_handlers::get_class_hierarchy),
+        )
+        .route("/api/code/subclasses", get(code_handlers::find_subclasses))
+        .route(
+            "/api/code/interface-implementors",
+            get(code_handlers::find_interface_implementors),
+        )
+        // ================================================================
+        // Process Detection & Navigation
+        // ================================================================
+        .route(
+            "/api/code/processes/detect",
+            post(code_handlers::detect_processes),
+        )
+        .route("/api/code/processes", get(code_handlers::list_processes))
+        .route(
+            "/api/code/processes/detail",
+            get(code_handlers::get_process_detail),
+        )
+        .route(
+            "/api/code/entry-points",
+            get(code_handlers::get_entry_points),
+        )
+        // ================================================================
+        // Community Enrichment
+        // ================================================================
+        .route(
+            "/api/code/communities/enrich",
+            post(code_handlers::enrich_communities),
+        )
+        // ================================================================
+        // Bridge Subgraph (GraIL)
+        // ================================================================
+        .route("/api/code/bridge", get(code_handlers::get_bridge))
+        // ================================================================
+        // Topological Firewall (GraIL Plan 3)
+        // ================================================================
+        .route(
+            "/api/code/topology/check",
+            get(code_handlers::check_topology),
+        )
+        .route(
+            "/api/code/topology/rules",
+            get(code_handlers::list_topology_rules).post(code_handlers::create_topology_rule),
+        )
+        .route(
+            "/api/code/topology/rules/{rule_id}",
+            delete(code_handlers::delete_topology_rule),
+        )
+        .route(
+            "/api/code/topology/check-file",
+            post(code_handlers::check_file_topology),
+        )
+        // ================================================================
+        // Structural DNA
+        // ================================================================
+        .route(
+            "/api/code/structural-profile",
+            post(code_handlers::get_structural_profile),
+        )
+        .route(
+            "/api/code/structural-twins",
+            post(code_handlers::find_structural_twins),
+        )
+        .route(
+            "/api/code/structural-clusters",
+            post(code_handlers::cluster_dna),
+        )
+        .route(
+            "/api/code/structural-twins/cross-project",
+            post(code_handlers::find_cross_project_twins),
+        )
+        // ================================================================
+        // Link Prediction
+        // ================================================================
+        .route(
+            "/api/code/predict-links",
+            post(code_handlers::predict_missing_links),
+        )
+        .route(
+            "/api/code/link-plausibility",
+            post(code_handlers::check_link_plausibility),
+        )
+        // ================================================================
+        // Stress Testing
+        // ================================================================
+        .route(
+            "/api/code/stress-test-node",
+            post(code_handlers::stress_test_node),
+        )
+        .route(
+            "/api/code/stress-test-edge",
+            post(code_handlers::stress_test_edge),
+        )
+        .route(
+            "/api/code/stress-test-cascade",
+            post(code_handlers::stress_test_cascade),
+        )
+        .route("/api/code/find-bridges", post(code_handlers::find_bridges))
+        // ================================================================
+        // Context Cards (GraIL Plan 8)
+        // ================================================================
+        .route(
+            "/api/code/context-card",
+            get(code_handlers::get_context_card),
+        )
+        .route(
+            "/api/code/context-cards/refresh",
+            post(code_handlers::refresh_context_cards),
+        )
+        // ================================================================
+        // WL Fingerprint & Isomorphic Groups (GraIL Plan 7)
+        // ================================================================
+        .route("/api/code/fingerprint", get(code_handlers::get_fingerprint))
+        .route("/api/code/isomorphic", get(code_handlers::find_isomorphic))
+        .route(
+            "/api/code/structural-templates",
+            get(code_handlers::suggest_structural_templates),
+        )
+        // ================================================================
+        // Implementation Planner
+        // ================================================================
+        .route(
+            "/api/code/plan-implementation",
+            post(code_handlers::plan_implementation),
+        )
+        // ================================================================
+        // Feedback (OutcomeTracker — closed-loop learning)
+        // ================================================================
+        .route(
+            "/api/feedback",
+            get(feedback_handlers::list_feedback).post(feedback_handlers::create_feedback),
+        )
+        .route(
+            "/api/feedback/stats",
+            get(feedback_handlers::get_feedback_stats),
+        )
+        // ================================================================
+        // Documents (attachments)
+        // ================================================================
+        // The upload route carries its own body limit. axum's default is 2 MiB,
+        // which an ordinary PDF exceeds; the rejection that follows says nothing
+        // about size, so the failure reads as a mystery rather than as "too
+        // big". The limit is derived from the blob store's cap so the two
+        // cannot drift apart — see `document_handlers::upload_body_limit`.
+        .route(
+            "/api/documents",
+            get(document_handlers::list_documents).merge(
+                post(document_handlers::upload_document)
+                    .layer(DefaultBodyLimit::max(document_handlers::upload_body_limit())),
+            ),
+        )
+        .route(
+            "/api/documents/{document_id}",
+            get(document_handlers::get_document).delete(document_handlers::delete_document),
+        )
+        .route(
+            "/api/documents/{document_id}/chunks",
+            get(document_handlers::get_document_chunks),
+        )
+        .route(
+            "/api/documents/{document_id}/raw",
+            get(document_handlers::get_document_raw),
+        )
+        // ================================================================
+        // Knowledge Notes
+        // ================================================================
+        // Notes CRUD
+        .route(
+            "/api/notes",
+            get(note_handlers::list_notes).post(note_handlers::create_note),
+        )
+        // Notes injected in every turn (a person pins them: human-only mutation).
+        .route(
+            "/api/knowledge/pinned-notes",
+            get(note_handlers::get_pinned_notes).put(note_handlers::put_pinned_notes),
+        )
+        // What a person is asked to declare, and what the prompt will really carry of it
+        // (read-only: the declaration itself goes through `pinned-notes`).
+        .route(
+            "/api/knowledge/self-core",
+            get(note_handlers::get_self_core),
+        )
+        .route(
+            "/api/notes/{note_id}",
+            get(note_handlers::get_note)
+                .patch(note_handlers::update_note)
+                .delete(note_handlers::delete_note),
+        )
+        .route(
+            "/api/notes/{note_id}/scope",
+            axum::routing::post(note_handlers::rescope_note),
+        )
+        // Notes search
+        .route("/api/notes/search", get(note_handlers::search_notes))
+        .route(
+            "/api/notes/search-semantic",
+            get(note_handlers::search_notes_semantic),
+        )
+        .route(
+            "/api/notes/neurons/search",
+            get(note_handlers::search_neurons),
+        )
+        .route(
+            "/api/notes/neurons/reinforce",
+            post(note_handlers::reinforce_neurons),
+        )
+        .route(
+            "/api/notes/neurons/decay",
+            post(note_handlers::decay_synapses),
+        )
+        .route(
+            "/api/notes/neurons/heal-scars",
+            post(note_handlers::heal_scars),
+        )
+        .route(
+            "/api/notes/consolidate-memory",
+            post(note_handlers::consolidate_memory),
+        )
+        .route(
+            "/api/notes/purge-auto-observed",
+            post(note_handlers::purge_auto_observed),
+        )
+        // Runner feedback analysis
+        .route(
+            "/api/admin/analyze-runner-feedback",
+            post(note_handlers::analyze_runner_feedback),
+        )
+        .route(
+            "/api/admin/generate-feedback-rfcs",
+            post(note_handlers::generate_feedback_rfcs),
+        )
+        .route(
+            "/api/admin/apply-feedback-rfc",
+            post(note_handlers::apply_feedback_rfc),
+        )
+        // Notes needing review
+        .route(
+            "/api/notes/needs-review",
+            get(note_handlers::get_notes_needing_review),
+        )
+        // Update staleness scores
+        .route(
+            "/api/notes/update-staleness",
+            post(note_handlers::update_staleness_scores),
+        )
+        // Update energy scores (Hebbian decay)
+        .route(
+            "/api/notes/update-energy",
+            post(note_handlers::update_energy_scores),
+        )
+        // Notes for a project
+        .route(
+            "/api/projects/{project_id}/notes",
+            get(note_handlers::list_project_notes),
+        )
+        // Note lifecycle operations
+        .route(
+            "/api/notes/{note_id}/confirm",
+            post(note_handlers::confirm_note),
+        )
+        .route(
+            "/api/notes/{note_id}/invalidate",
+            post(note_handlers::invalidate_note),
+        )
+        .route(
+            "/api/notes/{note_id}/supersede",
+            post(note_handlers::supersede_note),
+        )
+        // Note linking
+        .route(
+            "/api/notes/{note_id}/links",
+            post(note_handlers::link_note_to_entity),
+        )
+        .route(
+            "/api/notes/{note_id}/links/{entity_type}/{entity_id}",
+            axum::routing::delete(note_handlers::unlink_note_from_entity),
+        )
+        // Context notes (direct + propagated)
+        .route("/api/notes/context", get(note_handlers::get_context_notes))
+        .route(
+            "/api/notes/propagated",
+            get(note_handlers::get_propagated_notes),
+        )
+        // Unified context knowledge (notes + decisions + commits)
+        .route(
+            "/api/notes/context-knowledge",
+            get(note_handlers::get_context_knowledge),
+        )
+        // Enriched propagated knowledge (notes + decisions + relation stats)
+        .route(
+            "/api/notes/propagated-knowledge",
+            get(note_handlers::get_propagated_knowledge),
+        )
+        // Entity notes (direct only)
+        .route(
+            "/api/entities/{entity_type}/{entity_id}/notes",
+            get(note_handlers::get_entity_notes),
+        )
+        // Ego-graph around any entity (entity pages, agents)
+        .route(
+            "/api/graph/transverse",
+            get(project_handlers::get_transverse_graph),
+        )
+        .route(
+            "/api/graph/neighborhood",
+            get(graph_handlers::get_neighborhood),
+        )
+        // Read-only views of the measured schema and of a causal path between two nodes
+        .route("/api/graph/schema", get(graph_handlers::get_schema_catalog))
+        .route("/api/graph/path", get(graph_handlers::get_typed_path))
+        // ================================================================
+        // Analysis Profiles
+        // ================================================================
+        .route(
+            "/api/analysis-profiles",
+            get(profile_handlers::list_analysis_profiles)
+                .post(profile_handlers::create_analysis_profile),
+        )
+        .route(
+            "/api/analysis-profiles/{profile_id}",
+            get(profile_handlers::get_analysis_profile)
+                .delete(profile_handlers::delete_analysis_profile),
+        )
+        // ================================================================
+        // Skills (Neural Skills)
+        // ================================================================
+        .route(
+            "/api/skills",
+            get(skill_handlers::list_skills).post(skill_handlers::create_skill),
+        )
+        .route(
+            "/api/skills/search",
+            axum::routing::post(skill_handlers::search_skills),
+        )
+        .route(
+            "/api/skills/{skill_id}",
+            get(skill_handlers::get_skill)
+                .put(skill_handlers::update_skill)
+                .delete(skill_handlers::delete_skill),
+        )
+        .route(
+            "/api/skills/{skill_id}/members",
+            get(skill_handlers::get_skill_members).post(skill_handlers::add_skill_member),
+        )
+        .route(
+            "/api/skills/{skill_id}/members/{entity_type}/{entity_id}",
+            axum::routing::delete(skill_handlers::remove_skill_member),
+        )
+        .route(
+            "/api/skills/{skill_id}/activate",
+            post(skill_handlers::activate_skill),
+        )
+        .route(
+            "/api/skills/{skill_id}/export",
+            get(skill_handlers::export_skill),
+        )
+        .route("/api/skills/import", post(skill_handlers::import_skill))
+        .route(
+            "/api/skills/{skill_id}/health",
+            get(skill_handlers::get_skill_health),
+        )
+        .route(
+            "/api/skills/{skill_id}/split",
+            post(skill_handlers::split_skill),
+        )
+        .route("/api/skills/merge", post(skill_handlers::merge_skills))
+        // ================================================================
+        // Personas (Living Personas — Adaptive Knowledge Agents)
+        // ================================================================
+        .route(
+            "/api/personas",
+            get(persona_handlers::list_personas).post(persona_handlers::create_persona),
+        )
+        // Static sub-paths MUST come before /{persona_id} to avoid capture
+        .route(
+            "/api/personas/global",
+            get(persona_handlers::list_global_personas),
+        )
+        .route(
+            "/api/personas/find-for-file",
+            get(persona_handlers::find_for_file),
+        )
+        .route(
+            "/api/personas/import",
+            post(persona_handlers::import_persona),
+        )
+        .route(
+            "/api/personas/auto-build",
+            post(persona_handlers::auto_build_persona),
+        )
+        .route(
+            "/api/personas/maintain",
+            post(persona_handlers::maintain_personas),
+        )
+        .route(
+            "/api/personas/detect",
+            post(persona_handlers::detect_personas),
+        )
+        .route(
+            "/api/personas/learning-health",
+            get(persona_handlers::get_learning_health),
+        )
+        .route(
+            "/api/personas/{persona_id}",
+            get(persona_handlers::get_persona)
+                .put(persona_handlers::update_persona)
+                .delete(persona_handlers::delete_persona),
+        )
+        .route(
+            "/api/personas/{persona_id}/subgraph",
+            get(persona_handlers::get_subgraph),
+        )
+        .route(
+            "/api/personas/{persona_id}/export",
+            get(persona_handlers::export_persona),
+        )
+        .route(
+            "/api/personas/{persona_id}/activate",
+            post(persona_handlers::activate_persona),
+        )
+        // Relation routes — Skills (MASTERS)
+        .route(
+            "/api/personas/{persona_id}/skills/{skill_id}",
+            post(persona_handlers::add_skill).delete(persona_handlers::remove_skill),
+        )
+        // Relation routes — Protocols (FOLLOWS)
+        .route(
+            "/api/personas/{persona_id}/protocols/{protocol_id}",
+            post(persona_handlers::add_protocol).delete(persona_handlers::remove_protocol),
+        )
+        // Relation routes — FeatureGraph (SCOPED_TO)
+        .route(
+            "/api/personas/{persona_id}/feature-graphs/{feature_graph_id}",
+            post(persona_handlers::scope_to_feature_graph)
+                .delete(persona_handlers::unscope_feature_graph),
+        )
+        // Relation routes — Files (KNOWS)
+        .route(
+            "/api/personas/{persona_id}/files",
+            post(persona_handlers::add_file).delete(persona_handlers::remove_file),
+        )
+        // Relation routes — Functions (KNOWS)
+        .route(
+            "/api/personas/{persona_id}/functions",
+            post(persona_handlers::add_function).delete(persona_handlers::remove_function),
+        )
+        // Relation routes — Notes (USES)
+        .route(
+            "/api/personas/{persona_id}/notes/{note_id}",
+            post(persona_handlers::add_note).delete(persona_handlers::remove_note),
+        )
+        // Relation routes — Decisions (USES)
+        .route(
+            "/api/personas/{persona_id}/decisions/{decision_id}",
+            post(persona_handlers::add_decision).delete(persona_handlers::remove_decision),
+        )
+        // Relation routes — Extends (EXTENDS)
+        .route(
+            "/api/personas/{persona_id}/extends/{parent_persona_id}",
+            post(persona_handlers::add_extends).delete(persona_handlers::remove_extends),
+        )
+        // ================================================================
+        // Skill Registry (Pattern Federation)
+        // ================================================================
+        .route(
+            "/api/registry/publish",
+            post(registry_handlers::publish_skill),
+        )
+        .route(
+            "/api/registry/search",
+            get(registry_handlers::search_registry),
+        )
+        .route(
+            "/api/registry/{id}",
+            get(registry_handlers::get_published_skill),
+        )
+        .route(
+            "/api/registry/{id}/import",
+            post(registry_handlers::import_from_registry),
+        )
+        // Chat references: suggestions for the `#` picker (additive, read-only)
+        .route("/api/refs/search", get(refs_handlers::search_refs))
+        .route("/api/refs/kinds", get(refs_handlers::ref_kinds))
+        // ================================================================
+        // RFCs (Notes with note_type=rfc, frontend-friendly API)
+        // ================================================================
+        .route(
+            "/api/rfcs",
+            get(rfc_handlers::list_rfcs).post(rfc_handlers::create_rfc),
+        )
+        .route(
+            "/api/rfcs/{rfc_id}",
+            get(rfc_handlers::get_rfc)
+                .patch(rfc_handlers::update_rfc)
+                .delete(rfc_handlers::delete_rfc),
+        )
+        .route(
+            "/api/rfcs/{rfc_id}/transition",
+            post(rfc_handlers::transition_rfc),
+        )
+        // ================================================================
+        // Protocols (Pattern Federation)
+        // ================================================================
+        .route(
+            "/api/protocols",
+            get(protocol_handlers::list_protocols).post(protocol_handlers::create_protocol),
+        )
+        .route(
+            "/api/protocols/route",
+            get(protocol_handlers::route_protocols),
+        )
+        .route(
+            "/api/protocols/validate",
+            get(protocol_handlers::validate_all_protocols),
+        )
+        .route(
+            "/api/protocols/compose",
+            post(protocol_handlers::compose_protocol),
+        )
+        .route(
+            "/api/protocols/simulate",
+            post(protocol_handlers::simulate_activation),
+        )
+        .route(
+            "/api/protocols/{protocol_id}",
+            get(protocol_handlers::get_protocol)
+                .put(protocol_handlers::update_protocol)
+                .delete(protocol_handlers::delete_protocol),
+        )
+        .route(
+            "/api/protocols/{protocol_id}/states",
+            get(protocol_handlers::list_states).post(protocol_handlers::add_state),
+        )
+        .route(
+            "/api/protocols/{protocol_id}/states/{state_id}",
+            axum::routing::delete(protocol_handlers::delete_state),
+        )
+        .route(
+            "/api/protocols/{protocol_id}/transitions",
+            get(protocol_handlers::list_transitions).post(protocol_handlers::add_transition),
+        )
+        .route(
+            "/api/protocols/{protocol_id}/transitions/{transition_id}",
+            axum::routing::delete(protocol_handlers::delete_transition),
+        )
+        .route(
+            "/api/protocols/{protocol_id}/link-skill",
+            post(protocol_handlers::link_to_skill),
+        )
+        // Protocol Runs (FSM Runtime)
+        .route(
+            "/api/protocols/{protocol_id}/runs",
+            get(protocol_handlers::list_runs).post(protocol_handlers::start_run),
+        )
+        .route("/api/protocols/runs", get(protocol_handlers::list_all_runs))
+        .route(
+            "/api/protocols/runs/{run_id}",
+            get(protocol_handlers::get_run).delete(protocol_handlers::delete_run),
+        )
+        .route(
+            "/api/protocols/runs/{run_id}/transition",
+            post(protocol_handlers::fire_transition),
+        )
+        .route(
+            "/api/protocols/runs/{run_id}/cancel",
+            post(protocol_handlers::cancel_run),
+        )
+        .route(
+            "/api/protocols/runs/{run_id}/fail",
+            post(protocol_handlers::fail_run),
+        )
+        .route(
+            "/api/protocols/runs/{run_id}/progress",
+            post(protocol_handlers::report_progress),
+        )
+        .route(
+            "/api/protocols/runs/{run_id}/children",
+            get(protocol_handlers::get_run_children),
+        )
+        .route(
+            "/api/protocols/runs/{run_id}/tree",
+            get(protocol_handlers::get_run_tree),
+        )
+        // ================================================================
+        // Reasoning Tree
+        // ================================================================
+        .route("/api/reason", post(reason_handlers::reason))
+        .route(
+            "/api/reason/{tree_id}/feedback",
+            post(reason_handlers::reason_feedback),
+        )
+        // ================================================================
+        // Episodes (Episodic Memory)
+        // ================================================================
+        .route("/api/episodes", get(episode_handlers::list_episodes))
+        .route(
+            "/api/episodes/collect",
+            post(episode_handlers::collect_episode),
+        )
+        .route(
+            "/api/episodes/anonymize",
+            post(episode_handlers::anonymize_episode),
+        )
+        .route(
+            "/api/episodes/export-artifact",
+            post(episode_handlers::export_artifact),
+        )
+        // ================================================================
+        // Admin — Embedding Backfill
+        // ================================================================
+        .route(
+            "/api/admin/backfill-embeddings",
+            post(note_handlers::start_backfill_embeddings)
+                .delete(note_handlers::cancel_backfill_embeddings),
+        )
+        .route(
+            "/api/admin/backfill-embeddings/status",
+            get(note_handlers::get_backfill_embeddings_status),
+        )
+        // ================================================================
+        // Admin — Synapse Backfill
+        // ================================================================
+        .route(
+            "/api/admin/backfill-synapses",
+            post(note_handlers::start_backfill_synapses)
+                .delete(note_handlers::cancel_backfill_synapses),
+        )
+        .route(
+            "/api/admin/backfill-synapses/status",
+            get(note_handlers::get_backfill_synapses_status),
+        )
+        // ================================================================
+        // Admin — Decision Reindex & Backfill
+        // ================================================================
+        .route(
+            "/api/admin/reindex-decisions",
+            post(handlers::reindex_decisions),
+        )
+        .route(
+            "/api/admin/backfill-decision-embeddings",
+            post(handlers::backfill_decision_embeddings),
+        )
+        .route(
+            "/api/admin/backfill-decision-project-slugs",
+            post(handlers::backfill_decision_project_slugs),
+        )
+        .route(
+            "/api/admin/backfill-discussed",
+            post(handlers::backfill_discussed),
+        )
+        // ================================================================
+        // Meilisearch Maintenance
+        // ================================================================
+        .route(
+            "/api/meilisearch/stats",
+            get(handlers::get_meilisearch_stats),
+        )
+        .route(
+            "/api/meilisearch/orphans",
+            axum::routing::delete(handlers::delete_meilisearch_orphans),
+        )
+        // ================================================================
+        // Admin Cleanup
+        // ================================================================
+        .route(
+            "/api/admin/cleanup-cross-project-calls",
+            post(handlers::cleanup_cross_project_calls),
+        )
+        .route(
+            "/api/admin/cleanup-builtin-calls",
+            post(handlers::cleanup_builtin_calls),
+        )
+        .route(
+            "/api/admin/migrate-calls-confidence",
+            post(handlers::migrate_calls_confidence),
+        )
+        .route(
+            "/api/admin/cleanup-sync-data",
+            post(handlers::cleanup_sync_data),
+        )
+        // ================================================================
+        // Admin — Knowledge Fabric
+        // ================================================================
+        .route(
+            "/api/admin/update-fabric-scores",
+            post(handlers::update_fabric_scores),
+        )
+        .route(
+            "/api/admin/bootstrap-knowledge-fabric",
+            post(handlers::bootstrap_knowledge_fabric),
+        )
+        .route("/api/admin/audit-gaps", post(handlers::audit_gaps))
+        .route(
+            "/api/admin/persist-health-report",
+            post(handlers::persist_health_report),
+        )
+        .route(
+            "/api/admin/reinforce-isomorphic",
+            post(handlers::reinforce_isomorphic_synapses),
+        )
+        .route("/api/admin/detect-skills", post(handlers::detect_skills))
+        .route(
+            "/api/admin/detect-skill-fission",
+            post(handlers::detect_skill_fission),
+        )
+        .route(
+            "/api/admin/detect-skill-fusion",
+            post(handlers::detect_skill_fusion),
+        )
+        .route(
+            "/api/admin/auto-anchor-notes",
+            post(handlers::auto_anchor_notes),
+        )
+        .route(
+            "/api/admin/reconstruct-knowledge",
+            post(handlers::reconstruct_knowledge),
+        )
+        .route(
+            "/api/admin/skill-maintenance",
+            post(handlers::skill_maintenance),
+        )
+        .route(
+            "/api/admin/detect-stagnation/{project_id}",
+            get(handlers::detect_stagnation),
+        )
+        .route(
+            "/api/admin/deep-maintenance/{project_id}",
+            post(handlers::run_deep_maintenance),
+        )
+        .route(
+            "/api/admin/learning-metrics/{project_id}",
+            get(handlers::get_learning_metrics),
+        )
+        .route(
+            "/api/admin/seed-prompt-fragments/{project_id}",
+            post(handlers::seed_prompt_fragments),
+        )
+        // NOTE: /api/admin/install-hooks removed — hooks are now managed
+        // in-process via SkillActivationHook (zero config required)
+        // ================================================================
+        // Event Triggers (persistent event-to-protocol triggers)
+        // ================================================================
+        .route(
+            "/api/event-triggers",
+            get(trigger_handlers::list_triggers).post(trigger_handlers::create_trigger),
+        )
+        // Static sub-paths MUST come before /{id} to avoid capture
+        .route(
+            "/api/event-triggers/stats",
+            get(trigger_handlers::trigger_stats),
+        )
+        .route(
+            "/api/event-triggers/{id}",
+            get(trigger_handlers::get_trigger)
+                .put(trigger_handlers::update_trigger)
+                .delete(trigger_handlers::delete_trigger),
+        )
+        .route(
+            "/api/event-triggers/{id}/enable",
+            post(trigger_handlers::enable_trigger),
+        )
+        .route(
+            "/api/event-triggers/{id}/disable",
+            post(trigger_handlers::disable_trigger),
+        )
+        // ================================================================
+        // Alerts (HeartbeatEngine)
+        // ================================================================
+        .route("/api/alerts", get(handlers::list_alerts))
+        .route(
+            "/api/alerts/{alert_id}/acknowledge",
+            post(handlers::acknowledge_alert),
+        )
+        // ================================================================
+        // Workspaces
+        // ================================================================
+        .route(
+            "/api/workspaces",
+            get(workspace_handlers::list_workspaces).post(workspace_handlers::create_workspace),
+        )
+        .route(
+            "/api/workspaces/{slug}",
+            get(workspace_handlers::get_workspace)
+                .patch(workspace_handlers::update_workspace)
+                .delete(workspace_handlers::delete_workspace),
+        )
+        .route(
+            "/api/workspaces/{slug}/overview",
+            get(workspace_handlers::get_workspace_overview),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects",
+            get(workspace_handlers::list_workspace_projects)
+                .post(workspace_handlers::add_project_to_workspace),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}",
+            axum::routing::delete(workspace_handlers::remove_project_from_workspace),
+        )
+        // Workspace Milestones
+        .route(
+            "/api/workspaces/{slug}/milestones",
+            get(workspace_handlers::list_workspace_milestones)
+                .post(workspace_handlers::create_workspace_milestone),
+        )
+        .route(
+            "/api/workspace-milestones",
+            get(workspace_handlers::list_all_workspace_milestones),
+        )
+        .route(
+            "/api/workspace-milestones/{id}",
+            get(workspace_handlers::get_workspace_milestone)
+                .patch(workspace_handlers::update_workspace_milestone)
+                .delete(workspace_handlers::delete_workspace_milestone),
+        )
+        .route(
+            "/api/workspace-milestones/{id}/tasks",
+            get(workspace_handlers::list_workspace_milestone_tasks)
+                .post(workspace_handlers::add_task_to_workspace_milestone),
+        )
+        .route(
+            "/api/workspace-milestones/{id}/plans",
+            post(workspace_handlers::link_plan_to_workspace_milestone),
+        )
+        .route(
+            "/api/workspace-milestones/{id}/plans/{plan_id}",
+            delete(workspace_handlers::unlink_plan_from_workspace_milestone),
+        )
+        .route(
+            "/api/workspace-milestones/{id}/progress",
+            get(workspace_handlers::get_workspace_milestone_progress),
+        )
+        // Resources
+        .route(
+            "/api/workspaces/{slug}/resources",
+            get(workspace_handlers::list_resources).post(workspace_handlers::create_resource),
+        )
+        .route(
+            "/api/resources/{id}",
+            get(workspace_handlers::get_resource)
+                .patch(workspace_handlers::update_resource)
+                .delete(workspace_handlers::delete_resource),
+        )
+        .route(
+            "/api/resources/{id}/projects",
+            post(workspace_handlers::link_resource_to_project),
+        )
+        // Components
+        .route(
+            "/api/workspaces/{slug}/components",
+            get(workspace_handlers::list_components).post(workspace_handlers::create_component),
+        )
+        .route(
+            "/api/components/{id}",
+            get(workspace_handlers::get_component)
+                .patch(workspace_handlers::update_component)
+                .delete(workspace_handlers::delete_component),
+        )
+        .route(
+            "/api/components/{id}/dependencies",
+            post(workspace_handlers::add_component_dependency),
+        )
+        .route(
+            "/api/components/{id}/dependencies/{dep_id}",
+            axum::routing::delete(workspace_handlers::remove_component_dependency),
+        )
+        .route(
+            "/api/components/{id}/project",
+            axum::routing::put(workspace_handlers::map_component_to_project),
+        )
+        .route(
+            "/api/workspaces/{slug}/topology",
+            get(workspace_handlers::get_workspace_topology),
+        )
+        .route(
+            "/api/workspaces/{slug}/topology/derive",
+            post(workspace_handlers::derive_workspace_topology),
+        )
+        .route(
+            "/api/workspaces/{slug}/coupling-matrix",
+            get(workspace_handlers::get_coupling_matrix),
+        )
+        // Workspace Intelligence (aggregated graph + summary)
+        .route(
+            "/api/workspaces/{slug}/graph",
+            get(workspace_handlers::get_workspace_graph),
+        )
+        .route(
+            "/api/workspaces/{slug}/intelligence/summary",
+            get(workspace_handlers::get_workspace_intelligence_summary),
+        )
+        // ================================================================
+        // Chat (session management — streaming via WebSocket above)
+        // ================================================================
+        .route(
+            "/api/chat/sessions",
+            get(chat_handlers::list_sessions).post(chat_handlers::create_session),
+        )
+        .route("/api/chat/search", get(chat_handlers::search_messages))
+        // What every session is doing right now, read from the live
+        // ChatManager. Polled by the conversation list to reconcile its
+        // working indicators — an indicator driven by events alone goes
+        // stale on mount and on any dropped event.
+        .route(
+            "/api/chat/live-activity",
+            get(chat_handlers::get_live_activity),
+        )
+        .route(
+            "/api/chat/sessions/backfill-previews",
+            post(chat_handlers::backfill_previews),
+        )
+        .route(
+            "/api/chat/sessions/{id}",
+            get(chat_handlers::get_session)
+                .patch(chat_handlers::update_session)
+                .delete(chat_handlers::delete_session),
+        )
+        // Close (non-destructive) a live session: ends its turn and frees its
+        // envelope slot without removing the node (ZOMBIE-CLI explicit closure).
+        .route(
+            "/api/chat/sessions/{id}/close",
+            post(chat_handlers::close_session),
+        )
+        .route(
+            "/api/chat/sessions/{id}/messages",
+            get(chat_handlers::list_messages).post(chat_handlers::send_session_message),
+        )
+        // Answer a permission request over REST (same server path as the WS
+        // `permission_response` frame): 410 dead session, 409 already decided.
+        .route(
+            "/api/chat/sessions/{id}/permissions/{request_id}",
+            post(chat_handlers::respond_permission),
+        )
+        // The caller's lasting approvals (`always`, P11b): list and revoke, human only.
+        .route(
+            "/api/chat/permission-rules",
+            get(chat_handlers::list_permission_rules),
+        )
+        .route(
+            "/api/chat/permission-rules/{id}",
+            delete(chat_handlers::revoke_permission_rule),
+        )
+        .route(
+            "/api/chat/sessions/{id}/children",
+            get(chat_handlers::get_session_children),
+        )
+        .route(
+            "/api/chat/sessions/{id}/tree",
+            get(chat_handlers::get_session_tree),
+        )
+        // Token usage and prompt-cache hits of a conversation, turn by turn (CTX0).
+        .route(
+            "/api/chat/sessions/{id}/usage",
+            get(chat_handlers::get_session_usage),
+        )
+        .route(
+            "/api/chat/runs/{run_id}/costs",
+            get(chat_handlers::get_run_costs),
+        )
+        .route(
+            "/api/chat/runs/{run_id}/sessions",
+            get(chat_handlers::get_run_sessions),
+        )
+        // DISCUSSED relations (ChatSession → Entity)
+        .route(
+            "/api/chat/sessions/{id}/discussed",
+            post(chat_handlers::add_discussed).get(chat_handlers::get_session_entities),
+        )
+        // Context anchors of a conversation (T4 of plan 09c88ffe): who placed an
+        // anchor comes from the token; ETag / If-Match on the anchor set.
+        .route(
+            "/api/chat/sessions/{id}/anchors",
+            get(chat_handlers::anchors::list_anchors).post(chat_handlers::anchors::add_anchor),
+        )
+        .route(
+            "/api/chat/sessions/{id}/anchors/{anchor_id}",
+            patch(chat_handlers::anchors::update_anchor)
+                .delete(chat_handlers::anchors::remove_anchor),
+        )
+        // Reverse read: the conversations anchored on one entity, paginated.
+        .route(
+            "/api/chat/anchored-sessions",
+            get(chat_handlers::anchors::list_anchored_sessions),
+        )
+        // ASSOCIATED_WITH relation (ChatSession → Plan/Task)
+        .route(
+            "/api/chat/sessions/{id}/associate",
+            post(chat_handlers::associate_session),
+        )
+        // End the current turn (REST fallback for the WS `interrupt`
+        // frame). Transport-independent on purpose: Stop must still
+        // work when the chat WebSocket is down — which is precisely
+        // when the user reaches for it. See the handler doc-comment.
+        .route(
+            "/api/chat/sessions/{id}/interrupt",
+            post(chat_handlers::interrupt_session),
+        )
+        // How THIS conversation is routed (the chat menu: Auto or the models ticked),
+        // stored on the session, never in the settings. Human only.
+        .route(
+            "/api/chat/sessions/{id}/routing",
+            put(chat_handlers::set_session_routing),
+        )
+        // Continue the conversation on another provider (B-SW): a new session,
+        // the earlier conversation relayed to it, the old one closed.
+        .route(
+            "/api/chat/sessions/{id}/switch-provider",
+            post(chat_handlers::switch_provider),
+        )
+        // Cancel running tools (T3 of plan 28e9afe3) — kill the
+        // currently-running tool subprocess(es) WITHOUT ending the
+        // LLM turn. See chat_handlers::cancel_tools doc-comment.
+        .route(
+            "/api/chat/sessions/{id}/cancel-tools",
+            post(chat_handlers::cancel_tools),
+        )
+        // Background tasks (T6 + T8 of plan 754a1379) — snapshot
+        // of the tracked Monitor / Bash bg subprocesses, plus the
+        // granular per-task cancel that targets a single tool_use_id
+        // instead of nuking every descendant.
+        .route(
+            "/api/chat/sessions/{id}/background-tasks",
+            get(chat_handlers::get_background_tasks),
+        )
+        .route(
+            "/api/chat/sessions/{id}/cancel-task/{task_id}",
+            post(chat_handlers::cancel_task),
+        )
+        // Chat permission config (runtime GET/PUT)
+        .route(
+            "/api/chat/config/permissions",
+            get(chat_handlers::get_chat_permissions).put(chat_handlers::update_chat_permissions),
+        )
+        // Chat full configuration (GET/PATCH — includes permissions + env config)
+        .route(
+            "/api/chat/config",
+            get(chat_handlers::get_chat_config).patch(chat_handlers::update_chat_config),
+        )
+        // Detect user PATH from login shell
+        .route("/api/chat/detect-path", get(chat_handlers::detect_path))
+        // CLI version management (check + install/upgrade)
+        .route(
+            "/api/chat/providers",
+            get(chat_handlers::list_providers).post(provider_handlers::create_provider),
+        )
+        .route(
+            "/api/chat/providers/test",
+            post(provider_handlers::test_provider),
+        )
+        .route(
+            "/api/chat/providers/ssh-host-key",
+            post(provider_handlers::scan_ssh_host_key),
+        )
+        .route(
+            "/api/chat/providers/{id}",
+            get(provider_handlers::get_provider)
+                .put(provider_handlers::update_provider)
+                .patch(provider_handlers::update_provider)
+                .delete(provider_handlers::delete_provider),
+        )
+        .route(
+            "/api/chat/providers/{id}/status",
+            get(provider_handlers::provider_status),
+        )
+        // RL7: the state of the instance's configured rate limits (usage,
+        // remaining, resets_at, status). Never a secret: only a credential
+        // REFERENCE is ever echoed.
+        .route(
+            "/api/chat/providers/{id}/limits",
+            get(provider_handlers::provider_limits),
+        )
+        // QUOTA: until when an account refuses, and the windows the provider reports. The PUT is a
+        // person's entry for a provider that exposes nothing (human only, like every mutation
+        // under /api/chat/providers).
+        .route(
+            "/api/chat/provider-quotas",
+            get(quota_handlers::list_quotas),
+        )
+        .route(
+            "/api/chat/providers/{id}/quota",
+            get(quota_handlers::get_quota)
+                .put(quota_handlers::put_quota)
+                .delete(quota_handlers::delete_quota),
+        )
+        .route(
+            "/api/chat/providers/{id}/models",
+            get(provider_handlers::provider_models),
+        )
+        // The agent's own door to the SAME instance operations, for the MCP
+        // `provider` mega-tool. `/api/chat/providers` above keeps its mutations
+        // reserved to a person (A25); these routes add the refusals an agent
+        // cannot lift for itself (trust, pinned host key) instead of removing
+        // that rule. Closed to the restricted and read-only profiles, which do
+        // not see the `provider` tool either.
+        .route(
+            "/api/agent/providers",
+            get(provider_handlers::agent_list_providers)
+                .post(provider_handlers::agent_create_provider),
+        )
+        .route(
+            "/api/agent/providers/test",
+            post(provider_handlers::agent_test_provider),
+        )
+        .route(
+            "/api/agent/providers/ssh-host-key",
+            post(provider_handlers::agent_scan_host_key),
+        )
+        .route(
+            "/api/agent/providers/{id}",
+            get(provider_handlers::agent_get_provider)
+                .patch(provider_handlers::agent_update_provider)
+                .delete(provider_handlers::agent_delete_provider),
+        )
+        .route(
+            "/api/agent/providers/{id}/status",
+            get(provider_handlers::agent_provider_status),
+        )
+        .route(
+            "/api/agent/providers/{id}/models",
+            get(provider_handlers::agent_provider_models),
+        )
+        .route(
+            "/api/chat/send-journal",
+            get(provider_handlers::send_journal),
+        )
+        .route(
+            "/api/chat/roles",
+            get(provider_handlers::get_roles).put(provider_handlers::put_roles),
+        )
+        .route(
+            "/api/chat/model-aliases",
+            get(provider_handlers::get_aliases).put(provider_handlers::put_aliases),
+        )
+        .route(
+            "/api/chat/model-policy",
+            get(provider_handlers::get_policy).put(provider_handlers::put_policy),
+        )
+        // The consents for the chats outside any project (B3): same body, same rules.
+        .route(
+            "/api/chat/llm-consents",
+            get(provider_handlers::list_no_project_consents)
+                .put(provider_handlers::allow_no_project_consent),
+        )
+        .route(
+            "/api/chat/llm-consents/{provider_id}",
+            put(provider_handlers::allow_no_project_consent_for)
+                .delete(provider_handlers::revoke_no_project_consent),
+        )
+        .route(
+            "/api/projects/{slug}/llm-consent",
+            get(provider_handlers::list_consents).put(provider_handlers::allow_consent),
+        )
+        .route(
+            "/api/projects/{slug}/llm-consents",
+            get(provider_handlers::list_consents).put(provider_handlers::allow_consent),
+        )
+        .route(
+            "/api/projects/{slug}/llm-consent/{provider_id}",
+            put(provider_handlers::allow_consent_for).delete(provider_handlers::revoke_consent),
+        )
+        .route(
+            "/api/projects/{slug}/llm-consents/{provider_id}",
+            put(provider_handlers::allow_consent_for).delete(provider_handlers::revoke_consent),
+        )
+        .route(
+            "/api/projects/{slug}/llm-roles",
+            get(provider_handlers::get_project_roles).put(provider_handlers::put_project_roles),
+        )
+        // Network tools of a native session (P6): the project's consent by origin and its
+        // browser authorisation, and the search engines (tool providers `tool:<id>`).
+        .route(
+            "/api/projects/{slug}/network-tools",
+            get(network_tools_handlers::get_network_tools),
+        )
+        .route(
+            "/api/projects/{slug}/network-tools/origins",
+            put(network_tools_handlers::put_origin).delete(network_tools_handlers::delete_origin),
+        )
+        .route(
+            "/api/projects/{slug}/network-tools/browser",
+            put(network_tools_handlers::put_browser),
+        )
+        .route(
+            "/api/chat/search-engines",
+            get(network_tools_handlers::list_search_engines)
+                .post(network_tools_handlers::create_search_engine)
+                .put(network_tools_handlers::put_search_engine_order),
+        )
+        .route(
+            "/api/chat/search-engines/{id}",
+            delete(network_tools_handlers::delete_search_engine),
+        )
+        // The models a person lets their Auto choose among (AUTO-L): per person, human only.
+        .route(
+            "/api/chat/auto-models",
+            get(routing_handlers::get_auto_models).put(routing_handlers::put_auto_models),
+        )
+        // The cap on a parent's live children, changed while the server runs (PLAFOND-RT):
+        // readable by anyone signed in, written by the root account only.
+        .route(
+            "/api/chat/delegation-limits",
+            get(routing_handlers::get_delegation_limits)
+                .put(routing_handlers::put_delegation_limits)
+                .delete(routing_handlers::delete_delegation_limits),
+        )
+        // The tools the native harness defers behind `ToolSearch` (CTX2): readable by
+        // anyone signed in, written by the root account only.
+        .route(
+            "/api/chat/deferred-tools",
+            get(routing_handlers::get_deferred_tools)
+                .put(routing_handlers::put_deferred_tools)
+                .delete(routing_handlers::delete_deferred_tools),
+        )
+        // TEAM-2: two-way messaging inside a session team (parent and children). The
+        // sender is the calling session of the signed token; a person is refused.
+        .route("/api/chat/team", get(team_handlers::get_team))
+        .route(
+            "/api/chat/team/message",
+            post(team_handlers::post_team_message),
+        )
+        // Routing mode and learning stage (R2): global, with a per-project override.
+        .route(
+            "/api/chat/routing",
+            get(routing_handlers::get_routing).put(routing_handlers::put_routing),
+        )
+        .route(
+            "/api/chat/routing/decisions",
+            get(routing_handlers::list_decisions),
+        )
+        .route(
+            "/api/chat/routing/report",
+            get(routing_handlers::get_report),
+        )
+        .route(
+            "/api/projects/{slug}/routing",
+            get(routing_handlers::get_project_routing)
+                .put(routing_handlers::put_project_routing)
+                .delete(routing_handlers::delete_project_routing),
+        )
+        .route("/api/chat/cli/status", get(chat_handlers::get_cli_status))
+        .route("/api/chat/cli/install", post(chat_handlers::install_cli))
+        // CLI auth status
+        .route(
+            "/api/chat/cli/auth-status",
+            get(chat_handlers::get_cli_auth_status),
+        )
+        // ================================================================
+        // MCP Federation (external MCP server connections)
+        // ================================================================
+        .route(
+            "/api/mcp-federation/servers",
+            get(mcp_federation_handlers::list_servers)
+                .post(mcp_federation_handlers::connect_server),
+        )
+        .route(
+            "/api/mcp-federation/servers/{id}",
+            get(mcp_federation_handlers::get_server_status)
+                .delete(mcp_federation_handlers::disconnect_server),
+        )
+        .route(
+            "/api/mcp-federation/servers/{id}/tools",
+            get(mcp_federation_handlers::list_server_tools),
+        )
+        .route(
+            "/api/mcp-federation/servers/{id}/probe",
+            post(mcp_federation_handlers::probe_server),
+        )
+        .route(
+            "/api/mcp-federation/servers/{id}/reconnect",
+            post(mcp_federation_handlers::reconnect_server),
+        )
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::EventBus;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    #[test]
+    fn static_assets_detected_but_spa_routes_with_dots_are_not() {
+        // Vite hashed assets and known static files are assets (404 when missing).
+        assert!(is_static_asset("assets/index-abc.js"));
+        assert!(is_static_asset("favicon.ico"));
+        assert!(is_static_asset("site.webmanifest"));
+        assert!(is_static_asset("assets/logo-123.svg"));
+        // Extension-less SPA routes fall back to index.html.
+        assert!(!is_static_asset("login"));
+        assert!(!is_static_asset("projects/my-org/my-app"));
+        // SPA routes with a dot must NOT be treated as static assets.
+        assert!(!is_static_asset("projects/my.repo"));
+        assert!(!is_static_asset("user/john.doe"));
+    }
+
+    use crate::orchestrator::{FileWatcher, Orchestrator};
+    use crate::test_helpers::{mock_app_state, test_auth_config};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt; // for oneshot
+
+    /// Build a test router with serve_frontend enabled, pointing at a temp dir
+    async fn test_app_with_frontend(dir: &std::path::Path) -> Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let state = Arc::new(handlers::ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: true,
+            frontend_path: dir.to_str().unwrap().to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
+        });
+        create_router(state)
+    }
+
+    /// Build a test router with a specific remote MCP config and no frontend, so
+    /// unmounted routes resolve to a clean 404 (not the SPA fallback).
+    async fn test_app_remote_mcp(remote_mcp: crate::RemoteMcpConfig) -> Router {
+        test_app_remote_mcp_with(mock_app_state(), remote_mcp).await
+    }
+
+    /// Same, on a caller-provided state (to seed the mock store beforehand).
+    async fn test_app_remote_mcp_with(
+        app_state: crate::AppState,
+        remote_mcp: crate::RemoteMcpConfig,
+    ) -> Router {
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let state = Arc::new(handlers::ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            remote_mcp,
+            ingress: Default::default(),
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
+        });
+        create_router(state)
+    }
+
+    /// remote MCP DISABLED (default): the OAuth AS discovery routes are NOT
+    /// mounted. The authoritative signal is the *public* metadata route: when
+    /// mounted it returns 200 JSON; when absent the request falls through to the
+    /// require_auth-guarded fallback → 401 (never the 200 metadata document).
+    /// (`/mcp` itself is auth-guarded and returns 401 whether or not it is
+    /// mounted, so it can't discriminate at unit level — see the E2E task.)
+    #[tokio::test]
+    async fn test_remote_mcp_disabled_routes_absent() {
+        let app = test_app_remote_mcp(crate::RemoteMcpConfig::default()).await;
+
+        let meta = app
+            .oneshot(
+                Request::get("/.well-known/oauth-authorization-server")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            meta.status(),
+            StatusCode::OK,
+            "OAuth AS metadata must NOT be served when remote MCP is disabled"
+        );
+    }
+
+    /// remote MCP ENABLED: OAuth AS metadata is public (200); /mcp is mounted but
+    /// stays behind require_auth (401 without a token — crucially NOT 404).
+    #[tokio::test]
+    async fn test_remote_mcp_enabled_routes_present() {
+        let cfg = crate::RemoteMcpConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let app = test_app_remote_mcp(cfg).await;
+
+        let meta = app
+            .clone()
+            .oneshot(
+                Request::get("/.well-known/oauth-authorization-server")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            meta.status(),
+            StatusCode::OK,
+            "OAuth AS metadata must be served when remote MCP is enabled"
+        );
+
+        let mcp = app
+            .oneshot(
+                Request::post("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            mcp.status(),
+            StatusCode::NOT_FOUND,
+            "/mcp must be mounted when remote MCP is enabled"
+        );
+        assert_eq!(
+            mcp.status(),
+            StatusCode::UNAUTHORIZED,
+            "/mcp must remain behind require_auth (401 without a token)"
+        );
+    }
+
+    /// A signed-in user who merely OPENS an authorize link must not hand a code
+    /// to the client: `GET /oauth/authorize` renders a consent page, and only
+    /// the user's explicit approval (`POST`, with the session of the same
+    /// user) issues the code. Before the consent step, the GET redirected to
+    /// the client's `redirect_uri` with `code=` straight away — and client
+    /// registration is open to anyone.
+    #[tokio::test]
+    async fn test_oauth_authorize_requires_explicit_consent() {
+        // A user with a live session (refresh cookie).
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let user_id = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+        graph
+            .upsert_user(&crate::neo4j::models::UserNode {
+                id: user_id,
+                email: "victim@example.com".into(),
+                name: "Victim".into(),
+                picture_url: None,
+                auth_provider: crate::neo4j::models::AuthProvider::Password,
+                external_id: None,
+                password_hash: None,
+                created_at: now,
+                last_login_at: now,
+            })
+            .await
+            .unwrap();
+        let raw_refresh = crate::auth::refresh::generate_token();
+        graph
+            .create_refresh_token(
+                user_id,
+                &crate::auth::refresh::hash_token(&raw_refresh),
+                now + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        let cookie = format!("refresh_token={raw_refresh}");
+
+        let app = test_app_remote_mcp_with(
+            crate::test_helpers::mock_app_state_with_graph(graph),
+            crate::RemoteMcpConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let body_of = |resp: axum::response::Response| async move {
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+
+        // Anyone can register a client — here, under a hostile name.
+        let registered = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"client_name":"<b>Claude</b>","redirect_uris":["https://attacker.example/cb"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), StatusCode::CREATED);
+        let registration: serde_json::Value =
+            serde_json::from_str(&body_of(registered).await).unwrap();
+        let client_id = registration["client_id"].as_str().unwrap().to_string();
+
+        let authorize_url = format!(
+            "/oauth/authorize?response_type=code&client_id={client_id}\
+             &redirect_uri=https%3A%2F%2Fattacker.example%2Fcb\
+             &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\
+             &code_challenge_method=S256&state=xyz"
+        );
+
+        // GET with the victim's session: a page, not a redirect carrying a code.
+        let page = app
+            .clone()
+            .oneshot(
+                Request::get(&authorize_url)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.status(),
+            StatusCode::OK,
+            "authorize must show a consent page, not redirect with a code"
+        );
+        assert!(page.headers().get("location").is_none());
+        assert_eq!(page.headers().get("x-frame-options").unwrap(), "DENY");
+        let html = body_of(page).await;
+        assert!(
+            html.contains("https://attacker.example"),
+            "destination shown"
+        );
+        assert!(html.contains("victim@example.com"), "account shown");
+        assert!(
+            html.contains("&lt;b&gt;Claude&lt;/b&gt;") && !html.contains("<b>Claude</b>"),
+            "the client name is escaped"
+        );
+        let token = html
+            .split("name=\"consent_token\" value=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("consent token in the form")
+            .to_string();
+
+        let post = |cookie: Option<String>, form: String| {
+            let mut req = Request::post("/oauth/authorize")
+                .header("content-type", "application/x-www-form-urlencoded");
+            if let Some(cookie) = cookie {
+                req = req.header("cookie", cookie);
+            }
+            req.body(Body::from(form)).unwrap()
+        };
+
+        // The approval without the user's session (cross-site POST): refused.
+        let no_session = app
+            .clone()
+            .oneshot(post(
+                None,
+                format!("consent_token={token}&decision=approve"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_session.status(), StatusCode::FORBIDDEN);
+        assert!(no_session.headers().get("location").is_none());
+
+        // A forged token: refused.
+        let forged = app
+            .clone()
+            .oneshot(post(
+                Some(cookie.clone()),
+                "consent_token=not-a-token&decision=approve".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forged.status(), StatusCode::BAD_REQUEST);
+
+        // Deny: back to the client with access_denied and the state, no code.
+        let denied = app
+            .clone()
+            .oneshot(post(
+                Some(cookie.clone()),
+                format!("consent_token={token}&decision=deny"),
+            ))
+            .await
+            .unwrap();
+        assert!(denied.status().is_redirection());
+        let location = denied.headers().get("location").unwrap().to_str().unwrap();
+        assert!(location.starts_with("https://attacker.example/cb?error=access_denied"));
+        assert!(location.ends_with("&state=xyz") && !location.contains("code="));
+
+        // Approve with the session: the code is issued, with the state.
+        let approved = app
+            .clone()
+            .oneshot(post(
+                Some(cookie),
+                format!("consent_token={token}&decision=approve"),
+            ))
+            .await
+            .unwrap();
+        assert!(approved.status().is_redirection());
+        let location = approved
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("https://attacker.example/cb?code="));
+        assert!(location.ends_with("&state=xyz"));
+    }
+
+    /// `/hooks/wake` completes a task and `/internal/events` injects an event
+    /// into the bus: with auth configured, neither may answer without a token.
+    /// The authenticated leg keeps the test honest: the routes are still
+    /// mounted (an empty body is a 4xx other than 401/404, not a pass-through).
+    #[tokio::test]
+    async fn test_state_changing_hooks_require_auth() {
+        let app = test_app_no_frontend().await;
+        let token = crate::test_helpers::test_bearer_token();
+
+        for path in ["/hooks/wake", "/internal/events"] {
+            let anonymous = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                anonymous.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must refuse a request without a Bearer token"
+            );
+
+            let authed = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .header("authorization", token.as_str())
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                authed.status().is_client_error()
+                    && authed.status() != StatusCode::UNAUTHORIZED
+                    && authed.status() != StatusCode::NOT_FOUND,
+                "{path} must stay mounted behind auth, got {}",
+                authed.status()
+            );
+        }
+    }
+
+    /// The interrupt route must be **mounted**.
+    ///
+    /// This is not a hypothetical: `chatApi.interruptSession()` had been
+    /// POSTing to `/api/chat/sessions/{id}/interrupt` from four places in
+    /// the frontend while no such route existed, and every caller swallowed
+    /// the 404 in an empty `catch`. Stop buttons did nothing, silently, and
+    /// nothing in either codebase noticed.
+    ///
+    /// The assertion is relative rather than absolute, because an
+    /// unauthenticated request cannot see past `require_auth`: the route is
+    /// required to answer exactly like its mounted sibling `cancel-tools`,
+    /// and differently from a path that really is absent. The third request
+    /// keeps the test honest — if an absent path answered like a mounted
+    /// one, this test would fail instead of quietly proving nothing.
+    #[tokio::test]
+    async fn test_chat_interrupt_route_is_mounted() {
+        let app = test_app_no_frontend().await;
+        let sid = "11111111-2222-3333-4444-555555555555";
+
+        // Authenticated, otherwise every path — mounted or not — answers 401
+        // from the auth fallback and the comparison proves nothing.
+        let token = crate::test_helpers::test_bearer_token();
+        // The status alone cannot discriminate: this router is built with
+        // `chat_manager: None`, so a mounted chat route answers 404 from its
+        // own handler — the same status an absent path gets. The body is what
+        // separates "the handler ran and said chat is not configured" from
+        // "nothing answered", so compare both.
+        let answer_of = |app: Router, path: String, token: String| async move {
+            let res = app
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .header("authorization", token)
+                        .body(Body::from(r#"{}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        };
+
+        let interrupt = answer_of(
+            app.clone(),
+            format!("/api/chat/sessions/{sid}/interrupt"),
+            token.clone(),
+        )
+        .await;
+        let sibling = answer_of(
+            app.clone(),
+            format!("/api/chat/sessions/{sid}/cancel-tools"),
+            token.clone(),
+        )
+        .await;
+        let absent = answer_of(
+            app.clone(),
+            format!("/api/chat/sessions/{sid}/no-such-endpoint"),
+            token,
+        )
+        .await;
+
+        assert_ne!(
+            sibling, absent,
+            "the test cannot conclude: a mounted route and an absent one answer alike"
+        );
+        assert_eq!(
+            interrupt, sibling,
+            "/interrupt must be mounted, like its sibling /cancel-tools (got {interrupt:?}, sibling {sibling:?})"
+        );
+    }
+
+    /// Build a test router with serve_frontend disabled
+    async fn test_app_no_frontend() -> Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let state = Arc::new(handlers::ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
+        });
+        create_router(state)
+    }
+
+    /// Create a fake dist/ directory with index.html and an asset file
+    fn create_fake_dist() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<!DOCTYPE html><html><body>SPA</body></html>",
+        )
+        .unwrap();
+        // Create assets subdirectory with a JS file
+        let assets = dir.path().join("assets");
+        std::fs::create_dir(&assets).unwrap();
+        std::fs::write(assets.join("app.js"), "console.log('hello');").unwrap();
+        dir
+    }
+
+    // ====================================================================
+    // SPA fallback: GET / returns index.html
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_spa_root_returns_index_html() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("SPA"),
+            "Expected index.html content, got: {text}"
+        );
+    }
+
+    // ====================================================================
+    // SPA fallback: GET /workspaces (client-side route) returns index.html
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_spa_client_route_returns_index_html() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(Request::get("/workspaces").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("SPA"), "SPA route should return index.html");
+    }
+
+    // ====================================================================
+    // Static assets: GET /assets/app.js returns the JS file
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_static_asset_served() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(Request::get("/assets/app.js").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("console.log"), "Expected JS content");
+    }
+
+    // ====================================================================
+    // API routes NOT intercepted: /health still works
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_health_not_intercepted_by_fallback() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // /health returns JSON with status field, NOT index.html
+        assert!(
+            text.contains("\"status\""),
+            "Expected JSON health response, got: {text}"
+        );
+        assert!(!text.contains("SPA"), "Health should NOT return index.html");
+    }
+
+    // ====================================================================
+    // serve_frontend=false: SPA routes return 404
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_no_frontend_no_spa_fallback() {
+        let app = test_app_no_frontend().await;
+
+        let resp = app
+            .oneshot(Request::get("/some-spa-route").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // Without frontend serving, unmatched routes have no fallback.
+        // The response will be either 404 (no route) or 401 (auth middleware rejects).
+        // Either way, it must NOT be 200 with index.html content.
+        let status = resp.status();
+        assert!(
+            status == StatusCode::NOT_FOUND || status == StatusCode::UNAUTHORIZED,
+            "Expected 404 or 401 without frontend, got: {status}"
+        );
+    }
+
+    // ====================================================================
+    // /auth/callback (React Router route) gets index.html, not 404
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_auth_callback_spa_route_returns_index_html() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(Request::get("/auth/callback").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // /auth/callback is NOT a registered backend route (backend has /auth/oidc/callback POST).
+        // As a GET, it should fall through to the SPA fallback and return index.html.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("SPA"),
+            "/auth/callback GET should return SPA index.html"
+        );
+    }
+
+    // ====================================================================
+    // Cache-Control: index.html (and SPA fallback) must have no-cache
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_index_html_has_no_cache_headers() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cache_control = resp
+            .headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(
+            cache_control.as_deref(),
+            Some("no-cache, no-store, must-revalidate"),
+            "index.html must have no-cache to prevent stale WKWebView caching"
+        );
+    }
+
+    // ====================================================================
+    // Cache-Control: static assets also get no-cache (ServeDir wrapper)
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_static_asset_has_cache_control() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(Request::get("/assets/app.js").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cache_control = resp
+            .headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap().to_string());
+        assert!(
+            cache_control.is_some(),
+            "Static assets must have Cache-Control header"
+        );
+    }
+}

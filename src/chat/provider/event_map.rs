@@ -1,0 +1,2202 @@
+//! `AgentEvent` (nexus contract) to `ChatEvent` (the wire the frontend knows).
+//!
+//! The table is `docs/agent-contract.md` section 14. This module is pure: no
+//! I/O, no clock beyond the `received_at` stamp of out-of-turn events. It is the
+//! only place where a provider-neutral event becomes a backend event, so a new
+//! provider cannot change what the frontend receives.
+//!
+//! Two entry points:
+//! - [`EventMapper::map`] for the events of a turn (what `message_to_events`
+//!   does for the legacy path);
+//! - [`out_of_band_to_chat_events`] for the events received between turns,
+//!   regrouped by provider message number into `background_output`.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use std::collections::{HashMap, HashSet};
+
+use chrono::{DateTime, Utc};
+use nexus_claude::agent::{
+    AgentEvent, BackgroundTask, BackgroundTaskKind as AgentTaskKind, BackgroundTaskStatus,
+    CompactionPhase, Cost, DeltaKind, ProviderError, QuestionReply, StopReason, TaskPhase,
+    ToolCategory, ToolOutput, Usage,
+};
+use serde_json::{json, Value};
+
+use super::endpoint_guard::redact_error_body;
+use super::errors::open_failure;
+use super::policy::{legacy_name, neutral_name};
+use crate::chat::manager::{MASKING_FAILED_MESSAGE, MASKING_FAILED_SUBTYPE};
+use crate::chat::types::{BackgroundTaskInfo, BackgroundTaskKind, BackgroundTool, ChatEvent};
+
+/** How many announced tool names are remembered while waiting for their result. */
+pub const MAX_REMEMBERED_TOOL_NAMES: usize = 64;
+
+/** How much of a background tool result travels as its head (the rest stays out). */
+pub const RESULT_HEAD_CHARS: usize = 400;
+
+/// What the mapping remembers from one event to the next.
+#[derive(Debug, Default, Clone)]
+pub struct EventMapper {
+    /// Tool calls already announced with an incomplete input: their complete
+    /// form becomes `tool_use_input_resolved`, not a second `tool_use`.
+    announced_tools: HashSet<String>,
+    /// `event_id` of the task updates already forwarded (de-duplication).
+    seen_task_events: HashSet<String>,
+    /// The last `background_tasks` snapshot of the provider: what
+    /// `active_tasks_update` shows, and how a wire task id (the `tool_use` that
+    /// started the task, as on the Claude Code engine) finds the provider's own id.
+    background_tasks: Vec<BackgroundTask>,
+    /// Name of each announced tool call still waiting for its result — a
+    /// background `ToolResult` names no tool (see `remember_tool_name`).
+    pending_tool_names: HashMap<String, String>,
+}
+
+/// The id a background task has on the wire: the `tool_use` that started it,
+/// as the Claude Code engine keys its tasks (`BackgroundTaskInfo::id` ≡ the
+/// `correlation_id` of its output), else the provider's own id.
+fn wire_task_id(task: &BackgroundTask) -> String {
+    task.tool_call_id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| task.id.clone())
+}
+
+/// A running provider task in the shape the Claude Code engine broadcasts.
+fn task_info(task: &BackgroundTask) -> BackgroundTaskInfo {
+    let started_at = task
+        .started_at_ms
+        .and_then(|ms| i64::try_from(ms).ok())
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .unwrap_or_else(Utc::now);
+    BackgroundTaskInfo {
+        id: wire_task_id(task),
+        kind: match task.kind {
+            AgentTaskKind::Monitor => BackgroundTaskKind::Monitor,
+            // The wire knows two kinds: anything that is not a watcher is a
+            // command left running.
+            _ => BackgroundTaskKind::BashBackground,
+        },
+        description: task.description.clone(),
+        started_at,
+        pid: task.pid,
+        parent_tool_use_id: task.parent.clone().or_else(|| task.tool_call_id.clone()),
+        last_seen_at: started_at,
+        pending_removal_at: None,
+        signalled: false,
+    }
+}
+
+impl EventMapper {
+    /// A fresh mapper (one per session).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Remember the name of an announced tool call: its result names no tool.
+    /// Bounded to `MAX_REMEMBERED_TOOL_NAMES`: past it ONE entry is dropped (a
+    /// `HashMap` has no order, so which one is arbitrary — the point is that a
+    /// long session's memory does not grow, not which name is lost first).
+    pub fn remember_tool_name(&mut self, id: &str, name: &str) {
+        if self.pending_tool_names.len() >= MAX_REMEMBERED_TOOL_NAMES {
+            if let Some(oldest) = self.pending_tool_names.keys().next().cloned() {
+                self.pending_tool_names.remove(&oldest);
+            }
+        }
+        self.pending_tool_names
+            .insert(id.to_string(), name.to_string());
+    }
+
+    /// The name of the call a result answers, consumed as it is read.
+    pub fn take_tool_name(&mut self, id: &str) -> Option<String> {
+        self.pending_tool_names.remove(id)
+    }
+
+    /// The background tasks still running, as `active_tasks_update` carries them
+    /// (`GET /api/chat/sessions/{id}/background-tasks` on the agent engine).
+    pub fn active_tasks(&self) -> Vec<BackgroundTaskInfo> {
+        self.background_tasks
+            .iter()
+            .filter(|task| task.status == BackgroundTaskStatus::Running)
+            .map(task_info)
+            .collect()
+    }
+
+    /// The provider's id of the background task the wire calls `wire_id` (its
+    /// `tool_use` id, or the provider's id itself), with whether it still runs.
+    /// `None`: the last snapshot does not know it.
+    pub fn provider_task(&self, wire_id: &str) -> Option<(String, bool)> {
+        self.background_tasks
+            .iter()
+            .find(|task| wire_task_id(task) == wire_id)
+            .or_else(|| self.background_tasks.iter().find(|task| task.id == wire_id))
+            .map(|task| {
+                (
+                    task.id.clone(),
+                    task.status == BackgroundTaskStatus::Running,
+                )
+            })
+    }
+
+    /// Maps one event of a turn. Never panics on an event it does not know: it
+    /// maps to nothing.
+    pub fn map(&mut self, event: &AgentEvent) -> Vec<ChatEvent> {
+        match event {
+            AgentEvent::SessionStarted {
+                provider_session_id,
+                model,
+                policy_mode,
+                native_mode,
+                tools,
+                mcp_servers,
+                ..
+            } => vec![ChatEvent::SystemInit {
+                cli_session_id: provider_session_id.clone().unwrap_or_default(),
+                model: model.clone(),
+                tools: tools.clone(),
+                mcp_servers: mcp_servers
+                    .iter()
+                    .map(|s| json!({"name": s.name, "status": s.status}))
+                    .collect(),
+                permission_mode: native_mode
+                    .clone()
+                    .or_else(|| policy_mode.map(|m| legacy_name(m).to_string())),
+                // Added by the session owner, who knows the instance and the policy.
+                provider: None,
+                capabilities: None,
+                tool_policy: None,
+                policy_mode: policy_mode.map(|m| neutral_name(m).to_string()),
+                engine: None,
+                degraded_features: None,
+            }],
+            // In a turn the echo of the user's own message is not an event
+            // (the backend already emitted `user_message`).
+            AgentEvent::UserEcho { .. } => Vec::new(),
+            AgentEvent::Text { text, parent, .. } => vec![ChatEvent::AssistantText {
+                content: text.clone(),
+                parent_tool_use_id: parent.clone(),
+            }],
+            AgentEvent::Thinking { text, parent, .. } => vec![ChatEvent::Thinking {
+                content: text.clone(),
+                parent_tool_use_id: parent.clone(),
+            }],
+            AgentEvent::Delta {
+                kind: DeltaKind::Text,
+                text,
+                parent,
+                ..
+            } => vec![ChatEvent::StreamDelta {
+                text: text.clone(),
+                parent_tool_use_id: parent.clone(),
+            }],
+            // Thinking and tool-input fragments have no ChatEvent today.
+            AgentEvent::Delta { .. } => Vec::new(),
+            AgentEvent::ToolCall {
+                id,
+                name,
+                input,
+                input_complete,
+                parent,
+                category,
+                canonical,
+                ..
+            } => {
+                let (category, canonical) = (Some(category_name(*category)), canonical.clone());
+                // A `ToolResult` of a background sub-agent carries the call's id,
+                // never its name: keep it so the flattened tick can say which
+                // tool returned what (bounded, oldest dropped).
+                self.remember_tool_name(id, name);
+                if *input_complete && self.announced_tools.remove(id) {
+                    vec![ChatEvent::ToolUseInputResolved {
+                        id: id.clone(),
+                        input: input.clone(),
+                        parent_tool_use_id: parent.clone(),
+                    }]
+                } else {
+                    if !*input_complete {
+                        self.announced_tools.insert(id.clone());
+                    }
+                    vec![ChatEvent::ToolUse {
+                        id: id.clone(),
+                        tool: name.clone(),
+                        input: input.clone(),
+                        parent_tool_use_id: parent.clone(),
+                        category,
+                        canonical,
+                    }]
+                }
+            }
+            AgentEvent::ToolResult {
+                id,
+                output,
+                is_error,
+                parent,
+                ..
+            } => {
+                // A tool result is not the agent's words: a `#kind:uuid` inside
+                // it is data, and is never read as a citation of the agent.
+                let mut result = tool_output_value(output.as_ref());
+                crate::refs::cite::neutralize_value(&mut result);
+                vec![ChatEvent::ToolResult {
+                    id: id.clone(),
+                    result,
+                    is_error: *is_error,
+                    parent_tool_use_id: parent.clone(),
+                }]
+            }
+            AgentEvent::PermissionAsk {
+                request_id,
+                tool_name,
+                input,
+                parent,
+                category,
+                canonical,
+                tool_call_id,
+                ..
+            } => vec![ChatEvent::PermissionRequest {
+                id: request_id.clone(),
+                tool: tool_name.clone(),
+                input: input.clone(),
+                parent_tool_use_id: parent.clone(),
+                category: Some(category_name(*category)),
+                canonical: canonical.clone(),
+                tool_use_id: tool_call_id.clone(),
+                always: None,
+                consent: None,
+            }],
+            AgentEvent::Question {
+                question_id,
+                tool_call_id,
+                questions,
+                input,
+                parent,
+                reply,
+            } => vec![ChatEvent::AskUserQuestion {
+                id: question_id.clone(),
+                tool_call_id: tool_call_id.clone().unwrap_or_default(),
+                // The provider's own shape when it gave one, the parsed list
+                // otherwise: the frontend reads `questions` leniently.
+                questions: input
+                    .get("questions")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::to_value(questions).unwrap_or(json!([]))),
+                input: input.clone(),
+                parent_tool_use_id: parent.clone(),
+                // A provider without a native question: the answer is a user turn (A45).
+                synthetic: (*reply == QuestionReply::Turn).then_some(true),
+            }],
+            AgentEvent::Compaction {
+                phase,
+                trigger,
+                pre_tokens,
+            } => {
+                let trigger = trigger.map_or("auto", |t| t.as_str()).to_string();
+                match phase {
+                    CompactionPhase::Started => vec![ChatEvent::CompactionStarted { trigger }],
+                    _ => vec![ChatEvent::CompactBoundary {
+                        trigger,
+                        pre_tokens: *pre_tokens,
+                    }],
+                }
+            }
+            // The complete snapshot of the provider's background tasks: the
+            // `active_tasks_update` of the Claude Code engine, the tasks still
+            // running only (an ended or killed task leaves the list, as there).
+            AgentEvent::BackgroundTasks { tasks } => {
+                self.background_tasks = tasks.clone();
+                vec![ChatEvent::ActiveTasksUpdate {
+                    tasks: self.active_tasks(),
+                }]
+            }
+            AgentEvent::TaskUpdate {
+                phase,
+                task_id,
+                summary,
+                event_id,
+                data,
+                ..
+            } => {
+                if let Some(id) = event_id {
+                    if !self.seen_task_events.insert(id.clone()) {
+                        return Vec::new();
+                    }
+                }
+                // A line of a background task (a `Monitor`): the Claude Code
+                // engine shows it as a `background_output` tied to the task's
+                // `tool_use` (`correlation_id`), the same here.
+                let background = task_id.as_deref().and_then(|id| {
+                    self.background_tasks
+                        .iter()
+                        .find(|task| task.id == id)
+                        .map(wire_task_id)
+                });
+                if let (TaskPhase::Progress, Some(correlation_id)) = (phase, background) {
+                    let content = summary.clone().unwrap_or_else(|| {
+                        data.get("line")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| data.to_string())
+                    });
+                    return vec![ChatEvent::BackgroundOutput {
+                        source: "tool_result".to_string(),
+                        content,
+                        received_at: Utc::now(),
+                        correlation_id: Some(correlation_id),
+                        tool: None,
+                    }];
+                }
+                vec![ChatEvent::Workflow {
+                    subtype: format!("task_{}", phase.as_str()),
+                    data: data.clone(),
+                }]
+            }
+            AgentEvent::ModelChanged { model } => vec![ChatEvent::ModelChanged {
+                model: model.clone(),
+                reason: None,
+            }],
+            AgentEvent::PolicyModeChanged { mode, native_mode } => {
+                vec![ChatEvent::PermissionModeChanged {
+                    mode: native_mode
+                        .clone()
+                        .unwrap_or_else(|| legacy_name(*mode).to_string()),
+                    policy_mode: Some(neutral_name(*mode).to_string()),
+                }]
+            }
+            AgentEvent::Done {
+                stop_reason,
+                subtype,
+                is_error,
+                result_text,
+                usage,
+                cost,
+                duration_ms,
+                num_turns,
+                provider_session_id,
+                model,
+                error,
+                ..
+            } => vec![ChatEvent::Result {
+                session_id: provider_session_id.clone().unwrap_or_default(),
+                duration_ms: *duration_ms,
+                cost_usd: cost.usd,
+                subtype: subtype
+                    .clone()
+                    .unwrap_or_else(|| default_subtype(*stop_reason, *is_error).to_string()),
+                is_error: *is_error,
+                num_turns: Some(i32::try_from(*num_turns).unwrap_or(i32::MAX)),
+                result_text: result_text.clone(),
+                cost: Some(cost_value(cost)),
+                usage: usage_value(usage),
+                model: model.clone(),
+                stop_reason: Some(stop_reason_name(*stop_reason).to_string()),
+                // ERR-1: surface the typed provider error that was otherwise flattened
+                // to a bare "error_during_execution", so the stored thread says WHY.
+                error_code: error
+                    .as_ref()
+                    .map(|e| open_failure(e, None).code.to_string()),
+                error_message: error.as_ref().map(|e| open_failure(e, None).message),
+            }],
+            AgentEvent::Error { error } => vec![error_event(error)],
+            AgentEvent::ProviderNotice { kind, .. } if kind == MASKING_FAILED_SUBTYPE => {
+                vec![ChatEvent::Error {
+                    message: MASKING_FAILED_MESSAGE.to_string(),
+                    parent_tool_use_id: None,
+                    code: None,
+                    reason: None,
+                    index: None,
+                    request_id: None,
+                }]
+            }
+            // A turn its time limit or a session budget stopped: said as such, with the
+            // figures and what to do, not as an opaque failure (ISO5).
+            AgentEvent::ProviderNotice { kind, data }
+                if limit_notice_message(kind, data).is_some() =>
+            {
+                vec![ChatEvent::Error {
+                    message: limit_notice_message(kind, data).unwrap_or_default(),
+                    parent_tool_use_id: None,
+                    code: Some(kind.clone()),
+                    reason: None,
+                    index: None,
+                    request_id: None,
+                }]
+            }
+            // A compaction that failed (nexus native harness, #105) no longer ends the turn:
+            // it goes on with the history intact, and this notice is the only thing that says
+            // why. Shown as an error frame with its code, so the thread carries it instead of
+            // letting the failure look like nothing happened.
+            AgentEvent::ProviderNotice { kind, data } if kind == COMPACTION_FAILED_NOTICE => {
+                vec![ChatEvent::Error {
+                    message: compaction_failed_message(data),
+                    parent_tool_use_id: None,
+                    code: Some(kind.clone()),
+                    reason: None,
+                    index: None,
+                    request_id: None,
+                }]
+            }
+            // An advisory the person may have to act on (`credentials_locked` and
+            // kind): not an error, the turn goes on, but it must reach the screen.
+            // Dropped here until 03/11/2026, a locked vault waited 930 s in silence
+            // (plan "coffre verrouillé = attente muette").
+            AgentEvent::ProviderNotice { kind, data } if notice_severity(kind).is_some() => {
+                vec![ChatEvent::ProviderNotice {
+                    kind: kind.clone(),
+                    code: data
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| Some(kind.clone())),
+                    message: notice_message(kind, data),
+                    severity: notice_severity(kind).unwrap_or("latency").to_string(),
+                    data: Some(data.clone()),
+                }]
+            }
+            // A notice is a diagnostic: nothing in a turn (it goes to the logs).
+            AgentEvent::ProviderNotice { .. } => Vec::new(),
+            // The account's limits go to the quota registry (`AgentSessionHandle::observe_quota`),
+            // not to the thread: nothing to show in a turn.
+            AgentEvent::Quota { .. } => Vec::new(),
+            // `AgentEvent` is non-exhaustive: an unknown event is ignored.
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn category_name(c: ToolCategory) -> String {
+    serde_json::to_value(c)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "other".to_string())
+}
+
+pub(crate) fn stop_reason_name(s: StopReason) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "error".to_string())
+}
+
+/// `{ usd?, basis }`: an unknown price carries no `usd` (never 0).
+fn cost_value(cost: &Cost) -> Value {
+    serde_json::to_value(cost).unwrap_or(Value::Null)
+}
+
+/// The token counts of the turn, `None` when the provider reported none.
+fn usage_value(usage: &Usage) -> Option<Value> {
+    let counts = json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+        "cache_creation_tokens": usage.cache_creation_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+    });
+    let map: serde_json::Map<String, Value> = counts
+        .as_object()?
+        .iter()
+        .filter(|(_, v)| !v.is_null())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    (!map.is_empty()).then_some(Value::Object(map))
+}
+
+/// Notice of a native turn stopped by its configured time limit (nexus `loop.rs`).
+pub const TURN_TIME_LIMIT_NOTICE: &str = "turn_time_limit";
+/// Notice of a native session whose configured budget is spent (nexus `loop.rs`).
+pub const SESSION_BUDGET_NOTICE: &str = "session_budget_reached";
+
+/// Notice of an automatic compaction that failed (nexus `providers/native/loop.rs`, #105): the
+/// turn goes on with the history intact, and this notice is the only thing that says why.
+pub const COMPACTION_FAILED_NOTICE: &str = "compaction_failed";
+
+/// Longest cause kept from the provider's own words in a `compaction_failed` notice.
+const COMPACTION_CAUSE_MAX: usize = 400;
+
+/// A duration as a person reads it: `25 min`, `25 min 3 s`, `40 s`, `400 ms`.
+fn human_duration(ms: u64) -> String {
+    match (ms / 60_000, (ms % 60_000) / 1000) {
+        (0, 0) => format!("{ms} ms"),
+        (0, s) => format!("{s} s"),
+        (m, 0) => format!("{m} min"),
+        (m, s) => format!("{m} min {s} s"),
+    }
+}
+
+/// The text shown for a turn a configured limit stopped; `None` for any other notice.
+/// Built from numbers only: no text of the provider is copied.
+pub(crate) fn limit_notice_message(kind: &str, data: &Value) -> Option<String> {
+    match kind {
+        TURN_TIME_LIMIT_NOTICE => {
+            let limit = data.get("limit_ms").and_then(Value::as_u64)?;
+            let elapsed = data
+                .get("elapsed_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(limit);
+            Some(format!(
+                "Turn stopped after {} by the configured turn time limit ({}, \
+                 chat.native_turn_timeout_secs). The work done so far is kept; send a message to \
+                 go on: the model is told why its turn stopped.",
+                human_duration(elapsed),
+                human_duration(limit),
+            ))
+        }
+        SESSION_BUDGET_NOTICE => {
+            let limit = data.get("limit")?;
+            let spent = data.get("spent").cloned().unwrap_or(Value::Null);
+            Some(match data.get("budget").and_then(Value::as_str) {
+                Some("usd") => format!(
+                    "Session cost budget reached: {} of {} USD. Every new turn of this \
+                     conversation stops until the budget is raised or removed; start a new \
+                     conversation, or change the budget and restart the server.",
+                    spent, limit
+                ),
+                _ => format!(
+                    "Session token budget reached: {} of {} tokens (cache reads not counted; \
+                     chat.native_session_max_tokens). Every new turn of this conversation stops \
+                     until the budget is raised or removed; start a new conversation, or change \
+                     the setting and restart the server.",
+                    spent, limit
+                ),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Longest sentence kept for an advisory: a client shows it in a block, not a log line.
+const NOTICE_MESSAGE_MAX: usize = 400;
+
+/// What a client does with an advisory of the harness. `action_required` becomes a
+/// block in the thread **with the way out**, `latency` only feeds the composer's
+/// "waiting" state (a retry, a recovery), and anything else is a diagnostic that
+/// belongs to the logs.
+///
+/// Measured 03/11/2026: `credentials_locked` asked the person to unlock the vault,
+/// fell into the catch-all ("a notice is a diagnostic") and was dropped — the turn
+/// then waited 930 s with nothing on screen, and only the Stop button ended it.
+/// The rule this class list encodes: anything that expects a human gesture, or a
+/// human decision, is `action_required`; nothing else is.
+pub(crate) fn notice_severity(kind: &str) -> Option<&'static str> {
+    match kind {
+        // A gesture or a decision is expected of the person.
+        "credentials_locked"
+        | "prompt_blocked"
+        | "policy_patterns_partial"
+        | "browser_unavailable"
+        | "mcp_servers_refused"
+        | "mcp_server_status"
+        | "model_not_applied"
+        | "hooks_not_supported"
+        | "extension_ignored" => Some("action_required"),
+        // Nothing to do, but it says why nothing came for a while.
+        "model_retry" | "model_recovered" => Some("latency"),
+        // Everything else is diagnostic: the logs (see `structured_out_of_turn`).
+        _ => None,
+    }
+}
+
+/// The sentence a person reads for an advisory: the harness' own when it wrote one
+/// (`credentials_locked` does), a built one otherwise. Redacted and bounded here —
+/// a notice can carry an endpoint's text, and a thread is not a log file.
+pub(crate) fn notice_message(kind: &str, data: &Value) -> String {
+    let given = data
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !given.is_empty() {
+        return redact_error_body(given, NOTICE_MESSAGE_MAX);
+    }
+    match kind {
+        "model_retry" => {
+            let attempt = data.get("attempt").and_then(Value::as_u64);
+            let max = data.get("max_attempts").and_then(Value::as_u64);
+            let delay = data.get("delay_ms").and_then(Value::as_u64);
+            match (attempt, max, delay) {
+                (Some(a), Some(m), Some(d)) => format!(
+                    "The model did not answer (attempt {a} of {m}): trying again in {}.",
+                    human_duration(d)
+                ),
+                _ => "The model did not answer: trying again.".to_string(),
+            }
+        }
+        "model_recovered" => "The model answers again.".to_string(),
+        _ => format!("The provider reported: {}.", kind.replace('_', " ")),
+    }
+}
+
+/// The text shown for a compaction that failed: what could not be done, and what happened
+/// instead. Never empty, and never a bare code — the notice's `code` (`protocol`, an endpoint
+/// error) says nothing on its own, the cause is in its `message`.
+///
+/// Unlike [`limit_notice_message`], built from numbers only, the cause here is the provider's
+/// own sentence: it is the only place that says *why* (a summary that came back empty, an
+/// endpoint that refused the call). nexus has already redacted it; it is redacted again here
+/// and bounded, so a verbose endpoint can neither leak a credential nor flood the thread.
+pub(crate) fn compaction_failed_message(data: &Value) -> String {
+    let message = data
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    // Redacted in full first — a credential split by the cut would escape otherwise — then
+    // bounded; a cut is said, so a sentence never ends mid-word without a trace.
+    let redacted = redact_error_body(message, usize::MAX);
+    let mut cause = redact_error_body(&redacted, COMPACTION_CAUSE_MAX);
+    if cause.len() < redacted.len() {
+        cause.push('…');
+    }
+    let said = if data.get("trigger").and_then(Value::as_str) == Some("auto") {
+        "The conversation's context could not be summarised automatically"
+    } else {
+        "The conversation's context could not be summarised"
+    };
+    const INTACT: &str = "The turn went on without compacting: the history is intact, so \
+                          nothing of the conversation is lost.";
+    if cause.is_empty() {
+        format!("{said}. {INTACT}")
+    } else {
+        format!("{said} ({cause}). {INTACT}")
+    }
+}
+
+/// `subtype` of a `result` when the provider gave none.
+pub(crate) fn default_subtype(stop: StopReason, is_error: bool) -> &'static str {
+    match stop {
+        StopReason::Completed => "success",
+        StopReason::MaxTurns => "error_max_turns",
+        // A token budget as much as a USD one (nexus says `error_max_budget` itself): the
+        // `_usd` of Claude Code's own subtype would name the wrong budget.
+        StopReason::BudgetExceeded => "error_max_budget",
+        _ if is_error => "error_during_execution",
+        _ => "success",
+    }
+}
+
+fn tool_output_value(output: Option<&ToolOutput>) -> Value {
+    match output {
+        Some(ToolOutput::Text(s)) => Value::String(s.clone()),
+        Some(ToolOutput::Blocks(blocks)) => Value::Array(blocks.clone()),
+        None => Value::Null,
+    }
+}
+
+/// The event of a failed turn: a process that died is a session error, any
+/// other failure is an in-stream error whose text never carries a credential,
+/// a path or a URL (it is written in `errors.rs`, not copied from the source).
+fn error_event(error: &ProviderError) -> ChatEvent {
+    if matches!(error, ProviderError::ProcessExited { .. }) {
+        return ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "The provider process exited unexpectedly.".to_string(),
+            received_at: Utc::now(),
+        };
+    }
+    ChatEvent::Error {
+        message: format!("Error: {}", open_failure(error, None).message),
+        parent_tool_use_id: None,
+        code: None,
+        reason: None,
+        index: None,
+        request_id: None,
+    }
+}
+
+/// One group of out-of-turn lines sharing a provider message number.
+struct Group {
+    seq: Option<u64>,
+    lines: Vec<String>,
+    has_user: bool,
+    only_results: bool,
+    parent: Option<String>,
+}
+
+impl Group {
+    fn new(seq: Option<u64>) -> Self {
+        Self {
+            seq,
+            lines: Vec::new(),
+            has_user: false,
+            only_results: true,
+            parent: None,
+        }
+    }
+
+    fn flush(self, at: DateTime<Utc>, out: &mut Vec<ChatEvent>) {
+        if self.lines.is_empty() {
+            return;
+        }
+        let source = if self.has_user {
+            "user"
+        } else if self.only_results {
+            "tool_result"
+        } else {
+            "assistant"
+        };
+        out.push(ChatEvent::BackgroundOutput {
+            source: source.to_string(),
+            content: self.lines.join("\n"),
+            received_at: at,
+            correlation_id: self.parent,
+            tool: None,
+        });
+    }
+}
+
+/// The head of a tool result: the first `RESULT_HEAD_CHARS` characters of what
+/// the tool returned. A background tick carries this, never the whole blob (a
+/// `Read` of a large file would otherwise travel twice, once here and once in
+/// the mirror).
+fn result_head(output: Option<&ToolOutput>) -> Option<String> {
+    let text = match output? {
+        ToolOutput::Text(s) => s.clone(),
+        ToolOutput::Blocks(blocks) => serde_json::to_string(blocks).ok()?,
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= RESULT_HEAD_CHARS {
+        return Some(trimmed.to_string());
+    }
+    let mut head: String = trimmed.chars().take(RESULT_HEAD_CHARS).collect();
+    head.push('…');
+    Some(head)
+}
+
+fn result_line(output: Option<&ToolOutput>) -> String {
+    match output {
+        Some(ToolOutput::Text(s)) => format!("[tool_result] {s}"),
+        Some(ToolOutput::Blocks(blocks)) => {
+            format!(
+                "[tool_result] {}",
+                serde_json::to_string(blocks).unwrap_or_default()
+            )
+        }
+        None => "[tool_result]".to_string(),
+    }
+}
+
+/// An event received out of turn in its structured form, as a turn shows it: a text, a
+/// thought, a complete tool call, a tool result (with its `parent_tool_use_id`). Nothing
+/// for any other event. [`out_of_band_to_chat_events`] flattens these for the session;
+/// this form is what follows a sub-agent still running after the turn (`chat::mirror`).
+/// Pure: a fresh mapper each time (a complete call is a `tool_use`, never a resolution).
+pub fn structured_out_of_turn(event: &AgentEvent) -> Vec<ChatEvent> {
+    match event {
+        AgentEvent::Text { .. }
+        | AgentEvent::Thinking { .. }
+        | AgentEvent::ToolResult { .. }
+        | AgentEvent::ToolCall {
+            input_complete: true,
+            ..
+        } => EventMapper::new().map(event),
+        _ => Vec::new(),
+    }
+}
+
+/// One text-like out-of-turn event: (seq, parent, line, is_user, is_result).
+type TextLine = (Option<u64>, Option<String>, String, bool, bool);
+
+/// Maps the events received out of turn. Text-like events are regrouped by
+/// provider message number into one `background_output` per message; a
+/// `provider_notice` becomes `background_output { source: "system:<kind>" }`;
+/// the other events go through [`EventMapper::map`].
+pub fn out_of_band_to_chat_events(
+    events: &[AgentEvent],
+    mapper: &mut EventMapper,
+    received_at: DateTime<Utc>,
+) -> Vec<ChatEvent> {
+    let mut out = Vec::new();
+    let mut group: Option<Group> = None;
+
+    for event in events {
+        // A tool call, or its result, is a TICK OF ITS OWN carrying the
+        // structure: the client can then draw the real per-tool card (a diff
+        // for `Edit`, a path and a range for `Read`) instead of reading a
+        // flattened `[tool_use: Bash]` marker.
+        match event {
+            AgentEvent::ToolCall {
+                id,
+                name,
+                input,
+                input_complete: true,
+                parent,
+                ..
+            } => {
+                mapper.remember_tool_name(id, name);
+                if let Some(done) = group.take() {
+                    done.flush(received_at, &mut out);
+                }
+                out.push(ChatEvent::BackgroundOutput {
+                    source: "tool".to_string(),
+                    content: format!("[tool_use: {name}]"),
+                    received_at,
+                    correlation_id: parent.clone(),
+                    tool: Some(BackgroundTool::call(name.clone(), Some(input.clone()))),
+                });
+                continue;
+            }
+            AgentEvent::ToolResult {
+                id,
+                output,
+                is_error,
+                parent,
+                ..
+            } => {
+                let name = mapper.take_tool_name(id).unwrap_or_default();
+                if let Some(done) = group.take() {
+                    done.flush(received_at, &mut out);
+                }
+                out.push(ChatEvent::BackgroundOutput {
+                    source: "tool_result".to_string(),
+                    content: result_line(output.as_ref()),
+                    received_at,
+                    correlation_id: parent.clone(),
+                    tool: Some(BackgroundTool::result(
+                        name,
+                        result_head(output.as_ref()),
+                        *is_error,
+                    )),
+                });
+                continue;
+            }
+            _ => {}
+        }
+
+        // (seq, parent, line, is_user, is_result) of a text-like event.
+        let line: Option<TextLine> = match event {
+            AgentEvent::Text {
+                text, seq, parent, ..
+            } => Some((*seq, parent.clone(), text.clone(), false, false)),
+            AgentEvent::Thinking {
+                text, seq, parent, ..
+            } => Some((
+                *seq,
+                parent.clone(),
+                format!("[thinking] {text}"),
+                false,
+                false,
+            )),
+            AgentEvent::UserEcho {
+                text, seq, parent, ..
+            } => Some((*seq, parent.clone(), text.clone(), true, false)),
+            _ => None,
+        };
+
+        match line {
+            Some((seq, parent, text, is_user, is_result)) => {
+                let same = group
+                    .as_ref()
+                    .is_some_and(|g| g.seq.is_some() && g.seq == seq);
+                if !same {
+                    if let Some(done) = group.take() {
+                        done.flush(received_at, &mut out);
+                    }
+                    group = Some(Group::new(seq));
+                }
+                if let Some(g) = group.as_mut() {
+                    g.lines.push(text);
+                    g.has_user |= is_user;
+                    g.only_results &= is_result;
+                    if g.parent.is_none() {
+                        g.parent = parent;
+                    }
+                }
+            }
+            None => {
+                if let Some(done) = group.take() {
+                    done.flush(received_at, &mut out);
+                }
+                match event {
+                    AgentEvent::ProviderNotice { kind, data } if kind != MASKING_FAILED_SUBTYPE => {
+                        out.push(ChatEvent::BackgroundOutput {
+                            source: format!("system:{kind}"),
+                            content: serde_json::to_string_pretty(data).unwrap_or_default(),
+                            received_at,
+                            correlation_id: None,
+                            tool: None,
+                        });
+                    }
+                    // A stream fragment or an announced-but-incomplete tool call
+                    // is an in-turn artefact, never an out-of-turn event.
+                    AgentEvent::Delta { .. } => {}
+                    AgentEvent::ToolCall { .. } => {}
+                    other => out.extend(mapper.map(other)),
+                }
+            }
+        }
+    }
+    if let Some(done) = group.take() {
+        done.flush(received_at, &mut out);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::manager::ChatManager;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    use nexus_claude::providers::claude_code::{map_message, MapState};
+    use nexus_claude::{
+        AssistantMessage, ContentBlock, ContentValue, Message, StreamDelta, StreamEventData,
+        TextContent, ThinkingContent, ToolResultContent, ToolUseContent, UserMessage,
+    };
+
+    fn result_msg(subtype: &str, is_error: bool, cost: Option<f64>, text: Option<&str>) -> Message {
+        Message::Result {
+            subtype: subtype.into(),
+            duration_ms: 5000,
+            duration_api_ms: 4500,
+            is_error,
+            num_turns: 3,
+            session_id: "cli-abc-123".into(),
+            total_cost_usd: cost,
+            usage: None,
+            result: text.map(str::to_string),
+            structured_output: None,
+        }
+    }
+
+    fn assistant(blocks: Vec<ContentBlock>, parent: Option<&str>) -> Message {
+        Message::Assistant {
+            message: AssistantMessage { content: blocks },
+            parent_tool_use_id: parent.map(str::to_string),
+        }
+    }
+
+    fn user_blocks(blocks: Vec<ContentBlock>) -> Message {
+        Message::User {
+            message: UserMessage {
+                content: String::new(),
+                content_blocks: Some(blocks),
+            },
+            parent_tool_use_id: None,
+        }
+    }
+
+    fn tool_result(
+        id: &str,
+        content: Option<ContentValue>,
+        is_error: Option<bool>,
+    ) -> ContentBlock {
+        ContentBlock::ToolResult(ToolResultContent {
+            tool_use_id: id.into(),
+            content,
+            is_error,
+        })
+    }
+
+    fn stream(event: StreamEventData, parent: Option<&str>) -> Message {
+        Message::StreamEvent {
+            event,
+            session_id: None,
+            parent_tool_use_id: parent.map(str::to_string),
+        }
+    }
+
+    /// Every message shape the legacy path knows, with the parent set where it
+    /// can be.
+    fn corpus() -> Vec<(&'static str, Message)> {
+        vec![
+            (
+                "init",
+                Message::System {
+                    subtype: "init".into(),
+                    data: json!({
+                        "session_id": "cli-sess-abc", "model": "claude-sonnet-4-6",
+                        "tools": ["Bash", "Read"], "mcp_servers": [{"name": "po", "status": "connected"}],
+                        "permissionMode": "acceptEdits", "cwd": "/tmp/x"
+                    }),
+                },
+            ),
+            (
+                "init_without_fields",
+                Message::System {
+                    subtype: "init".into(),
+                    data: json!({}),
+                },
+            ),
+            (
+                "text_thinking_tool_use",
+                assistant(
+                    vec![
+                        ContentBlock::Thinking(ThinkingContent {
+                            thinking: "hmm".into(),
+                            signature: "sig".into(),
+                        }),
+                        ContentBlock::Text(TextContent {
+                            text: "Hello!".into(),
+                        }),
+                        ContentBlock::ToolUse(ToolUseContent {
+                            id: "toolu_1".into(),
+                            name: "mcp__po__plan".into(),
+                            input: json!({"action": "list"}),
+                        }),
+                    ],
+                    None,
+                ),
+            ),
+            (
+                "sub_agent_text",
+                assistant(
+                    vec![ContentBlock::Text(TextContent {
+                        text: "from a sub-agent".into(),
+                    })],
+                    Some("toolu_parent"),
+                ),
+            ),
+            (
+                "assistant_tool_result_text",
+                assistant(
+                    vec![tool_result(
+                        "t",
+                        Some(ContentValue::Text("ok".into())),
+                        Some(false),
+                    )],
+                    None,
+                ),
+            ),
+            (
+                "user_tool_result_structured_error",
+                user_blocks(vec![tool_result(
+                    "t2",
+                    Some(ContentValue::Structured(vec![
+                        json!({"type": "text", "text": "boom"}),
+                    ])),
+                    Some(true),
+                )]),
+            ),
+            (
+                "user_tool_result_without_content",
+                user_blocks(vec![tool_result("t3", None, None)]),
+            ),
+            (
+                "user_plain_text",
+                Message::User {
+                    message: UserMessage {
+                        content: "Hi".into(),
+                        content_blocks: None,
+                    },
+                    parent_tool_use_id: None,
+                },
+            ),
+            (
+                "text_delta",
+                stream(
+                    StreamEventData::ContentBlockDelta {
+                        index: 0,
+                        delta: StreamDelta::TextDelta { text: "Hel".into() },
+                    },
+                    Some("toolu_parent"),
+                ),
+            ),
+            (
+                "thinking_delta",
+                stream(
+                    StreamEventData::ContentBlockDelta {
+                        index: 0,
+                        delta: StreamDelta::ThinkingDelta {
+                            thinking: "hm".into(),
+                        },
+                    },
+                    None,
+                ),
+            ),
+            (
+                "block_start_tool_use",
+                stream(
+                    StreamEventData::ContentBlockStart {
+                        index: 1,
+                        content_block: json!({"type": "tool_use", "id": "toolu_s", "name": "Bash", "input": {}}),
+                    },
+                    None,
+                ),
+            ),
+            (
+                "block_start_text",
+                stream(
+                    StreamEventData::ContentBlockStart {
+                        index: 0,
+                        content_block: json!({"type": "text", "text": ""}),
+                    },
+                    None,
+                ),
+            ),
+            ("message_stop", stream(StreamEventData::MessageStop, None)),
+            (
+                "compact_boundary",
+                Message::System {
+                    subtype: "compact_boundary".into(),
+                    data: json!({"compact_metadata": {"trigger": "manual", "pre_tokens": 1234}}),
+                },
+            ),
+            (
+                "compact_boundary_without_metadata",
+                Message::System {
+                    subtype: "compact_boundary".into(),
+                    data: json!({}),
+                },
+            ),
+            (
+                "unknown_system",
+                Message::System {
+                    subtype: "status".into(),
+                    data: json!({"status": "compacting"}),
+                },
+            ),
+            (
+                "masking_failed",
+                Message::System {
+                    subtype: MASKING_FAILED_SUBTYPE.into(),
+                    data: json!({}),
+                },
+            ),
+            (
+                "result_success",
+                result_msg("success", false, Some(0.15), Some("done")),
+            ),
+            (
+                "result_without_cost",
+                result_msg("success", false, None, None),
+            ),
+            (
+                "result_max_turns",
+                result_msg("error_max_turns", true, Some(1.0), None),
+            ),
+            (
+                "result_during_execution",
+                result_msg("error_during_execution", true, None, Some("oops")),
+            ),
+        ]
+    }
+
+    fn mapped(msg: &Message, state: &mut MapState, mapper: &mut EventMapper) -> Vec<Value> {
+        map_message(msg, state)
+            .iter()
+            .flat_map(|e| mapper.map(e))
+            .map(|e| {
+                // The legacy path knows none of the additive fields.
+                let mut v = serde_json::to_value(e).unwrap();
+                if let Some(o) = v.as_object_mut() {
+                    let is_result = o.get("type").and_then(Value::as_str) == Some("result");
+                    for k in ADDITIVE {
+                        // `model` is a legacy field of system_init, additive only on result.
+                        if *k != "model" || is_result {
+                            o.remove(*k);
+                        }
+                    }
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// Fields the contract adds to the legacy frames (always optional).
+    const ADDITIVE: &[&str] = &[
+        "category",
+        "canonical",
+        "cost",
+        "usage",
+        "model",
+        "stop_reason",
+        "policy_mode",
+        "synthetic",
+        "engine",
+        "degraded_features",
+    ];
+
+    #[test]
+    fn the_additive_fields_carry_what_the_provider_reported() {
+        use nexus_claude::agent::{Cost, CostBasis, ToolCategory, Usage};
+        let mut mapper = EventMapper::new();
+        let call = AgentEvent::ToolCall {
+            id: "t".into(),
+            name: "Bash".into(),
+            input: json!({}),
+            category: ToolCategory::Command,
+            canonical: Some("shell".into()),
+            input_complete: true,
+            seq: None,
+            parent: None,
+        };
+        match &mapper.map(&call)[0] {
+            ChatEvent::ToolUse {
+                category,
+                canonical,
+                ..
+            } => {
+                assert_eq!(category.as_deref(), Some("command"));
+                assert_eq!(canonical.as_deref(), Some("shell"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let done = AgentEvent::Done {
+            stop_reason: StopReason::MaxTurns,
+            subtype: None,
+            is_error: true,
+            result_text: None,
+            usage: Usage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                ..Default::default()
+            },
+            cost: Cost {
+                usd: None,
+                basis: CostBasis::Unknown,
+            },
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: Some("m-1".into()),
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        let v = serde_json::to_value(&mapper.map(&done)[0]).unwrap();
+        assert_eq!(v["stop_reason"], "max_turns");
+        assert_eq!(v["model"], "m-1");
+        assert_eq!(v["usage"], json!({"input_tokens": 10, "output_tokens": 5}));
+        assert_eq!(v["cost"], json!({"basis": "unknown"}));
+        assert!(v["cost_usd"].is_null(), "an unknown price is not a zero");
+        let q = AgentEvent::Question {
+            question_id: "q".into(),
+            tool_call_id: None,
+            reply: QuestionReply::Turn,
+            questions: vec![],
+            input: json!({}),
+            parent: None,
+        };
+        let v = serde_json::to_value(&mapper.map(&q)[0]).unwrap();
+        assert_eq!(v["synthetic"], true);
+        let m = AgentEvent::PolicyModeChanged {
+            mode: nexus_claude::agent::PolicyMode::AutoEdits,
+            native_mode: Some("acceptEdits".into()),
+        };
+        let v = serde_json::to_value(&mapper.map(&m)[0]).unwrap();
+        assert_eq!(
+            (v["mode"].as_str(), v["policy_mode"].as_str()),
+            (Some("acceptEdits"), Some("auto_edits"))
+        );
+    }
+
+    #[test]
+    fn a_failed_done_carries_the_provider_error_code_and_message() {
+        // ERR-1: the typed provider error must reach the Result, not be flattened
+        // to a bare "error_during_execution".
+        use nexus_claude::agent::{Cost, CostBasis, Usage};
+        let mut mapper = EventMapper::new();
+        let done = AgentEvent::Done {
+            stop_reason: StopReason::Error,
+            subtype: None,
+            is_error: true,
+            result_text: None,
+            usage: Usage::default(),
+            cost: Cost {
+                usd: None,
+                basis: CostBasis::Unknown,
+            },
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: Some("m-1".into()),
+            provider_session_id: None,
+            structured_output: None,
+            error: Some(nexus_claude::agent::ProviderError::Timeout { after_ms: 30_000 }),
+        };
+        let v = serde_json::to_value(&mapper.map(&done)[0]).unwrap();
+        assert_eq!(v["subtype"], "error_during_execution");
+        let failure = open_failure(
+            &nexus_claude::agent::ProviderError::Timeout { after_ms: 30_000 },
+            None,
+        );
+        assert_eq!(v["error_code"], failure.code);
+        assert_eq!(v["error_message"], failure.message);
+    }
+
+    #[test]
+    fn replay_gives_the_same_chat_events_as_the_legacy_path() {
+        let mut state = MapState::new();
+        let mut mapper = EventMapper::new();
+        // What the agent runtime stamps on the `system_init` of a Claude Code session
+        // (`AgentSessionHandle::offered_capabilities`: the provider's, without `always`).
+        let mut caps =
+            nexus_claude::providers::claude_code::ClaudeCodeConfig::default().capabilities(None);
+        caps.permission_scopes
+            .retain(|s| *s != nexus_claude::agent::PermissionScope::Always);
+        let agent_stamp = serde_json::to_value(caps).unwrap();
+        assert!(
+            agent_stamp["images"].is_boolean(),
+            "the whole object: {agent_stamp}"
+        );
+        for (name, msg) in corpus() {
+            // The legacy init says which engine it is and what it declares; the mapper
+            // leaves that to the session owner (the agent runtime stamps `engine`,
+            // `degraded_features` and `capabilities` on `system_init`, `emit_one`).
+            // `capabilities` is compared: the legacy engine declares the whole object the
+            // agent runtime stamps on a Claude Code session.
+            let legacy: Vec<Value> = ChatManager::message_to_events(&msg)
+                .iter()
+                .map(|e| {
+                    let mut v = serde_json::to_value(e).unwrap();
+                    if let Some(o) = v.as_object_mut() {
+                        o.remove("engine");
+                        o.remove("degraded_features");
+                    }
+                    v
+                })
+                .collect();
+            let via_contract: Vec<Value> = mapped(&msg, &mut state, &mut mapper)
+                .into_iter()
+                .map(|mut v| {
+                    if v["type"] == "system_init"
+                        && v.get("capabilities").is_none_or(Value::is_null)
+                    {
+                        v["capabilities"] = agent_stamp.clone();
+                    }
+                    v
+                })
+                .collect();
+            assert_eq!(via_contract, legacy, "message `{name}` maps differently");
+        }
+    }
+
+    /// The two engines that drive Claude Code declare the same approval scopes: the
+    /// legacy one (`LEGACY_PERMISSION_SCOPES`, in its `system_init`) and the agent one
+    /// (the Claude Code provider's own, without `always`, as `offered_capabilities`).
+    #[test]
+    fn both_claude_code_engines_declare_the_same_permission_scopes() {
+        let provider = nexus_claude::providers::claude_code::ClaudeCodeConfig::default()
+            .capabilities(None)
+            .permission_scopes
+            .into_iter()
+            .filter(|s| *s != nexus_claude::agent::PermissionScope::Always)
+            .map(|s| serde_json::to_value(s).unwrap())
+            .collect::<Vec<_>>();
+        let legacy = crate::chat::manager::LEGACY_PERMISSION_SCOPES
+            .iter()
+            .map(|s| serde_json::to_value(s).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(provider, legacy);
+    }
+
+    #[test]
+    fn an_announced_tool_call_completes_as_input_resolved() {
+        let mut mapper = EventMapper::new();
+        let call = |complete: bool| AgentEvent::ToolCall {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: json!({"command": "ls"}),
+            category: Default::default(),
+            canonical: None,
+            input_complete: complete,
+            seq: None,
+            parent: None,
+        };
+        let first = mapper.map(&call(false));
+        let second = mapper.map(&call(true));
+        assert!(matches!(first[0], ChatEvent::ToolUse { .. }));
+        assert!(matches!(second[0], ChatEvent::ToolUseInputResolved { .. }));
+        // A call never announced is a plain tool_use.
+        let mut fresh = EventMapper::new();
+        assert!(matches!(
+            fresh.map(&call(true))[0],
+            ChatEvent::ToolUse { .. }
+        ));
+    }
+
+    #[test]
+    fn done_without_subtype_gets_the_legacy_one_from_the_stop_reason() {
+        let done = |stop, is_error| AgentEvent::Done {
+            stop_reason: stop,
+            subtype: None,
+            is_error,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 2,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        let subtype = |stop, is_error| match &EventMapper::new().map(&done(stop, is_error))[0] {
+            ChatEvent::Result { subtype, .. } => subtype.clone(),
+            other => panic!("not a result: {other:?}"),
+        };
+        assert_eq!(subtype(StopReason::Completed, false), "success");
+        assert_eq!(subtype(StopReason::MaxTurns, true), "error_max_turns");
+        // A token budget is not a USD one: the subtype names neither wrongly.
+        assert_eq!(
+            subtype(StopReason::BudgetExceeded, true),
+            "error_max_budget"
+        );
+        assert_eq!(subtype(StopReason::Error, true), "error_during_execution");
+    }
+
+    /// A native turn on an OpenAI-compatible endpoint: the cache reads it reports
+    /// travel in the `result` usage, the same field as Claude Code's (what the chat
+    /// events store, the runner copies to `AgentExecution.tokens_cache_read` and the
+    /// frontend shows); an unreported cache write is absent, never a zero.
+    #[test]
+    fn a_native_turn_keeps_its_cache_reads_in_the_result_usage() {
+        use nexus_claude::agent::CostBasis;
+        let done = AgentEvent::Done {
+            stop_reason: StopReason::Completed,
+            subtype: Some("success".into()),
+            is_error: false,
+            result_text: None,
+            usage: Usage {
+                input_tokens: Some(700),
+                output_tokens: Some(50),
+                cache_read_tokens: Some(1600),
+                cache_creation_tokens: None,
+                context_tokens: Some(1300),
+                ..Default::default()
+            },
+            cost: Cost {
+                usd: Some(0.00096),
+                basis: CostBasis::Priced,
+            },
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 2,
+            model: Some("deepseek-chat".into()),
+            provider_session_id: Some("native-transcript".into()),
+            structured_output: None,
+            error: None,
+        };
+        let v = serde_json::to_value(&EventMapper::new().map(&done)[0]).unwrap();
+        assert_eq!(
+            v["usage"],
+            json!({"input_tokens": 700, "output_tokens": 50, "cache_read_tokens": 1600})
+        );
+        assert_eq!(v["cost"], json!({"usd": 0.00096, "basis": "priced"}));
+    }
+
+    /// Measured 03/11/2026: a locked credential vault asked the person to unlock it,
+    /// the advisory was dropped as a "diagnostic", and the turn waited 930 s with
+    /// nothing on screen. It must reach the thread, with its code and its way out.
+    #[test]
+    fn a_locked_vault_notice_reaches_the_thread() {
+        let notice = AgentEvent::ProviderNotice {
+            kind: "credentials_locked".to_string(),
+            data: json!({
+                "provider": "native",
+                "code": "credentials_locked",
+                "message": "the credential vault is locked: the turn resumes when it is unlocked",
+            }),
+        };
+        match EventMapper::new().map(&notice).as_slice() {
+            [ChatEvent::ProviderNotice {
+                kind,
+                code,
+                message,
+                severity,
+                data,
+            }] => {
+                assert_eq!(kind, "credentials_locked");
+                assert_eq!(code.as_deref(), Some("credentials_locked"));
+                assert_eq!(severity, "action_required");
+                assert!(
+                    message.contains("vault is locked"),
+                    "the person reads what happened: {message}"
+                );
+                assert_eq!(
+                    data.as_ref()
+                        .and_then(|d| d.get("provider"))
+                        .and_then(Value::as_str),
+                    Some("native"),
+                    "the structured detail travels with the advisory"
+                );
+            }
+            other => panic!("one provider_notice expected, got {other:?}"),
+        }
+    }
+
+    /// A retry explains a wait; it is not a block in the thread. The client feeds a
+    /// "waiting" state from it and shows nothing else.
+    #[test]
+    fn a_retry_notice_only_feeds_the_waiting_state() {
+        let notice = AgentEvent::ProviderNotice {
+            kind: "model_retry".to_string(),
+            data: json!({"attempt": 1, "max_attempts": 5, "delay_ms": 2000}),
+        };
+        match EventMapper::new().map(&notice).as_slice() {
+            [ChatEvent::ProviderNotice {
+                severity, message, ..
+            }] => {
+                assert_eq!(severity, "latency");
+                assert!(message.contains("1 of 5"), "{message}");
+                assert!(message.contains("2 s"), "{message}");
+            }
+            other => panic!("one provider_notice expected, got {other:?}"),
+        }
+    }
+
+    /// The rest stays a diagnostic: a thread is not a log file.
+    #[test]
+    fn a_diagnostic_notice_stays_out_of_the_thread() {
+        let notice = AgentEvent::ProviderNotice {
+            kind: "lagged".to_string(),
+            data: json!({"skipped": 3}),
+        };
+        assert!(EventMapper::new().map(&notice).is_empty());
+        assert_eq!(notice_severity("lagged"), None);
+    }
+
+    /// Anything that expects a human gesture is `action_required`, and nothing else
+    /// is: the classification is the contract the client renders.
+    #[test]
+    fn every_kind_that_expects_a_gesture_is_action_required() {
+        for kind in [
+            "credentials_locked",
+            "prompt_blocked",
+            "browser_unavailable",
+            "mcp_servers_refused",
+        ] {
+            assert_eq!(notice_severity(kind), Some("action_required"), "{kind}");
+        }
+        assert_eq!(notice_severity("model_retry"), Some("latency"));
+        assert_eq!(notice_severity("usage_estimated"), None);
+    }
+
+    /// ISO5: a turn a configured limit stopped is shown as such (an `error` frame with its
+    /// code, the figures and what to do), not as an opaque failure or nothing at all.
+    #[test]
+    fn a_turn_stopped_by_a_configured_limit_is_said_as_such() {
+        let frame = |kind: &str, data: Value| {
+            let notice = AgentEvent::ProviderNotice {
+                kind: kind.to_string(),
+                data,
+            };
+            match EventMapper::new().map(&notice).as_slice() {
+                [ChatEvent::Error { message, code, .. }] => (message.clone(), code.clone()),
+                other => panic!("one error frame expected: {other:?}"),
+            }
+        };
+        let (message, code) = frame(
+            TURN_TIME_LIMIT_NOTICE,
+            json!({"limit_ms": 1_800_000, "elapsed_ms": 1_800_005, "next_turn_note": "x"}),
+        );
+        assert_eq!(code.as_deref(), Some("turn_time_limit"));
+        assert!(
+            message
+                .starts_with("Turn stopped after 30 min by the configured turn time limit (30 min"),
+            "{message}"
+        );
+        assert!(
+            message.contains("chat.native_turn_timeout_secs"),
+            "{message}"
+        );
+        assert!(message.contains("work done so far is kept"), "{message}");
+
+        let (message, code) = frame(
+            SESSION_BUDGET_NOTICE,
+            json!({"budget": "tokens", "limit": 10_000_000, "spent": 10_026_330, "requests_this_turn": 24}),
+        );
+        assert_eq!(code.as_deref(), Some("session_budget_reached"));
+        assert!(
+            message.contains("10026330 of 10000000 tokens (cache reads not counted"),
+            "{message}"
+        );
+        assert!(message.contains("start a new conversation"), "{message}");
+        let (message, _) = frame(
+            SESSION_BUDGET_NOTICE,
+            json!({"budget": "usd", "limit": 5.0, "spent": 5.2}),
+        );
+        assert!(message.contains("5.2 of 5.0 USD"), "{message}");
+
+        // Any other notice stays a diagnostic: nothing in the turn.
+        let other = AgentEvent::ProviderNotice {
+            kind: "usage_estimated".into(),
+            data: json!({"tokens": 3}),
+        };
+        assert!(EventMapper::new().map(&other).is_empty());
+        // A limit notice without its figures is not invented into a message.
+        let bare = AgentEvent::ProviderNotice {
+            kind: TURN_TIME_LIMIT_NOTICE.into(),
+            data: Value::Null,
+        };
+        assert!(EventMapper::new().map(&bare).is_empty());
+    }
+
+    /// COMPACT-2 (nexus #105): a compaction that fails no longer ends the turn — the native
+    /// harness goes on with the history intact and says so with a `provider_notice`. That
+    /// notice has to reach the thread, cause included: the typed `code` alone (`protocol`)
+    /// would say nothing, and the turn would look as if nothing had happened.
+    #[test]
+    fn a_compaction_that_failed_is_said_in_the_thread_with_its_cause() {
+        let frame = |data: Value| {
+            let notice = AgentEvent::ProviderNotice {
+                kind: COMPACTION_FAILED_NOTICE.to_string(),
+                data,
+            };
+            match EventMapper::new().map(&notice).as_slice() {
+                [ChatEvent::Error { message, code, .. }] => (message.clone(), code.clone()),
+                other => panic!("one error frame expected: {other:?}"),
+            }
+        };
+
+        let (message, code) = frame(json!({
+            "trigger": "auto",
+            "code": "protocol",
+            "message": "protocol error: the compaction summary came back empty",
+        }));
+        assert_eq!(code.as_deref(), Some("compaction_failed"));
+        // The cause — nexus' own words, already redacted there — is what a bare `protocol`
+        // code loses.
+        assert!(
+            message.contains("the compaction summary came back empty"),
+            "{message}"
+        );
+        // Both facts, and neither in the place of the other: the context could not be
+        // summarised AND the turn went on.
+        assert!(message.contains("could not be summarised"), "{message}");
+        assert!(message.contains("went on without compacting"), "{message}");
+
+        // A notice without a cause still says the two facts, and invents none.
+        let (message, code) = frame(Value::Null);
+        assert_eq!(code.as_deref(), Some("compaction_failed"));
+        assert!(message.contains("could not be summarised"), "{message}");
+        assert!(message.contains("went on without compacting"), "{message}");
+
+        // A credential the endpoint echoed back never reaches the thread: nexus redacts the
+        // notice, and a credential-looking shape is caught here as well.
+        let (message, _) = frame(json!({
+            "trigger": "auto",
+            "code": "protocol",
+            "message": "upstream refused the summary: api_key=sk-live-0123456789abcdef",
+        }));
+        assert!(!message.contains("sk-live-0123456789abcdef"), "{message}");
+    }
+
+    /// The same notice out of turn stays a diagnostic line: the background path carries what
+    /// the provider said, it does not turn it into an in-turn error.
+    #[test]
+    fn a_compaction_that_failed_out_of_turn_stays_a_diagnostic() {
+        let notice = AgentEvent::ProviderNotice {
+            kind: COMPACTION_FAILED_NOTICE.to_string(),
+            data: json!({"trigger": "auto", "code": "protocol", "message": "empty summary"}),
+        };
+        let out = out_of_band_to_chat_events(&[notice], &mut EventMapper::new(), Utc::now());
+        assert!(
+            matches!(out.as_slice(), [ChatEvent::BackgroundOutput { source, .. }]
+                if source == "system:compaction_failed"),
+            "{out:?}"
+        );
+    }
+
+    /// ISO3: a `/compact` on the native harness is announced out of turn with `trigger:
+    /// manual`; both phases reach the thread with that trigger (never dropped, never read
+    /// as automatic).
+    #[test]
+    fn a_manual_compaction_out_of_turn_keeps_its_trigger() {
+        use nexus_claude::agent::{CompactionPhase, CompactionTrigger};
+        let events = [
+            AgentEvent::Compaction {
+                phase: CompactionPhase::Started,
+                trigger: Some(CompactionTrigger::Manual),
+                pre_tokens: Some(9000),
+            },
+            AgentEvent::Compaction {
+                phase: CompactionPhase::Completed,
+                trigger: Some(CompactionTrigger::Manual),
+                pre_tokens: Some(9000),
+            },
+        ];
+        let out = out_of_band_to_chat_events(&events, &mut EventMapper::new(), Utc::now());
+        assert!(
+            matches!(out.as_slice(), [
+                ChatEvent::CompactionStarted { trigger: started },
+                ChatEvent::CompactBoundary { trigger: done, pre_tokens: Some(9000) },
+            ] if started == "manual" && done == "manual"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_cost_is_not_a_fake_zero() {
+        let done = AgentEvent::Done {
+            stop_reason: StopReason::Completed,
+            subtype: Some("success".into()),
+            is_error: false,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        match &EventMapper::new().map(&done)[0] {
+            ChatEvent::Result { cost_usd, .. } => assert_eq!(*cost_usd, None),
+            other => panic!("not a result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dead_process_is_a_session_error_and_other_failures_leak_nothing() {
+        let dead = AgentEvent::Error {
+            error: ProviderError::ProcessExited { code: Some(1) },
+        };
+        assert!(matches!(
+            EventMapper::new().map(&dead)[0],
+            ChatEvent::SessionError { ref reason, .. } if reason == "subprocess_exited"
+        ));
+        let unreachable = AgentEvent::Error {
+            error: ProviderError::EndpointUnreachable {
+                detail: "https://user:hunter2@10.0.0.5/v1 refused".into(),
+            },
+        };
+        match &EventMapper::new().map(&unreachable)[0] {
+            ChatEvent::Error { message, .. } => {
+                assert!(
+                    !message.contains("hunter2") && !message.contains("10.0.0.5"),
+                    "{message}"
+                );
+            }
+            other => panic!("not an error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_task_updates_are_forwarded_once() {
+        let mut mapper = EventMapper::new();
+        let update = AgentEvent::TaskUpdate {
+            phase: nexus_claude::agent::TaskPhase::Progress,
+            task_id: Some("a".into()),
+            tool_call_id: None,
+            description: None,
+            status: None,
+            summary: None,
+            event_id: Some("u-1".into()),
+            data: json!({"x": 1}),
+        };
+        assert_eq!(mapper.map(&update).len(), 1);
+        assert!(mapper.map(&update).is_empty());
+    }
+
+    fn bg_task(id: &str, tool_call: Option<&str>, status: BackgroundTaskStatus) -> BackgroundTask {
+        BackgroundTask {
+            id: id.into(),
+            kind: AgentTaskKind::Shell,
+            description: "sleep 30".into(),
+            status,
+            started_at_ms: Some(1_700_000_000_000),
+            tool_call_id: tool_call.map(str::to_string),
+            parent: None,
+            pid: Some(4242),
+        }
+    }
+
+    /// P4: the provider's snapshot is the `active_tasks_update` of the Claude Code
+    /// engine — running tasks only, keyed by the `tool_use` that started them.
+    #[test]
+    fn a_background_tasks_snapshot_is_an_active_tasks_update_keyed_by_tool_use() {
+        let mut mapper = EventMapper::new();
+        let out = mapper.map(&AgentEvent::BackgroundTasks {
+            tasks: vec![
+                bg_task("nt-1", Some("c7"), BackgroundTaskStatus::Running),
+                bg_task("nt-2", None, BackgroundTaskStatus::Running),
+                bg_task("nt-3", Some("c9"), BackgroundTaskStatus::Killed),
+            ],
+        });
+        let [ChatEvent::ActiveTasksUpdate { tasks }] = out.as_slice() else {
+            panic!("one active_tasks_update: {out:?}");
+        };
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["c7", "nt-2"], "running only, by tool_use id");
+        assert_eq!(tasks[0].pid, Some(4242));
+        assert_eq!(tasks[0].kind, BackgroundTaskKind::BashBackground);
+        assert_eq!(tasks[0].started_at.timestamp_millis(), 1_700_000_000_000);
+        assert_eq!(tasks[0].parent_tool_use_id.as_deref(), Some("c7"));
+        // The wire id finds the provider's own; an ended task is known, not running.
+        assert_eq!(mapper.provider_task("c7"), Some(("nt-1".into(), true)));
+        assert_eq!(mapper.provider_task("nt-1"), Some(("nt-1".into(), true)));
+        assert_eq!(mapper.provider_task("c9"), Some(("nt-3".into(), false)));
+        assert_eq!(mapper.provider_task("zz"), None);
+        // An empty snapshot empties the list.
+        let out = mapper.map(&AgentEvent::BackgroundTasks { tasks: vec![] });
+        assert!(
+            matches!(out.as_slice(), [ChatEvent::ActiveTasksUpdate { tasks }] if tasks.is_empty())
+        );
+        assert!(mapper.active_tasks().is_empty());
+    }
+
+    /// A `Monitor` line of a background task is its `background_output`, tied to
+    /// its `tool_use`; a task update of anything else stays a workflow event.
+    #[test]
+    fn a_progress_line_of_a_background_task_is_background_output() {
+        let mut mapper = EventMapper::new();
+        mapper.map(&AgentEvent::BackgroundTasks {
+            tasks: vec![bg_task("nt-1", Some("c7"), BackgroundTaskStatus::Running)],
+        });
+        let line = AgentEvent::TaskUpdate {
+            phase: TaskPhase::Progress,
+            task_id: Some("nt-1".into()),
+            tool_call_id: Some("c7".into()),
+            description: None,
+            status: None,
+            summary: Some("epoch 3 loss=0.1".into()),
+            event_id: None,
+            data: json!({"task_id": "nt-1", "line": "epoch 3 loss=0.1"}),
+        };
+        let out = mapper.map(&line);
+        assert!(
+            matches!(out.as_slice(), [ChatEvent::BackgroundOutput { source, content, correlation_id, .. }]
+                if source == "tool_result" && content == "epoch 3 loss=0.1"
+                    && correlation_id.as_deref() == Some("c7")),
+            "{out:?}"
+        );
+        let other = AgentEvent::TaskUpdate {
+            phase: TaskPhase::Progress,
+            task_id: Some("subagent-1".into()),
+            tool_call_id: None,
+            description: None,
+            status: None,
+            summary: None,
+            event_id: None,
+            data: json!({"x": 1}),
+        };
+        assert!(
+            matches!(mapper.map(&other).as_slice(), [ChatEvent::Workflow { subtype, .. }] if subtype == "task_progress")
+        );
+    }
+
+    /// What a sub-agent prints out of turn, in the form a turn shows it (its mirror's
+    /// source): a complete call is a `tool_use` with its parent, a result keeps its parent;
+    /// an announced-but-incomplete call, a delta, a task update or a notice give nothing.
+    #[test]
+    fn structured_out_of_turn_keeps_the_sub_agents_structure() {
+        let call = |input_complete| AgentEvent::ToolCall {
+            id: "t-bash".into(),
+            name: "Bash".into(),
+            input: json!({"command": "ls"}),
+            category: Default::default(),
+            canonical: None,
+            input_complete,
+            seq: Some(4),
+            parent: Some("toolu_bg".into()),
+        };
+        assert!(matches!(
+            structured_out_of_turn(&call(true)).as_slice(),
+            [ChatEvent::ToolUse { id, tool, parent_tool_use_id: Some(p), .. }]
+                if id == "t-bash" && tool == "Bash" && p == "toolu_bg"
+        ));
+        assert!(structured_out_of_turn(&call(false)).is_empty());
+        let result = AgentEvent::ToolResult {
+            id: "t-bash".into(),
+            output: Some(ToolOutput::Text("a.md".into())),
+            is_error: false,
+            seq: Some(5),
+            parent: Some("toolu_bg".into()),
+        };
+        assert!(matches!(
+            structured_out_of_turn(&result).as_slice(),
+            [ChatEvent::ToolResult { id, parent_tool_use_id: Some(p), .. }]
+                if id == "t-bash" && p == "toolu_bg"
+        ));
+        let text = AgentEvent::Text {
+            text: "done".into(),
+            seq: Some(6),
+            parent: Some("toolu_bg".into()),
+        };
+        assert!(matches!(
+            structured_out_of_turn(&text).as_slice(),
+            [ChatEvent::AssistantText { content, parent_tool_use_id: Some(_) }] if content == "done"
+        ));
+        assert!(structured_out_of_turn(&AgentEvent::ProviderNotice {
+            kind: "status".into(),
+            data: json!({}),
+        })
+        .is_empty());
+    }
+
+    #[test]
+    fn out_of_turn_messages_regroup_by_message_number() {
+        let at = Utc::now();
+        let events = vec![
+            AgentEvent::Text {
+                text: "a".into(),
+                seq: Some(1),
+                parent: None,
+            },
+            AgentEvent::ToolCall {
+                id: "t".into(),
+                name: "Monitor".into(),
+                input: json!({}),
+                category: Default::default(),
+                canonical: None,
+                input_complete: true,
+                seq: Some(1),
+                parent: None,
+            },
+            AgentEvent::ToolResult {
+                id: "t".into(),
+                output: Some(ToolOutput::Text("line".into())),
+                is_error: false,
+                seq: Some(2),
+                parent: Some("p".into()),
+            },
+            AgentEvent::UserEcho {
+                text: "hello".into(),
+                seq: Some(3),
+                parent: None,
+            },
+            AgentEvent::ProviderNotice {
+                kind: "status".into(),
+                data: json!({"s": 1}),
+            },
+        ];
+        let out = out_of_band_to_chat_events(&events, &mut EventMapper::new(), at);
+        let rows: Vec<(String, String, Option<String>)> = out
+            .into_iter()
+            .map(|e| match e {
+                ChatEvent::BackgroundOutput {
+                    source,
+                    content,
+                    correlation_id,
+                    ..
+                } => (source, content, correlation_id),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        // A tool call is NO LONGER folded into the text group: it is a tick of
+        // its own, so the client can draw the real tool card (the text group
+        // used to swallow it as a `[tool_use: …]` line).
+        assert_eq!(rows[0], ("assistant".into(), "a".into(), None));
+        assert_eq!(rows[1], ("tool".into(), "[tool_use: Monitor]".into(), None));
+        assert_eq!(
+            rows[2],
+            (
+                "tool_result".into(),
+                "[tool_result] line".into(),
+                Some("p".into())
+            )
+        );
+        assert_eq!(rows[3], ("user".into(), "hello".into(), None));
+        assert_eq!(rows[4].0, "system:status");
+        assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn a_background_tool_tick_carries_its_call_and_its_result() {
+        // Why this exists: the client can only draw a REAL per-tool card (a
+        // path for Read, a diff for Edit) if the call's input survives the
+        // flattening. Measured before this: 3 989 `[tool_use: …]` markers in
+        // three days, with no argument attached to any of them.
+        let at = Utc::now();
+        let events = vec![
+            AgentEvent::ToolCall {
+                id: "t1".into(),
+                name: "Read".into(),
+                input: json!({"file_path": "src/a.rs"}),
+                category: Default::default(),
+                canonical: None,
+                input_complete: true,
+                seq: Some(1),
+                parent: Some("p".into()),
+            },
+            AgentEvent::ToolResult {
+                id: "t1".into(),
+                output: Some(ToolOutput::Text("x".repeat(1000))),
+                is_error: false,
+                seq: Some(2),
+                parent: Some("p".into()),
+            },
+            AgentEvent::ToolResult {
+                id: "unknown".into(),
+                output: None,
+                is_error: true,
+                seq: Some(3),
+                parent: None,
+            },
+        ];
+        let out = out_of_band_to_chat_events(&events, &mut EventMapper::new(), at);
+        assert_eq!(out.len(), 3);
+        match &out[0] {
+            ChatEvent::BackgroundOutput {
+                tool: Some(tool),
+                content,
+                ..
+            } => {
+                assert_eq!(tool.name, "Read");
+                assert_eq!(tool.input, Some(json!({"file_path": "src/a.rs"})));
+                assert!(!tool.is_error);
+                assert!(tool.result_head.is_none(), "a call has no result yet");
+                // The marker stays, so an older client still shows something.
+                assert_eq!(content, "[tool_use: Read]");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &out[1] {
+            ChatEvent::BackgroundOutput {
+                tool: Some(tool), ..
+            } => {
+                // The result names the call it answers: the provider does not
+                // repeat the tool name on a result.
+                assert_eq!(tool.name, "Read");
+                let head = tool.result_head.as_deref().expect("a head");
+                assert!(head.ends_with('…'));
+                // Capped: never the whole blob (a Read of a big file).
+                assert_eq!(head.chars().count(), RESULT_HEAD_CHARS + 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        match &out[2] {
+            ChatEvent::BackgroundOutput {
+                tool: Some(tool), ..
+            } => {
+                // A result whose call is unknown still reports the failure; the
+                // client attaches it to the call above it.
+                assert_eq!(tool.name, "");
+                assert!(tool.is_error);
+                assert!(tool.result_head.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_result_head_is_short_or_absent_and_never_the_whole_blob() {
+        // Blocks (an image, a structured result): serialised, then capped like text.
+        let blocks = ToolOutput::Blocks(vec![]);
+        assert_eq!(result_head(Some(&blocks)).as_deref(), Some("[]"));
+        // An empty or whitespace result has NO head — not an empty string (the
+        // client would draw an empty second line under the tool).
+        assert!(result_head(Some(&ToolOutput::Text("   \n ".into()))).is_none());
+        assert!(result_head(None).is_none());
+        // A short result travels whole, without an ellipsis.
+        assert_eq!(
+            result_head(Some(&ToolOutput::Text("ok".into()))).as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn remembered_tool_names_are_bounded() {
+        // A long-lived session calls thousands of tools: the memory of names
+        // must not grow with the session, and forgetting must not panic.
+        let mut mapper = EventMapper::new();
+        for i in 0..(MAX_REMEMBERED_TOOL_NAMES + 5) {
+            mapper.remember_tool_name(&format!("t{i}"), "Bash");
+        }
+        assert_eq!(mapper.pending_tool_names.len(), MAX_REMEMBERED_TOOL_NAMES);
+        // The newest still answers; the memory simply stops growing.
+        assert_eq!(
+            mapper.take_tool_name(&format!("t{}", MAX_REMEMBERED_TOOL_NAMES + 4)),
+            Some("Bash".into())
+        );
+        assert_eq!(
+            mapper.pending_tool_names.len(),
+            MAX_REMEMBERED_TOOL_NAMES - 1
+        );
+    }
+
+    #[test]
+    fn every_agent_event_type_is_handled_without_panicking() {
+        // The contract lists its tags; a variant added to nexus must not crash
+        // the mapping (it falls in the wildcard arm and maps to nothing).
+        let mut mapper = EventMapper::new();
+        for tag in AgentEvent::TYPE_NAMES {
+            assert!(!tag.is_empty());
+        }
+        let notice = AgentEvent::ProviderNotice {
+            kind: "x".into(),
+            data: Value::Null,
+        };
+        assert!(mapper.map(&notice).is_empty());
+    }
+
+    /// A reopened session on a new provider must still map the provider's own
+    /// `SessionStarted` → `system_init` and `ModelChanged` → `model_changed`
+    /// identically: those two mappings are what the frontend uses to render the
+    /// "now on provider X / model Y" notice on the same thread after an in-place
+    /// switch. Pin them so the switch path cannot drift the mapping.
+    #[test]
+    fn a_reopened_session_on_a_new_provider_maps_system_init_and_model_changed_identically() {
+        let mut mapper = EventMapper::new();
+        let started = AgentEvent::SessionStarted {
+            provider_session_id: Some("p1".into()),
+            model: Some("example-model-large".into()),
+            policy_mode: None,
+            native_mode: Some("acceptEdits".into()),
+            tools: vec!["Bash".into()],
+            mcp_servers: vec![],
+            cwd: None,
+        };
+        let init = mapper.map(&started);
+        let [ChatEvent::SystemInit {
+            cli_session_id,
+            model,
+            tools,
+            mcp_servers,
+            permission_mode,
+            provider,
+            capabilities,
+            tool_policy,
+            policy_mode,
+            engine,
+            degraded_features,
+        }] = init.as_slice()
+        else {
+            panic!("SessionStarted maps to one system_init: {init:?}");
+        };
+        assert_eq!(cli_session_id, "p1");
+        assert_eq!(model.as_deref(), Some("example-model-large"));
+        assert_eq!(tools, &vec!["Bash".to_string()]);
+        assert!(mcp_servers.is_empty());
+        // The native mode is preferred for the wire `permission_mode`.
+        assert_eq!(permission_mode.as_deref(), Some("acceptEdits"));
+        assert!(provider.is_none());
+        assert!(capabilities.is_none());
+        assert!(tool_policy.is_none());
+        assert!(policy_mode.is_none());
+        assert!(engine.is_none());
+        assert!(degraded_features.is_none());
+
+        let changed = AgentEvent::ModelChanged {
+            model: "example-model-large".into(),
+        };
+        let mapped = mapper.map(&changed);
+        let [ChatEvent::ModelChanged { model, .. }] = mapped.as_slice() else {
+            panic!("ModelChanged maps to one model_changed: {mapped:?}");
+        };
+        assert_eq!(model, "example-model-large");
+    }
+
+    #[test]
+    fn a_tool_result_never_carries_a_live_citation() {
+        const ID: &str = "57cf05c9-25b6-495d-ab04-000000000000";
+        let result = AgentEvent::ToolResult {
+            id: "t-mcp".into(),
+            output: Some(ToolOutput::Text(format!(
+                "{{\"entity\": \"#plan:57cf05c9-25b6-495d-ab07-de4b11d64736\"}} et #note:{ID}"
+            ))),
+            is_error: false,
+            seq: Some(5),
+            parent: None,
+        };
+        let mapped = structured_out_of_turn(&result);
+        let ChatEvent::ToolResult { result, .. } = &mapped[0] else {
+            panic!("a tool result");
+        };
+        let text = result.as_str().expect("the text of the result");
+        assert!(
+            text.contains("#plan:57cf05c9-25b6-495d-ab07-de4b11d64736"),
+            "the person still reads the token: {text:?}"
+        );
+        assert!(
+            crate::refs::cite::cited_refs(text).is_empty(),
+            "a tool result is data, never a citation of the agent: {text:?}"
+        );
+    }
+}

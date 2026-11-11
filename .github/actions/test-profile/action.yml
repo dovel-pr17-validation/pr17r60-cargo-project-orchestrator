@@ -1,0 +1,42 @@
+name: Test profile for CI
+description: >
+  Compiles the DEPENDENCIES (not this workspace's own crates) with optimisations in the dev/test
+  profile, and keeps the build lean. The suite is ~7,400 tests that mostly run axum, tokio and
+  serde code from the dependencies: unoptimised, that code is the bulk of the run time.
+  Measured on the same 349 tests (api::chat_handlers, orchestrator::runner, api::auth_handlers):
+  286 s of execution without it, 88 s with it. The dependencies compile once per cache key (the
+  cache is written by main), so a pull request pays only for its own crates.
+
+  Applied by every job that restores a `ci-test` or `ci-cov` cache: the setting is part of the
+  compiled artefacts, so a job without it would find nothing it can reuse.
+runs:
+  using: composite
+  steps:
+    - name: Optimise dependencies, keep line tables only, no incremental state
+      shell: bash
+      run: |
+        # CARGO_HOME, not $HOME/.cargo: on a self-hosted runner CARGO_HOME points at the
+        # runner's own directory, and $HOME is the operator's account. Written ONCE: a persistent
+        # runner keeps the file, and appending the table again would make cargo reject a
+        # duplicate key on every later run.
+        CFG="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+        mkdir -p "$(dirname "$CFG")"
+        if ! grep -qF '[profile.dev.package."*"]' "$CFG" 2>/dev/null; then
+          cat >> "$CFG" <<'TOML'
+        [profile.dev.package."*"]
+        opt-level = 2
+        TOML
+        fi
+        {
+          # A hosted runner starts from a clean checkout and never reads incremental state; it
+          # only bloats the cache. The self-hosted runner keeps its target/ (CARGO_TARGET_DIR)
+          # between runs: there, incremental state is what makes the next build fast.
+          if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            echo "CARGO_INCREMENTAL=1"
+          else
+            echo "CARGO_INCREMENTAL=0"
+          fi
+          # File and line of a panic are all a CI log needs; full debug info is what makes the
+          # link of each large test binary slow.
+          echo "CARGO_PROFILE_DEV_DEBUG=line-tables-only"
+        } >> "$GITHUB_ENV"

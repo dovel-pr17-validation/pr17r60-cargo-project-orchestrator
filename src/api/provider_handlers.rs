@@ -1,0 +1,2379 @@
+//! Provider settings API: instances, project consent, pilot/executor roles,
+//! model aliases and policy (decisions A15, A19, A24, A25, A28, A32).
+//!
+//! Every mutation is reserved to a human session: `auth::middleware` refuses an
+//! `agent_session` token on these paths (A25) and each handler checks again, so
+//! the rule survives a route being moved. No body carries a secret: instances
+//! name a credential reference, and a body with any other field is refused.
+//!
+//! Instances are stored (Neo4j `LlmSetting` documents) and listed; a stored
+//! instance opens sessions on the agent engine (`ChatManager::provider_for`),
+//! once a project has consented to its origin and credential reference. The
+//! security gate (A32) refuses to create one on a server running without
+//! authentication.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Extension, Json,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use super::handlers::{AppError, OrchestratorState};
+use crate::auth::jwt::Claims;
+use crate::chat::provider::endpoint_guard::{validate_endpoint, EndpointPolicy};
+use crate::chat::provider::listing::{HealthEntry, ModelEntry, ProviderEntry, RemoteEntry};
+use crate::chat::provider::quota::QUOTA_PREFIX;
+use crate::chat::provider::resolver::CLAUDE_CODE;
+use crate::chat::provider::settings::{
+    self as st, ConsentRecord, InstanceDraft, InstancePatch, InstanceRecord, ModelAlias,
+    ModelPolicy, RoleAssignments, SettingsError, ALIASES_KEY, CONSENT_PREFIX, GLOBAL,
+    INSTANCE_PREFIX, POLICY_KEY, ROLES_KEY,
+};
+use crate::neo4j::GraphStore;
+use std::sync::Arc;
+
+pub(crate) fn require_human(state: &OrchestratorState, claims: &Claims) -> Result<(), AppError> {
+    if state.auth_config.is_none() || claims.is_human() {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "provider settings can only be changed by a signed-in user".to_string(),
+        ))
+    }
+}
+
+/// A server-wide routing decision that applies to OTHER people's chats (the global pilot
+/// role, the consent for the chats outside any project): the root account only. Any other
+/// signed-in person gets 403 — they could otherwise send everyone's content to an endpoint
+/// of their choosing. Without authentication there is one user and no third party anyway.
+pub(crate) fn require_root(state: &OrchestratorState, claims: &Claims) -> Result<(), AppError> {
+    require_human(state, claims)?;
+    if state.auth_config.is_none() {
+        return Ok(());
+    }
+    let is_root = uuid::Uuid::parse_str(&claims.sub)
+        .is_ok_and(|id| super::auth_handlers::is_root_user(state.auth_config.as_ref(), id));
+    if is_root {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "root_required: only the root account can change this server-wide setting".to_string(),
+        ))
+    }
+}
+
+/// Who may write a consent of `scope`: any person for a project (as before), the root
+/// account for the chats outside any project (a server-wide default, review of #722).
+fn require_scope_writer(
+    state: &OrchestratorState,
+    claims: &Claims,
+    scope: &str,
+) -> Result<(), AppError> {
+    if scope == st::NO_PROJECT_SCOPE {
+        require_root(state, claims)
+    } else {
+        require_human(state, claims)
+    }
+}
+
+/// The security gate (A32): a third-party instance is refused while session
+/// tokens cannot be bound to a signing key, i.e. while authentication is off.
+fn security_gate(state: &OrchestratorState) -> Result<(), AppError> {
+    if state.auth_config.is_some() {
+        Ok(())
+    } else {
+        Err(AppError::Conflict(
+            "security_gate_closed: third-party providers need authentication enabled (bound session tokens)"
+                .to_string(),
+        ))
+    }
+}
+
+fn map_settings_error(e: SettingsError) -> AppError {
+    match e {
+        SettingsError::Builtin => AppError::Forbidden(e.to_string()),
+        SettingsError::UnknownInstance(_) => AppError::NotFound(e.to_string()),
+        SettingsError::Invalid(_) | SettingsError::Endpoint(_) => {
+            AppError::BadRequest(e.to_string())
+        }
+    }
+}
+
+fn graph(state: &OrchestratorState) -> Arc<dyn GraphStore> {
+    state.orchestrator.neo4j_arc()
+}
+
+fn parse<T: serde::de::DeserializeOwned>(raw: &str) -> Option<T> {
+    serde_json::from_str(raw).ok()
+}
+
+/// Every stored instance.
+pub async fn load_instances(graph: &dyn GraphStore) -> Result<Vec<InstanceRecord>, AppError> {
+    Ok(graph
+        .list_llm_settings(GLOBAL, INSTANCE_PREFIX)
+        .await
+        .map_err(AppError::Internal)?
+        .iter()
+        .filter_map(|(_, v)| parse::<InstanceRecord>(v))
+        .collect())
+}
+
+async fn load_aliases(graph: &dyn GraphStore) -> Result<Vec<ModelAlias>, AppError> {
+    Ok(graph
+        .get_llm_setting(GLOBAL, ALIASES_KEY)
+        .await
+        .map_err(AppError::Internal)?
+        .and_then(|v| parse(&v))
+        .unwrap_or_default())
+}
+
+async fn load_scope_consents(
+    graph: &dyn GraphStore,
+    scope: &str,
+) -> Result<Vec<ConsentRecord>, AppError> {
+    Ok(graph
+        .list_llm_settings(scope, CONSENT_PREFIX)
+        .await
+        .map_err(AppError::Internal)?
+        .iter()
+        .filter_map(|(_, v)| parse::<ConsentRecord>(v))
+        .collect())
+}
+
+/// The instances a chat may open in the asked scope: consented by the project, or, with
+/// no project, for the chats outside any project (B3). Bound to the current origin (A28).
+pub async fn allowed_here(
+    graph: &dyn GraphStore,
+    project_slug: Option<&str>,
+) -> Result<Vec<String>, AppError> {
+    let consents = load_scope_consents(graph, &st::consent_scope(project_slug)).await?;
+    Ok(load_instances(graph)
+        .await?
+        .into_iter()
+        .filter(|i| consents.iter().any(|c| st::consent_holds(c, i)))
+        .map(|i| i.id)
+        .collect())
+}
+
+/// The stored instances as listing entries, consent evaluated for the asked scope (a project,
+/// or the chats outside any project).
+pub async fn stored_entries(
+    graph: &dyn GraphStore,
+    project_slug: Option<&str>,
+) -> Result<Vec<ProviderEntry>, AppError> {
+    // The consents of the asked scope: the project's, or with no project those of the chats
+    // outside any project (the scope those chats are opened in, B3).
+    let consents = load_scope_consents(graph, &st::consent_scope(project_slug)).await?;
+    let aliases = load_aliases(graph).await?;
+    Ok(load_instances(graph)
+        .await?
+        .into_iter()
+        .map(|i| {
+            let allowed = Some(consents.iter().any(|c| st::consent_holds(c, &i)));
+            // What the provider of this instance declares, before any session: an
+            // instance listed with EMPTY capabilities made the interface claim it
+            // could not ask for approval ("policy only") when it can.
+            let caps = crate::chat::provider::native_factory::declared_capabilities(&i);
+            let models = i
+                .default_model
+                .iter()
+                .map(|m| {
+                    let alias = aliases
+                        .iter()
+                        .find(|a| a.provider == i.id && &a.model == m)
+                        .map(|a| a.alias.clone());
+                    ModelEntry::new(m.clone(), alias, &caps)
+                })
+                .collect();
+            let remote = remote_entry(&i);
+            ProviderEntry {
+                id: i.id.clone(),
+                kind: match i.kind.as_str() {
+                    "codex" => "codex",
+                    "acp" => "acp",
+                    st::KIND_ANTHROPIC => "anthropic",
+                    st::KIND_CLAUDE_CODE_REMOTE => "claude_code_remote",
+                    _ => "openai_compatible",
+                },
+                label: i.label,
+                builtin: false,
+                is_default: false,
+                allowed_for_project: allowed,
+                endpoint_origin: (!st::is_process_kind(&i.kind)).then(|| i.origin.clone()),
+                credential: i.credential_ref,
+                health: HealthEntry::unknown(),
+                models,
+                capabilities: serde_json::to_value(&caps).ok(),
+                remote,
+            }
+        })
+        .collect())
+}
+
+fn instance_view(i: &InstanceRecord) -> Value {
+    let mut view = json!({
+        "id": i.id, "kind": i.kind, "preset": i.preset, "label": i.label,
+        "base_url": i.base_url, "origin": i.origin, "default_model": i.default_model,
+        "cost_source": i.cost_source, "credential_ref": i.credential_ref, "builtin": false,
+    });
+    // RL1: additive — the limits travel with the instance they belong to, so the
+    // edit form loads them with the rest. An empty list is what an instance
+    // without limits has always had; nothing here is a secret (a credential
+    // scope names a reference).
+    view["rate_limit"] = serde_json::to_value(&i.rate_limit).unwrap_or_else(|_| json!([]));
+    // B30: auto_consent bypasses per-project consent for trusted local instances.
+    view["auto_consent"] = json!(i.auto_consent);
+    // Additive: only a remote instance carries the machine fields. The pinned key
+    // is public; its fingerprint is what a human compares. The SSH private key is
+    // only ever referenced (`credential_ref`), never present.
+    if i.kind == st::KIND_CLAUDE_CODE_REMOTE {
+        view["host"] = json!(i.host);
+        view["ssh_user"] = json!(i.ssh_user);
+        view["ssh_port"] = json!(i.ssh_port.unwrap_or(22));
+        view["host_key"] = json!(i.host_key);
+        view["host_key_fingerprint"] = json!(i.host_key_fingerprint());
+        view["remote_cwd"] = json!(i.remote_cwd);
+        view["allow_trust"] = json!(i.allow_trust);
+    }
+    view
+}
+
+/// The machine of a remote instance, for the listing.
+fn remote_entry(i: &InstanceRecord) -> Option<RemoteEntry> {
+    (i.kind == st::KIND_CLAUDE_CODE_REMOTE).then(|| RemoteEntry {
+        host: i.host.clone().unwrap_or_default(),
+        ssh_user: i.ssh_user.clone(),
+        ssh_port: i.ssh_port.unwrap_or(22),
+        host_key_fingerprint: i.host_key_fingerprint(),
+        remote_cwd: i.remote_cwd.clone(),
+        allow_trust: i.allow_trust,
+    })
+}
+
+// ============================================================================
+// One implementation per instance operation
+//
+// The settings routes (`/api/chat/providers…`, a person's) and the agent surface
+// the MCP `provider` mega-tool calls (`/api/agent/providers…`) run THE SAME
+// functions: one set of validations (`settings::record_from_draft`,
+// `settings::apply_patch`, `endpoint_guard::validate_endpoint`) and one store
+// (`llm_settings` under `INSTANCE_PREFIX`). The parity test
+// `the_agent_surface_answers_exactly_as_the_human_one` holds the two entry
+// points to the same answer, so a validation added on one side cannot go missing
+// on the other.
+//
+// The surface never changes WHICH validation runs; it adds the refusals an agent
+// cannot make for itself ([`AgentGrant`]).
+// ============================================================================
+
+/// Who is asking. Read from the token, never from a request body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// A signed-in person on the settings routes — or any caller on a server
+    /// running without authentication, where there is one user and no boundary
+    /// (the reasoning [`require_root`] already follows).
+    Human,
+    /// A chat session's token (an agent session, or an MCP access token), on the
+    /// agent surface.
+    Agent,
+}
+
+impl Surface {
+    /// The surface a call sits on.
+    pub fn of(state: &OrchestratorState, claims: &Claims) -> Self {
+        if state.auth_config.is_none() || claims.is_human() {
+            Self::Human
+        } else {
+            Self::Agent
+        }
+    }
+}
+
+/// What an agent's call would add to the reach of the session behind it, and
+/// which therefore needs a person's agreement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentGrant {
+    /// `allow_trust: true`: a machine that runs WITHOUT asking.
+    Trust,
+    /// A pinned `host_key`. Trust on first use is only worth lasting because a
+    /// person compared the fingerprint with the machine's own; an agent that
+    /// scans and pins in one gesture compared nothing.
+    HostKey,
+}
+
+impl AgentGrant {
+    /// Stable machine-readable refusal code, next to the `security_gate_closed`
+    /// and `root_required` codes this module already answers with.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Trust => "provider_trust_needs_a_human",
+            Self::HostKey => "provider_host_key_needs_a_human",
+        }
+    }
+
+    /// The wire name of the grant, for the journal.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Trust => "trust",
+            Self::HostKey => "host_key",
+        }
+    }
+}
+
+/// Whether a session ceiling (a permission-mode string) already runs without
+/// confirmation: `trust`, in the Claude spelling and the neutral one (A43).
+fn ceiling_runs_unconfirmed(ceiling: &str) -> bool {
+    matches!(ceiling, "bypassPermissions" | "trust")
+}
+
+/// The grants a stored record carries — what creating it with these values would
+/// hand out.
+fn grants_of_record(record: &InstanceRecord) -> Vec<AgentGrant> {
+    let mut out = Vec::new();
+    if record.allow_trust {
+        out.push(AgentGrant::Trust);
+    }
+    if record.host_key.is_some() {
+        out.push(AgentGrant::HostKey);
+    }
+    out
+}
+
+/// Refuse, on the agent surface, a call that widens its session beyond what the
+/// person already agreed to — and journal the ones that go through.
+///
+/// The agreement is the session's own ceiling: a person who let this session run
+/// without confirmation accepted that it reaches machines without asking. In
+/// every other mode (Ask, AutoEdits, PlanOnly) the call is refused with a stable
+/// code and nothing is written. A human token is never concerned.
+///
+/// The journal goes to the send journal (`journal`), fail closed like B30: an
+/// approval nobody can read back is not an approval. It carries the calling
+/// identity, the session, the instance and the grants — never a secret.
+async fn agent_grants(
+    state: &OrchestratorState,
+    claims: &Claims,
+    surface: Surface,
+    grants: &[AgentGrant],
+    instance_id: &str,
+) -> Result<(), AppError> {
+    if surface == Surface::Human || grants.is_empty() {
+        return Ok(());
+    }
+    let binding = crate::auth::jwt::agent_session_binding(claims);
+    let ceiling = binding
+        .as_ref()
+        .and_then(|b| b.ceiling.clone())
+        .unwrap_or_default();
+    if !ceiling_runs_unconfirmed(&ceiling) {
+        let first = grants[0];
+        let mode = if ceiling.is_empty() {
+            "default".to_string()
+        } else {
+            ceiling.clone()
+        };
+        return Err(AppError::Forbidden(format!(
+            "{}: {} needs a person's agreement, and this session runs in '{mode}' — \
+             ask the user to set it in Settings → Providers, or to run the session in trust",
+            first.code(),
+            first.as_str()
+        )));
+    }
+    let entry = json!({
+        "caller": claims.email,
+        "subject": claims.sub,
+        "session": binding.as_ref().map(|b| b.session_id.clone()),
+        "instance": instance_id,
+        "grants": grants.iter().map(|g| g.code()).collect::<Vec<_>>(),
+        "ceiling": ceiling,
+        "at": chrono::Utc::now().timestamp_millis(),
+    });
+    let key = format!(
+        "provider:{}:{instance_id}",
+        chrono::Utc::now().timestamp_millis()
+    );
+    graph(state)
+        .put_llm_setting("journal", &key, &entry.to_string())
+        .await
+        .map_err(AppError::Internal)?;
+    tracing::info!(
+        caller = %claims.email,
+        session = ?entry["session"],
+        instance = %instance_id,
+        grants = ?entry["grants"],
+        "provider grant given by an agent session"
+    );
+    Ok(())
+}
+
+// ============================================================================
+// Instances
+// ============================================================================
+
+/// POST /api/chat/providers/test — try a draft BEFORE saving it. Always 200:
+/// the verdict is in the body.
+pub async fn test_provider(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(draft): Json<InstanceDraft>,
+) -> Result<Json<Value>, AppError> {
+    require_human(&state, &claims)?;
+    instance_test(&state, draft).await.map(Json)
+}
+
+/// The verdict of a draft, shared by both surfaces (see [`Surface`]). Nothing is
+/// stored, so no grant is involved: the shape of the answer is the contract.
+async fn instance_test(
+    state: &OrchestratorState,
+    mut draft: InstanceDraft,
+) -> Result<Value, AppError> {
+    draft.id.get_or_insert_with(|| "draft".to_string());
+    let policy = EndpointPolicy::default();
+    let verdict =
+        |state: &str, code: &str| json!({"ok": false, "health": {"state": state, "code": code}});
+    let env_allow = st::env_credential_allowlist();
+    let record = match st::record_from_draft(&draft, &policy, &env_allow) {
+        Ok(r) => r,
+        Err(SettingsError::Endpoint(e)) => return Ok(verdict("unreachable", e.code())),
+        Err(e) => return Err(map_settings_error(e)),
+    };
+    if !st::is_process_kind(&record.kind) {
+        if let Err(e) = validate_endpoint(&record.base_url, &policy).await {
+            return Ok(verdict("unreachable", e.code()));
+        }
+    }
+    // A codex / acp instance is a local process: the test is its health check
+    // (version, login), nothing is sent anywhere.
+    if st::is_process_kind(&record.kind) {
+        let provider = match crate::chat::provider::native_factory::build_native_provider(
+            &record,
+            Some(state.vault.clone()),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                let failure = crate::chat::provider::errors::open_failure(&e, Some(&record.id));
+                return Ok(verdict("unknown", failure.code));
+            }
+        };
+        let nexus_health = provider.health().await;
+        let health = HealthEntry::from_nexus(&nexus_health);
+        let health = if record.kind == st::KIND_CLAUDE_CODE_REMOTE {
+            health.with_remote_reason(&nexus_health)
+        } else {
+            health
+        };
+        let mut verdict = json!({
+            "ok": health.state == "ok",
+            "health": { "state": health.state, "code": health.code, "action": health.action },
+            "models": [],
+        });
+        // Additive: only a remote machine explains itself.
+        if let Some(reason) = health.reason {
+            verdict["health"]["reason"] = json!(reason);
+        }
+        return Ok(verdict);
+    }
+    // A test that carries a credential sends it to the endpoint: it is only done
+    // for an instance that is ALREADY saved, at the origin it was saved with and
+    // with the credential reference it was saved with. A draft with a key is
+    // saved first (it cannot serve a session until a project consents anyway).
+    if record.credential_ref != "none" {
+        let saved = graph(state)
+            .get_llm_setting(GLOBAL, &format!("{INSTANCE_PREFIX}{}", record.id))
+            .await
+            .map_err(AppError::Internal)?
+            .and_then(|raw| parse::<InstanceRecord>(&raw));
+        let same = saved.is_some_and(|s| {
+            s.origin == record.origin && s.credential_ref == record.credential_ref
+        });
+        if !same {
+            return Ok(verdict(
+                "unknown",
+                "credential_test_requires_saved_instance",
+            ));
+        }
+    }
+    let report = match crate::chat::provider::native_factory::probe_instance(
+        &record,
+        Some(state.vault.clone()),
+        record.default_model.as_deref(),
+    )
+    .await
+    {
+        Ok(report) => report,
+        // A credential problem (locked vault, no grant) is a verdict, not a 500.
+        Err(e) => {
+            let failure = crate::chat::provider::errors::open_failure(&e, Some(&record.id));
+            return Ok(verdict(
+                if failure.code == "credentials_locked" || failure.code == "auth_required" {
+                    "auth_required"
+                } else {
+                    "unknown"
+                },
+                failure.code,
+            ));
+        }
+    };
+    let health = HealthEntry::from_nexus(&report.health);
+    let probe_failure = report
+        .probe_error
+        .as_ref()
+        .map(|e| crate::chat::provider::errors::open_failure(e, Some(&record.id)).code);
+    let tools_ok = report.tools == Some(true);
+    let ok = health.state == "ok" && tools_ok;
+    let mut body = json!({
+        "ok": ok,
+        "health": {
+            "state": health.state,
+            "code": health.code.or(probe_failure).or((report.tools == Some(false)).then_some("model_no_tools")),
+        },
+        "models": report.models.iter().map(|m| json!({ "id": m })).collect::<Vec<_>>(),
+    });
+    if report.tools.is_some() || report.context_window.is_some() {
+        body["probe"] = json!({
+            "tools": tools_ok,
+            "context_window": report.context_window,
+        });
+    }
+    Ok(body)
+}
+
+/// POST /api/chat/providers — create an instance.
+pub async fn create_provider(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(draft): Json<InstanceDraft>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    require_human(&state, &claims)?;
+    let view = instance_create(&state, &claims, draft).await?;
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// Create an instance on either surface. The validations and the store are
+/// `settings::record_from_draft` and `llm_settings`, exactly as the person's
+/// route always used; the surface only adds the grants an agent may not give
+/// itself.
+async fn instance_create(
+    state: &OrchestratorState,
+    claims: &Claims,
+    draft: InstanceDraft,
+) -> Result<Value, AppError> {
+    security_gate(state)?;
+    let policy = EndpointPolicy::default();
+    let record = st::record_from_draft(&draft, &policy, &st::env_credential_allowlist())
+        .map_err(map_settings_error)?;
+    agent_grants(
+        state,
+        claims,
+        Surface::of(state, claims),
+        &grants_of_record(&record),
+        &record.id,
+    )
+    .await?;
+    if !st::is_process_kind(&record.kind) {
+        validate_endpoint(&record.base_url, &policy)
+            .await
+            .map_err(|e| AppError::BadRequest(format!("endpoint refused: {e}")))?;
+    }
+    let graph = graph(state);
+    let key = format!("{INSTANCE_PREFIX}{}", record.id);
+    if graph
+        .get_llm_setting(GLOBAL, &key)
+        .await
+        .map_err(AppError::Internal)?
+        .is_some()
+    {
+        return Err(AppError::Conflict(format!(
+            "provider '{}' already exists",
+            record.id
+        )));
+    }
+    let body = serde_json::to_string(&record).map_err(|e| AppError::Internal(e.into()))?;
+    graph
+        .put_llm_setting(GLOBAL, &key, &body)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(instance_view(&record))
+}
+
+/// GET /api/chat/providers/{id} — the stored detail of one instance, for the
+/// edit form: the full `base_url` (path included), model, preset, cost source
+/// and credential REFERENCE. Human only: the listing deliberately never shows a
+/// path, and this route is the one that does. Never a secret value.
+pub async fn get_provider(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    require_human(&state, &claims)?;
+    instance_get(&state, &id).await.map(Json)
+}
+
+/// The stored detail of one instance, shared by both surfaces.
+async fn instance_get(state: &OrchestratorState, id: &str) -> Result<Value, AppError> {
+    if id == CLAUDE_CODE {
+        return Err(map_settings_error(SettingsError::Builtin));
+    }
+    let record: InstanceRecord = graph(state)
+        .get_llm_setting(GLOBAL, &format!("{INSTANCE_PREFIX}{id}"))
+        .await
+        .map_err(AppError::Internal)?
+        .and_then(|v| parse(&v))
+        .ok_or_else(|| map_settings_error(SettingsError::UnknownInstance(id.to_string())))?;
+    Ok(instance_view(&record))
+}
+
+/// PUT|PATCH /api/chat/providers/{id} — change an instance (never its id).
+pub async fn update_provider(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+    Json(patch): Json<InstancePatch>,
+) -> Result<Json<Value>, AppError> {
+    require_human(&state, &claims)?;
+    instance_update(&state, &claims, &id, patch).await.map(Json)
+}
+
+/// Change an instance on either surface (never its id).
+async fn instance_update(
+    state: &OrchestratorState,
+    claims: &Claims,
+    id: &str,
+    patch: InstancePatch,
+) -> Result<Value, AppError> {
+    if id == CLAUDE_CODE {
+        return Err(map_settings_error(SettingsError::Builtin));
+    }
+    let graph = graph(state);
+    let key = format!("{INSTANCE_PREFIX}{id}");
+    let old: InstanceRecord = graph
+        .get_llm_setting(GLOBAL, &key)
+        .await
+        .map_err(AppError::Internal)?
+        .and_then(|v| parse(&v))
+        .ok_or_else(|| AppError::NotFound(format!("unknown provider instance '{id}'")))?;
+    let policy = EndpointPolicy::default();
+    let (next, origin_changed) =
+        st::apply_patch(&old, &patch, &policy, &st::env_credential_allowlist())
+            .map_err(map_settings_error)?;
+    // Only what this patch actually CHANGES is a grant: sending back the values an
+    // instance already has widens nothing.
+    let mut grants = Vec::new();
+    if patch.allow_trust.is_some() && next.allow_trust != old.allow_trust {
+        grants.push(AgentGrant::Trust);
+    }
+    if patch.host_key.is_some() && next.host_key != old.host_key {
+        grants.push(AgentGrant::HostKey);
+    }
+    agent_grants(state, claims, Surface::of(state, claims), &grants, id).await?;
+    if patch.base_url.is_some() {
+        validate_endpoint(&next.base_url, &policy)
+            .await
+            .map_err(|e| AppError::BadRequest(format!("endpoint refused: {e}")))?;
+    }
+    let body = serde_json::to_string(&next).map_err(|e| AppError::Internal(e.into()))?;
+    graph
+        .put_llm_setting(GLOBAL, &key, &body)
+        .await
+        .map_err(AppError::Internal)?;
+    let mut view = instance_view(&next);
+    // Consents are tied to the origin: a new origin leaves them stored but no
+    // longer valid, and they are reported as such (A28).
+    view["consents_invalidated"] = json!(origin_changed);
+    Ok(view)
+}
+
+/// DELETE /api/chat/providers/{id}.
+pub async fn delete_provider(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    require_human(&state, &claims)?;
+    match instance_delete(&state, &id).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(AppError::NotFound(format!(
+            "unknown provider instance '{id}'"
+        ))),
+    }
+}
+
+/// Remove an instance on either surface: `true` when something was removed.
+///
+/// The instance's QUOTA goes with it (QUOTA). An id can be created again, and a quota that
+/// outlived its instance would hold the NEW one out until a reset nobody can explain — so both
+/// the stored document and, when the router runs, the live entry are dropped. The stored key is
+/// removed whether or not the chat router is up: the registry reloads it at startup otherwise.
+async fn instance_delete(state: &OrchestratorState, id: &str) -> Result<bool, AppError> {
+    if id == CLAUDE_CODE {
+        return Err(map_settings_error(SettingsError::Builtin));
+    }
+    let removed = graph(state)
+        .delete_llm_setting(GLOBAL, &format!("{INSTANCE_PREFIX}{id}"))
+        .await
+        .map_err(AppError::Internal)?;
+    if removed {
+        if let Some(routing) = state
+            .chat_manager
+            .as_ref()
+            .and_then(|manager| manager.cognitive_routing())
+        {
+            routing.quota.clear(id);
+        }
+        // Idempotent, and the one that matters after a restart.
+        graph(state)
+            .delete_llm_setting(GLOBAL, &format!("{QUOTA_PREFIX}{id}"))
+            .await
+            .map_err(AppError::Internal)?;
+    }
+    Ok(removed)
+}
+
+/// GET /api/chat/providers/{id}/status — health of one instance.
+pub async fn provider_status(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<String>,
+) -> Result<Json<HealthEntry>, AppError> {
+    instance_status(&state, &id).await.map(Json)
+}
+
+/// The health of one instance, shared by both surfaces.
+async fn instance_status(state: &OrchestratorState, id: &str) -> Result<HealthEntry, AppError> {
+    use nexus_claude::agent::AgentProvider;
+    if id == CLAUDE_CODE {
+        let provider = nexus_claude::providers::claude_code::ClaudeCodeProvider::new(
+            nexus_claude::providers::claude_code::ClaudeCodeConfig::default(),
+        );
+        return Ok(HealthEntry::from_nexus(&provider.health().await));
+    }
+    let record = crate::chat::provider::store::instance(graph(state).as_ref(), id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("unknown provider instance '{id}'")))?;
+    // The REAL health of the instance now (reachable? logged in? a locked vault is
+    // `auth_required`), checked by the provider itself. Nothing is sent but the
+    // provider's own health request.
+    let health = match crate::chat::provider::native_factory::build_native_provider(
+        &record,
+        Some(state.vault.clone()),
+    ) {
+        Ok(provider) => {
+            let nexus_health = provider.health().await;
+            let entry = HealthEntry::from_nexus(&nexus_health);
+            if record.kind == st::KIND_CLAUDE_CODE_REMOTE {
+                entry.with_remote_reason(&nexus_health)
+            } else {
+                entry
+            }
+        }
+        Err(_) => HealthEntry::unknown(),
+    };
+    Ok(health)
+}
+
+/// GET /api/chat/providers/{id}/limits — the CURRENT state of one instance's
+/// configured limits (RL7): one entry per limit, with its usage, what is left,
+/// when it resets and its status (`ok | limited | overloaded | unknown`).
+///
+/// The numbers are the MEASURED ones (RL5): RL2's counters fill `used`,
+/// `remaining` and `resets_at`, and RL4's breaker fills `status` — `limited` for a
+/// spent quota, `overloaded` for a provider having a bad minute — with the instant
+/// of the next attempt. Without a configured limit the answer is unchanged.
+///
+/// Never a secret — not in this response, not in any other: a limit scoped to a
+/// credential names the credential REFERENCE (`vault:<name>`, `env:<VAR>`), which
+/// is what the instance already carries.
+pub async fn provider_limits(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<String>,
+) -> Result<Json<st::RateLimitReport>, AppError> {
+    if id == CLAUDE_CODE {
+        // The built-in instance is not a stored one: it carries no configured
+        // limit, and there is nothing to report.
+        return Ok(Json(st::RateLimitReport {
+            provider_id: id,
+            status: st::RateLimitStatus::Ok,
+            limits: Vec::new(),
+        }));
+    }
+    let record = crate::chat::provider::store::instance(graph(&state).as_ref(), &id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("unknown provider instance '{id}'")))?;
+    // The measured state comes from the ONE gate the chat sessions use. With no chat
+    // manager nothing is counting, so the answer stays the settled shape.
+    Ok(Json(limits_report(
+        state
+            .chat_manager
+            .as_ref()
+            .map(|manager| manager.provider_limits().as_ref()),
+        &record,
+    )))
+}
+
+/// The state of an instance's limits: the gate's MEASURED numbers when there is one,
+/// the settled shape (`unknown`, null numbers) when nothing is counting.
+fn limits_report(
+    gate: Option<&crate::chat::provider::limits::Gate>,
+    record: &st::InstanceRecord,
+) -> st::RateLimitReport {
+    match gate {
+        Some(gate) => gate.report(record),
+        None => st::rate_limit_report(record),
+    }
+}
+
+// ============================================================================
+// SSH host key discovery (claude_code_remote)
+// ============================================================================
+
+/// Body of `POST /api/chat/providers/ssh-host-key`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostKeyScanBody {
+    /// Host name or address of the machine.
+    pub host: String,
+    /// ssh port (22 when absent).
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+}
+
+/// Total time `ssh-keyscan` may take (its own `-T 5` is per connection).
+const KEYSCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Output ceiling: a key line is a few hundred bytes.
+const KEYSCAN_MAX_OUTPUT: u64 = 64 * 1024;
+
+/// Why a scan failed; the texts are fixed (no raw tool output).
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeyScanError {
+    /// `ssh-keyscan` could not be started on this server.
+    NotAvailable,
+    /// No usable key came back (unreachable, refused, timed out, no ssh there).
+    NoKey,
+}
+
+/// The arguments of `ssh-keyscan` for a host: explicit words, never a shell, and
+/// `--` before the host so it can never be read as an option.
+pub fn keyscan_args(host: &str, port: u16) -> Vec<String> {
+    vec![
+        "-T".into(),
+        "5".into(),
+        "-p".into(),
+        port.to_string(),
+        "-t".into(),
+        "ed25519,ecdsa,rsa".into(),
+        "--".into(),
+        host.to_string(),
+    ]
+}
+
+/// The first valid key of `ssh-keyscan` output (`<host> <type> <base64>` lines,
+/// `#` comments): `("<type> <base64>", fingerprint)`.
+pub fn parse_keyscan_output(output: &str) -> Option<(String, String)> {
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let [_host, kind, blob] = words[..] else {
+            return None;
+        };
+        let key = format!("{kind} {blob}");
+        st::parse_host_key(&key).ok()?;
+        let fingerprint = st::host_key_fingerprint(&key)?;
+        Some((key, fingerprint))
+    })
+}
+
+/// Runs `program` with `args` under the deadline and the output ceiling, and
+/// parses the first key. The child dies with the future (`kill_on_drop`).
+pub async fn run_keyscan(
+    program: &str,
+    args: &[String],
+    deadline: std::time::Duration,
+) -> Result<(String, String), KeyScanError> {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| KeyScanError::NotAvailable)?;
+    let stdout = child.stdout.take().ok_or(KeyScanError::NotAvailable)?;
+    let read = async {
+        let mut buf = Vec::new();
+        let _ = stdout.take(KEYSCAN_MAX_OUTPUT).read_to_end(&mut buf).await;
+        buf
+    };
+    let Ok(buf) = tokio::time::timeout(deadline, read).await else {
+        let _ = child.start_kill();
+        return Err(KeyScanError::NoKey);
+    };
+    // Past the ceiling or not, the child is not waited on: it is killed.
+    let _ = child.start_kill();
+    parse_keyscan_output(&String::from_utf8_lossy(&buf)).ok_or(KeyScanError::NoKey)
+}
+
+/// POST /api/chat/providers/ssh-host-key — read the public host key a machine
+/// presents, and its fingerprint, so a HUMAN can confirm it before pinning it.
+///
+/// This is trust on first use made explicit: the key returned here is whatever
+/// the network answered, so the UI must show the fingerprint and ask the person
+/// to compare it with the machine's own (`ssh-keygen -lf` on the host). Nothing
+/// is stored; the pinned key only enters through creating or patching an
+/// instance. Same auth as the other provider-settings writes (a signed-in
+/// person, authentication enabled): the server opens a connection to the host
+/// the body names.
+pub async fn scan_ssh_host_key(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<HostKeyScanBody>,
+) -> Result<Json<Value>, AppError> {
+    require_human(&state, &claims)?;
+    instance_scan_host_key(&state, body).await.map(Json)
+}
+
+/// Reads the key a machine presents. Stores nothing, so it hands out no grant:
+/// pinning that key is what a person decides, by creating or patching an instance.
+async fn instance_scan_host_key(
+    state: &OrchestratorState,
+    body: HostKeyScanBody,
+) -> Result<Value, AppError> {
+    security_gate(state)?;
+    if !st::valid_ssh_word(&body.host) {
+        return Err(AppError::BadRequest(
+            "host: a plain name or address (letters, digits and . _ - : [ ] % @, not starting with '-')"
+                .to_string(),
+        ));
+    }
+    if body.ssh_port == Some(0) {
+        return Err(AppError::BadRequest(
+            "ssh_port: between 1 and 65535".to_string(),
+        ));
+    }
+    let args = keyscan_args(&body.host, body.ssh_port.unwrap_or(22));
+    match run_keyscan("ssh-keyscan", &args, KEYSCAN_DEADLINE).await {
+        Ok((host_key, host_key_fingerprint)) => Ok(json!({
+            "host_key": host_key,
+            "host_key_fingerprint": host_key_fingerprint,
+        })),
+        Err(KeyScanError::NotAvailable) => Err(AppError::NotImplemented(
+            "ssh-keyscan is not available on this server".to_string(),
+        )),
+        Err(KeyScanError::NoKey) => Err(AppError::BadRequest(
+            "no host key could be read from that machine (unreachable, refused or too slow)"
+                .to_string(),
+        )),
+    }
+}
+
+/// Query of `GET /api/chat/send-journal`.
+#[derive(Debug, Deserialize)]
+pub struct JournalQuery {
+    /// Only the sendings of this project.
+    pub project_slug: Option<String>,
+    /// Most recent first, at most this many (default 100, max 500).
+    pub limit: Option<usize>,
+}
+
+/// GET /api/chat/send-journal — who sent which project's content to which origin
+/// (A37), most recent first. A person only: the journal is the user's own audit
+/// trail, an agent has no business reading it. It never holds the content sent.
+pub async fn send_journal(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Query(query): axum::extract::Query<JournalQuery>,
+) -> Result<Json<Value>, AppError> {
+    require_human(&state, &claims)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let mut rows = graph(&state)
+        .list_llm_settings("journal", "send:")
+        .await
+        .map_err(AppError::Internal)?;
+    // Keys are `send:<epoch ms>:<session>`: newest last.
+    rows.reverse();
+    let entries: Vec<Value> = rows
+        .iter()
+        .filter_map(|(_, v)| serde_json::from_str::<Value>(v).ok())
+        .filter(|e| match &query.project_slug {
+            Some(p) => e["project"] == p.as_str(),
+            None => true,
+        })
+        .take(limit)
+        .collect();
+    Ok(Json(json!({ "entries": entries })))
+}
+
+/// The stored default stays first and is kept even when the endpoint does not
+/// list it (some gateways answer with a partial list); duplicates collapse.
+fn merge_listed_models(mut listed: Vec<String>, default: Option<&str>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    listed.retain(|m| seen.insert(m.clone()));
+    if let Some(d) = default {
+        listed.retain(|m| m != d);
+        listed.insert(0, d.to_string());
+    }
+    listed
+}
+
+/// GET /api/chat/providers/{id}/models — models of one instance.
+pub async fn provider_models(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    instance_models(&state, &id).await.map(Json)
+}
+
+/// The models of one instance, shared by both surfaces.
+async fn instance_models(state: &OrchestratorState, id: &str) -> Result<Value, AppError> {
+    let graph = graph(state);
+    if id == CLAUDE_CODE {
+        let model = state
+            .chat_manager
+            .as_ref()
+            .map(|m| m.resolve_model(None))
+            .unwrap_or_else(|| crate::chat::ChatConfig::from_env().default_model);
+        return Ok(json!([{ "id": model }]));
+    }
+    let record: InstanceRecord = graph
+        .get_llm_setting(GLOBAL, &format!("{INSTANCE_PREFIX}{id}"))
+        .await
+        .map_err(AppError::Internal)?
+        .and_then(|v| parse(&v))
+        .ok_or_else(|| AppError::NotFound(format!("unknown provider instance '{id}'")))?;
+    let stored: Vec<Value> = record
+        .default_model
+        .iter()
+        .map(|m| json!({ "id": m }))
+        .collect();
+    // A process instance (codex, acp) chooses its own models: only the stored
+    // default is known here.
+    if st::is_process_kind(&record.kind) {
+        return Ok(json!(stored));
+    }
+    // An OpenAI-compatible endpoint lists its models (`GET /models`). Ask it:
+    // answering with the stored default alone left an instance saved without a
+    // default with an empty picker, so no session could ever name a model.
+    // A refusal or an unreachable endpoint falls back to the stored default; the
+    // chat shows its own state card for the failure when a session is opened.
+    let listed = match crate::chat::provider::native_factory::list_models(
+        &record,
+        Some(state.vault.clone()),
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(provider = %record.id, error = %e, "model listing failed");
+            Vec::new()
+        }
+    };
+    if listed.is_empty() {
+        return Ok(json!(stored));
+    }
+    let ids = merge_listed_models(listed, record.default_model.as_deref());
+    Ok(json!(ids
+        .iter()
+        .map(|m| json!({ "id": m }))
+        .collect::<Vec<_>>()))
+}
+
+// ============================================================================
+// Consent
+// ============================================================================
+
+/// Body of `PUT .../llm-consent`: the instance and the origin being allowed.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsentBody {
+    /// Instance (taken from the path when the route carries it).
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// Origin the human is allowing: it must be the instance's current origin.
+    pub origin: String,
+}
+
+/// GET /api/projects/{slug}/llm-consent[s].
+pub async fn list_consents(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+) -> Result<Json<Vec<st::ConsentView>>, AppError> {
+    list_scope_consents(&state, &st::project_scope(&slug)).await
+}
+
+/// GET /api/chat/llm-consents — the consents that hold for the chats outside any project
+/// (B3), in the same shape as a project's.
+pub async fn list_no_project_consents(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<Vec<st::ConsentView>>, AppError> {
+    list_scope_consents(&state, st::NO_PROJECT_SCOPE).await
+}
+
+async fn list_scope_consents(
+    state: &OrchestratorState,
+    scope: &str,
+) -> Result<Json<Vec<st::ConsentView>>, AppError> {
+    let graph = graph(state);
+    let instances = load_instances(graph.as_ref()).await?;
+    let rows = load_scope_consents(graph.as_ref(), scope)
+        .await?
+        .iter()
+        .map(|c| {
+            let current = instances.iter().find(|i| i.id == c.provider_id);
+            st::consent_view(c, current)
+        })
+        .collect();
+    Ok(Json(rows))
+}
+
+/// Stores a person's consent for `scope` (a project's, or [`st::NO_PROJECT_SCOPE`]): the
+/// same rules whatever the scope — a human token, a registered instance, the origin the
+/// person was shown, bound to the origin and the credential reference (A28).
+async fn put_consent(
+    state: &OrchestratorState,
+    claims: &Claims,
+    scope: &str,
+    provider_id: &str,
+    origin: &str,
+) -> Result<Json<st::ConsentView>, AppError> {
+    require_scope_writer(state, claims, scope)?;
+    if provider_id == CLAUDE_CODE {
+        return Err(AppError::BadRequest(
+            "claude-code is always allowed: it needs no consent".to_string(),
+        ));
+    }
+    let graph = graph(state);
+    let instance: InstanceRecord = graph
+        .get_llm_setting(GLOBAL, &format!("{INSTANCE_PREFIX}{provider_id}"))
+        .await
+        .map_err(AppError::Internal)?
+        .and_then(|v| parse(&v))
+        .ok_or_else(|| AppError::NotFound(format!("unknown provider instance '{provider_id}'")))?;
+    // The human saw an origin on screen: it must still be the instance's.
+    if instance.origin != origin {
+        return Err(AppError::Conflict(
+            "origin_mismatch: the instance no longer points at the origin you were shown"
+                .to_string(),
+        ));
+    }
+    let record = ConsentRecord {
+        provider_id: provider_id.to_string(),
+        origin: instance.origin.clone(),
+        consented_by: claims.email.clone(),
+        consented_at: chrono::Utc::now().to_rfc3339(),
+        credential_ref: Some(instance.credential_ref.clone()),
+        host_key_fingerprint: instance.host_key_fingerprint(),
+    };
+    let body = serde_json::to_string(&record).map_err(|e| AppError::Internal(e.into()))?;
+    graph
+        .put_llm_setting(scope, &format!("{CONSENT_PREFIX}{provider_id}"), &body)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(st::consent_view(&record, Some(&instance))))
+}
+
+/// PUT /api/projects/{slug}/llm-consent — body `{ provider_id, origin }`.
+pub async fn allow_consent(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(slug): Path<String>,
+    Json(body): Json<ConsentBody>,
+) -> Result<Json<st::ConsentView>, AppError> {
+    let provider_id = body_provider(&body)?;
+    put_consent(
+        &state,
+        &claims,
+        &st::project_scope(&slug),
+        &provider_id,
+        &body.origin,
+    )
+    .await
+}
+
+/// PUT /api/projects/{slug}/llm-consents/{provider_id} — body `{ origin }`.
+pub async fn allow_consent_for(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path((slug, provider_id)): Path<(String, String)>,
+    Json(body): Json<ConsentBody>,
+) -> Result<Json<st::ConsentView>, AppError> {
+    put_consent(
+        &state,
+        &claims,
+        &st::project_scope(&slug),
+        &provider_id,
+        &body.origin,
+    )
+    .await
+}
+
+/// PUT /api/chat/llm-consents — body `{ provider_id, origin }`: a person allows an instance
+/// for the chats outside any project (B3). A project never inherits it.
+pub async fn allow_no_project_consent(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<ConsentBody>,
+) -> Result<Json<st::ConsentView>, AppError> {
+    let provider_id = body_provider(&body)?;
+    put_consent(
+        &state,
+        &claims,
+        st::NO_PROJECT_SCOPE,
+        &provider_id,
+        &body.origin,
+    )
+    .await
+}
+
+/// PUT /api/chat/llm-consents/{provider_id} — body `{ origin }`.
+pub async fn allow_no_project_consent_for(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(provider_id): Path<String>,
+    Json(body): Json<ConsentBody>,
+) -> Result<Json<st::ConsentView>, AppError> {
+    put_consent(
+        &state,
+        &claims,
+        st::NO_PROJECT_SCOPE,
+        &provider_id,
+        &body.origin,
+    )
+    .await
+}
+
+fn body_provider(body: &ConsentBody) -> Result<String, AppError> {
+    body.provider_id
+        .clone()
+        .ok_or_else(|| AppError::BadRequest("provider_id is required".to_string()))
+}
+
+/// DELETE /api/projects/{slug}/llm-consent[s]/{provider_id}.
+pub async fn revoke_consent(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path((slug, provider_id)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    delete_consent(&state, &claims, &st::project_scope(&slug), &provider_id).await
+}
+
+/// DELETE /api/chat/llm-consents/{provider_id}.
+pub async fn revoke_no_project_consent(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(provider_id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    delete_consent(&state, &claims, st::NO_PROJECT_SCOPE, &provider_id).await
+}
+
+async fn delete_consent(
+    state: &OrchestratorState,
+    claims: &Claims,
+    scope: &str,
+    provider_id: &str,
+) -> Result<StatusCode, AppError> {
+    require_scope_writer(state, claims, scope)?;
+    let removed = graph(state)
+        .delete_llm_setting(scope, &format!("{CONSENT_PREFIX}{provider_id}"))
+        .await
+        .map_err(AppError::Internal)?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound("no consent to revoke".to_string()))
+    }
+}
+
+// ============================================================================
+// Roles, aliases, policy
+// ============================================================================
+
+async fn read_roles(graph: &dyn GraphStore, scope: &str) -> Result<RoleAssignments, AppError> {
+    Ok(graph
+        .get_llm_setting(scope, ROLES_KEY)
+        .await
+        .map_err(AppError::Internal)?
+        .and_then(|v| parse(&v))
+        .unwrap_or_default())
+}
+
+async fn write_roles(
+    state: &OrchestratorState,
+    claims: &Claims,
+    scope: &str,
+    roles: RoleAssignments,
+) -> Result<Json<RoleAssignments>, AppError> {
+    require_human(state, claims)?;
+    let graph = graph(state);
+    let stored: Vec<String> = load_instances(graph.as_ref())
+        .await?
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    st::validate_roles(&roles, &|id| {
+        id == CLAUDE_CODE || stored.iter().any(|s| s == id)
+    })
+    .map_err(map_settings_error)?;
+    let body = serde_json::to_string(&roles).map_err(|e| AppError::Internal(e.into()))?;
+    graph
+        .put_llm_setting(scope, ROLES_KEY, &body)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(roles))
+}
+
+/// GET /api/chat/roles.
+pub async fn get_roles(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<RoleAssignments>, AppError> {
+    Ok(Json(read_roles(graph(&state).as_ref(), GLOBAL).await?))
+}
+
+/// PUT /api/chat/roles.
+pub async fn put_roles(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(roles): Json<RoleAssignments>,
+) -> Result<Json<RoleAssignments>, AppError> {
+    // The global pilot routes every user's chats that name no provider: root only.
+    require_root(&state, &claims)?;
+    write_roles(&state, &claims, GLOBAL, roles).await
+}
+
+/// GET /api/projects/{slug}/llm-roles (an absent role inherits the global one).
+pub async fn get_project_roles(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+) -> Result<Json<RoleAssignments>, AppError> {
+    Ok(Json(
+        read_roles(graph(&state).as_ref(), &st::project_scope(&slug)).await?,
+    ))
+}
+
+/// PUT /api/projects/{slug}/llm-roles.
+pub async fn put_project_roles(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(slug): Path<String>,
+    Json(roles): Json<RoleAssignments>,
+) -> Result<Json<RoleAssignments>, AppError> {
+    write_roles(&state, &claims, &st::project_scope(&slug), roles).await
+}
+
+/// GET /api/chat/model-aliases.
+pub async fn get_aliases(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<Vec<ModelAlias>>, AppError> {
+    Ok(Json(load_aliases(graph(&state).as_ref()).await?))
+}
+
+/// PUT /api/chat/model-aliases.
+pub async fn put_aliases(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(aliases): Json<Vec<ModelAlias>>,
+) -> Result<Json<Vec<ModelAlias>>, AppError> {
+    require_human(&state, &claims)?;
+    let graph = graph(&state);
+    let stored: Vec<String> = load_instances(graph.as_ref())
+        .await?
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    st::validate_aliases(&aliases, &|id| {
+        id == CLAUDE_CODE || stored.iter().any(|s| s == id)
+    })
+    .map_err(map_settings_error)?;
+    let body = serde_json::to_string(&aliases).map_err(|e| AppError::Internal(e.into()))?;
+    graph
+        .put_llm_setting(GLOBAL, ALIASES_KEY, &body)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(aliases))
+}
+
+/// GET /api/chat/model-policy (ships as `off`).
+pub async fn get_policy(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<ModelPolicy>, AppError> {
+    Ok(Json(
+        graph(&state)
+            .get_llm_setting(GLOBAL, POLICY_KEY)
+            .await
+            .map_err(AppError::Internal)?
+            .and_then(|v| parse(&v))
+            .unwrap_or_default(),
+    ))
+}
+
+/// PUT /api/chat/model-policy.
+pub async fn put_policy(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(policy): Json<ModelPolicy>,
+) -> Result<Json<ModelPolicy>, AppError> {
+    require_human(&state, &claims)?;
+    let graph = graph(&state);
+    let aliases = load_aliases(graph.as_ref()).await?;
+    st::validate_policy(&policy, &|a| aliases.iter().any(|x| x.alias == a))
+        .map_err(map_settings_error)?;
+    let body = serde_json::to_string(&policy).map_err(|e| AppError::Internal(e.into()))?;
+    graph
+        .put_llm_setting(GLOBAL, POLICY_KEY, &body)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(policy))
+}
+
+#[allow(dead_code)]
+#[derive(Serialize)]
+struct _Unused;
+
+// ============================================================================
+// The agent-facing surface: what the MCP `provider` mega-tool calls
+// ============================================================================
+//
+// `/api/chat/providers…` is reserved to a person (A25) and stays so: an agent
+// that could write an instance would choose the endpoint it runs on. These
+// routes are the agent's own door to the SAME operations — not a second set of
+// validations, not a second store — under the refusals of [`AgentGrant`]. They
+// exist because adding a machine (n1, n2, n3, dgx) went through no tool at all:
+// only a REST route an agent could not reach.
+//
+// They are closed to the restricted and read-only profiles, which do not see the
+// `provider` tool either (`auth/tool_profile.rs`): a third-party or read-only
+// session cannot reach them with its token.
+
+/// The agent surface accepts a person's session token (someone driving the tool
+/// from a shell — and the parity test) and a chat session's; it refuses a caller
+/// that is neither.
+fn require_known_caller(state: &OrchestratorState, claims: &Claims) -> Result<(), AppError> {
+    if state.auth_config.is_none()
+        || claims.is_human()
+        || claims.is_agent_session()
+        || claims.is_mcp_token()
+    {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "provider: a person's or a chat session's token is required".to_string(),
+        ))
+    }
+}
+
+/// GET /api/agent/providers — every stored instance, each in the shape of
+/// `GET /api/chat/providers/{id}`: it names a credential REFERENCE, never a value.
+pub async fn agent_list_providers(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, AppError> {
+    require_known_caller(&state, &claims)?;
+    instance_list(&state).await.map(Json)
+}
+
+/// Every stored instance, shared by both surfaces.
+async fn instance_list(state: &OrchestratorState) -> Result<Value, AppError> {
+    let graph = graph(state);
+    let rows: Vec<Value> = load_instances(graph.as_ref())
+        .await?
+        .iter()
+        .map(instance_view)
+        .collect();
+    Ok(json!({ "providers": rows }))
+}
+
+/// GET /api/agent/providers/{id}
+pub async fn agent_get_provider(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    require_known_caller(&state, &claims)?;
+    instance_get(&state, &id).await.map(Json)
+}
+
+/// POST /api/agent/providers — the same creation as `POST /api/chat/providers`,
+/// with [`agent_grants`] on top.
+pub async fn agent_create_provider(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(draft): Json<InstanceDraft>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    require_known_caller(&state, &claims)?;
+    let view = instance_create(&state, &claims, draft).await?;
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// PATCH /api/agent/providers/{id}
+pub async fn agent_update_provider(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+    Json(patch): Json<InstancePatch>,
+) -> Result<Json<Value>, AppError> {
+    require_known_caller(&state, &claims)?;
+    instance_update(&state, &claims, &id, patch).await.map(Json)
+}
+
+/// DELETE /api/agent/providers/{id}
+pub async fn agent_delete_provider(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    require_known_caller(&state, &claims)?;
+    match instance_delete(&state, &id).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(AppError::NotFound(format!(
+            "unknown provider instance '{id}'"
+        ))),
+    }
+}
+
+/// POST /api/agent/providers/test — the verdict of a draft, always 200.
+pub async fn agent_test_provider(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(draft): Json<InstanceDraft>,
+) -> Result<Json<Value>, AppError> {
+    require_known_caller(&state, &claims)?;
+    instance_test(&state, draft).await.map(Json)
+}
+
+/// GET /api/agent/providers/{id}/status
+pub async fn agent_provider_status(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Result<Json<HealthEntry>, AppError> {
+    require_known_caller(&state, &claims)?;
+    instance_status(&state, &id).await.map(Json)
+}
+
+/// GET /api/agent/providers/{id}/models
+pub async fn agent_provider_models(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    require_known_caller(&state, &claims)?;
+    instance_models(&state, &id).await.map(Json)
+}
+
+/// POST /api/agent/providers/ssh-host-key — read the key a machine presents, so a
+/// person can compare the fingerprint before an instance pins it.
+pub async fn agent_scan_host_key(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<HostKeyScanBody>,
+) -> Result<Json<Value>, AppError> {
+    require_known_caller(&state, &claims)?;
+    instance_scan_host_key(&state, body).await.map(Json)
+}
+
+#[cfg(test)]
+mod agent_surface_tests {
+    //! The agent surface the MCP `provider` mega-tool calls: THE SAME answers as
+    //! the person's settings routes (no second set of validations), plus the two
+    //! grants an agent may not give itself.
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    const SECRET: &str = "test-secret-key-minimum-32-chars!!";
+    const KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXTCY3J636nEyMNqNrVj6HXnIXUnXL8sk4c5J6tek3N";
+
+    async fn app() -> (axum::Router, Arc<crate::neo4j::mock::MockGraphStore>) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        (
+            crate::test_helpers::router_with_auth(graph.clone()).await,
+            graph,
+        )
+    }
+
+    /// A person's session token.
+    fn person() -> String {
+        crate::test_helpers::test_bearer_token()
+    }
+
+    /// QUOTA: deleting an instance takes its quota with it. An id can be created again, and a
+    /// quota that outlived its instance would hold the NEW one out until a reset nobody can
+    /// explain. The stored document is what matters: the registry reloads it at startup.
+    #[tokio::test]
+    async fn deleting_an_instance_forgets_its_quota_so_a_new_one_starts_clean() {
+        use crate::chat::provider::quota::QUOTA_PREFIX;
+
+        let (app, graph) = app().await;
+        let id = "deepseek-spent";
+        let instance_key = format!("{INSTANCE_PREFIX}{id}");
+        let quota_key = format!("{QUOTA_PREFIX}{id}");
+        // An instance, and an account of it reported as used up until some instant.
+        graph
+            .put_llm_setting(GLOBAL, &instance_key, "{}")
+            .await
+            .unwrap();
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                &quota_key,
+                r#"{"windows":[],"source":"live","observed_at_ms":1792500000000,
+                    "exhaustion":{"resets_at_ms":1792900000000,"reset_known":true,
+                    "cause":"rate_limited"}}"#,
+            )
+            .await
+            .unwrap();
+
+        let gone = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/chat/providers/{id}"))
+                    .header("authorization", person())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), axum::http::StatusCode::NO_CONTENT);
+
+        assert!(
+            graph
+                .get_llm_setting(GLOBAL, &instance_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "the instance itself is gone"
+        );
+        assert!(
+            graph
+                .get_llm_setting(GLOBAL, &quota_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "its quota is gone too, or a new instance of the same id inherits it"
+        );
+
+        // The same id created again starts with nothing known about its account.
+        graph
+            .put_llm_setting(GLOBAL, &instance_key, "{}")
+            .await
+            .unwrap();
+        assert!(
+            graph
+                .get_llm_setting(GLOBAL, &quota_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "no quota is resurrected with the id"
+        );
+    }
+
+    /// A chat session's token, its permission ceiling signed into it (B21).
+    fn session(id: &str, ceiling: Option<&str>) -> String {
+        let bare = crate::test_helpers::test_bearer_token();
+        let bare = bare.trim_start_matches("Bearer ");
+        let human = crate::auth::jwt::decode_jwt(bare, SECRET).expect("the test token");
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: id.to_string(),
+            ceiling: ceiling.map(str::to_string),
+            tool_profile: None,
+            third_party: false,
+        };
+        let (token, jti) =
+            crate::auth::jwt::generate_session_token(&human, Some(&binding), SECRET, 600)
+                .expect("an agent token");
+        crate::auth::agent_tokens::register(&jti, Some(id));
+        format!("Bearer {token}")
+    }
+
+    async fn call(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        token: &str,
+    ) -> (u16, String) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", token);
+        let body = match body {
+            Some(b) => {
+                req = req.header("content-type", "application/json");
+                Body::from(b.to_string())
+            }
+            None => Body::empty(),
+        };
+        let res = app
+            .clone()
+            .oneshot(req.body(body).expect("a request"))
+            .await
+            .expect("the router answers");
+        let status = res.status().as_u16();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .expect("a body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// A remote instance asking for the two grants: a pinned key and no-confirmation.
+    fn remote_machine() -> Value {
+        json!({
+            "id": "claude-code@n1",
+            "kind": "claude_code_remote",
+            "label": "n1",
+            "host": "n1.example.net",
+            "host_key": KEY,
+            "remote_cwd": "/work/repo",
+            "credential_ref": "vault:ssh-n1",
+            "allow_trust": true,
+        })
+    }
+
+    // ── the parity itself ──────────────────────────────────────────────────
+
+    /// Every refusal the person's route produces, the agent surface produces
+    /// byte for byte. This is what "no second path" means: an agent cannot get a
+    /// weaker validation, and the person's route does not get a stronger one.
+    #[tokio::test]
+    async fn the_agent_surface_answers_exactly_as_the_human_one() {
+        let (app, _graph) = app().await;
+        let token = person();
+        let cases: Vec<(&str, Value)> = vec![
+            (
+                "an unknown kind",
+                json!({"id": "x", "kind": "nope", "label": "X"}),
+            ),
+            ("no id at all", json!({"kind": "codex", "label": "X"})),
+            (
+                "an id that is not a slug",
+                json!({"id": "Not A Slug", "label": "X"}),
+            ),
+            (
+                "the built-in id",
+                json!({"id": "claude-code", "label": "X", "base_url": "https://api.example.com/v1"}),
+            ),
+            (
+                "a credential VALUE instead of a reference",
+                json!({"id": "x", "label": "X", "base_url": "https://api.example.com/v1",
+                       "credential_ref": "sk-live-0123456789"}),
+            ),
+            (
+                "an env reference that is not in the allow-list",
+                json!({"id": "x", "label": "X", "base_url": "https://api.example.com/v1",
+                       "credential_ref": "env:NOT_ALLOWED_VAR"}),
+            ),
+            (
+                "a remote field on a URL instance",
+                json!({"id": "x", "label": "X", "base_url": "https://api.example.com/v1",
+                       "allow_trust": true}),
+            ),
+            (
+                "a remote machine without a working directory",
+                json!({"id": "claude-code@n1", "kind": "claude_code_remote", "label": "n1",
+                       "host": "n1.example.net", "host_key": KEY,
+                       "credential_ref": "vault:ssh-n1"}),
+            ),
+            (
+                "a host key that is not a key",
+                json!({"id": "claude-code@n1", "kind": "claude_code_remote", "label": "n1",
+                       "host": "n1.example.net", "host_key": "ssh-ed25519 not*base64*at-all",
+                       "remote_cwd": "/work", "credential_ref": "vault:ssh-n1"}),
+            ),
+            (
+                "an ssh key that does not come from the vault",
+                json!({"id": "claude-code@n1", "kind": "claude_code_remote", "label": "n1",
+                       "host": "n1.example.net", "host_key": KEY,
+                       "remote_cwd": "/work", "credential_ref": "env:SSH_KEY"}),
+            ),
+            (
+                "an ssh host that looks like an option",
+                json!({"id": "claude-code@n1", "kind": "claude_code_remote", "label": "n1",
+                       "host": "-oProxyCommand=sh", "host_key": KEY,
+                       "remote_cwd": "/work", "credential_ref": "vault:ssh-n1"}),
+            ),
+            (
+                "plain http towards a public host",
+                json!({"id": "x", "label": "X", "base_url": "http://api.example.com/v1"}),
+            ),
+            (
+                "a URL with a credential inside it",
+                json!({"id": "x", "label": "X", "base_url": "https://user:pw@api.example.com/v1"}),
+            ),
+            (
+                "an acp agent that is not declared",
+                json!({"id": "x", "kind": "acp", "label": "X", "preset": "sh -c id"}),
+            ),
+            (
+                "a base URL on a process kind",
+                json!({"id": "x", "kind": "codex", "label": "X", "base_url": "https://api.example.com/v1"}),
+            ),
+            (
+                "an unknown cost source",
+                json!({"id": "x", "kind": "codex", "label": "X", "cost_source": "guesswork"}),
+            ),
+        ];
+        for (label, body) in cases {
+            let (human_status, human_body) = call(
+                &app,
+                "POST",
+                "/api/chat/providers",
+                Some(body.clone()),
+                &token,
+            )
+            .await;
+            let (agent_status, agent_body) = call(
+                &app,
+                "POST",
+                "/api/agent/providers",
+                Some(body.clone()),
+                &token,
+            )
+            .await;
+            assert_eq!(human_status, agent_status, "{label}: status\n{body}");
+            assert_eq!(human_body, agent_body, "{label}: body\n{body}");
+            // A parity test where everything is refused for a good reason proves
+            // nothing unless it also proves these ARE refusals.
+            assert!(
+                human_status >= 400,
+                "{label}: both surfaces accepted it ({human_status}) — the case is not a \
+                 refusal any more, find another one\n{body}\n{human_body}"
+            );
+        }
+    }
+
+    /// The same on the other verbs: reading, editing, removing.
+    #[tokio::test]
+    async fn the_agent_surface_answers_like_the_human_one_on_every_verb() {
+        let (app, _graph) = app().await;
+        let token = person();
+        let patch = json!({"base_url": "http://api.example.com/v1"});
+        let cases: Vec<(&str, &str, &str, &str, Option<Value>)> = vec![
+            (
+                "a stored instance nobody created",
+                "GET",
+                "/api/chat/providers/ghost",
+                "/api/agent/providers/ghost",
+                None,
+            ),
+            (
+                "the built-in instance",
+                "GET",
+                "/api/chat/providers/claude-code",
+                "/api/agent/providers/claude-code",
+                None,
+            ),
+            (
+                "the health of an instance nobody created",
+                "GET",
+                "/api/chat/providers/ghost/status",
+                "/api/agent/providers/ghost/status",
+                None,
+            ),
+            (
+                "the models of an instance nobody created",
+                "GET",
+                "/api/chat/providers/ghost/models",
+                "/api/agent/providers/ghost/models",
+                None,
+            ),
+            (
+                "a patch of an instance nobody created",
+                "PATCH",
+                "/api/chat/providers/ghost",
+                "/api/agent/providers/ghost",
+                Some(patch),
+            ),
+            (
+                "a patch of the built-in instance",
+                "PATCH",
+                "/api/chat/providers/claude-code",
+                "/api/agent/providers/claude-code",
+                Some(json!({"label": "mine"})),
+            ),
+            (
+                "the removal of an instance nobody created",
+                "DELETE",
+                "/api/chat/providers/ghost",
+                "/api/agent/providers/ghost",
+                None,
+            ),
+            (
+                "the removal of the built-in instance",
+                "DELETE",
+                "/api/chat/providers/claude-code",
+                "/api/agent/providers/claude-code",
+                None,
+            ),
+        ];
+        for (label, method, human_uri, agent_uri, body) in cases {
+            let (human_status, human_body) =
+                call(&app, method, human_uri, body.clone(), &token).await;
+            let (agent_status, agent_body) =
+                call(&app, method, agent_uri, body.clone(), &token).await;
+            assert_eq!(human_status, agent_status, "{label}: status");
+            assert_eq!(human_body, agent_body, "{label}: body");
+            assert!(human_status >= 400, "{label}: accepted ({human_status})");
+        }
+    }
+
+    // ── what an agent may not give itself ──────────────────────────────────
+
+    /// The point of the tool: a chat session with no special mode can still add
+    /// the machines and endpoints it needs, as long as it grants nothing.
+    #[tokio::test]
+    async fn an_agent_adds_an_instance_that_grants_nothing() {
+        let (app, graph) = app().await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/agent/providers",
+            Some(json!({"id": "lagent", "kind": "codex", "label": "Codex"})),
+            &session("sess-1", Some("default")),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        assert!(
+            body.contains("lagent"),
+            "the created instance comes back: {body}"
+        );
+        // The store is the same one the settings page reads (one store, not two).
+        assert!(graph
+            .get_llm_setting(GLOBAL, "instance:lagent")
+            .await
+            .unwrap()
+            .is_some());
+        // Nothing was granted, so nothing was journaled.
+        assert!(graph
+            .list_llm_settings("journal", "provider:")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A machine that runs WITHOUT asking, on a session that still asks: refused,
+    /// nothing stored, stable code.
+    #[tokio::test]
+    async fn an_agent_in_default_cannot_trust_a_machine() {
+        let (app, graph) = app().await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/agent/providers",
+            Some(remote_machine()),
+            &session("sess-2", Some("default")),
+        )
+        .await;
+        assert_eq!(status, 403, "{body}");
+        assert!(
+            body.contains("provider_trust_needs_a_human"),
+            "the refusal names the grant: {body}"
+        );
+        assert!(
+            graph
+                .get_llm_setting(GLOBAL, "instance:claude-code@n1")
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing is stored when the grant is refused"
+        );
+    }
+
+    /// The same call on a session the person put in trust: accepted, and the
+    /// journal names the caller, the session and both grants.
+    #[tokio::test]
+    async fn an_agent_in_trust_adds_the_machine_and_the_grant_is_journaled() {
+        let (app, graph) = app().await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/agent/providers",
+            Some(remote_machine()),
+            &session("sess-3", Some("bypassPermissions")),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        let rows = graph
+            .list_llm_settings("journal", "provider:")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "one grant, one line: {rows:?}");
+        let entry: Value = serde_json::from_str(&rows[0].1).expect("a journal entry");
+        assert_eq!(entry["session"], "sess-3");
+        assert_eq!(entry["instance"], "claude-code@n1");
+        assert_eq!(entry["ceiling"], "bypassPermissions");
+        assert_eq!(
+            entry["grants"],
+            json!([
+                "provider_trust_needs_a_human",
+                "provider_host_key_needs_a_human"
+            ])
+        );
+        assert!(
+            entry["caller"].as_str().is_some_and(|c| !c.is_empty()),
+            "the calling identity is in the line: {entry}"
+        );
+        // Not a secret anywhere in what was written.
+        assert!(!rows[0].1.contains("PRIVATE KEY"));
+    }
+
+    /// A patch only grants what it CHANGES: sending back the value an instance
+    /// already has is not a new agreement.
+    #[tokio::test]
+    async fn a_patch_that_changes_nothing_grants_nothing() {
+        let (app, graph) = app().await;
+        let person = person();
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/chat/providers",
+            Some(remote_machine()),
+            &person,
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        // An agent of a session that does NOT run in trust patches it, re-sending
+        // the same `allow_trust`: no change, no grant, no refusal.
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            "/api/agent/providers/claude-code@n1",
+            Some(json!({"allow_trust": true, "host_key": KEY, "label": "n1 renamed"})),
+            &session("sess-4", Some("default")),
+        )
+        .await;
+        assert_eq!(status, 200, "a no-op grant must not be refused: {body}");
+        assert!(body.contains("n1 renamed"), "{body}");
+        assert!(
+            graph
+                .list_llm_settings("journal", "provider:")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a patch that widens nothing writes no approval"
+        );
+    }
+
+    /// And when it does widen: refused for an agent in default, accepted in trust.
+    #[tokio::test]
+    async fn an_agent_cannot_flip_trust_on_an_instance_that_has_none() {
+        let (app, _graph) = app().await;
+        let person = person();
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/chat/providers",
+            Some(json!({
+                "id": "claude-code@n2", "kind": "claude_code_remote", "label": "n2",
+                "host": "n2.example.net", "host_key": KEY,
+                "remote_cwd": "/work", "credential_ref": "vault:ssh-n2",
+            })),
+            &person,
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            "/api/agent/providers/claude-code@n2",
+            Some(json!({"allow_trust": true})),
+            &session("sess-5", Some("ask")),
+        )
+        .await;
+        assert_eq!(status, 403, "{body}");
+        assert!(body.contains("provider_trust_needs_a_human"), "{body}");
+    }
+
+    /// The person's route keeps its rule (A25): an agent token cannot write it,
+    /// even in trust — the agent has its own door, with its own refusals.
+    #[tokio::test]
+    async fn the_persons_route_still_refuses_an_agent_token() {
+        let (app, _graph) = app().await;
+        let agent = session("sess-6", Some("bypassPermissions"));
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/api/chat/providers",
+                Some(json!({"id": "lagent", "kind": "codex", "label": "X"})),
+            ),
+            (
+                "PATCH",
+                "/api/chat/providers/x",
+                Some(json!({"label": "X"})),
+            ),
+            ("DELETE", "/api/chat/providers/x", None),
+        ] {
+            let (status, body) = call(&app, method, uri, body, &agent).await;
+            assert_eq!(status, 403, "{method} {uri}: {body}");
+        }
+    }
+
+    /// Reading what the settings page reads, with a session token: the tool has
+    /// to be usable, and it never hands back a secret.
+    #[tokio::test]
+    async fn an_agent_reads_the_instances_it_needs() {
+        let (app, _graph) = app().await;
+        let person = person();
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/chat/providers",
+            Some(json!({
+                "id": "nim", "label": "NVIDIA NIM",
+                "base_url": "https://integrate.api.nvidia.com/v1",
+                "credential_ref": "vault:nvidia-nim",
+            })),
+            &person,
+        )
+        .await;
+        // No network here: the endpoint guard resolves `integrate.api.nvidia.com`.
+        // It either resolves (201) or does not (400) — never a 500, and never a
+        // secret in the body.
+        assert!(status == 201 || status == 400, "{status} {body}");
+        let agent = session("sess-7", Some("default"));
+        let (status, body) = call(&app, "GET", "/api/agent/providers", None, &agent).await;
+        assert_eq!(status, 200, "{body}");
+        let listed: Value = serde_json::from_str(&body).expect("a listing");
+        assert!(listed["providers"].is_array(), "{body}");
+        assert!(!body.contains("sk-"), "never a value: {body}");
+    }
+}
+
+#[cfg(test)]
+mod listed_models_tests {
+    use super::merge_listed_models;
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn the_endpoint_order_is_kept_without_a_default() {
+        assert_eq!(
+            merge_listed_models(v(&["deepseek-chat", "deepseek-reasoner"]), None),
+            v(&["deepseek-chat", "deepseek-reasoner"])
+        );
+    }
+
+    #[test]
+    fn the_stored_default_comes_first_and_is_not_repeated() {
+        assert_eq!(
+            merge_listed_models(v(&["a", "b", "c"]), Some("b")),
+            v(&["b", "a", "c"])
+        );
+    }
+
+    #[test]
+    fn a_default_the_endpoint_does_not_list_is_kept() {
+        assert_eq!(merge_listed_models(v(&["a"]), Some("z")), v(&["z", "a"]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    const KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXTCY3J636nEyMNqNrVj6HXnIXUnXL8sk4c5J6tek3N";
+    const FP: &str = "SHA256:lP63ZdLutNnRU0/59cDaFw2mPoJzdasi0I3zFrtS3Ak";
+
+    /// A fake `ssh-keyscan`: a shell script printing `body`.
+    fn script(dir: &tempfile::TempDir, body: &str) -> String {
+        let path = dir.path().join("fake-keyscan");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    #[test]
+    fn the_first_valid_key_line_is_parsed_and_noise_is_skipped() {
+        let out = format!(
+            "# build-1:22 SSH-2.0-OpenSSH\n\nbuild-1 ssh-rsa not*base64*key-at-all\nbuild-1 ssh-ed25519\nbuild-1 {KEY}\nbuild-1 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7\n"
+        );
+        let (key, fp) = parse_keyscan_output(&out).expect("a key");
+        assert_eq!(key, KEY);
+        assert_eq!(fp, FP);
+        assert!(parse_keyscan_output("# only a comment\n").is_none());
+        assert!(parse_keyscan_output("host ssh-ed25519 AAAA\n").is_none());
+        assert!(parse_keyscan_output(
+            "host ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXTCY3J636n extra words\n"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn the_host_always_follows_the_end_of_options_marker() {
+        let args = keyscan_args("build-1.example.net", 2222);
+        let end = args.iter().position(|a| a == "--").expect("a `--`");
+        assert_eq!(args[end + 1], "build-1.example.net");
+        assert_eq!(end + 2, args.len());
+        assert_eq!(&args[..2], ["-T", "5"]);
+        assert!(args.windows(2).any(|w| w == ["-p", "2222"]));
+        assert!(args.windows(2).any(|w| w == ["-t", "ed25519,ecdsa,rsa"]));
+    }
+
+    #[tokio::test]
+    async fn a_scan_returns_the_key_and_its_fingerprint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let program = script(&dir, &format!("printf 'h {KEY}\\n'"));
+        let (key, fp) = run_keyscan(&program, &keyscan_args("h", 22), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!((key.as_str(), fp.as_str()), (KEY, FP));
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_hangs_is_cut_at_the_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let program = script(&dir, "sleep 30");
+        let started = Instant::now();
+        let r = run_keyscan(&program, &[], Duration::from_millis(300)).await;
+        assert_eq!(r, Err(KeyScanError::NoKey));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_never_stops_writing_is_capped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let program = script(&dir, "yes 'host ssh-ed25519 junk'");
+        let started = Instant::now();
+        let mut r = run_keyscan(&program, &[], Duration::from_secs(8)).await;
+        // The shared CI runner is occasionally memory/load-starved and a
+        // fork/exec fails with EAGAIN, surfacing as NotAvailable. That is an
+        // ENVIRONMENT failure, not a regression of the output ceiling, so retry
+        // a bounded number of times before trusting the verdict.
+        for _ in 0..5 {
+            if !matches!(r, Err(KeyScanError::NotAvailable)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            r = run_keyscan(&program, &[], Duration::from_secs(8)).await;
+        }
+        assert_eq!(r, Err(KeyScanError::NoKey));
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "the output ceiling must end the read, not the deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_program_is_not_available() {
+        let r = run_keyscan("/nonexistent/ssh-keyscan", &[], Duration::from_secs(1)).await;
+        assert_eq!(r, Err(KeyScanError::NotAvailable));
+    }
+
+    // ---- RL5: the route reads the measured numbers -----------------------------
+
+    #[test]
+    fn the_limits_route_reads_the_gate_when_there_is_one() {
+        use crate::chat::provider::limits::{Ask, Gate};
+        let limit = st::RateLimit {
+            kind: st::RateLimitKind::Requests,
+            window: st::RateLimitWindow::Unit(st::RateLimitUnit::Minute),
+            calendar: None,
+            max: 5.0,
+            scope: st::RateLimitScope::Instance(st::InstanceScope::Instance),
+        };
+        let record = st::InstanceRecord {
+            id: "deepseek".into(),
+            rate_limit: vec![limit.clone()],
+            ..Default::default()
+        };
+        // Nothing is counting: the settled shape, unknown and null.
+        let unmeasured = limits_report(None, &record);
+        assert_eq!(unmeasured.limits[0].used, None);
+        // A gate that admitted one call: the measured number.
+        let gate = Gate::unlimited();
+        assert!(gate
+            .admit("deepseek", &[limit], &Ask::default())
+            .is_admitted());
+        let measured = limits_report(Some(&gate), &record);
+        // A unit window is a bucket that refills continuously: a hair under one.
+        assert!(measured.limits[0].used.is_some_and(|u| u > 0.9 && u <= 1.0));
+        assert!(measured.limits[0]
+            .remaining
+            .is_some_and(|r| (4.0..4.1).contains(&r)));
+    }
+
+    // ---- RL7: the limits travel with the instance, and never as a value ------
+
+    #[test]
+    fn the_instance_view_carries_the_limits_and_never_a_value() {
+        let draft = st::InstanceDraft {
+            id: Some("nim".into()),
+            kind: Some("openai_compatible".into()),
+            base_url: Some("https://integrate.api.nvidia.com/v1".into()),
+            credential_ref: Some("vault:nvidia-nim".into()),
+            rate_limit: serde_json::from_value(serde_json::json!([
+                {"kind": "requests", "window": "minute", "max": 40.0,
+                 "scope": {"credential": "vault:nvidia-nim"}}
+            ]))
+            .expect("the golden limit"),
+            ..Default::default()
+        };
+        let record = st::record_from_draft(&draft, &EndpointPolicy::default(), &[]).unwrap();
+        let view = instance_view(&record);
+        assert_eq!(view["rate_limit"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            view["rate_limit"][0]["scope"]["credential"], "vault:nvidia-nim",
+            "the reference is what the response names"
+        );
+        let text = view.to_string();
+        assert!(text.contains("vault:nvidia-nim"), "{text}");
+        assert!(!text.contains("sk-"), "never a value: {text}");
+        // And an instance that never configured a limit carries an EMPTY list: no
+        // default limit is invented for it.
+        let plain = InstanceRecord {
+            id: "plain".into(),
+            ..Default::default()
+        };
+        assert_eq!(instance_view(&plain)["rate_limit"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn the_limits_report_of_an_instance_is_the_golden_shape() {
+        let path = format!(
+            "{}/tests/fixtures/rate_limit/limits.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let limits: Vec<st::RateLimit> = serde_json::from_value(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["limits"].clone(),
+        )
+        .expect("the golden limits");
+        let draft = st::InstanceDraft {
+            id: Some("deepseek".into()),
+            kind: Some("openai_compatible".into()),
+            base_url: Some("https://api.deepseek.com/v1".into()),
+            credential_ref: Some("vault:deepseek".into()),
+            rate_limit: limits,
+            ..Default::default()
+        };
+        let record = st::record_from_draft(&draft, &EndpointPolicy::default(), &[]).unwrap();
+        let report = serde_json::to_value(st::rate_limit_report(&record)).unwrap();
+        // The very shape the status route answers and the frontend reads.
+        assert_eq!(report["provider_id"], "deepseek");
+        assert_eq!(report["status"], "unknown");
+        assert_eq!(report["limits"].as_array().unwrap().len(), 5);
+        assert_eq!(report["limits"][3]["credential"], "vault:nvidia-nim");
+        assert!(report["limits"][0]["used"].is_null());
+        assert!(!report.to_string().contains("sk-"));
+    }
+}

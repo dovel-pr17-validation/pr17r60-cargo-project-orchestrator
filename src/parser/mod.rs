@@ -1,0 +1,2194 @@
+//! Tree-sitter based code parser
+//!
+//! Supports multiple programming languages with full AST extraction.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+pub mod ast_cache;
+pub mod code_ir;
+pub mod helpers;
+pub mod languages;
+pub mod noise_filter;
+
+use crate::meilisearch::indexes::CodeDocument;
+use crate::neo4j::models::*;
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::path::Path;
+use tree_sitter::{Language, Parser};
+
+/// Supported programming languages
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SupportedLanguage {
+    Rust,
+    TypeScript,
+    Python,
+    Go,
+    Java,
+    C,
+    Cpp,
+    Ruby,
+    Php,
+    Kotlin,
+    Swift,
+    Bash,
+    CSharp,
+    Scala,
+    Zig,
+    Hcl,
+    Dart,
+}
+
+impl SupportedLanguage {
+    /// Detect language from file extension
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext.to_lowercase().as_str() {
+            "rs" => Some(Self::Rust),
+            "ts" | "tsx" => Some(Self::TypeScript),
+            "js" | "jsx" | "mjs" | "cjs" => Some(Self::TypeScript), // Use TS parser for JS
+            "py" | "pyi" => Some(Self::Python),
+            "go" => Some(Self::Go),
+            "java" => Some(Self::Java),
+            "c" | "h" => Some(Self::C),
+            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(Self::Cpp),
+            "rb" | "rake" | "gemspec" => Some(Self::Ruby),
+            "php" | "phtml" | "php5" | "php7" => Some(Self::Php),
+            "kt" | "kts" => Some(Self::Kotlin),
+            "swift" => Some(Self::Swift),
+            "sh" | "bash" | "zsh" => Some(Self::Bash),
+            "cs" => Some(Self::CSharp),
+            "scala" | "sc" => Some(Self::Scala),
+            "zig" => Some(Self::Zig),
+            "tf" | "tfvars" => Some(Self::Hcl),
+            "dart" => Some(Self::Dart),
+            _ => None,
+        }
+    }
+
+    /// Get the tree-sitter language
+    pub fn tree_sitter_language(&self) -> Language {
+        match self {
+            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::Python => tree_sitter_python::LANGUAGE.into(),
+            Self::Go => tree_sitter_go::LANGUAGE.into(),
+            Self::Java => tree_sitter_java::LANGUAGE.into(),
+            Self::C => tree_sitter_c::LANGUAGE.into(),
+            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+            Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+            Self::Swift => tree_sitter_swift::LANGUAGE.into(),
+            Self::Bash => tree_sitter_bash::LANGUAGE.into(),
+            Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            Self::Scala => tree_sitter_scala::LANGUAGE.into(),
+            Self::Zig => tree_sitter_zig::LANGUAGE.into(),
+            Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
+            Self::Dart => tree_sitter_dart::LANGUAGE.into(),
+        }
+    }
+
+    /// Get the language name as a string
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::TypeScript => "typescript",
+            Self::Python => "python",
+            Self::Go => "go",
+            Self::Java => "java",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::Ruby => "ruby",
+            Self::Php => "php",
+            Self::Kotlin => "kotlin",
+            Self::Swift => "swift",
+            Self::Bash => "bash",
+            Self::CSharp => "csharp",
+            Self::Scala => "scala",
+            Self::Zig => "zig",
+            Self::Hcl => "hcl",
+            Self::Dart => "dart",
+        }
+    }
+
+    /// Get all supported languages
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Rust,
+            Self::TypeScript,
+            Self::Python,
+            Self::Go,
+            Self::Java,
+            Self::C,
+            Self::Cpp,
+            Self::Ruby,
+            Self::Php,
+            Self::Kotlin,
+            Self::Swift,
+            Self::Bash,
+            Self::CSharp,
+            Self::Scala,
+            Self::Zig,
+            Self::Hcl,
+            Self::Dart,
+        ]
+    }
+}
+
+/// Code parser using tree-sitter
+pub struct CodeParser {
+    parsers: HashMap<SupportedLanguage, Parser>,
+}
+
+impl CodeParser {
+    /// Create a new code parser
+    pub fn new() -> Result<Self> {
+        let mut parsers = HashMap::new();
+
+        for lang in SupportedLanguage::all() {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&lang.tree_sitter_language())
+                .context(format!("Failed to set language for {:?}", lang))?;
+            parsers.insert(*lang, parser);
+        }
+
+        Ok(Self { parsers })
+    }
+
+    /// Parse a file and extract code structure
+    pub fn parse_file(&mut self, path: &Path, content: &str) -> Result<ParsedFile> {
+        self.parse_file_with_tree(path, content)
+            .map(|(parsed, _tree)| parsed)
+    }
+
+    /// Parse a file and additionally build the canonical [`code_ir::CodeIr`]
+    /// (AST → scene projection, stage 2 of the pipeline).
+    pub fn parse_file_with_ir(
+        &mut self,
+        path: &Path,
+        content: &str,
+    ) -> Result<(ParsedFile, code_ir::CodeIr)> {
+        let (parsed, tree) = self.parse_file_with_tree(path, content)?;
+        let ir = code_ir::build_code_ir(&tree.root_node(), content, &parsed);
+        Ok((parsed, ir))
+    }
+
+    /// Parse a file, keep the tree alive for downstream passes (CodeIR build).
+    fn parse_file_with_tree(
+        &mut self,
+        path: &Path,
+        content: &str,
+    ) -> Result<(ParsedFile, tree_sitter::Tree)> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+
+        let language = SupportedLanguage::from_extension(ext)
+            .context(format!("Unsupported file extension: {}", ext))?;
+
+        let parser = self
+            .parsers
+            .get_mut(&language)
+            .context("Parser not found")?;
+
+        let tree = parser
+            .parse(content, None)
+            .context("Failed to parse file")?;
+
+        let root = tree.root_node();
+        let path_str = path.to_string_lossy().to_string();
+
+        // Compute content hash
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
+        let mut parsed = ParsedFile {
+            path: path_str.clone(),
+            language: language.as_str().to_string(),
+            hash,
+            functions: Vec::new(),
+            structs: Vec::new(),
+            traits: Vec::new(),
+            enums: Vec::new(),
+            imports: Vec::new(),
+            impl_blocks: Vec::new(),
+            function_calls: Vec::new(),
+            symbols: Vec::new(),
+        };
+
+        // Extract based on language
+        match language {
+            SupportedLanguage::Rust => {
+                languages::rust::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::TypeScript => {
+                languages::typescript::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Python => {
+                languages::python::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Go => {
+                languages::go::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Java => {
+                languages::java::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::C => {
+                languages::c::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Cpp => {
+                languages::cpp::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Ruby => {
+                languages::ruby::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Php => {
+                languages::php::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Kotlin => {
+                languages::kotlin::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Swift => {
+                languages::swift::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Bash => {
+                languages::bash::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::CSharp => {
+                languages::csharp::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Scala => {
+                languages::scala::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Zig => {
+                languages::zig::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Hcl => {
+                languages::hcl::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Dart => {
+                languages::dart::extract(&root, content, &path_str, &mut parsed)?;
+            }
+        }
+
+        assign_owners(&mut parsed);
+        assign_import_occurrences(&mut parsed);
+
+        Ok((parsed, tree))
+    }
+
+    /// Convert parsed file to a code document for Meilisearch
+    ///
+    /// Creates a lightweight document for semantic search containing:
+    /// - Symbol names for keyword search
+    /// - Docstrings for semantic/natural language search
+    /// - Function signatures for quick reference
+    pub fn to_code_document(
+        parsed: &ParsedFile,
+        project_id: &str,
+        project_slug: &str,
+    ) -> CodeDocument {
+        // Collect all docstrings
+        let mut docstrings = Vec::new();
+
+        for func in &parsed.functions {
+            if let Some(ref doc) = func.docstring {
+                docstrings.push(doc.clone());
+            }
+        }
+        for s in &parsed.structs {
+            if let Some(ref doc) = s.docstring {
+                docstrings.push(doc.clone());
+            }
+        }
+        for t in &parsed.traits {
+            if let Some(ref doc) = t.docstring {
+                docstrings.push(doc.clone());
+            }
+        }
+        for e in &parsed.enums {
+            if let Some(ref doc) = e.docstring {
+                docstrings.push(doc.clone());
+            }
+        }
+
+        // Build function signatures
+        let signatures: Vec<String> = parsed
+            .functions
+            .iter()
+            .map(|f| {
+                let params = f
+                    .params
+                    .iter()
+                    .map(|p| {
+                        if let Some(ref t) = p.type_name {
+                            format!("{}: {}", p.name, t)
+                        } else {
+                            p.name.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ret = f
+                    .return_type
+                    .as_ref()
+                    .map(|r| format!(" -> {}", r))
+                    .unwrap_or_default();
+                let async_kw = if f.is_async { "async " } else { "" };
+                format!("{}fn {}({}){}", async_kw, f.name, params, ret)
+            })
+            .collect();
+
+        CodeDocument {
+            id: crate::meilisearch::client::MeiliClient::path_to_id(&parsed.path),
+            path: parsed.path.clone(),
+            language: parsed.language.clone(),
+            symbols: parsed.symbols.clone(),
+            docstrings: docstrings.join("\n\n"),
+            signatures,
+            imports: parsed.imports.iter().map(|i| i.path.clone()).collect(),
+            project_id: project_id.to_string(),
+            project_slug: project_slug.to_string(),
+        }
+    }
+}
+
+/// Result of parsing a file
+#[derive(Debug, Clone)]
+pub struct ParsedFile {
+    pub path: String,
+    pub language: String,
+    pub hash: String,
+    pub functions: Vec<FunctionNode>,
+    pub structs: Vec<StructNode>,
+    pub traits: Vec<TraitNode>,
+    pub enums: Vec<EnumNode>,
+    pub imports: Vec<ImportNode>,
+    pub impl_blocks: Vec<ImplNode>,
+    pub function_calls: Vec<FunctionCall>,
+    pub symbols: Vec<String>,
+}
+
+/// Represents a function call found in code
+#[derive(Debug, Clone)]
+pub struct FunctionCall {
+    /// The function making the call
+    pub caller_id: String,
+    /// The name of the function being called
+    pub callee_name: String,
+    /// Line where the call occurs
+    pub line: u32,
+    /// Confidence score (0.0-1.0) for the call relationship.
+    /// Set during import resolution: import-resolved=0.90, same-file=0.85, fuzzy-global=0.30-0.50
+    pub confidence: f64,
+    /// Reason for the confidence level (e.g., "import-resolved", "same-file", "fuzzy-unique", "fuzzy-ambiguous")
+    pub reason: String,
+}
+
+/// Give every method its owner, for every language at once.
+///
+/// A method pushed by a language extractor carries a bare name; the blocks
+/// that own it — an `impl` (Rust, Swift/Dart extension) or a class (modelled
+/// as a `StructNode`), and the classes THAT one is nested in — are the ones
+/// whose lines enclose the method's, chained outer to inner (`Foo::Config`),
+/// by the ONE rule of `symbol_key::enclosing_owner`, which the
+/// backfill of legacy nodes applies to the `Impl`/`Struct` nodes of the graph.
+/// An owner an extractor set itself (Rust's `extract_impl`, which knows the
+/// trait) is kept.
+pub fn assign_owners(parsed: &mut ParsedFile) {
+    let candidates: Vec<(u32, u32, SymbolOwner)> = parsed
+        .impl_blocks
+        .iter()
+        .map(|i| {
+            (
+                i.line_start,
+                i.line_end,
+                SymbolOwner::new(i.for_type.clone(), i.trait_name.clone()),
+            )
+        })
+        .chain(parsed.structs.iter().map(|s| {
+            (
+                s.line_start,
+                s.line_end,
+                SymbolOwner::new(s.name.clone(), None::<String>),
+            )
+        }))
+        .collect();
+    for func in parsed.functions.iter_mut().filter(|f| f.owner.is_none()) {
+        func.owner = crate::neo4j::symbol_key::enclosing_owner(
+            func.line_start,
+            func.line_end,
+            candidates.iter().cloned(),
+        );
+    }
+}
+
+/// Rank the imports of one path within the file, in source order: the first
+/// is `0`, a genuine duplicate (`use std::fmt;` at the top and again in
+/// `mod tests`) is `1`, ... The rank replaces the line in the import's stable
+/// identity (`symbol_key::stable_import_key`).
+pub fn assign_import_occurrences(parsed: &mut ParsedFile) {
+    let mut seen: HashMap<&str, u32> = HashMap::new();
+    let mut imports = std::mem::take(&mut parsed.imports);
+    imports.sort_by_key(|i| i.line);
+    // Two extractors seeing the same `import` line (dart.rs: regex + tree-sitter)
+    // is one import, not a duplicate to rank.
+    imports.dedup_by(|b, a| a.line == b.line && a.path == b.path);
+    for import in imports.iter_mut() {
+        let n = seen.entry(import.path.as_str()).or_insert(0);
+        import.occurrence = *n;
+        *n += 1;
+    }
+    parsed.imports = imports;
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    fn func(name: &str, start: u32, end: u32) -> FunctionNode {
+        FunctionNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/a.rs".to_string(),
+            line_start: start,
+            line_end: end,
+            docstring: None,
+            owner: None,
+        }
+    }
+
+    fn parsed() -> ParsedFile {
+        ParsedFile {
+            path: "src/a.rs".to_string(),
+            language: "rust".to_string(),
+            hash: String::new(),
+            functions: vec![],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            imports: vec![],
+            impl_blocks: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        }
+    }
+
+    // The review's defect: two `new` in two impls of one file shared a key.
+    // The owner is deduced from the enclosing block, the same way for every
+    // language and for the backfill of legacy nodes.
+    #[test]
+    fn methods_take_the_innermost_enclosing_block_as_owner() {
+        let mut p = parsed();
+        p.impl_blocks.push(ImplNode {
+            for_type: "A".into(),
+            trait_name: None,
+            generics: vec![],
+            where_clause: None,
+            file_path: "src/a.rs".into(),
+            line_start: 10,
+            line_end: 20,
+        });
+        p.impl_blocks.push(ImplNode {
+            for_type: "A".into(),
+            trait_name: Some("Display".into()),
+            generics: vec![],
+            where_clause: None,
+            file_path: "src/a.rs".into(),
+            line_start: 30,
+            line_end: 40,
+        });
+        p.structs.push(StructNode {
+            name: "Klass".into(),
+            visibility: Visibility::Public,
+            generics: vec![],
+            file_path: "src/a.py".into(),
+            line_start: 50,
+            line_end: 70,
+            docstring: None,
+            parent_class: None,
+            interfaces: vec![],
+        });
+        p.functions.push(func("new", 11, 15));
+        p.functions.push(func("fmt", 31, 35));
+        p.functions.push(func("__init__", 51, 55));
+        p.functions.push(func("free", 80, 85));
+        // An extractor that already knows the owner is not second-guessed.
+        let mut known = func("known", 12, 13);
+        known.owner = Some(SymbolOwner::new("Given", None::<&str>));
+        p.functions.push(known);
+
+        assign_owners(&mut p);
+
+        let owner = |n: &str| {
+            p.functions
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap()
+                .owner
+                .clone()
+        };
+        assert_eq!(owner("new"), Some(SymbolOwner::new("A", None::<&str>)));
+        assert_eq!(owner("fmt"), Some(SymbolOwner::new("A", Some("Display"))));
+        assert_eq!(
+            owner("__init__"),
+            Some(SymbolOwner::new("Klass", None::<&str>))
+        );
+        assert_eq!(owner("free"), None);
+        assert_eq!(
+            owner("known"),
+            Some(SymbolOwner::new("Given", None::<&str>))
+        );
+    }
+
+    // Review 2, point 1: a Go method's receiver IS its owner. Two `String()`
+    // on two types of one file are two methods; the type is a `StructNode`
+    // spanning its own declaration only, so line inclusion never finds it.
+    #[test]
+    fn a_go_method_takes_its_receiver_as_owner() {
+        use std::path::PathBuf;
+        let src = "package m\n\ntype A struct{}\ntype B struct{}\n\nfunc (a A) String() string { return \"a\" }\nfunc (b *B) String() string { return \"b\" }\nfunc (g Gen[T]) Name() string { return \"g\" }\nfunc Free() {}\n";
+        let parsed = CodeParser::new()
+            .unwrap()
+            .parse_file(&PathBuf::from("m.go"), src)
+            .unwrap();
+        let owner = |n: &str, line: u32| {
+            parsed
+                .functions
+                .iter()
+                .find(|f| f.name == n && f.line_start == line)
+                .unwrap_or_else(|| panic!("{n} at {line}"))
+                .owner
+                .clone()
+        };
+        assert_eq!(
+            owner("String", 6),
+            Some(SymbolOwner::new("A", None::<&str>))
+        );
+        // `*B` is the receiver of B's method, not of a type called `*B`.
+        assert_eq!(
+            owner("String", 7),
+            Some(SymbolOwner::new("B", None::<&str>))
+        );
+        // Generic receiver `Gen[T]`: the type is `Gen`.
+        assert_eq!(
+            owner("Name", 8),
+            Some(SymbolOwner::new("Gen", None::<&str>))
+        );
+        assert_eq!(owner("Free", 9), None);
+    }
+
+    // Review 2, point 3: dart.rs extracts imports by regex AND by tree-sitter
+    // (`library_import`), so one `import` line yielded two ImportNodes — the
+    // same id written twice, the survivor ranked `#2`, the bare key never
+    // written. One (line, path) is one import.
+    #[test]
+    fn one_import_line_is_one_import_even_when_two_extractors_see_it() {
+        use std::path::PathBuf;
+        // Seven shapes of import/export, a `library` header and a comment,
+        // so that whichever shape the grammar manages to parse is covered.
+        let src = "library app;\n// comment\nimport 'package:flutter/material.dart';\nimport 'dart:async' as async;\nimport 'package:a/b.dart' show X, Y;\nimport 'package:a/c.dart' hide Z;\nimport 'package:a/d.dart' deferred as d;\nexport 'src/e.dart';\nimport \"package:a/f.dart\";\n\nvoid main() {}\n";
+        let parsed = CodeParser::new()
+            .unwrap()
+            .parse_file(&PathBuf::from("a.dart"), src)
+            .unwrap();
+        let seen: Vec<(u32, String, u32)> = parsed
+            .imports
+            .iter()
+            .map(|i| (i.line, i.path.clone(), i.occurrence))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (3, "package:flutter/material.dart".to_string(), 0),
+                (4, "dart:async".to_string(), 0),
+                (5, "package:a/b.dart".to_string(), 0),
+                (6, "package:a/c.dart".to_string(), 0),
+                (7, "package:a/d.dart".to_string(), 0),
+                (8, "src/e.dart".to_string(), 0),
+                (9, "package:a/f.dart".to_string(), 0),
+            ],
+            "{seen:?}"
+        );
+    }
+
+    // Review 2, point 5: nested classes. `class Foo { class Config { load } }`
+    // and `class Bar { class Config { load } }` in one file: the innermost
+    // block alone (`Config::load`) merges them; the owner is the CHAIN.
+    #[test]
+    fn nested_classes_chain_their_owners() {
+        let mut p = parsed();
+        let class = |name: &str, start: u32, end: u32| StructNode {
+            name: name.into(),
+            visibility: Visibility::Public,
+            generics: vec![],
+            file_path: "src/a.py".into(),
+            line_start: start,
+            line_end: end,
+            docstring: None,
+            parent_class: None,
+            interfaces: vec![],
+        };
+        p.structs.push(class("Foo", 1, 50));
+        p.structs.push(class("Config", 2, 10));
+        p.structs.push(class("Bar", 60, 100));
+        p.structs.push(class("Config", 61, 70));
+        p.functions.push(func("load", 3, 5));
+        p.functions.push(func("load", 62, 65));
+        assign_owners(&mut p);
+        let keys: Vec<String> = p
+            .functions
+            .iter()
+            .map(|f| {
+                crate::neo4j::symbol_key::stable_symbol_key(
+                    &f.file_path,
+                    f.owner.as_ref(),
+                    &f.name,
+                    &f.params,
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["src/a.rs::Foo::Config::load", "src/a.rs::Bar::Config::load"]
+        );
+    }
+
+    // Review 2, point 3: two extractors (regex + tree-sitter in dart.rs) may
+    // both push the SAME (line, path). It is one import, written once under
+    // one id — ranking the copy `#2` would leave the bare key never written.
+    #[test]
+    fn an_exact_double_push_is_one_import() {
+        let mut p = parsed();
+        let imp = |path: &str, line: u32| ImportNode {
+            path: path.into(),
+            alias: None,
+            items: vec![],
+            file_path: "src/a.dart".into(),
+            line,
+            occurrence: 0,
+        };
+        p.imports.push(imp("package:a/b.dart", 1));
+        p.imports.push(imp("package:a/b.dart", 1));
+        p.imports.push(imp("package:a/b.dart", 7));
+        assign_import_occurrences(&mut p);
+        let occ: Vec<(u32, u32)> = p.imports.iter().map(|i| (i.line, i.occurrence)).collect();
+        assert_eq!(occ, vec![(1, 0), (7, 1)]);
+    }
+
+    #[test]
+    fn duplicate_imports_are_ranked_in_source_order() {
+        let mut p = parsed();
+        let imp = |path: &str, line: u32| ImportNode {
+            path: path.into(),
+            alias: None,
+            items: vec![],
+            file_path: "src/a.rs".into(),
+            line,
+            occurrence: 0,
+        };
+        p.imports.push(imp("std::fmt", 90));
+        p.imports.push(imp("std::fmt", 3));
+        p.imports.push(imp("std::io", 4));
+        assign_import_occurrences(&mut p);
+        let occ: Vec<(String, u32, u32)> = p
+            .imports
+            .iter()
+            .map(|i| (i.path.clone(), i.line, i.occurrence))
+            .collect();
+        assert_eq!(
+            occ,
+            vec![
+                ("std::fmt".to_string(), 3, 0),
+                ("std::io".to_string(), 4, 0),
+                ("std::fmt".to_string(), 90, 1),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    use std::path::PathBuf;
+
+    // =========================================================================
+    // Coverage batch 1 — exercise every language extractor + metadata helpers.
+    // The smoke test below runs parse_file for all 18 supported languages,
+    // covering the per-language extraction code in src/parser/languages/*.
+    // =========================================================================
+
+    /// One representative snippet per language: parse must succeed, report the
+    /// right language tag, produce a content hash, and not panic.
+    #[test]
+    fn test_parse_file_all_languages_smoke() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "a.rs",
+                "pub fn foo() -> i32 { 1 }\nstruct S { x: i32 }\nenum E { A, B }\n",
+                "rust",
+            ),
+            (
+                "a.ts",
+                "export function foo(): number { return 1; }\nclass C { m() {} }\n",
+                "typescript",
+            ),
+            (
+                "a.tsx",
+                "export const C = () => <div/>;\nfunction g(){return 1;}\n",
+                "typescript",
+            ),
+            (
+                "a.js",
+                "function foo(){ return 1; }\nclass C {}\n",
+                "typescript",
+            ),
+            (
+                "a.py",
+                "def foo():\n    return 1\nclass C:\n    def m(self):\n        pass\n",
+                "python",
+            ),
+            (
+                "a.go",
+                "package m\nimport \"fmt\"\nfunc Foo() int { return 1 }\n",
+                "go",
+            ),
+            (
+                "a.java",
+                "package p;\nclass C { int foo() { return 1; } }\n",
+                "java",
+            ),
+            ("a.c", "#include <stdio.h>\nint foo() { return 1; }\n", "c"),
+            (
+                "a.cpp",
+                "class C { public: int foo() { return 1; } };\n",
+                "cpp",
+            ),
+            ("a.rb", "def foo\n  1\nend\nclass C\nend\n", "ruby"),
+            (
+                "a.php",
+                "<?php\nfunction foo() { return 1; }\nclass C {}\n",
+                "php",
+            ),
+            ("a.kt", "fun foo(): Int { return 1 }\nclass C\n", "kotlin"),
+            (
+                "a.swift",
+                "func foo() -> Int { return 1 }\nclass C {}\n",
+                "swift",
+            ),
+            ("a.sh", "foo() {\n  echo 1\n}\n", "bash"),
+            ("a.cs", "class C { int Foo() { return 1; } }\n", "csharp"),
+            ("a.scala", "object O { def foo(): Int = 1 }\n", "scala"),
+            ("a.zig", "fn foo() i32 { return 1; }\n", "zig"),
+            (
+                "a.tf",
+                "resource \"aws_s3_bucket\" \"b\" {\n  bucket = \"x\"\n}\n",
+                "hcl",
+            ),
+            ("a.dart", "int foo() { return 1; }\nclass C {}\n", "dart"),
+        ];
+        let mut parser = CodeParser::new().unwrap();
+        for (fname, src, lang) in cases {
+            let parsed = parser
+                .parse_file(&PathBuf::from(fname), src)
+                .unwrap_or_else(|e| panic!("parse_file failed for {fname}: {e}"));
+            assert_eq!(&parsed.language, lang, "language mismatch for {fname}");
+            assert!(!parsed.hash.is_empty(), "empty hash for {fname}");
+            assert_eq!(parsed.path, *fname);
+
+            // A grammar that loads but parses nothing (the failure mode of a
+            // tree-sitter runtime bump: the ABI stays inside the accepted
+            // range, the grammar silently stops matching) still yields a hash.
+            // Require a real symbol out of a snippet that defines one.
+            let symbols = parsed.functions.len() + parsed.structs.len() + parsed.enums.len();
+            assert!(symbols > 0, "no symbol extracted from {fname}");
+
+            // And the tree must be free of ERROR nodes, per language. This is
+            // the assertion a runtime bump has to earn: 0.26 → 0.27 keeps ABI
+            // 13-15 compatible, but nothing else guarantees the grammars still
+            // agree with the runtime they are driven by.
+            let extension = std::path::Path::new(fname)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default();
+            let language = SupportedLanguage::from_extension(extension)
+                .unwrap_or_else(|| panic!("unknown extension for {fname}"));
+            let mut raw = tree_sitter::Parser::new();
+            raw.set_language(&language.tree_sitter_language())
+                .unwrap_or_else(|e| panic!("set_language failed for {fname}: {e}"));
+            let tree = raw
+                .parse(src, None)
+                .unwrap_or_else(|| panic!("no tree for {fname}"));
+            // A JSX/TSX case is exempt: `from_extension` maps tsx/jsx to the
+            // plain TypeScript grammar, which has no JSX production, so the
+            // tree carries an ERROR node. That predates this bump — measured
+            // identical under tree-sitter 0.26.13 and 0.27.1 — and fixing it
+            // means adding the TSX grammar (LANGUAGE_TSX), not bumping the
+            // runtime. Keep the exemption narrow so a real regression still
+            // fails here.
+            let jsx_gap = fname.ends_with(".tsx") || fname.ends_with(".jsx");
+            let bad = !jsx_gap && tree.root_node().has_error();
+            assert!(
+                !bad,
+                "parse error in {fname}: {}",
+                tree.root_node().to_sexp()
+            );
+        }
+    }
+
+    /// Major languages should extract at least one function symbol — exercises
+    /// the function-extraction branch of each extractor.
+    #[test]
+    fn test_parse_file_extracts_functions_major_langs() {
+        let cases: &[(&str, &str)] = &[
+            ("a.rs", "fn alpha() {}\nfn beta() {}\n"),
+            ("a.py", "def alpha():\n    pass\ndef beta():\n    pass\n"),
+            ("a.go", "package m\nfunc Alpha() {}\nfunc Beta() {}\n"),
+            ("a.ts", "function alpha(){}\nfunction beta(){}\n"),
+            ("a.java", "class C { void alpha(){} void beta(){} }\n"),
+        ];
+        let mut parser = CodeParser::new().unwrap();
+        for (fname, src) in cases {
+            let parsed = parser.parse_file(&PathBuf::from(fname), src).unwrap();
+            assert!(
+                !parsed.functions.is_empty() || !parsed.symbols.is_empty(),
+                "no functions/symbols extracted for {fname}"
+            );
+        }
+    }
+
+    /// Unknown extension → parse_file errors (Unsupported file extension path).
+    #[test]
+    fn test_parse_file_unsupported_extension_errors() {
+        let mut parser = CodeParser::new().unwrap();
+        let res = parser.parse_file(&PathBuf::from("a.unknownext"), "whatever");
+        assert!(res.is_err(), "expected error for unsupported extension");
+    }
+
+    /// Same content → same hash; different content → different hash.
+    #[test]
+    fn test_parse_file_hash_is_content_addressed() {
+        let mut parser = CodeParser::new().unwrap();
+        let a = parser
+            .parse_file(&PathBuf::from("a.rs"), "fn x() {}\n")
+            .unwrap();
+        let b = parser
+            .parse_file(&PathBuf::from("b.rs"), "fn x() {}\n")
+            .unwrap();
+        let c = parser
+            .parse_file(&PathBuf::from("c.rs"), "fn y() {}\n")
+            .unwrap();
+        assert_eq!(a.hash, b.hash, "same content must hash equally");
+        assert_ne!(a.hash, c.hash, "different content must hash differently");
+    }
+
+    /// SupportedLanguage::all() and as_str() round-trip + are non-empty/unique.
+    #[test]
+    fn test_supported_language_all_and_as_str() {
+        let all = SupportedLanguage::all();
+        assert!(all.len() >= 17, "expected all supported languages");
+        let mut names: Vec<&str> = all.iter().map(|l| l.as_str()).collect();
+        let n = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), n, "as_str() names must be unique");
+        assert!(names.iter().all(|s| !s.is_empty()));
+    }
+
+    /// from_extension is case-insensitive and rejects the empty/unknown case.
+    #[test]
+    fn test_from_extension_case_insensitive_and_unknown() {
+        assert_eq!(
+            SupportedLanguage::from_extension("RS"),
+            Some(SupportedLanguage::Rust)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("Py"),
+            Some(SupportedLanguage::Python)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("DART"),
+            Some(SupportedLanguage::Dart)
+        );
+        assert_eq!(SupportedLanguage::from_extension(""), None);
+        assert_eq!(SupportedLanguage::from_extension("xyz"), None);
+    }
+
+    // =========================================================================
+    // SupportedLanguage Tests
+    // =========================================================================
+
+    #[test]
+    fn test_from_extension_rust() {
+        assert_eq!(
+            SupportedLanguage::from_extension("rs"),
+            Some(SupportedLanguage::Rust)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_typescript() {
+        assert_eq!(
+            SupportedLanguage::from_extension("ts"),
+            Some(SupportedLanguage::TypeScript)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("tsx"),
+            Some(SupportedLanguage::TypeScript)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_javascript_uses_ts_parser() {
+        // JavaScript uses TypeScript parser
+        assert_eq!(
+            SupportedLanguage::from_extension("js"),
+            Some(SupportedLanguage::TypeScript)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("jsx"),
+            Some(SupportedLanguage::TypeScript)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("mjs"),
+            Some(SupportedLanguage::TypeScript)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("cjs"),
+            Some(SupportedLanguage::TypeScript)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_python() {
+        assert_eq!(
+            SupportedLanguage::from_extension("py"),
+            Some(SupportedLanguage::Python)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("pyi"),
+            Some(SupportedLanguage::Python)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_go() {
+        assert_eq!(
+            SupportedLanguage::from_extension("go"),
+            Some(SupportedLanguage::Go)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_java() {
+        assert_eq!(
+            SupportedLanguage::from_extension("java"),
+            Some(SupportedLanguage::Java)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_c() {
+        assert_eq!(
+            SupportedLanguage::from_extension("c"),
+            Some(SupportedLanguage::C)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("h"),
+            Some(SupportedLanguage::C)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_cpp() {
+        assert_eq!(
+            SupportedLanguage::from_extension("cpp"),
+            Some(SupportedLanguage::Cpp)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("cc"),
+            Some(SupportedLanguage::Cpp)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("cxx"),
+            Some(SupportedLanguage::Cpp)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("hpp"),
+            Some(SupportedLanguage::Cpp)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("hxx"),
+            Some(SupportedLanguage::Cpp)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("hh"),
+            Some(SupportedLanguage::Cpp)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_ruby() {
+        assert_eq!(
+            SupportedLanguage::from_extension("rb"),
+            Some(SupportedLanguage::Ruby)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("rake"),
+            Some(SupportedLanguage::Ruby)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("gemspec"),
+            Some(SupportedLanguage::Ruby)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_php() {
+        assert_eq!(
+            SupportedLanguage::from_extension("php"),
+            Some(SupportedLanguage::Php)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("phtml"),
+            Some(SupportedLanguage::Php)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("php5"),
+            Some(SupportedLanguage::Php)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("php7"),
+            Some(SupportedLanguage::Php)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_kotlin() {
+        assert_eq!(
+            SupportedLanguage::from_extension("kt"),
+            Some(SupportedLanguage::Kotlin)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("kts"),
+            Some(SupportedLanguage::Kotlin)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_swift() {
+        assert_eq!(
+            SupportedLanguage::from_extension("swift"),
+            Some(SupportedLanguage::Swift)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_bash() {
+        assert_eq!(
+            SupportedLanguage::from_extension("sh"),
+            Some(SupportedLanguage::Bash)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("bash"),
+            Some(SupportedLanguage::Bash)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("zsh"),
+            Some(SupportedLanguage::Bash)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_hcl() {
+        assert_eq!(
+            SupportedLanguage::from_extension("tf"),
+            Some(SupportedLanguage::Hcl)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("tfvars"),
+            Some(SupportedLanguage::Hcl)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_case_insensitive() {
+        assert_eq!(
+            SupportedLanguage::from_extension("RS"),
+            Some(SupportedLanguage::Rust)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("Py"),
+            Some(SupportedLanguage::Python)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("JAVA"),
+            Some(SupportedLanguage::Java)
+        );
+    }
+
+    #[test]
+    fn test_from_extension_unsupported() {
+        assert_eq!(SupportedLanguage::from_extension("txt"), None);
+        assert_eq!(SupportedLanguage::from_extension("md"), None);
+        assert_eq!(SupportedLanguage::from_extension("json"), None);
+        assert_eq!(SupportedLanguage::from_extension("yaml"), None);
+        assert_eq!(SupportedLanguage::from_extension(""), None);
+    }
+
+    #[test]
+    fn test_as_str_all_languages() {
+        assert_eq!(SupportedLanguage::Rust.as_str(), "rust");
+        assert_eq!(SupportedLanguage::TypeScript.as_str(), "typescript");
+        assert_eq!(SupportedLanguage::Python.as_str(), "python");
+        assert_eq!(SupportedLanguage::Go.as_str(), "go");
+        assert_eq!(SupportedLanguage::Java.as_str(), "java");
+        assert_eq!(SupportedLanguage::C.as_str(), "c");
+        assert_eq!(SupportedLanguage::Cpp.as_str(), "cpp");
+        assert_eq!(SupportedLanguage::Ruby.as_str(), "ruby");
+        assert_eq!(SupportedLanguage::Php.as_str(), "php");
+        assert_eq!(SupportedLanguage::Kotlin.as_str(), "kotlin");
+        assert_eq!(SupportedLanguage::Swift.as_str(), "swift");
+        assert_eq!(SupportedLanguage::Bash.as_str(), "bash");
+        assert_eq!(SupportedLanguage::CSharp.as_str(), "csharp");
+        assert_eq!(SupportedLanguage::Scala.as_str(), "scala");
+        assert_eq!(SupportedLanguage::Zig.as_str(), "zig");
+        assert_eq!(SupportedLanguage::Hcl.as_str(), "hcl");
+        assert_eq!(SupportedLanguage::Dart.as_str(), "dart");
+    }
+
+    #[test]
+    fn test_all_returns_17_languages() {
+        let all = SupportedLanguage::all();
+        assert_eq!(all.len(), 17);
+    }
+
+    #[test]
+    fn test_all_contains_all_variants() {
+        let all = SupportedLanguage::all();
+        assert!(all.contains(&SupportedLanguage::Rust));
+        assert!(all.contains(&SupportedLanguage::TypeScript));
+        assert!(all.contains(&SupportedLanguage::Python));
+        assert!(all.contains(&SupportedLanguage::Go));
+        assert!(all.contains(&SupportedLanguage::Java));
+        assert!(all.contains(&SupportedLanguage::C));
+        assert!(all.contains(&SupportedLanguage::Cpp));
+        assert!(all.contains(&SupportedLanguage::Ruby));
+        assert!(all.contains(&SupportedLanguage::Php));
+        assert!(all.contains(&SupportedLanguage::Kotlin));
+        assert!(all.contains(&SupportedLanguage::Swift));
+        assert!(all.contains(&SupportedLanguage::Bash));
+        assert!(all.contains(&SupportedLanguage::CSharp));
+        assert!(all.contains(&SupportedLanguage::Scala));
+        assert!(all.contains(&SupportedLanguage::Zig));
+        assert!(all.contains(&SupportedLanguage::Hcl));
+        assert!(all.contains(&SupportedLanguage::Dart));
+    }
+
+    // =========================================================================
+    // CodeParser Tests
+    // =========================================================================
+
+    #[test]
+    fn test_code_parser_creation() {
+        let parser = CodeParser::new();
+        assert!(parser.is_ok());
+    }
+
+    #[test]
+    fn test_parse_rust_file() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+/// A simple function
+fn hello() -> String {
+    "Hello".to_string()
+}
+
+pub struct Config {
+    pub name: String,
+}
+"#;
+        let path = PathBuf::from("test.rs");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.language, "rust");
+        assert!(!parsed.functions.is_empty());
+        assert!(!parsed.structs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_python_file() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+def hello():
+    """A simple function"""
+    return "Hello"
+
+class Config:
+    def __init__(self, name):
+        self.name = name
+"#;
+        let path = PathBuf::from("test.py");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.language, "python");
+    }
+
+    #[test]
+    fn test_parse_python_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+class Animal:
+    pass
+
+class Dog(Animal):
+    """A dog inherits from Animal"""
+    pass
+
+class GuideDog(Dog, Serializable, Loggable):
+    """Multiple inheritance: first is parent, rest are interfaces/mixins"""
+    pass
+
+class Standalone:
+    """No inheritance"""
+    pass
+"#;
+        let path = PathBuf::from("test_inheritance.py");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        assert_eq!(parsed.structs.len(), 4);
+
+        // Animal — no parent
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+        assert!(animal.interfaces.is_empty());
+        assert!(
+            animal.generics.is_empty(),
+            "generics should be empty, heritage goes in parent_class/interfaces"
+        );
+
+        // Dog — inherits from Animal
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.interfaces.is_empty());
+
+        // GuideDog — multiple inheritance
+        let guide = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "GuideDog")
+            .unwrap();
+        assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
+        assert_eq!(guide.interfaces, vec!["Serializable", "Loggable"]);
+
+        // Standalone — no inheritance
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
+        assert!(standalone.parent_class.is_none());
+        assert!(standalone.interfaces.is_empty());
+    }
+
+    #[test]
+    fn test_parse_php_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"<?php
+
+class Animal {
+    public $name;
+}
+
+class Dog extends Animal {
+    public $breed;
+}
+
+class GuideDog extends Dog implements Serializable, JsonSerializable {
+    public $handler;
+}
+
+class Standalone {
+    public $value;
+}
+"#;
+        let path = PathBuf::from("test_inheritance.php");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        assert_eq!(parsed.structs.len(), 4);
+
+        // Animal — no parent
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+        assert!(animal.interfaces.is_empty());
+        assert!(
+            animal.generics.is_empty(),
+            "generics should be empty, heritage goes in parent_class/interfaces"
+        );
+
+        // Dog — extends Animal
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.interfaces.is_empty());
+
+        // GuideDog — extends Dog, implements Serializable + JsonSerializable
+        let guide = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "GuideDog")
+            .unwrap();
+        assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
+        assert_eq!(guide.interfaces, vec!["Serializable", "JsonSerializable"]);
+
+        // Standalone — no inheritance
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
+        assert!(standalone.parent_class.is_none());
+        assert!(standalone.interfaces.is_empty());
+    }
+
+    #[test]
+    fn test_parse_java_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+public class Animal {
+    String name;
+}
+
+public class Dog extends Animal {
+    String breed;
+}
+
+public class GuideDog extends Dog implements Serializable, Comparable<GuideDog> {
+    String handler;
+}
+
+public class Standalone {
+    int value;
+}
+"#;
+        let path = PathBuf::from("Test.java");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        assert_eq!(parsed.structs.len(), 4);
+
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+        assert!(animal.interfaces.is_empty());
+
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.interfaces.is_empty());
+
+        let guide = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "GuideDog")
+            .unwrap();
+        assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
+        assert!(
+            guide.interfaces.len() >= 2,
+            "expected at least 2 interfaces: {:?}",
+            guide.interfaces
+        );
+
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
+        assert!(standalone.parent_class.is_none());
+        assert!(standalone.interfaces.is_empty());
+    }
+
+    #[test]
+    fn test_parse_csharp_class_and_interface() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+using System;
+using Models.Data;
+
+namespace MyApp.Services
+{
+    public interface IUserService
+    {
+        User GetUser(int id);
+    }
+
+    public class UserService : BaseService, IUserService, IDisposable
+    {
+        public User GetUser(int id)
+        {
+            return new User();
+        }
+
+        private void Cleanup() { }
+    }
+
+    public enum UserRole
+    {
+        Admin,
+        User,
+        Guest
+    }
+
+    public struct Point
+    {
+        public int X;
+        public int Y;
+    }
+}
+"#;
+        let path = PathBuf::from("UserService.cs");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        assert_eq!(parsed.language, "csharp");
+
+        // Imports
+        assert!(
+            parsed.imports.len() >= 2,
+            "expected at least 2 using directives, got {}",
+            parsed.imports.len()
+        );
+
+        // Interface
+        let iface = parsed.traits.iter().find(|t| t.name == "IUserService");
+        assert!(iface.is_some(), "IUserService interface not found");
+
+        // Class with inheritance
+        let svc = parsed.structs.iter().find(|s| s.name == "UserService");
+        assert!(svc.is_some(), "UserService class not found");
+        let svc = svc.unwrap();
+        assert_eq!(svc.parent_class.as_deref(), Some("BaseService"));
+        assert!(svc.interfaces.contains(&"IUserService".to_string()));
+        assert!(svc.interfaces.contains(&"IDisposable".to_string()));
+
+        // Methods
+        assert!(
+            parsed.functions.iter().any(|f| f.name == "GetUser"),
+            "GetUser method not found"
+        );
+        assert!(
+            parsed.functions.iter().any(|f| f.name == "Cleanup"),
+            "Cleanup method not found"
+        );
+
+        // Enum
+        let e = parsed.enums.iter().find(|e| e.name == "UserRole");
+        assert!(e.is_some(), "UserRole enum not found");
+        let e = e.unwrap();
+        assert_eq!(e.variants.len(), 3);
+
+        // Struct
+        let point = parsed.structs.iter().find(|s| s.name == "Point");
+        assert!(point.is_some(), "Point struct not found");
+    }
+
+    #[test]
+    fn test_parse_typescript_file() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+function hello(): string {
+    return "Hello";
+}
+
+interface Config {
+    name: string;
+}
+"#;
+        let path = PathBuf::from("test.ts");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.language, "typescript");
+    }
+
+    #[test]
+    fn test_parse_typescript_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+class Animal {
+    name: string;
+}
+
+class Dog extends Animal {
+    breed: string;
+}
+
+class GuideDog extends Dog implements Serializable, Comparable {
+    handler: string;
+}
+
+class Standalone {
+    value: number;
+}
+"#;
+        let path = PathBuf::from("test_inheritance.ts");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        assert_eq!(parsed.structs.len(), 4);
+
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+        assert!(animal.interfaces.is_empty());
+
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.interfaces.is_empty());
+
+        let guide = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "GuideDog")
+            .unwrap();
+        assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
+        assert!(
+            guide.interfaces.len() >= 2,
+            "expected at least 2 interfaces: {:?}",
+            guide.interfaces
+        );
+
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
+        assert!(standalone.parent_class.is_none());
+        assert!(standalone.interfaces.is_empty());
+    }
+
+    #[test]
+    fn test_parse_cpp_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+class Animal {
+public:
+    string name;
+};
+
+class Dog : public Animal {
+public:
+    string breed;
+};
+
+class GuideDog : public Dog, public Serializable {
+public:
+    string handler;
+};
+
+class Standalone {
+    int value;
+};
+"#;
+        let path = PathBuf::from("test_inheritance.cpp");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+        assert!(animal.interfaces.is_empty());
+
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.interfaces.is_empty());
+
+        let guide = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "GuideDog")
+            .unwrap();
+        assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
+        assert_eq!(
+            guide.interfaces.len(),
+            1,
+            "expected 1 interface: {:?}",
+            guide.interfaces
+        );
+
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
+        assert!(standalone.parent_class.is_none());
+        assert!(standalone.interfaces.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ruby_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+class Animal
+  attr_accessor :name
+end
+
+class Dog < Animal
+  attr_accessor :breed
+end
+
+class Standalone
+  attr_accessor :value
+end
+"#;
+        let path = PathBuf::from("test_inheritance.rb");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+        assert!(
+            animal.generics.is_empty(),
+            "generics should be empty for Ruby classes"
+        );
+
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.generics.is_empty());
+
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
+        assert!(standalone.parent_class.is_none());
+    }
+
+    #[test]
+    fn test_parse_kotlin_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+open class Animal {
+    var name: String = ""
+}
+
+class Dog : Animal() {
+    var breed: String = ""
+}
+
+class GuideDog : Dog(), Serializable, Comparable<GuideDog> {
+    var handler: String = ""
+}
+
+class Standalone {
+    var value: Int = 0
+}
+"#;
+        let path = PathBuf::from("test_inheritance.kt");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.interfaces.is_empty());
+
+        let guide = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "GuideDog")
+            .unwrap();
+        assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
+        assert!(
+            guide.interfaces.len() >= 2,
+            "expected at least 2 interfaces: {:?}",
+            guide.interfaces
+        );
+
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
+        assert!(standalone.parent_class.is_none());
+    }
+
+    #[test]
+    fn test_parse_swift_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+class Animal {
+    var name: String = ""
+}
+
+class Dog: Animal {
+    var breed: String = ""
+}
+
+class Standalone {
+    var value: Int = 0
+}
+"#;
+        let path = PathBuf::from("test_inheritance.swift");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
+        assert!(standalone.parent_class.is_none());
+    }
+
+    #[test]
+    fn test_parse_go_file() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+package main
+
+func hello() string {
+    return "Hello"
+}
+
+type Config struct {
+    Name string
+}
+"#;
+        let path = PathBuf::from("test.go");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.language, "go");
+    }
+
+    #[test]
+    fn test_parse_hcl_resource_and_data() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+resource "aws_vpc" "main" {
+  cidr_block = "10.0.0.0/16"
+}
+
+resource "aws_instance" "web" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = "t3.micro"
+  subnet_id     = aws_subnet.main.id
+}
+
+data "aws_ami" "ubuntu" {
+  most_recent = true
+}
+"#;
+        let path = PathBuf::from("main.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.language, "hcl");
+
+        // 2 resources → StructNode
+        assert!(parsed.structs.iter().any(|s| s.name == "aws_vpc.main"));
+        assert!(parsed.structs.iter().any(|s| s.name == "aws_instance.web"));
+        // 1 data source → StructNode
+        assert!(parsed
+            .structs
+            .iter()
+            .any(|s| s.name == "data.aws_ami.ubuntu"));
+
+        // Symbols should also contain the struct names
+        assert!(parsed.symbols.contains(&"aws_vpc.main".to_string()));
+        assert!(parsed.symbols.contains(&"aws_instance.web".to_string()));
+        assert!(parsed.symbols.contains(&"data.aws_ami.ubuntu".to_string()));
+
+        // __same_dir__ implicit import
+        assert!(parsed.imports.iter().any(|i| i.path == "__same_dir__"));
+    }
+
+    #[test]
+    fn test_parse_hcl_variable_and_output() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+variable "vpc_cidr" {
+  type    = string
+  default = "10.0.0.0/16"
+}
+
+variable "region" {
+  type    = string
+  default = "eu-west-1"
+}
+
+output "instance_ip" {
+  value = aws_instance.web.public_ip
+}
+"#;
+        let path = PathBuf::from("variables.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert!(parsed.symbols.contains(&"var.vpc_cidr".to_string()));
+        assert!(parsed.symbols.contains(&"var.region".to_string()));
+        assert!(parsed.symbols.contains(&"output.instance_ip".to_string()));
+    }
+
+    #[test]
+    fn test_parse_hcl_locals() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+locals {
+  env    = "prod"
+  region = "eu-west-1"
+  name   = "my-app"
+}
+"#;
+        let path = PathBuf::from("locals.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert!(parsed.symbols.contains(&"local.env".to_string()));
+        assert!(parsed.symbols.contains(&"local.region".to_string()));
+        assert!(parsed.symbols.contains(&"local.name".to_string()));
+    }
+
+    #[test]
+    fn test_parse_hcl_module() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+module "vpc" {
+  source = "./modules/vpc"
+  cidr   = var.vpc_cidr
+}
+
+module "database" {
+  source  = "terraform-aws-modules/rds/aws"
+  version = "5.0.0"
+}
+"#;
+        let path = PathBuf::from("modules.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        // Module symbols
+        assert!(parsed.symbols.contains(&"module.vpc".to_string()));
+        assert!(parsed.symbols.contains(&"module.database".to_string()));
+
+        // Module source imports (+ __same_dir__)
+        assert!(parsed
+            .imports
+            .iter()
+            .any(|i| i.path == "./modules/vpc" && i.alias == Some("vpc".to_string())));
+        assert!(parsed
+            .imports
+            .iter()
+            .any(|i| i.path == "terraform-aws-modules/rds/aws"));
+        assert!(parsed.imports.iter().any(|i| i.path == "__same_dir__"));
+    }
+
+    #[test]
+    fn test_parse_hcl_provider() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+provider "aws" {
+  region = "eu-west-1"
+}
+
+provider "google" {
+  project = "my-project"
+}
+"#;
+        let path = PathBuf::from("providers.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert!(parsed.symbols.contains(&"provider.aws".to_string()));
+        assert!(parsed.symbols.contains(&"provider.google".to_string()));
+    }
+
+    #[test]
+    fn test_parse_hcl_references() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+resource "aws_instance" "web" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = "t3.micro"
+  subnet_id     = aws_subnet.main.id
+}
+
+output "ip" {
+  value = aws_instance.web.public_ip
+}
+"#;
+        let path = PathBuf::from("refs.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        // aws_subnet.main reference from aws_instance.web (data.aws_ami is internal scope → filtered)
+        assert!(
+            parsed
+                .function_calls
+                .iter()
+                .any(|c| c.callee_name == "aws_subnet.main" && c.reason == "hcl-reference"),
+            "Expected aws_subnet.main reference, got: {:?}",
+            parsed
+                .function_calls
+                .iter()
+                .map(|c| &c.callee_name)
+                .collect::<Vec<_>>()
+        );
+        // aws_instance.web reference from output
+        assert!(
+            parsed
+                .function_calls
+                .iter()
+                .any(|c| c.callee_name == "aws_instance.web" && c.reason == "hcl-reference"),
+            "Expected aws_instance.web reference, got: {:?}",
+            parsed
+                .function_calls
+                .iter()
+                .map(|c| &c.callee_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_parse_hcl_complete_terraform() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+variable "vpc_cidr" {
+  type    = string
+  default = "10.0.0.0/16"
+}
+
+locals {
+  env    = "prod"
+  region = "eu-west-1"
+}
+
+resource "aws_vpc" "main" {
+  cidr_block = var.vpc_cidr
+}
+
+data "aws_ami" "ubuntu" {
+  most_recent = true
+}
+
+resource "aws_instance" "web" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = "t3.micro"
+  subnet_id     = aws_subnet.main.id
+}
+
+output "instance_ip" {
+  value = aws_instance.web.public_ip
+}
+
+module "vpc" {
+  source = "./modules/vpc"
+  cidr   = var.vpc_cidr
+}
+
+provider "aws" {
+  region = "eu-west-1"
+}
+"#;
+        let path = PathBuf::from("complete.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.language, "hcl");
+
+        // 2 resources + 1 data source = 3 structs
+        assert_eq!(
+            parsed.structs.len(),
+            3,
+            "Expected 3 structs, got: {:?}",
+            parsed.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        // symbols: 2 resources + 1 data + 1 variable + 2 locals + 1 output + 1 module + 1 provider = 9
+        assert_eq!(
+            parsed.symbols.len(),
+            9,
+            "Expected 9 symbols, got: {:?}",
+            parsed.symbols
+        );
+
+        // imports: 1 module source + 1 __same_dir__ = 2
+        assert_eq!(
+            parsed.imports.len(),
+            2,
+            "Expected 2 imports, got: {:?}",
+            parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>()
+        );
+
+        // references: aws_subnet.main + aws_instance.web (data.aws_ami is filtered as internal scope)
+        assert!(
+            parsed.function_calls.len() >= 2,
+            "Expected >= 2 references, got: {:?}",
+            parsed
+                .function_calls
+                .iter()
+                .map(|c| &c.callee_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_parse_hcl_tfvars_extension() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+vpc_cidr = "10.0.0.0/16"
+region   = "eu-west-1"
+"#;
+        let path = PathBuf::from("terraform.tfvars");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.language, "hcl");
+        // tfvars has no blocks, just top-level attributes — we only expect __same_dir__
+        assert!(parsed.imports.iter().any(|i| i.path == "__same_dir__"));
+    }
+
+    #[test]
+    fn test_parse_unsupported_extension() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = "some content";
+        let path = PathBuf::from("test.txt");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parsed_file_hash_changes_with_content() {
+        let mut parser = CodeParser::new().unwrap();
+        let path = PathBuf::from("test.rs");
+
+        let parsed1 = parser.parse_file(&path, "fn a() {}").unwrap();
+        let parsed2 = parser.parse_file(&path, "fn b() {}").unwrap();
+
+        assert_ne!(parsed1.hash, parsed2.hash);
+    }
+
+    #[test]
+    fn test_parsed_file_hash_consistent() {
+        let mut parser = CodeParser::new().unwrap();
+        let path = PathBuf::from("test.rs");
+        let content = "fn hello() {}";
+
+        let parsed1 = parser.parse_file(&path, content).unwrap();
+        let parsed2 = parser.parse_file(&path, content).unwrap();
+
+        assert_eq!(parsed1.hash, parsed2.hash);
+    }
+
+    // =========================================================================
+    // to_code_document Tests
+    // =========================================================================
+
+    #[test]
+    fn test_to_code_document() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+/// Says hello
+fn hello() -> String {
+    "Hello".to_string()
+}
+"#;
+        let path = PathBuf::from("src/lib.rs");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        let doc = CodeParser::to_code_document(&parsed, "project-123", "my-project");
+
+        assert_eq!(doc.path, "src/lib.rs");
+        assert_eq!(doc.language, "rust");
+        assert_eq!(doc.project_id, "project-123");
+        assert_eq!(doc.project_slug, "my-project");
+    }
+
+    #[test]
+    fn test_to_code_document_collects_docstrings() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+/// Function doc
+fn foo() {}
+
+/// Struct doc
+struct Bar {}
+"#;
+        let path = PathBuf::from("test.rs");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        let doc = CodeParser::to_code_document(&parsed, "id", "slug");
+
+        // Should have collected docstrings
+        assert!(doc.docstrings.contains("Function doc") || doc.docstrings.contains("Struct doc"));
+    }
+
+    // =========================================================================
+    // FunctionCall Tests
+    // =========================================================================
+
+    #[test]
+    fn test_function_call_struct() {
+        let call = FunctionCall {
+            caller_id: "main".to_string(),
+            callee_name: "helper".to_string(),
+            line: 42,
+            confidence: 0.85,
+            reason: "same-file".to_string(),
+        };
+
+        assert_eq!(call.caller_id, "main");
+        assert_eq!(call.callee_name, "helper");
+        assert_eq!(call.line, 42);
+        assert_eq!(call.confidence, 0.85);
+        assert_eq!(call.reason, "same-file");
+    }
+
+    // =========================================================================
+    // ParsedFile Tests
+    // =========================================================================
+
+    #[test]
+    fn test_parsed_file_default_empty() {
+        let parsed = ParsedFile {
+            path: "test.rs".to_string(),
+            language: "rust".to_string(),
+            hash: "abc123".to_string(),
+            functions: vec![],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            imports: vec![],
+            impl_blocks: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        };
+
+        assert!(parsed.functions.is_empty());
+        assert!(parsed.structs.is_empty());
+        assert!(parsed.imports.is_empty());
+    }
+}

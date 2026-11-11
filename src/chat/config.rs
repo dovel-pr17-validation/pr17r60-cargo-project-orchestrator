@@ -1,0 +1,1037 @@
+//! Chat configuration
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use nexus_claude::PermissionMode;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// Permission configuration for the chat system.
+/// Groups the permission mode and tool allow/disallow patterns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionConfig {
+    /// Permission mode: "default", "acceptEdits", "plan", "bypassPermissions"
+    #[serde(default = "PermissionConfig::default_mode")]
+    pub mode: String,
+    /// Tool patterns to explicitly allow (e.g. "Bash(git *)", "mcp__project-orchestrator__*").
+    /// Defaults to [`DEFAULT_ALLOWED_TOOLS`] when absent from config, ensuring MCP tools
+    /// are usable out of the box.
+    #[serde(default = "PermissionConfig::default_allowed_tools")]
+    pub allowed_tools: Vec<String>,
+    /// Tool patterns to explicitly disallow (e.g. "Bash(rm -rf *)", "Bash(sudo *)")
+    #[serde(default)]
+    pub disallowed_tools: Vec<String>,
+}
+
+impl PermissionConfig {
+    fn default_mode() -> String {
+        "default".into()
+    }
+
+    /// Convert the string mode to the Nexus SDK `PermissionMode` enum.
+    /// Falls back to `Default` for unknown values (safe-by-default).
+    pub fn to_nexus_mode(&self) -> PermissionMode {
+        // Legacy Claude strings AND the neutral names of the agent contract
+        // (decision A43): `ask`, `auto_edits`, `plan_only`, `trust`.
+        match self.mode.as_str() {
+            "default" | "ask" | "manual" | "dontAsk" => PermissionMode::Default,
+            "acceptEdits" | "auto_edits" | "auto" => PermissionMode::AcceptEdits,
+            "plan" | "plan_only" => PermissionMode::Plan,
+            "bypassPermissions" | "trust" => PermissionMode::BypassPermissions,
+            _ => {
+                tracing::warn!(
+                    mode = %self.mode,
+                    "Unknown permission mode, falling back to Default"
+                );
+                PermissionMode::Default
+            }
+        }
+    }
+
+    /// Accepted permission mode strings: the Claude strings the API always
+    /// took, plus the neutral names of the agent contract (A43). The legacy
+    /// `auto`, `dontAsk` and `manual` are accepted too (Claude Code knows them).
+    pub fn valid_modes() -> &'static [&'static str] {
+        &[
+            "default",
+            "acceptEdits",
+            "plan",
+            "bypassPermissions",
+            "auto",
+            "dontAsk",
+            "manual",
+            "ask",
+            "auto_edits",
+            "plan_only",
+            "trust",
+        ]
+    }
+
+    /// Check if the given mode string is valid.
+    pub fn is_valid_mode(mode: &str) -> bool {
+        Self::valid_modes().contains(&mode)
+    }
+
+    /// Default allowed tool patterns (MCP tools pre-approved out of the box).
+    pub fn default_allowed_tools() -> Vec<String> {
+        DEFAULT_ALLOWED_TOOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+}
+
+/// Default allowed tool patterns applied when no explicit configuration is provided.
+///
+/// These ensure that MCP tools from the Project Orchestrator server are usable
+/// out of the box, without requiring the user to manually add them via the
+/// chat settings page or config.yaml.
+pub const DEFAULT_ALLOWED_TOOLS: &[&str] = &["mcp__project-orchestrator__*"];
+
+impl Default for PermissionConfig {
+    fn default() -> Self {
+        Self {
+            mode: Self::default_mode(),
+            allowed_tools: DEFAULT_ALLOWED_TOOLS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            disallowed_tools: Vec::new(),
+        }
+    }
+}
+
+/// Retry configuration for transient API errors (5xx).
+///
+/// When the Anthropic API returns a retryable error (e.g., 500 api_error,
+/// 529 overloaded_error), the chat system automatically retries with
+/// exponential backoff. Only retries when no tokens have been emitted yet.
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts (default: 3)
+    pub max_attempts: u32,
+    /// Initial delay in milliseconds before the first retry (default: 1000)
+    pub initial_delay_ms: u64,
+    /// Backoff multiplier applied after each retry (default: 2.0).
+    /// Delay = initial_delay_ms × multiplier^(attempt-1)
+    pub backoff_multiplier: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_delay_ms: 1000,
+            backoff_multiplier: 2.0,
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Read retry config from environment variables with fallback to defaults.
+    pub fn from_env() -> Self {
+        Self {
+            max_attempts: std::env::var("CHAT_RETRY_MAX_ATTEMPTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
+            initial_delay_ms: std::env::var("CHAT_RETRY_INITIAL_DELAY_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000),
+            backoff_multiplier: std::env::var("CHAT_RETRY_BACKOFF_MULTIPLIER")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2.0),
+        }
+    }
+
+    /// Calculate the delay for a given attempt (1-indexed).
+    pub fn delay_for_attempt(&self, attempt: u32) -> u64 {
+        (self.initial_delay_ms as f64 * self.backoff_multiplier.powi(attempt as i32 - 1)) as u64
+    }
+}
+
+/// Configuration for the chat system
+#[derive(Debug, Clone)]
+pub struct ChatConfig {
+    /// Which engine drives a session: the historical Claude Code client
+    /// (`legacy`, default) or the provider-neutral `AgentSession` (`agent`).
+    pub provider_path: ProviderPath,
+    /// Path to the MCP server binary
+    pub mcp_server_path: PathBuf,
+    /// The `nexus-tools` executable (Read, Edit, Bash... over MCP) attached to every
+    /// native session as its `nexus` server (B40). `None`: not found at start, the
+    /// native sessions have the project-orchestrator tools only.
+    pub nexus_tools_path: Option<PathBuf>,
+    /// The browser (Obscura, N23) found on the `PATH` at start. Found is not authorised:
+    /// a project must authorise it (`nexus_tools::BROWSER_KEY`) before a session gets it.
+    pub nexus_browser_path: Option<PathBuf>,
+    /// Obscura (`dsh-obscura-nav`): the executable of the keyless `obscura` search engine
+    /// (`--search-engine obscura:<path>`). Server configuration only, never a request's:
+    /// `OBSCURA_BIN`, else `chat.obscura_path` in config.yaml (the variable wins), absolute only.
+    /// `None` is the default: the engine embedded in nexus-tools, else the `PATH`
+    /// (`dsh-obscura-nav`, then `obscura`) looked up at each opening ([`obscura_engine_program`]).
+    /// With `chat.obscura_browser: true` it is also the browser (N23) when none named `obscura`
+    /// was found.
+    pub obscura_path: Option<PathBuf>,
+    /// Default model to use when not specified in request
+    pub default_model: String,
+    /// Maximum number of concurrent active sessions
+    pub max_sessions: usize,
+    /// Timeout after which inactive sessions are closed (subprocess freed)
+    pub session_timeout: Duration,
+    /// Neo4j connection details for MCP server env
+    pub neo4j_uri: String,
+    pub neo4j_user: String,
+    pub neo4j_password: String,
+    /// Meilisearch connection details for MCP server env
+    pub meilisearch_url: String,
+    pub meilisearch_key: String,
+    /// NATS URL for inter-process event sync (MCP ↔ desktop)
+    pub nats_url: Option<String>,
+    /// Maximum number of agentic turns (tool calls) per message
+    pub max_turns: i32,
+    /// Permission configuration (mode + allowed/disallowed tool patterns)
+    pub permission: PermissionConfig,
+    /// Whether an interactive session continues a turn that stopped on its turn limit
+    /// (the backend sends "Continue", at most `post_stream::MAX_AUTO_CONTINUES` times in a
+    /// row). On by default for every session, with no per-session toggle (decision
+    /// 7b95342a); `CHAT_AUTO_CONTINUE=false` (or `0`) is the operator's kill switch.
+    /// Runner sessions always continue.
+    pub auto_continue: bool,
+    /// Retry configuration for transient API errors (5xx)
+    pub retry: RetryConfig,
+    /// PATH to inject into the Claude Code subprocess. When Some, overrides the inherited PATH.
+    /// Colon-separated on Unix (e.g. "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin").
+    pub process_path: Option<String>,
+    /// Absolute path to the Claude CLI binary. When Some, skips find_claude_cli() lookup.
+    pub claude_cli_path: Option<String>,
+    /// Enable automatic CLI version updates on startup (default: false).
+    pub auto_update_cli: bool,
+    /// Enable automatic Tauri application updates on startup (default: true).
+    pub auto_update_app: bool,
+    /// JWT secret for generating session tokens (MCP auth).
+    /// When Some (auth enabled), build_options() generates a session JWT
+    /// and injects PO_AUTH_TOKEN + PO_SERVER_URL into the MCP server env.
+    pub jwt_secret: Option<String>,
+    /// Server port for PO_SERVER_URL derivation (always 127.0.0.1:{port}).
+    pub server_port: u16,
+    /// Expiration duration for MCP session tokens in seconds (default: 24h = 86400s).
+    pub session_token_expiry_secs: u64,
+    /// The third-party MCP tools the operator declares READ-ONLY, by exact name
+    /// (`mcp__<server>__<tool>`, no pattern): the only third-party MCP tools a permission
+    /// approved "for the session" may cover (`chat::session_grants`, the identical call).
+    /// Any other is allowed once at a time. From `CHAT_READ_ONLY_MCP_TOOLS` (comma
+    /// separated); empty by default.
+    ///
+    /// A declaration binds a NAME, not a server: the Claude Code CLI also loads the
+    /// project's `.mcp.json`, where a server may take the name of one configured elsewhere.
+    /// A declaration whose server a project's `.mcp.json` defines is ignored for that
+    /// session (`session_grants::declarations_for_project`); declare only tools of servers
+    /// no project can redefine (the backend's own, or names no project uses). No strict MCP configuration is passed to the CLI: it would drop every
+    /// server configured outside the backend, the very ones a declaration is for
+    /// (`docs/guides/chat-websocket.md`).
+    pub read_only_mcp_tools: Vec<String>,
+    /// Where the lasting approvals (`always`, `chat::lasting_rules`) are kept: one file per
+    /// person, in a `0700` directory. `None`: no session keeps a lasting approval (`always`
+    /// is not offered). From `CHAT_PERMISSION_RULES_DIR`, else the application directory
+    /// (`lasting_rules::default_root`) on a unix host; never in the unit tests of the crate
+    /// (they would write in the developer's home), which set it explicitly.
+    pub lasting_rules_dir: Option<std::path::PathBuf>,
+    /// Wall-clock cap of one turn of a NATIVE session, in seconds
+    /// (`SessionLimits::turn_timeout_ms`). `None` by default: like Claude Code, a turn runs
+    /// as long as it works (bounded by `max_turns`, the Stop button and the model stream's
+    /// idle deadline). From `chat.native_turn_timeout_secs` / `CHAT_NATIVE_TURN_TIMEOUT_SECS`;
+    /// `0` means unset. ISO5: a 30 min default cut a working session.
+    pub native_turn_timeout_secs: Option<u64>,
+    /// Token budget of a NATIVE session (`SessionLimits::max_tokens`: input not served
+    /// from the cache + cache writes + output; cache reads are not counted). `None` by
+    /// default, like Claude Code. From `chat.native_session_max_tokens` /
+    /// `CHAT_NATIVE_SESSION_MAX_TOKENS`; `0` means unset. ISO5: a 10 M default, cache reads
+    /// included, stopped every later turn of a conversation.
+    pub native_session_max_tokens: Option<u64>,
+}
+
+/// Environment variable selecting the [`ProviderPath`].
+pub const PROVIDER_PATH_VAR: &str = "CHAT_PROVIDER_PATH";
+
+/// Variable naming the `nexus-tools` executable of the native sessions (B40).
+pub const NEXUS_TOOLS_PATH_VAR: &str = "NEXUS_TOOLS_PATH";
+
+/// The executable of the `obscura` search engine of a session: the configured one
+/// (`configured`, [`ChatConfig::obscura_path`]) when runnable (`runnable`: absolute, executable);
+/// else none when nexus-tools embeds Obscura (`embedded`: the engine runs in that process,
+/// `--search-engine obscura`); else `dsh-obscura-nav` on the `PATH` (`on_path`, held to the
+/// same `runnable` rule). The embedded engine is the default, the `PATH` only a fallback (OBS-R).
+pub fn obscura_engine_program(
+    configured: Option<&std::path::Path>,
+    embedded: bool,
+    on_path: impl FnOnce() -> Option<PathBuf>,
+    runnable: impl Fn(&std::path::Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match configured {
+        Some(path) => runnable(path),
+        None if embedded => None,
+        None => on_path().as_deref().and_then(runnable),
+    }
+}
+
+/// Variable naming the Obscura executable (`dsh-obscura-nav`) of the `obscura` search engine.
+pub const OBSCURA_BIN_VAR: &str = "OBSCURA_BIN";
+
+/// Variable listing the third-party MCP tools declared read-only
+/// ([`ChatConfig::read_only_mcp_tools`]).
+pub const READ_ONLY_MCP_TOOLS_VAR: &str = "CHAT_READ_ONLY_MCP_TOOLS";
+
+/// Environment variable of [`ChatConfig::native_turn_timeout_secs`].
+pub const NATIVE_TURN_TIMEOUT_VAR: &str = "CHAT_NATIVE_TURN_TIMEOUT_SECS";
+
+/// Environment variable of [`ChatConfig::native_session_max_tokens`].
+pub const NATIVE_SESSION_MAX_TOKENS_VAR: &str = "CHAT_NATIVE_SESSION_MAX_TOKENS";
+
+/// Variable naming the directory of the lasting approvals
+/// ([`ChatConfig::lasting_rules_dir`]).
+pub const PERMISSION_RULES_DIR_VAR: &str = "CHAT_PERMISSION_RULES_DIR";
+
+/// Engine that drives Claude Code sessions (decision A18 / task B38).
+///
+/// Routing is HYBRID only in what can be chosen: every third-party provider is served
+/// by the agent engine whatever this says, and Claude Code follows this. The default is
+/// `Agent` since M2 (plan "Claude Code devient optionnel"): the agent engine ports hooks,
+/// message queue, auto-continue, retry, compaction and NATS, measured on the same
+/// `fake_claude` transcript (`docs/parity/engines.md`, column "Claude Code (moteur
+/// agent)"). What a session still lacks is in its `system_init.degraded_features`, and
+/// the server logs it for a Claude Code session (`manager::forced_engine_warning`).
+/// `CHAT_PROVIDER_PATH=legacy` keeps Claude Code on the historical engine. The engine
+/// is frozen at opening: a session resumes on the engine it was opened on, whatever
+/// this says now (`ChatManager::ready_for_resume`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProviderPath {
+    /// The historical path: `InteractiveClient` straight on the Claude CLI.
+    Legacy,
+    /// The provider-neutral path: an `AgentSession` from the nexus registry.
+    #[default]
+    Agent,
+}
+
+impl ProviderPath {
+    /// `legacy` or `agent` (case-insensitive). Nothing (or blank) is the default (`agent`).
+    /// Anything else is `legacy`, with a warning: a value was set, so the operator meant to
+    /// choose, and a typo in the opt-out (`legasy`) must not land on the newer engine
+    /// (review of #726, point 4).
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("agent") => Self::Agent,
+            Some("legacy") => Self::Legacy,
+            None | Some("") => Self::default(),
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "unknown CHAT_PROVIDER_PATH (agent or legacy): Claude Code stays on the \
+                     historical engine (legacy)"
+                );
+                Self::Legacy
+            }
+        }
+    }
+
+    /// Stable name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+impl ChatConfig {
+    /// Create config from environment, auto-detecting the mcp_server binary path
+    pub fn from_env() -> Self {
+        let mcp_server_path = Self::detect_mcp_server_path();
+
+        Self {
+            provider_path: ProviderPath::parse(std::env::var(PROVIDER_PATH_VAR).ok().as_deref()),
+            mcp_server_path,
+            nexus_tools_path: Self::detect_nexus_tools_path(),
+            nexus_browser_path: nexus_claude::providers::native::BrowserTools::locate()
+                .map(|browser| browser.program),
+            obscura_path: Self::detect_obscura_path(),
+            default_model: std::env::var("CHAT_DEFAULT_MODEL")
+                .unwrap_or_else(|_| "claude-sonnet-5".into()),
+            max_sessions: std::env::var("CHAT_MAX_SESSIONS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
+            session_timeout: Duration::from_secs(
+                std::env::var("CHAT_SESSION_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1800), // 30 minutes
+            ),
+            neo4j_uri: std::env::var("NEO4J_URI")
+                .unwrap_or_else(|_| "bolt://localhost:7687".into()),
+            neo4j_user: std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into()),
+            neo4j_password: std::env::var("NEO4J_PASSWORD")
+                .unwrap_or_else(|_| "orchestrator123".into()),
+            meilisearch_url: std::env::var("MEILISEARCH_URL")
+                .unwrap_or_else(|_| "http://localhost:7700".into()),
+            meilisearch_key: std::env::var("MEILISEARCH_KEY")
+                .unwrap_or_else(|_| "orchestrator-meili-key-change-me".into()),
+            nats_url: std::env::var("NATS_URL").ok(),
+            max_turns: std::env::var("CHAT_MAX_TURNS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50),
+            permission: PermissionConfig {
+                mode: std::env::var("CHAT_PERMISSION_MODE").unwrap_or_else(|_| "default".into()),
+                allowed_tools: std::env::var("CHAT_ALLOWED_TOOLS")
+                    .ok()
+                    .map(|s| {
+                        s.split(',')
+                            .map(|t| t.trim().to_string())
+                            .filter(|t| !t.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_else(PermissionConfig::default_allowed_tools),
+                disallowed_tools: std::env::var("CHAT_DISALLOWED_TOOLS")
+                    .ok()
+                    .map(|s| {
+                        s.split(',')
+                            .map(|t| t.trim().to_string())
+                            .filter(|t| !t.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+            auto_continue: auto_continue_from_env(
+                std::env::var("CHAT_AUTO_CONTINUE").ok().as_deref(),
+            ),
+            retry: RetryConfig::from_env(),
+            process_path: std::env::var("CHAT_PROCESS_PATH").ok(),
+            claude_cli_path: std::env::var("CLAUDE_CLI_PATH").ok(),
+            auto_update_cli: std::env::var("CHAT_AUTO_UPDATE_CLI")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            auto_update_app: std::env::var("CHAT_AUTO_UPDATE_APP")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(true),
+            jwt_secret: None, // Injected from Config.auth_config in lib.rs
+            server_port: std::env::var("SERVER_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080),
+            session_token_expiry_secs: std::env::var("CHAT_SESSION_TOKEN_EXPIRY_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(86400), // 24 hours
+            read_only_mcp_tools: Self::parse_read_only_mcp_tools(
+                std::env::var(READ_ONLY_MCP_TOOLS_VAR).ok().as_deref(),
+            ),
+            lasting_rules_dir: Self::lasting_rules_dir_from_env(),
+            native_turn_timeout_secs: Self::positive_from_env(NATIVE_TURN_TIMEOUT_VAR),
+            native_session_max_tokens: Self::positive_from_env(NATIVE_SESSION_MAX_TOKENS_VAR),
+        }
+    }
+
+    /// A positive number from the environment variable `name`; unset, empty, `0` or not a
+    /// number: `None`.
+    pub(crate) fn positive_from_env(name: &str) -> Option<u64> {
+        Self::positive(std::env::var(name).ok().as_deref())
+    }
+
+    /// A positive number from its text; `None` for nothing, `0` or not a number.
+    pub(crate) fn positive(text: Option<&str>) -> Option<u64> {
+        text?.trim().parse::<u64>().ok().filter(|n| *n > 0)
+    }
+
+    /// [`ChatConfig::lasting_rules_dir`] from the environment.
+    fn lasting_rules_dir_from_env() -> Option<std::path::PathBuf> {
+        if cfg!(test) {
+            return None;
+        }
+        if let Some(dir) = std::env::var_os(PERMISSION_RULES_DIR_VAR).filter(|d| !d.is_empty()) {
+            return Some(std::path::PathBuf::from(dir));
+        }
+        if !cfg!(unix) {
+            return None;
+        }
+        Some(super::lasting_rules::default_root())
+    }
+
+    /// The declared read-only MCP tools of [`READ_ONLY_MCP_TOOLS_VAR`]: comma separated,
+    /// each an exact `mcp__<server>__<tool>` name. Anything else (a pattern, a server
+    /// alone, a tool of the `nexus` server, whose built-ins have their own rules) is
+    /// dropped with a warning: a declaration never widens beyond one named tool.
+    pub fn parse_read_only_mcp_tools(value: Option<&str>) -> Vec<String> {
+        let Some(value) = value else {
+            return Vec::new();
+        };
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .filter(|name| {
+                let exact = name
+                    .strip_prefix("mcp__")
+                    .and_then(|rest| rest.split_once("__"))
+                    .is_some_and(|(server, tool)| {
+                        !server.is_empty()
+                            && !tool.is_empty()
+                            && server != nexus_claude::providers::native::NEXUS_TOOLS_SERVER
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c))
+                    });
+                if !exact {
+                    tracing::warn!(
+                        tool = %name,
+                        "{READ_ONLY_MCP_TOOLS_VAR}: not an exact mcp__<server>__<tool> name, ignored"
+                    );
+                }
+                exact
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Public accessor for MCP server path detection.
+    ///
+    /// Used by `setup_claude` to auto-detect the binary path when configuring
+    /// Claude Code's mcp.json from the CLI `setup-claude` subcommand.
+    pub fn detect_mcp_server_path_public() -> PathBuf {
+        Self::detect_mcp_server_path()
+    }
+
+    /// Where `nexus-tools` is: `NEXUS_TOOLS_PATH` when set (an operator's choice,
+    /// taken as is), else next to the server's executable, else on the `PATH`
+    /// (`DefaultTools::locate` of nexus). Nothing downloads it: every release
+    /// channel ships it next to the server's executable (archives, Homebrew,
+    /// .deb/.rpm `/usr/bin`, Docker `/app`; the desktop app sets
+    /// `NEXUS_TOOLS_PATH`), built at the pinned nexus revision with `tls` by
+    /// `scripts/build-nexus-tools.sh`, which an operator can run too.
+    pub fn detect_nexus_tools_path() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os(NEXUS_TOOLS_PATH_VAR).filter(|p| !p.is_empty()) {
+            return Some(PathBuf::from(path));
+        }
+        nexus_claude::providers::native::DefaultTools::locate().map(|tools| tools.program)
+    }
+
+    /// [`Self::obscura_path`] from the environment: `OBSCURA_BIN` when absolute (a relative one
+    /// is ignored, with a warning at startup: `apply_obscura`). Never the `PATH`: without a
+    /// configured executable the engine embedded in nexus-tools is the default, and
+    /// [`Self::obscura_on_path`] only the fallback ([`obscura_engine_program`]).
+    pub fn detect_obscura_path() -> Option<PathBuf> {
+        std::env::var_os(OBSCURA_BIN_VAR)
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    }
+
+    /// Obscura found on the `PATH` (`dsh-obscura-nav`, then `obscura`): the fallback of the
+    /// `obscura` search engine when nothing is configured and nexus-tools does not embed it.
+    pub fn obscura_on_path() -> Option<PathBuf> {
+        nexus_tools::search::ObscuraBackend::locate().map(|o| o.program().to_path_buf())
+    }
+
+    fn detect_mcp_server_path() -> PathBuf {
+        // Try environment variable first
+        if let Ok(path) = std::env::var("MCP_SERVER_PATH") {
+            return PathBuf::from(path);
+        }
+
+        // Try relative to current executable
+        if let Ok(exe) = std::env::current_exe() {
+            let dir = exe.parent().unwrap_or(exe.as_ref());
+            let candidate = dir.join("mcp_server");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+
+        // Fallback
+        PathBuf::from("mcp_server")
+    }
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+/// `CHAT_AUTO_CONTINUE`: auto-continue is on unless the operator turns it off
+/// (`false` or `0`, any case). Unset or any other value: on.
+pub(crate) fn auto_continue_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("false" | "0")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    /// OBS-R (review of #751): Obscura ships inside nexus-tools, so the engine embedded there is
+    /// the default; `dsh-obscura-nav` on the PATH is only the fallback of a nexus-tools without
+    /// it, and an executable the operator configured still wins.
+    #[test]
+    fn the_embedded_obscura_is_the_default_and_the_path_only_a_fallback() {
+        use std::path::Path;
+        let on_path = || Some(PathBuf::from("/usr/local/bin/dsh-obscura-nav"));
+        let runnable = |p: &Path| p.is_absolute().then(|| p.to_path_buf());
+        let never = || -> Option<PathBuf> { panic!("the PATH is not looked up") };
+        // Embedded, nothing configured: no external executable, even with one on the PATH.
+        assert_eq!(obscura_engine_program(None, true, on_path, runnable), None);
+        assert_eq!(obscura_engine_program(None, true, never, runnable), None);
+        // Not embedded: the PATH is the fallback.
+        assert_eq!(
+            obscura_engine_program(None, false, on_path, runnable),
+            Some(PathBuf::from("/usr/local/bin/dsh-obscura-nav"))
+        );
+        assert_eq!(obscura_engine_program(None, false, || None, runnable), None);
+        // Configured: it wins over both, and is never replaced by the PATH.
+        let configured = Path::new("/opt/obscura/dsh-obscura-nav");
+        for embedded in [true, false] {
+            assert_eq!(
+                obscura_engine_program(Some(configured), embedded, never, runnable),
+                Some(configured.to_path_buf())
+            );
+        }
+        assert_eq!(
+            obscura_engine_program(Some(Path::new("rel/obscura")), false, never, runnable),
+            None
+        );
+    }
+
+    /// Auto-continue is on by default; `CHAT_AUTO_CONTINUE=false|0` is the kill switch.
+    #[test]
+    fn auto_continue_is_on_unless_the_operator_turns_it_off() {
+        assert!(auto_continue_from_env(None));
+        assert!(auto_continue_from_env(Some("true")));
+        assert!(auto_continue_from_env(Some("1")));
+        assert!(auto_continue_from_env(Some("")));
+        assert!(!auto_continue_from_env(Some("false")));
+        assert!(!auto_continue_from_env(Some(" FALSE ")));
+        assert!(!auto_continue_from_env(Some("0")));
+    }
+
+    /// M2: the agent engine is the default; legacy stays selectable; a value set but not
+    /// understood (a typo in the opt-out) is legacy (review of #726, point 4).
+    #[test]
+    fn provider_path_defaults_to_agent_and_an_unknown_value_is_legacy() {
+        assert_eq!(ProviderPath::parse(None), ProviderPath::Agent);
+        assert_eq!(ProviderPath::parse(Some("  ")), ProviderPath::Agent);
+        assert_eq!(ProviderPath::parse(Some(" LEGACY ")), ProviderPath::Legacy);
+        assert_eq!(ProviderPath::parse(Some("agent")), ProviderPath::Agent);
+        assert_eq!(ProviderPath::parse(Some("legasy")), ProviderPath::Legacy);
+        assert_eq!(ProviderPath::parse(Some("agnet")), ProviderPath::Legacy);
+        assert_eq!(ProviderPath::default().as_str(), "agent");
+        assert_eq!(ChatConfig::default().provider_path, ProviderPath::Agent);
+    }
+
+    #[test]
+    fn a_read_only_mcp_tool_is_declared_by_its_exact_name_only() {
+        assert!(ChatConfig::parse_read_only_mcp_tools(None).is_empty());
+        assert_eq!(
+            ChatConfig::parse_read_only_mcp_tools(Some(
+                " mcp__acme__list , ,mcp__docs-srv__search_docs,mcp__acme__*,mcp__acme,\
+                 mcp____x,mcp__nexus__Bash,Bash,acme__list,mcp__a__b c"
+            )),
+            vec!["mcp__acme__list", "mcp__docs-srv__search_docs"]
+        );
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = ChatConfig {
+            provider_path: Default::default(),
+            mcp_server_path: PathBuf::from("/usr/bin/mcp_server"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            obscura_path: None,
+            default_model: "claude-sonnet-4-6".into(),
+            max_sessions: 10,
+            session_timeout: Duration::from_secs(1800),
+            neo4j_uri: "bolt://localhost:7687".into(),
+            neo4j_user: "neo4j".into(),
+            neo4j_password: "test".into(),
+            meilisearch_url: "http://localhost:7700".into(),
+            meilisearch_key: "test-key".into(),
+            nats_url: None,
+            max_turns: 10,
+            permission: PermissionConfig::default(),
+            auto_continue: false,
+            retry: RetryConfig::default(),
+            process_path: None,
+            claude_cli_path: None,
+            auto_update_cli: false,
+            auto_update_app: true,
+            jwt_secret: None,
+            server_port: 8080,
+            session_token_expiry_secs: 86400,
+            read_only_mcp_tools: Vec::new(),
+            lasting_rules_dir: None,
+            native_turn_timeout_secs: None,
+            native_session_max_tokens: None,
+        };
+
+        assert_eq!(config.default_model, "claude-sonnet-4-6");
+        assert_eq!(config.max_sessions, 10);
+        assert_eq!(config.session_timeout.as_secs(), 1800);
+    }
+
+    /// Combined env var test to avoid parallel test race conditions.
+    /// Tests from_env() defaults, custom overrides, invalid fallback, and Default trait.
+    #[test]
+    fn test_from_env_lifecycle() {
+        // Phase 1: defaults (clear any chat env vars first)
+        std::env::remove_var("CHAT_DEFAULT_MODEL");
+        std::env::remove_var("CHAT_MAX_SESSIONS");
+        std::env::remove_var("CHAT_SESSION_TIMEOUT_SECS");
+        std::env::remove_var("MCP_SERVER_PATH");
+        std::env::remove_var("CHAT_PERMISSION_MODE");
+        std::env::remove_var("CHAT_ALLOWED_TOOLS");
+        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        std::env::remove_var("CHAT_PROCESS_PATH");
+        std::env::remove_var("CLAUDE_CLI_PATH");
+        std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+
+        let config = ChatConfig::from_env();
+        // Tracks the `default_model` literal in `from_env`; bump both together.
+        assert_eq!(config.default_model, "claude-sonnet-5");
+        assert_eq!(config.max_sessions, 10);
+        assert_eq!(config.session_timeout.as_secs(), 1800);
+        // PLAFOND-4: unset → default 4
+        // Permission defaults — MCP tools are pre-approved out of the box
+        assert_eq!(config.permission.mode, "default");
+        assert_eq!(
+            config.permission.allowed_tools,
+            vec!["mcp__project-orchestrator__*"]
+        );
+        assert!(config.permission.disallowed_tools.is_empty());
+        // New fields — defaults when env vars are absent
+        assert!(config.process_path.is_none());
+        assert!(config.claude_cli_path.is_none());
+        assert!(!config.auto_update_cli);
+
+        // Phase 2: custom values
+        std::env::set_var("CHAT_DEFAULT_MODEL", "claude-sonnet-4-6");
+        std::env::set_var("CHAT_MAX_SESSIONS", "5");
+        std::env::set_var("CHAT_SESSION_TIMEOUT_SECS", "600");
+        std::env::set_var("MCP_SERVER_PATH", "/custom/path/mcp_server");
+        std::env::set_var("CHAT_PERMISSION_MODE", "default");
+        std::env::set_var(
+            "CHAT_ALLOWED_TOOLS",
+            "Bash(git *),Read,mcp__project-orchestrator__*",
+        );
+        std::env::set_var("CHAT_DISALLOWED_TOOLS", "Bash(rm -rf *), Bash(sudo *)");
+        std::env::set_var(
+            "CHAT_PROCESS_PATH",
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        );
+        std::env::set_var("CLAUDE_CLI_PATH", "/opt/homebrew/bin/claude");
+        std::env::set_var("CHAT_AUTO_UPDATE_CLI", "true");
+
+        let config = ChatConfig::from_env();
+        assert_eq!(config.default_model, "claude-sonnet-4-6");
+        assert_eq!(config.max_sessions, 5);
+        assert_eq!(config.session_timeout.as_secs(), 600);
+        assert_eq!(
+            config.mcp_server_path,
+            PathBuf::from("/custom/path/mcp_server")
+        );
+        assert_eq!(config.permission.mode, "default");
+        assert_eq!(
+            config.permission.allowed_tools,
+            vec!["Bash(git *)", "Read", "mcp__project-orchestrator__*"]
+        );
+        assert_eq!(
+            config.permission.disallowed_tools,
+            vec!["Bash(rm -rf *)", "Bash(sudo *)"]
+        );
+        // New fields — custom values from env
+        assert_eq!(
+            config.process_path.as_deref(),
+            Some("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        );
+        assert_eq!(
+            config.claude_cli_path.as_deref(),
+            Some("/opt/homebrew/bin/claude")
+        );
+        assert!(config.auto_update_cli);
+
+        // Phase 2b: CSV parsing edge cases for tools
+        std::env::set_var("CHAT_ALLOWED_TOOLS", "Bash(git *), Read, Edit");
+        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        let config = ChatConfig::from_env();
+        assert_eq!(
+            config.permission.allowed_tools,
+            vec!["Bash(git *)", "Read", "Edit"]
+        );
+        assert!(config.permission.disallowed_tools.is_empty());
+
+        // Empty value should produce empty vec
+        std::env::set_var("CHAT_ALLOWED_TOOLS", "");
+        let config = ChatConfig::from_env();
+        assert!(config.permission.allowed_tools.is_empty());
+
+        // Phase 3: invalid value falls back to default
+        std::env::set_var("CHAT_MAX_SESSIONS", "not_a_number");
+        let config = ChatConfig::from_env();
+        assert_eq!(config.max_sessions, 10);
+
+        // Phase 4: Default trait (clear custom env vars first)
+        std::env::remove_var("CHAT_DEFAULT_MODEL");
+        std::env::remove_var("CHAT_MAX_SESSIONS");
+        std::env::remove_var("CHAT_SESSION_TIMEOUT_SECS");
+        std::env::remove_var("MCP_SERVER_PATH");
+        std::env::remove_var("CHAT_PERMISSION_MODE");
+        std::env::remove_var("CHAT_ALLOWED_TOOLS");
+        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        let config = ChatConfig::default();
+        assert!(!config.default_model.is_empty());
+        assert!(config.max_sessions > 0);
+        assert_eq!(config.permission.mode, "default");
+
+        // Phase 5: OBSCURA_BIN, read here where the environment is owned.
+        for (raw, want) in [
+            (
+                Some("/opt/obscura/dsh-obscura-nav"),
+                Some("/opt/obscura/dsh-obscura-nav"),
+            ),
+            (Some("bin/dsh-obscura-nav"), None),
+            (Some("./dsh-obscura-nav"), None),
+            (Some(""), None),
+            (None, None),
+        ] {
+            match raw {
+                Some(value) => std::env::set_var(OBSCURA_BIN_VAR, value),
+                None => std::env::remove_var(OBSCURA_BIN_VAR),
+            }
+            let want = want.map(PathBuf::from);
+            assert_eq!(ChatConfig::detect_obscura_path(), want, "{raw:?}");
+            assert_eq!(ChatConfig::from_env().obscura_path, want, "{raw:?}");
+        }
+        let located = nexus_tools::search::ObscuraBackend::locate();
+        assert_eq!(
+            ChatConfig::obscura_on_path(),
+            located.map(|o| o.program().to_path_buf())
+        );
+
+        // Cleanup
+        std::env::remove_var("CHAT_DEFAULT_MODEL");
+        std::env::remove_var("CHAT_MAX_SESSIONS");
+        std::env::remove_var("CHAT_SESSION_TIMEOUT_SECS");
+        std::env::remove_var("MCP_SERVER_PATH");
+        std::env::remove_var("CHAT_PERMISSION_MODE");
+        std::env::remove_var("CHAT_ALLOWED_TOOLS");
+        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        std::env::remove_var("CHAT_PROCESS_PATH");
+        std::env::remove_var("CLAUDE_CLI_PATH");
+        std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+    }
+
+    #[test]
+    fn test_permission_config_defaults() {
+        let config = PermissionConfig::default();
+        assert_eq!(config.mode, "default");
+        // MCP tools are pre-approved by default
+        assert_eq!(config.allowed_tools, vec!["mcp__project-orchestrator__*"]);
+        assert!(config.disallowed_tools.is_empty());
+    }
+
+    #[test]
+    fn test_permission_config_to_nexus_mode() {
+        use nexus_claude::PermissionMode;
+
+        // All 4 known modes
+        let config = PermissionConfig {
+            mode: "default".into(),
+            ..Default::default()
+        };
+        assert!(matches!(config.to_nexus_mode(), PermissionMode::Default));
+
+        let config = PermissionConfig {
+            mode: "acceptEdits".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.to_nexus_mode(),
+            PermissionMode::AcceptEdits
+        ));
+
+        let config = PermissionConfig {
+            mode: "plan".into(),
+            ..Default::default()
+        };
+        assert!(matches!(config.to_nexus_mode(), PermissionMode::Plan));
+
+        let config = PermissionConfig {
+            mode: "bypassPermissions".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.to_nexus_mode(),
+            PermissionMode::BypassPermissions
+        ));
+
+        // Unknown mode falls back to Default (safe-by-default)
+        let config = PermissionConfig {
+            mode: "nonsense".into(),
+            ..Default::default()
+        };
+        assert!(matches!(config.to_nexus_mode(), PermissionMode::Default));
+
+        let config = PermissionConfig {
+            mode: "".into(),
+            ..Default::default()
+        };
+        assert!(matches!(config.to_nexus_mode(), PermissionMode::Default));
+    }
+
+    #[test]
+    fn test_permission_config_valid_modes() {
+        assert!(PermissionConfig::is_valid_mode("default"));
+        assert!(PermissionConfig::is_valid_mode("acceptEdits"));
+        assert!(PermissionConfig::is_valid_mode("plan"));
+        assert!(PermissionConfig::is_valid_mode("bypassPermissions"));
+        assert!(!PermissionConfig::is_valid_mode("unknown"));
+        assert!(!PermissionConfig::is_valid_mode(""));
+        assert!(!PermissionConfig::is_valid_mode("Default")); // case-sensitive
+    }
+
+    #[test]
+    fn neutral_mode_names_are_accepted_next_to_the_legacy_strings() {
+        // Decision A43: the API accepts both forms.
+        for (neutral, legacy, expected) in [
+            ("ask", "default", PermissionMode::Default),
+            ("auto_edits", "acceptEdits", PermissionMode::AcceptEdits),
+            ("plan_only", "plan", PermissionMode::Plan),
+            (
+                "trust",
+                "bypassPermissions",
+                PermissionMode::BypassPermissions,
+            ),
+        ] {
+            assert!(PermissionConfig::is_valid_mode(neutral), "{neutral}");
+            let as_neutral = PermissionConfig {
+                mode: neutral.into(),
+                ..Default::default()
+            };
+            let as_legacy = PermissionConfig {
+                mode: legacy.into(),
+                ..Default::default()
+            };
+            assert_eq!(as_neutral.to_nexus_mode(), expected, "{neutral}");
+            assert_eq!(as_legacy.to_nexus_mode(), expected, "{legacy}");
+        }
+        // The other legacy strings Claude Code knows are accepted too, and
+        // never widen the policy beyond what they mean.
+        assert_eq!(
+            PermissionConfig {
+                mode: "dontAsk".into(),
+                ..Default::default()
+            }
+            .to_nexus_mode(),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            PermissionConfig {
+                mode: "auto".into(),
+                ..Default::default()
+            }
+            .to_nexus_mode(),
+            PermissionMode::AcceptEdits
+        );
+    }
+
+    #[test]
+    fn test_permission_config_serde_roundtrip() {
+        let config = PermissionConfig {
+            mode: "acceptEdits".into(),
+            allowed_tools: vec!["Bash(git *)".into(), "Read".into()],
+            disallowed_tools: vec!["Bash(rm -rf *)".into()],
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: PermissionConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.mode, "acceptEdits");
+        assert_eq!(deserialized.allowed_tools, vec!["Bash(git *)", "Read"]);
+        assert_eq!(deserialized.disallowed_tools, vec!["Bash(rm -rf *)"]);
+    }
+
+    #[test]
+    fn test_permission_config_serde_defaults() {
+        // Empty JSON should use defaults — MCP tools pre-approved
+        let config: PermissionConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.mode, "default");
+        assert_eq!(config.allowed_tools, vec!["mcp__project-orchestrator__*"]);
+        assert!(config.disallowed_tools.is_empty());
+
+        // Partial JSON should fill defaults
+        let config: PermissionConfig = serde_json::from_str(r#"{"mode":"default"}"#).unwrap();
+        assert_eq!(config.mode, "default");
+        assert_eq!(config.allowed_tools, vec!["mcp__project-orchestrator__*"]);
+
+        // Explicit empty array should be respected (user intent to disable)
+        let config: PermissionConfig =
+            serde_json::from_str(r#"{"mode":"default","allowed_tools":[]}"#).unwrap();
+        assert_eq!(config.mode, "default");
+        assert!(config.allowed_tools.is_empty());
+    }
+
+    // ====================================================================
+    // RetryConfig
+    // ====================================================================
+
+    #[test]
+    fn test_retry_config_defaults() {
+        let config = RetryConfig::default();
+        assert_eq!(config.max_attempts, 3);
+        assert_eq!(config.initial_delay_ms, 1000);
+        assert!((config.backoff_multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_retry_config_delay_calculation() {
+        let config = RetryConfig {
+            max_attempts: 3,
+            initial_delay_ms: 1000,
+            backoff_multiplier: 2.0,
+        };
+        assert_eq!(config.delay_for_attempt(1), 1000); // 1000 * 2^0
+        assert_eq!(config.delay_for_attempt(2), 2000); // 1000 * 2^1
+        assert_eq!(config.delay_for_attempt(3), 4000); // 1000 * 2^2
+    }
+
+    #[test]
+    fn test_retry_config_from_env() {
+        // Clear any existing vars
+        std::env::remove_var("CHAT_RETRY_MAX_ATTEMPTS");
+        std::env::remove_var("CHAT_RETRY_INITIAL_DELAY_MS");
+        std::env::remove_var("CHAT_RETRY_BACKOFF_MULTIPLIER");
+
+        // Defaults
+        let config = RetryConfig::from_env();
+        assert_eq!(config.max_attempts, 3);
+        assert_eq!(config.initial_delay_ms, 1000);
+
+        // Custom values
+        std::env::set_var("CHAT_RETRY_MAX_ATTEMPTS", "5");
+        std::env::set_var("CHAT_RETRY_INITIAL_DELAY_MS", "500");
+        std::env::set_var("CHAT_RETRY_BACKOFF_MULTIPLIER", "1.5");
+        let config = RetryConfig::from_env();
+        assert_eq!(config.max_attempts, 5);
+        assert_eq!(config.initial_delay_ms, 500);
+        assert!((config.backoff_multiplier - 1.5).abs() < f64::EPSILON);
+
+        // Cleanup
+        std::env::remove_var("CHAT_RETRY_MAX_ATTEMPTS");
+        std::env::remove_var("CHAT_RETRY_INITIAL_DELAY_MS");
+        std::env::remove_var("CHAT_RETRY_BACKOFF_MULTIPLIER");
+    }
+}

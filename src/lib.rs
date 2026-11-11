@@ -1,0 +1,3839 @@
+#![recursion_limit = "256"]
+// Allow sort_by with reverse ordering — sort_by_key(Reverse(..)) is less readable for complex keys
+#![allow(clippy::unnecessary_sort_by)]
+//! Project Orchestrator
+//!
+//! An AI agent orchestrator with:
+//! - Neo4j knowledge graph for code structure and relationships
+//! - Meilisearch for fast semantic search
+//! - Tree-sitter for precise code parsing
+//! - Plan management for coordinated multi-agent development
+//! - MCP server for Claude Code integration
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+pub mod analytics;
+pub mod api;
+pub mod architecture;
+pub mod auth;
+pub mod boot;
+pub mod chat;
+pub mod documents;
+pub mod embeddings;
+pub mod episodes;
+pub mod evaluation;
+pub mod events;
+pub mod feedback;
+pub mod graph;
+pub mod heartbeat;
+pub mod homeostasis;
+pub mod identity;
+pub mod ingress;
+pub mod lifecycle;
+pub mod logging;
+pub mod mcp;
+pub mod mcp_federation;
+pub mod meilisearch;
+pub mod neo4j;
+pub mod neurons;
+pub mod notes;
+pub mod orchestrator;
+pub mod parser;
+pub mod pipeline;
+pub mod plan;
+pub mod profile;
+pub mod protocol;
+pub mod reasoning;
+pub mod reception;
+pub mod reflex;
+pub mod refs;
+pub mod resolver;
+/// The tokio runtime the server runs on, shared by every binary that starts it: the
+/// `orchestrator` CLI (`src/main.rs`) and the desktop app (`desktop/src-tauri`).
+pub mod runtime {
+
+    /// Stack size of every runtime thread (workers and `spawn_blocking`), in bytes.
+    ///
+    /// The default is 2 MiB, and the chat turn does not fit in it: `stream_response`
+    /// is one very large `async fn`, polled through the enrichment pipeline, the
+    /// status stage, a Neo4j query, `neo4rs`, `deadpool` and the Bolt encoder, each
+    /// layer's future living on the worker's stack while it is polled. On
+    /// 2026-10-03 that chain overflowed a worker at the leaf (`BytesMut::reserve`),
+    /// the process aborted with SIGABRT, and every live Claude CLI died with it
+    /// ("The CLI subprocess for this session has exited"). Claude Code on the agent
+    /// engine (the default since M2) nests deeper still. Stack pages are mapped
+    /// lazily, so a larger size costs address space, not memory.
+    pub const RUNTIME_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+    // Checked when the crate compiles, not when tests run: a size that is not a whole
+    // number of 16 KiB pages (Apple silicon) or that falls under 8 MiB is a build error.
+    const _: () = assert!(
+        RUNTIME_STACK_BYTES.is_multiple_of(16 * 1024) && RUNTIME_STACK_BYTES >= 8 * 1024 * 1024
+    );
+
+    /// The multi-thread runtime of the server: `#[tokio::main]` with the stack above.
+    pub fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(RUNTIME_STACK_BYTES)
+            .build()
+    }
+
+    /// A thread with the same stack as the runtime's workers, for a caller that drives the
+    /// server from a thread of its own (the desktop app): `block_on` polls the server's
+    /// future on THAT thread's stack, not a worker's.
+    pub fn spawn_with_runtime_stack<F>(
+        name: &str,
+        f: F,
+    ) -> std::io::Result<std::thread::JoinHandle<()>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(RUNTIME_STACK_BYTES)
+            .spawn(f)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[allow(unused_imports)]
+        use crate::neo4j::traits::*;
+
+        /// Touches `bytes` of stack. Not inlined, and `black_box` keeps the array.
+        #[inline(never)]
+        fn burn_stack<const N: usize>() -> usize {
+            let buf = [7u8; N];
+            std::hint::black_box(&buf)
+                .iter()
+                .step_by(4096)
+                .map(|b| *b as usize)
+                .sum()
+        }
+
+        #[test]
+        fn a_worker_has_room_for_a_stack_far_beyond_the_two_mib_default() {
+            // 8 MiB of live stack: more than 4 times the default, below our size.
+            // On a 2 MiB worker this aborts the whole test process, as it did the server.
+            let rt = build_runtime().expect("runtime");
+            let touched = rt
+                .block_on(async {
+                    tokio::spawn(async { burn_stack::<{ 8 * 1024 * 1024 }>() }).await
+                })
+                .expect("task");
+            assert!(touched > 0);
+        }
+
+        /// The desktop app polls the server's future on its own thread (`block_on`): that
+        /// thread has the workers' stack too, not the 2 MiB of a bare `thread::spawn`.
+        #[test]
+        fn the_server_thread_has_the_runtime_stack_too() {
+            let handle = spawn_with_runtime_stack("server-stack-test", || {
+                let rt = build_runtime().expect("runtime");
+                let touched = rt.block_on(async { burn_stack::<{ 8 * 1024 * 1024 }>() });
+                assert!(touched > 0);
+            })
+            .expect("thread");
+            handle.join().expect("no overflow");
+        }
+    }
+}
+pub mod runner;
+pub mod setup_claude;
+pub mod sharing;
+pub mod skills;
+pub mod storage;
+pub mod transport;
+pub mod update;
+pub(crate) mod utils;
+pub mod vault;
+pub mod yaml;
+
+#[cfg(test)]
+pub(crate) mod test_helpers;
+
+use anyhow::Result;
+use serde::Deserialize;
+use std::path::Path;
+use std::sync::Arc;
+
+/// Expand tilde (~) in paths to the user's home directory.
+/// Shell expansion doesn't happen when paths are passed programmatically.
+pub(crate) fn expand_tilde(path: &str) -> String {
+    if path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}{}", home.display(), &path[1..]);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home.display().to_string();
+        }
+    }
+    path.to_string()
+}
+
+// ============================================================================
+// YAML config structs (deserialization targets)
+// ============================================================================
+
+/// Top-level YAML configuration file structure
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct YamlConfig {
+    /// When false, the app is not yet configured — the frontend shows the setup wizard.
+    /// Defaults to true for backward compat (existing config.yaml files without this field).
+    #[serde(default = "default_true")]
+    pub setup_completed: bool,
+    /// Infrastructure mode: "docker" or "external". Persisted by the setup wizard
+    /// so reconfigure mode can restore the exact wizard state.
+    #[serde(default)]
+    pub infra_mode: Option<String>,
+    pub server: ServerYamlConfig,
+    pub neo4j: Neo4jYamlConfig,
+    pub meilisearch: MeilisearchYamlConfig,
+    pub nats: NatsYamlConfig,
+    pub chat: ChatYamlConfig,
+    pub embeddings: EmbeddingsYamlConfig,
+    /// Auth section — if absent, auth_config will be None (anonymous/open access)
+    pub auth: Option<AuthConfig>,
+    /// Skill registry section (optional — enables cross-instance skill sharing)
+    #[serde(default)]
+    pub registry: RegistryYamlConfig,
+    /// Anthropic API section (optional — enables live model catalog discovery)
+    #[serde(default)]
+    pub anthropic: AnthropicYamlConfig,
+    /// Runner section (optional — configures autonomous plan execution)
+    #[serde(default)]
+    pub runner: runner::RunnerConfig,
+    /// Neural routing section (optional — trajectory-based route learning)
+    #[serde(default)]
+    pub neural_routing: neural_routing_runtime::NeuralRoutingConfig,
+    /// MCP Federation section (optional — connect to external MCP servers)
+    #[serde(default)]
+    pub mcp_federation: McpFederationConfig,
+    /// Remote MCP section (optional — exposes the /mcp Streamable HTTP transport
+    /// + OAuth 2.1 AS). Disabled by default: absent section ⇒ remote MCP off.
+    #[serde(default)]
+    pub remote_mcp: RemoteMcpConfig,
+    /// External events ingestion section (optional — the public route
+    /// `POST /hooks/events/{source}/{trigger_id}`). Off by default.
+    #[serde(default)]
+    pub ingress: ingress::IngressConfig,
+    /// Document storage section (optional — where uploaded blobs live)
+    #[serde(default)]
+    pub documents: DocumentsYamlConfig,
+    /// Storage backend selection (optional — which adapter builds the stores).
+    #[serde(default)]
+    pub storage: StorageYamlConfig,
+    /// Log file section (optional — persistent, rotated, secret-masked traces).
+    #[serde(default)]
+    pub log: logging::LogYamlConfig,
+}
+
+/// Document storage configuration section.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct DocumentsYamlConfig {
+    /// Root directory for content-addressed document blobs.
+    /// Default: `documents::store::default_storage_dir()`, i.e. a `documents/`
+    /// subdirectory of the same per-platform application directory that already
+    /// holds `config.yaml` and `identity.key`.
+    pub storage_dir: Option<String>,
+}
+
+/// Storage backend selection.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct StorageYamlConfig {
+    /// Which storage backend builds the stores. Absent ⇒
+    /// [`crate::storage::DEFAULT_BACKEND`].
+    pub backend: Option<String>,
+}
+
+/// MCP Federation configuration section.
+///
+/// Configures PO's ability to connect to external MCP servers as a client,
+/// making their tools available alongside PO's own tools.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct McpFederationConfig {
+    /// Pre-configured servers to connect to on startup.
+    #[serde(default)]
+    pub servers: Vec<ServerPresetConfig>,
+    /// Whether to probe read-only tools on connect (default: true).
+    #[serde(default = "default_true")]
+    pub probe_on_connect: bool,
+    /// Health check interval in seconds (0 = disabled, default: 60).
+    #[serde(default = "default_health_check_interval")]
+    pub health_check_interval_secs: u64,
+    /// Maximum reconnection attempts for failed servers (default: 3).
+    #[serde(default = "default_reconnect_retries")]
+    pub reconnect_max_retries: u32,
+}
+
+/// Remote MCP (Streamable HTTP) configuration section.
+///
+/// Gates the `/mcp` Streamable HTTP transport and the OAuth 2.1 Authorization
+/// Server / discovery routes. **Disabled by default** — those routes are only
+/// mounted when `enabled = true`, so a `config.yaml` without this section (the
+/// common case for existing installs) never exposes remote MCP. Opt-in is the
+/// consent gate for public exposure.
+///
+/// The public issuer/domain is NOT configured here — it reuses `server.public_url`
+/// (single source of truth for the OAuth issuer, `.well-known` metadata and the
+/// resource URL). No remote-MCP-specific secret is stored: Dynamic Client
+/// Registration client_ids and MCP access tokens are stateless JWTs signed with
+/// the existing `auth.jwt_secret`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RemoteMcpConfig {
+    /// Master switch. When false, `/mcp`, `/oauth/*` and the OAuth discovery
+    /// metadata routes are NOT mounted. Default: false (opt-in).
+    pub enabled: bool,
+    /// Advertised bind interface for the transport. The `/mcp` route shares the
+    /// main Axum listener, so this is the loopback/tailnet interface the operator
+    /// intends to expose behind a TLS proxy. Default `127.0.0.1`; never `0.0.0.0`
+    /// by default. Validated as an IP address at startup when enabled.
+    pub bind_addr: String,
+    /// Idle session TTL (seconds) for the `Mcp-Session-Id` registry. Default 3600.
+    /// Consumed by the multi-session management task.
+    pub session_ttl_secs: u64,
+    /// Per-token rate limit. Default 120 requests / 60s. Consumed by the
+    /// rate-limiting task.
+    pub rate_limit: RemoteMcpRateLimit,
+    /// Extra browser origins allowed to call `/mcp` (union'd with the server's
+    /// standard origins in `allowed_origins()`). Auto-seeded by the desktop
+    /// wizard with the Claude connector origins (`https://claude.ai`,
+    /// `https://claude.com`). Non-browser clients (CLI, Anthropic server-side
+    /// fetchers) send no `Origin` and are gated by the bearer token instead.
+    pub origin_allowlist: Vec<String>,
+}
+
+impl Default for RemoteMcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "127.0.0.1".into(),
+            session_ttl_secs: 3600,
+            rate_limit: RemoteMcpRateLimit::default(),
+            origin_allowlist: Vec::new(),
+        }
+    }
+}
+
+impl RemoteMcpConfig {
+    /// Fail-fast validation, called at startup. A no-op when disabled (an
+    /// unconfigured remote MCP block must never block boot). When enabled,
+    /// rejects nonsensical values with a clear message so a misconfigured
+    /// exposure surfaces immediately instead of at first request.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.bind_addr.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!(
+                "remote_mcp.bind_addr '{}' is not a valid IP address",
+                self.bind_addr
+            ));
+        }
+        if self.session_ttl_secs == 0 {
+            return Err("remote_mcp.session_ttl_secs must be > 0".into());
+        }
+        if self.rate_limit.window_secs == 0 || self.rate_limit.max_requests == 0 {
+            return Err(
+                "remote_mcp.rate_limit.window_secs and max_requests must both be > 0".into(),
+            );
+        }
+        for o in &self.origin_allowlist {
+            if !(o.starts_with("http://") || o.starts_with("https://")) {
+                return Err(format!(
+                    "remote_mcp.origin_allowlist entry '{o}' must be an http(s) origin"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-token rate limit for the remote MCP transport.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RemoteMcpRateLimit {
+    /// Sliding window length in seconds. Default 60.
+    pub window_secs: u64,
+    /// Max requests per token within the window. Default 120.
+    pub max_requests: u32,
+}
+
+impl Default for RemoteMcpRateLimit {
+    fn default() -> Self {
+        Self {
+            window_secs: 60,
+            max_requests: 120,
+        }
+    }
+}
+
+/// A pre-configured MCP server to connect to on startup.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerPresetConfig {
+    /// Unique server identifier (e.g., "grafeo", "github").
+    pub id: String,
+    /// Human-readable display name (optional, defaults to id).
+    pub display_name: Option<String>,
+    /// Transport configuration.
+    pub transport: mcp_federation::McpTransport,
+}
+
+fn default_health_check_interval() -> u64 {
+    60
+}
+
+fn default_reconnect_retries() -> u32 {
+    3
+}
+
+/// Skill registry configuration section (optional)
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct RegistryYamlConfig {
+    /// URL of a remote PO instance to use as a skill registry
+    /// (e.g. "https://po-central.example.com")
+    pub remote_url: Option<String>,
+}
+
+/// Anthropic API configuration section (optional).
+///
+/// When an API key is present, the backend queries Anthropic's Models API
+/// (`GET /v1/models`) to keep the chat model selector's catalog up to date
+/// automatically, instead of requiring a manual code change + release every
+/// time a model is added or renamed. See `chat::model_catalog`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct AnthropicYamlConfig {
+    /// Anthropic API key, used only for `GET /v1/models` (live model
+    /// discovery) — never for chat itself, which goes through the Claude
+    /// Code CLI subprocess and its own auth.
+    pub api_key: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Server configuration section
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ServerYamlConfig {
+    pub port: u16,
+    pub workspace_path: String,
+    /// Whether the backend should serve the frontend static files (default: true)
+    pub serve_frontend: bool,
+    /// Path to the frontend dist/ directory (default: "./dist")
+    pub frontend_path: String,
+    /// Public URL for reverse-proxy setups (e.g. https://po.ffs.dev).
+    /// Used for frontend_url, redirect_uri, and CORS when present.
+    #[serde(default)]
+    pub public_url: Option<String>,
+}
+
+impl Default for ServerYamlConfig {
+    fn default() -> Self {
+        Self {
+            port: 8080,
+            workspace_path: ".".into(),
+            serve_frontend: true,
+            frontend_path: "./dist".into(),
+            public_url: None,
+        }
+    }
+}
+
+/// Neo4j configuration section
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Neo4jYamlConfig {
+    pub uri: String,
+    pub user: String,
+    pub password: String,
+}
+
+impl Default for Neo4jYamlConfig {
+    fn default() -> Self {
+        Self {
+            uri: "bolt://localhost:7687".into(),
+            user: "neo4j".into(),
+            password: "orchestrator123".into(),
+        }
+    }
+}
+
+/// Meilisearch configuration section
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MeilisearchYamlConfig {
+    pub url: String,
+    pub key: String,
+}
+
+impl Default for MeilisearchYamlConfig {
+    fn default() -> Self {
+        Self {
+            url: "http://localhost:7700".into(),
+            key: "orchestrator-meili-key-change-me".into(),
+        }
+    }
+}
+
+/// NATS configuration section (optional — enables inter-process event sync)
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct NatsYamlConfig {
+    /// NATS server URL (e.g. "nats://localhost:4222")
+    pub url: Option<String>,
+}
+
+/// Chat configuration section (YAML only — ChatConfig in chat/config.rs handles full setup)
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ChatYamlConfig {
+    /// Provider chosen in the setup wizard (`claude-code`, `none`, ...). `none`
+    /// means the install has no chat provider: no default model, no CLI path.
+    pub provider: Option<String>,
+    pub default_model: Option<String>,
+    pub max_sessions: Option<usize>,
+    pub session_timeout_secs: Option<u64>,
+    pub max_turns: Option<i32>,
+    /// Permission configuration (mode + allowed/disallowed tool patterns).
+    /// When absent, falls back to env vars or defaults (BypassPermissions).
+    #[serde(default)]
+    pub permissions: Option<chat::config::PermissionConfig>,
+    /// PATH to inject into the Claude Code subprocess (overrides inherited PATH).
+    /// Colon-separated on Unix. Example: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    pub process_path: Option<String>,
+    /// Absolute path to the Claude CLI binary. Skips find_claude_cli() search.
+    /// Example: "/opt/homebrew/bin/claude"
+    pub claude_cli_path: Option<String>,
+    /// Enable automatic CLI version updates on startup (default: false).
+    pub auto_update_cli: Option<bool>,
+    /// Enable automatic Tauri application updates on startup (default: true).
+    pub auto_update_app: Option<bool>,
+    /// Wall-clock cap of a native turn, in seconds (`CHAT_NATIVE_TURN_TIMEOUT_SECS` wins).
+    /// Unset by default: no cap, as in Claude Code.
+    pub native_turn_timeout_secs: Option<u64>,
+    /// Token budget of a native session, cache reads not counted
+    /// (`CHAT_NATIVE_SESSION_MAX_TOKENS` wins). Unset by default: no budget, as in Claude Code.
+    pub native_session_max_tokens: Option<u64>,
+    /// Obscura's executable (`dsh-obscura-nav`), for the keyless `obscura` search engine of
+    /// native sessions, absolute (a relative path is ignored with a warning). `OBSCURA_BIN` wins.
+    /// Default: the engine embedded in nexus-tools, else `dsh-obscura-nav` found on the `PATH`.
+    pub obscura_path: Option<String>,
+    /// Also attach that executable as the native sessions' browser (`<path> mcp`, the
+    /// `browser_*` tools), still only for a project that authorised the browser. Default false.
+    pub obscura_browser: Option<bool>,
+}
+
+/// A boolean flag of the environment, read case-insensitively and trimmed: `true`/`1`/`yes`/`on`
+/// or `false`/`0`/`no`/`off`. Anything else is `None`, so it never overrides the YAML: a `TRUE`
+/// or a typo used to read as `false` and silently replace a `true` from config.yaml.
+pub(crate) fn parse_env_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// A flag whose environment variable wins over the YAML only when it parses
+/// ([`parse_env_flag`]): an unknown value falls back to the YAML.
+pub(crate) fn env_flag_over(env: Option<&str>, yaml: Option<bool>) -> Option<bool> {
+    env.and_then(parse_env_flag).or(yaml)
+}
+
+/// The startup warning for a configured Obscura executable (`OBSCURA_BIN` / `chat.obscura_path`)
+/// that is not absolute: such a path is ignored (the server runs executables by absolute path
+/// only, a relative one would name a file of a session's project), and without this trace the
+/// only symptom was a `tool_engine_not_installed` at the first search.
+pub(crate) fn relative_obscura_path_warning(path: &str) -> Option<String> {
+    let path = path.trim();
+    (!path.is_empty() && !std::path::Path::new(path).is_absolute()).then(|| {
+        format!(
+            "OBSCURA_BIN / chat.obscura_path is relative ({path}) and is ignored: give an \
+             absolute path (the Obscura engine embedded in nexus-tools, else dsh-obscura-nav on \
+             the PATH, is used instead)"
+        )
+    })
+}
+
+/// Obscura's place in the chat configuration: `path` (from `OBSCURA_BIN` or
+/// `chat.obscura_path`, absolute only — a relative one is ignored with a warning) is the
+/// executable of the `obscura` search engine. Without it, the engine embedded in nexus-tools
+/// is the default and `dsh-obscura-nav` on the `PATH` the fallback, resolved at each session
+/// opening. With `browser` true the configured executable — else `on_path`, the `PATH`
+/// lookup — is also the browser (`<path> mcp`) when no `obscura` was found. The browser is
+/// still attached only to a project that authorised it (`PUT .../network-tools/browser`).
+pub(crate) fn apply_obscura(
+    chat_config: &mut chat::ChatConfig,
+    path: Option<&str>,
+    browser: Option<bool>,
+    on_path: impl FnOnce() -> Option<std::path::PathBuf>,
+) {
+    if let Some(path) = path.filter(|p| !p.trim().is_empty()) {
+        match relative_obscura_path_warning(path) {
+            Some(warning) => tracing::warn!("{warning}"),
+            None => chat_config.obscura_path = Some(std::path::PathBuf::from(path.trim())),
+        }
+    }
+    if browser == Some(true) && chat_config.nexus_browser_path.is_none() {
+        chat_config.nexus_browser_path = chat_config.obscura_path.clone().or_else(on_path);
+    }
+}
+
+/// Embedding provider configuration section.
+///
+/// Controls how vector embeddings are generated for knowledge notes,
+/// enabling semantic search and automatic synapse creation.
+///
+/// Three provider modes:
+/// - `local` (default): In-process ONNX inference via fastembed-rs (zero external dependency)
+/// - `http`: Any OpenAI-compatible `/v1/embeddings` API (Ollama, OpenAI, LiteLLM, vLLM…)
+/// - `disabled`: No embeddings (semantic search unavailable)
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct EmbeddingsYamlConfig {
+    /// Provider type: "local", "http", or "disabled" (default: "local")
+    pub provider: Option<String>,
+    /// Model name for local fastembed provider (default: "multilingual-e5-base").
+    /// See `fastembed.rs` for the full list of supported model identifiers.
+    pub fastembed_model: Option<String>,
+    /// Cache directory for ONNX model files (default: ".fastembed_cache")
+    pub fastembed_cache_dir: Option<String>,
+    /// Number of texts per ONNX inference batch for the local provider (default: 8).
+    /// Bounds the peak attention-score memory; see `fastembed::DEFAULT_BATCH_SIZE`.
+    pub batch_size: Option<usize>,
+    /// URL for HTTP embedding provider (default: "http://localhost:11434/v1/embeddings")
+    pub url: Option<String>,
+    /// Model name for HTTP provider (default: "nomic-embed-text")
+    pub model: Option<String>,
+    /// API key for authenticated HTTP endpoints (e.g., OpenAI, Voyage)
+    pub api_key: Option<String>,
+    /// Expected embedding dimensions for HTTP provider (default: 768).
+    /// Must match the model output dimensions.
+    pub dimensions: Option<usize>,
+}
+
+/// Authentication configuration — flexible multi-provider auth.
+///
+/// Supports three modes depending on which sub-sections are present:
+/// - **No-auth**: No `auth` section in YAML → `auth_config = None` → open access
+/// - **Password**: `root_account` present → email/password login (root from config, others from Neo4j)
+/// - **OIDC**: `oidc` present → generic OpenID Connect (Google, Microsoft, Okta, Keycloak…)
+///
+/// Both `root_account` and `oidc` can coexist for maximum flexibility.
+///
+/// ### Backward compatibility
+/// The legacy Google OAuth fields (`google_client_id`, `google_client_secret`,
+/// `google_redirect_uri`) are still accepted. When present, they are automatically
+/// mapped to an equivalent `OidcConfig` via [`AuthConfig::effective_oidc()`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthConfig {
+    // ── Common fields ──────────────────────────────────────────────────
+    /// JWT signing secret (HS256, minimum 32 characters)
+    pub jwt_secret: String,
+    /// JWT access token lifetime in seconds (default: 900 = 15min).
+    /// Short-lived: renewed via the refresh token cookie.
+    #[serde(default = "default_access_token_expiry", alias = "jwt_expiry_secs")]
+    pub access_token_expiry_secs: u64,
+    /// Refresh token lifetime in seconds (default: 604800 = 7 days).
+    /// Stored as an HttpOnly cookie; hashed in the database.
+    #[serde(default = "default_refresh_token_expiry")]
+    pub refresh_token_expiry_secs: u64,
+    /// Optional domain restriction (e.g. "ffs.holdings")
+    pub allowed_email_domain: Option<String>,
+    /// Optional list of individually whitelisted emails (e.g. ["alice@gmail.com", "bob@ext.com"]).
+    /// An email is allowed if it matches `allowed_email_domain` OR is in `allowed_emails`.
+    #[serde(default)]
+    pub allowed_emails: Option<Vec<String>>,
+    /// Frontend URL for CORS and redirects (e.g. "http://localhost:3000")
+    pub frontend_url: Option<String>,
+    /// Additional allowed origins for CORS and OAuth redirect_uri validation.
+    /// Useful when the frontend dev server runs on a different port than the backend
+    /// (e.g. Vite on port 3000 while backend is on 8080).
+    #[serde(default)]
+    pub additional_origins: Vec<String>,
+    /// Allow new user registration via POST /auth/register (default: false)
+    #[serde(default)]
+    pub allow_registration: bool,
+
+    // ── Password auth (root account from config) ───────────────────────
+    /// Root account defined in config.yaml — always available, no DB needed.
+    pub root_account: Option<RootAccountConfig>,
+
+    // ── OIDC auth (generic OpenID Connect) ─────────────────────────────
+    /// Generic OIDC provider configuration.
+    pub oidc: Option<OidcConfig>,
+
+    // ── Legacy Google OAuth fields (backward compat) ───────────────────
+    /// Deprecated: use `oidc.client_id` instead.
+    #[serde(default)]
+    pub google_client_id: Option<String>,
+    /// Deprecated: use `oidc.client_secret` instead.
+    #[serde(default)]
+    pub google_client_secret: Option<String>,
+    /// Deprecated: use `oidc.redirect_uri` instead.
+    #[serde(default)]
+    pub google_redirect_uri: Option<String>,
+}
+
+/// Root account configuration — defined in config.yaml, verified in-memory.
+///
+/// The `password_hash` field can contain either:
+/// - A bcrypt hash (starts with `$2b$` or `$2a$`) → used as-is
+/// - A plaintext password → hashed with bcrypt at startup (with a warning log)
+#[derive(Debug, Clone, Deserialize)]
+pub struct RootAccountConfig {
+    /// Root account email (used as login identifier)
+    pub email: String,
+    /// Root account display name
+    pub name: String,
+    /// Bcrypt hash or plaintext password (hashed at startup if plaintext)
+    pub password_hash: String,
+}
+
+/// OIDC provider configuration — generic OpenID Connect.
+///
+/// Works with any OIDC-compliant provider: Google, Microsoft, Okta, Keycloak, etc.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OidcConfig {
+    /// Provider key for the frontend wizard (google, microsoft, okta, auth0, keycloak, custom).
+    /// Persisted so reconfigure mode can restore the exact provider selection.
+    pub provider_key: Option<String>,
+    /// OIDC discovery URL (e.g. "https://accounts.google.com/.well-known/openid-configuration").
+    /// If provided, `auth_endpoint` and `token_endpoint` are fetched automatically.
+    pub discovery_url: Option<String>,
+    /// Authorization endpoint (required if no discovery_url)
+    pub auth_endpoint: Option<String>,
+    /// Token endpoint (required if no discovery_url)
+    pub token_endpoint: Option<String>,
+    /// Userinfo endpoint (optional, fetched from discovery if available)
+    pub userinfo_endpoint: Option<String>,
+    /// OAuth2 client ID
+    pub client_id: String,
+    /// OAuth2 client secret
+    pub client_secret: String,
+    /// Redirect URI after auth (e.g. "http://localhost:3000/auth/callback")
+    pub redirect_uri: String,
+    /// Human-readable provider name shown in the UI (e.g. "Google", "Okta")
+    #[serde(default = "default_provider_name")]
+    pub provider_name: String,
+    /// OAuth2 scopes (default: "openid email profile")
+    #[serde(default = "default_scopes")]
+    pub scopes: String,
+    /// Extra query parameters appended to the authorization URL.
+    ///
+    /// Allows provider-specific params without hardcoding per provider_key.
+    /// Example: `{"access_type": "offline", "prompt": "consent"}` for Google.
+    /// Google defaults (access_type=offline, prompt=consent) are auto-injected
+    /// when provider_key is "google" unless explicitly overridden here.
+    #[serde(default)]
+    pub extra_auth_params: std::collections::HashMap<String, String>,
+}
+
+fn default_access_token_expiry() -> u64 {
+    900 // 15 minutes
+}
+
+fn default_refresh_token_expiry() -> u64 {
+    604800 // 7 days
+}
+
+fn default_provider_name() -> String {
+    "SSO".to_string()
+}
+
+fn default_scopes() -> String {
+    "openid email profile".to_string()
+}
+
+// Google OIDC well-known endpoints (used for legacy config mapping)
+const GOOGLE_AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_USERINFO_ENDPOINT: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
+
+impl AuthConfig {
+    /// Returns the effective OIDC config, preferring the explicit `oidc` section
+    /// and falling back to legacy `google_*` fields for backward compatibility.
+    pub fn effective_oidc(&self) -> Option<OidcConfig> {
+        // Prefer explicit oidc section
+        if self.oidc.is_some() {
+            return self.oidc.clone();
+        }
+
+        // Fall back to legacy Google fields
+        match (
+            &self.google_client_id,
+            &self.google_client_secret,
+            &self.google_redirect_uri,
+        ) {
+            (Some(client_id), Some(client_secret), Some(redirect_uri)) if !client_id.is_empty() => {
+                Some(OidcConfig {
+                    provider_key: Some("google".to_string()),
+                    discovery_url: None,
+                    auth_endpoint: Some(GOOGLE_AUTH_ENDPOINT.to_string()),
+                    token_endpoint: Some(GOOGLE_TOKEN_ENDPOINT.to_string()),
+                    userinfo_endpoint: Some(GOOGLE_USERINFO_ENDPOINT.to_string()),
+                    client_id: client_id.clone(),
+                    client_secret: client_secret.clone(),
+                    redirect_uri: redirect_uri.clone(),
+                    provider_name: "Google".to_string(),
+                    scopes: "openid email profile".to_string(),
+                    extra_auth_params: Default::default(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns true if password authentication is available (root account configured).
+    pub fn has_password_auth(&self) -> bool {
+        self.root_account.is_some()
+    }
+
+    /// Returns true if OIDC authentication is available (explicit or legacy Google).
+    pub fn has_oidc(&self) -> bool {
+        self.effective_oidc().is_some()
+    }
+
+    /// Check whether a given email is allowed by the configured restrictions.
+    ///
+    /// An email passes if **any** of these conditions hold:
+    /// 1. No restrictions configured (`allowed_email_domain` is None AND `allowed_emails` is None/empty)
+    /// 2. Email domain matches `allowed_email_domain` (e.g. "alice@ffs.holdings" with domain "ffs.holdings")
+    /// 3. Email is in the `allowed_emails` whitelist (case-insensitive)
+    ///
+    /// Otherwise the email is rejected.
+    pub fn is_email_allowed(&self, email: &str) -> bool {
+        let email_lower = email.to_lowercase();
+        let has_domain_filter = self.allowed_email_domain.is_some();
+        let has_emails_filter = self.allowed_emails.as_ref().is_some_and(|v| !v.is_empty());
+
+        // No restrictions → everyone passes
+        if !has_domain_filter && !has_emails_filter {
+            return true;
+        }
+
+        // Check domain match
+        if let Some(ref domain) = self.allowed_email_domain {
+            if email_lower.ends_with(&format!("@{}", domain.to_lowercase())) {
+                return true;
+            }
+        }
+
+        // Check individual email whitelist
+        if let Some(ref emails) = self.allowed_emails {
+            if emails.iter().any(|e| e.to_lowercase() == email_lower) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Ensure the root account password is bcrypt-hashed.
+    ///
+    /// If the password_hash field doesn't start with "$2b$" (bcrypt prefix),
+    /// it's treated as plaintext and hashed in-place with bcrypt cost 12.
+    /// Logs a warning when plaintext is detected to encourage using pre-hashed values.
+    pub fn ensure_root_password_hashed(&mut self) -> anyhow::Result<()> {
+        if let Some(ref mut root) = self.root_account {
+            if !root.password_hash.starts_with("$2b$") && !root.password_hash.starts_with("$2a$") {
+                tracing::warn!(
+                    "Root account password is stored as plaintext in config.yaml — hashing at startup. \
+                     Consider pre-hashing with: echo -n 'password' | htpasswd -bnBC 12 '' | cut -d: -f2"
+                );
+                root.password_hash = bcrypt::hash(&root.password_hash, 12)
+                    .map_err(|e| anyhow::anyhow!("Failed to hash root password: {}", e))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Runtime config (what the application actually uses)
+// ============================================================================
+
+/// Application configuration
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// When false, the setup wizard should be shown instead of the main app.
+    /// Defaults to true for backward compat.
+    pub setup_completed: bool,
+    pub neo4j_uri: String,
+    pub neo4j_user: String,
+    pub neo4j_password: String,
+    pub meilisearch_url: String,
+    pub meilisearch_key: String,
+    /// NATS server URL (optional — enables inter-process event sync)
+    pub nats_url: Option<String>,
+    pub workspace_path: String,
+    pub server_port: u16,
+    /// Auth config — None means anonymous/open access (no auth section in YAML); a WARN is logged at startup
+    pub auth_config: Option<AuthConfig>,
+    /// Whether to serve the frontend static files (default: true)
+    pub serve_frontend: bool,
+    /// Path to the frontend dist/ directory (default: "./dist")
+    pub frontend_path: String,
+    /// Public URL for reverse-proxy setups (e.g. https://ffs.dev).
+    /// Used for CORS and OAuth origin whitelist.
+    pub public_url: Option<String>,
+    /// Remote MCP transport config (disabled by default). Gates the `/mcp`
+    /// Streamable HTTP + OAuth 2.1 AS routes and carries the exposure settings
+    /// (bind, session TTL, rate limit, origin allowlist).
+    pub remote_mcp: RemoteMcpConfig,
+    /// External events ingestion (off by default): gates the public route
+    /// `POST /hooks/events/{source}/{trigger_id}` and carries its limits.
+    pub ingress: ingress::IngressConfig,
+    /// Chat permission config from YAML (if present).
+    /// Priority: YAML > env vars > defaults.
+    pub chat_permissions: Option<chat::config::PermissionConfig>,
+    /// Chat default model from YAML (if present).
+    /// Priority: YAML > env var (CHAT_DEFAULT_MODEL) > hardcoded default.
+    pub chat_default_model: Option<String>,
+    /// Chat max sessions from YAML (if present).
+    pub chat_max_sessions: Option<usize>,
+    /// Chat max turns from YAML (if present).
+    pub chat_max_turns: Option<i32>,
+    /// Chat session timeout from YAML (if present).
+    pub chat_session_timeout_secs: Option<u64>,
+    /// PATH to inject into the Claude Code subprocess.
+    /// Priority: env var (CHAT_PROCESS_PATH) > YAML (chat.process_path) > None (inherit parent).
+    pub chat_process_path: Option<String>,
+    /// Absolute path to the Claude CLI binary.
+    /// Priority: env var (CLAUDE_CLI_PATH) > YAML (chat.claude_cli_path) > None (auto-detect).
+    pub chat_claude_cli_path: Option<String>,
+    /// Enable automatic CLI version updates on startup.
+    /// Priority: env var (CHAT_AUTO_UPDATE_CLI) > YAML (chat.auto_update_cli) > None (false).
+    pub chat_auto_update_cli: Option<bool>,
+    /// Enable automatic Tauri application updates on startup.
+    /// Priority: env var (CHAT_AUTO_UPDATE_APP) > YAML (chat.auto_update_app) > None (true).
+    pub chat_auto_update_app: Option<bool>,
+    /// Wall-clock cap of a native turn, in seconds.
+    /// Priority: env var (CHAT_NATIVE_TURN_TIMEOUT_SECS) > YAML (chat.native_turn_timeout_secs) > None (no cap).
+    pub chat_native_turn_timeout_secs: Option<u64>,
+    /// Token budget of a native session (cache reads not counted).
+    /// Priority: env var (CHAT_NATIVE_SESSION_MAX_TOKENS) > YAML (chat.native_session_max_tokens) > None (no budget).
+    pub chat_native_session_max_tokens: Option<u64>,
+    /// Obscura's executable. Priority: env var (OBSCURA_BIN) > YAML (chat.obscura_path), absolute
+    /// only; unset, the engine embedded in nexus-tools, else `dsh-obscura-nav` on the PATH.
+    pub chat_obscura_path: Option<String>,
+    /// Obscura as the browser (N23). Priority: env var (OBSCURA_BROWSER, case-insensitive
+    /// true/1/yes/on or false/0/no/off; any other value is ignored) > YAML (chat.obscura_browser) > false.
+    pub chat_obscura_browser: Option<bool>,
+
+    // ── Embedding provider config ────────────────────────────────────────
+    /// Embedding provider type: "local", "http", or "disabled".
+    /// Priority: env var (EMBEDDING_PROVIDER) > YAML (embeddings.provider) > "local".
+    pub embedding_provider: Option<String>,
+    /// Local fastembed model name (e.g. "multilingual-e5-base").
+    /// Priority: env var (FASTEMBED_MODEL) > YAML (embeddings.fastembed_model) > None.
+    pub embedding_fastembed_model: Option<String>,
+    /// Local fastembed ONNX model cache directory.
+    /// Priority: env var (FASTEMBED_CACHE_DIR) > YAML (embeddings.fastembed_cache_dir) > None.
+    pub embedding_fastembed_cache_dir: Option<String>,
+    /// Local fastembed batch size (texts per ONNX inference call).
+    /// Priority: env var (EMBEDDING_BATCH_SIZE) > YAML (embeddings.batch_size) > 8.
+    pub embedding_fastembed_batch_size: Option<usize>,
+    /// HTTP embedding API URL (e.g. "http://localhost:11434/v1/embeddings").
+    /// Priority: env var (EMBEDDING_URL) > YAML (embeddings.url) > None.
+    pub embedding_url: Option<String>,
+    /// HTTP embedding model name (e.g. "nomic-embed-text").
+    /// Priority: env var (EMBEDDING_MODEL) > YAML (embeddings.model) > None.
+    pub embedding_model: Option<String>,
+    /// HTTP embedding API key (for OpenAI, Voyage, etc.).
+    /// Priority: env var (EMBEDDING_API_KEY) > YAML (embeddings.api_key) > None.
+    pub embedding_api_key: Option<String>,
+    /// HTTP embedding dimensions (must match model output).
+    /// Priority: env var (EMBEDDING_DIMENSIONS) > YAML (embeddings.dimensions) > None.
+    pub embedding_dimensions: Option<usize>,
+
+    // ── Anthropic API config ─────────────────────────────────────────────
+    /// Anthropic API key, used only for live model catalog discovery
+    /// (`GET /v1/models`) — chat itself goes through the Claude Code CLI.
+    /// Priority: env var (ANTHROPIC_API_KEY) > YAML (anthropic.api_key) > None.
+    /// When absent, the model selector falls back to a small static list.
+    pub anthropic_api_key: Option<String>,
+
+    // ── Skill Registry config ────────────────────────────────────────────
+    /// URL of a remote PO instance to use as a skill registry.
+    /// When set, registry search merges local + remote results.
+    /// Priority: env var (REGISTRY_REMOTE_URL) > YAML (registry.remote_url) > None.
+    pub registry_remote_url: Option<String>,
+
+    // ── Neural Routing config ─────────────────────────────────────────
+    /// Neural routing configuration (trajectory-based route learning).
+    /// Runtime-controlled — always compiled, enabled/disabled via settings.
+    pub neural_routing: neural_routing_runtime::NeuralRoutingConfig,
+
+    // ── Document storage config ──────────────────────────────────────────
+    /// Root directory for content-addressed document blobs.
+    /// Priority: env var (DOCUMENTS_STORAGE_DIR) > YAML (documents.storage_dir) >
+    /// None, in which case `documents::store::default_storage_dir()` applies.
+    /// Stored unexpanded; `DocumentStore::from_config` applies `expand_tilde`.
+    pub documents_storage_dir: Option<String>,
+
+    /// Storage backend selection: which adapter builds the stores.
+    /// Priority: env var (STORAGE_BACKEND) > YAML (storage.backend) > default.
+    pub storage_backend: String,
+
+    /// Persistent log file (dir, level, retention). Priority: env > YAML `log:` > defaults.
+    pub log: logging::LogSettings,
+
+    /// Resolved path to the config.yaml file that was loaded (if any).
+    /// Used for persisting runtime changes back to disk.
+    pub config_yaml_path: Option<std::path::PathBuf>,
+}
+
+impl Config {
+    /// Load configuration from environment variables only (backward compat).
+    /// Equivalent to from_yaml_and_env(None).
+    pub fn from_env() -> Result<Self> {
+        Self::from_yaml_and_env(None)
+    }
+
+    /// Load configuration from an optional YAML file, then override with env vars.
+    ///
+    /// Priority: env var > YAML > default
+    ///
+    /// If `yaml_path` is None, tries "config.yaml" in CWD. If the file doesn't
+    /// exist, falls back to pure env var / defaults (backward compatible).
+    pub fn from_yaml_and_env(yaml_path: Option<&Path>) -> Result<Self> {
+        // 1. Load YAML config (or defaults if file not found)
+        let (yaml, resolved_path) = Self::load_yaml_with_path(yaml_path)?;
+
+        // 2. Build Config with env var overrides
+        Ok(Self {
+            setup_completed: yaml.setup_completed,
+            neo4j_uri: std::env::var("NEO4J_URI").unwrap_or(yaml.neo4j.uri),
+            neo4j_user: std::env::var("NEO4J_USER").unwrap_or(yaml.neo4j.user),
+            neo4j_password: std::env::var("NEO4J_PASSWORD").unwrap_or(yaml.neo4j.password),
+            meilisearch_url: std::env::var("MEILISEARCH_URL").unwrap_or(yaml.meilisearch.url),
+            meilisearch_key: std::env::var("MEILISEARCH_KEY").unwrap_or(yaml.meilisearch.key),
+            nats_url: std::env::var("NATS_URL").ok().or(yaml.nats.url),
+            workspace_path: std::env::var("WORKSPACE_PATH").unwrap_or(yaml.server.workspace_path),
+            server_port: std::env::var("SERVER_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(yaml.server.port),
+            auth_config: yaml.auth,
+            serve_frontend: std::env::var("SERVE_FRONTEND")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(yaml.server.serve_frontend),
+            frontend_path: std::env::var("FRONTEND_PATH").unwrap_or(yaml.server.frontend_path),
+            public_url: std::env::var("PUBLIC_URL").ok().or(yaml.server.public_url),
+            // Remote MCP: YAML section, with a single env override for the master
+            // switch (REMOTE_MCP_ENABLED=true|1) so ops can toggle exposure without
+            // editing the file. Other fields stay YAML-only.
+            remote_mcp: {
+                let mut rm = yaml.remote_mcp;
+                if let Ok(v) = std::env::var("REMOTE_MCP_ENABLED") {
+                    rm.enabled = v == "true" || v == "1";
+                }
+                rm
+            },
+            // Ingress: YAML section, with one env override for the master switch
+            // (INGRESS_ENABLED=true|1), like remote MCP.
+            ingress: {
+                let mut ing = yaml.ingress;
+                if let Ok(v) = std::env::var("INGRESS_ENABLED") {
+                    ing.enabled = v == "true" || v == "1";
+                }
+                ing
+            },
+            chat_permissions: yaml.chat.permissions,
+            chat_default_model: yaml.chat.default_model,
+            chat_max_sessions: yaml.chat.max_sessions,
+            chat_max_turns: yaml.chat.max_turns,
+            chat_session_timeout_secs: yaml.chat.session_timeout_secs,
+            chat_process_path: std::env::var("CHAT_PROCESS_PATH")
+                .ok()
+                .or(yaml.chat.process_path),
+            chat_claude_cli_path: std::env::var("CLAUDE_CLI_PATH")
+                .ok()
+                .or(yaml.chat.claude_cli_path),
+            chat_auto_update_cli: std::env::var("CHAT_AUTO_UPDATE_CLI")
+                .ok()
+                .map(|v| v == "true" || v == "1")
+                .or(yaml.chat.auto_update_cli),
+            chat_auto_update_app: std::env::var("CHAT_AUTO_UPDATE_APP")
+                .ok()
+                .map(|v| v == "true" || v == "1")
+                .or(yaml.chat.auto_update_app),
+            chat_native_turn_timeout_secs: chat::config::ChatConfig::positive_from_env(
+                chat::config::NATIVE_TURN_TIMEOUT_VAR,
+            )
+            .or(yaml.chat.native_turn_timeout_secs.filter(|n| *n > 0)),
+            chat_native_session_max_tokens: chat::config::ChatConfig::positive_from_env(
+                chat::config::NATIVE_SESSION_MAX_TOKENS_VAR,
+            )
+            .or(yaml.chat.native_session_max_tokens.filter(|n| *n > 0)),
+            chat_obscura_path: std::env::var("OBSCURA_BIN")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .or(yaml.chat.obscura_path),
+            chat_obscura_browser: env_flag_over(
+                std::env::var("OBSCURA_BROWSER").ok().as_deref(),
+                yaml.chat.obscura_browser,
+            ),
+            // Embedding provider config (env var > YAML > None)
+            embedding_provider: std::env::var("EMBEDDING_PROVIDER")
+                .ok()
+                .or(yaml.embeddings.provider),
+            embedding_fastembed_model: std::env::var("FASTEMBED_MODEL")
+                .ok()
+                .or(yaml.embeddings.fastembed_model),
+            embedding_fastembed_cache_dir: std::env::var("FASTEMBED_CACHE_DIR")
+                .ok()
+                .or(yaml.embeddings.fastembed_cache_dir),
+            embedding_fastembed_batch_size: std::env::var("EMBEDDING_BATCH_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|n| *n > 0)
+                .or(yaml.embeddings.batch_size),
+            embedding_url: std::env::var("EMBEDDING_URL").ok().or(yaml.embeddings.url),
+            embedding_model: std::env::var("EMBEDDING_MODEL")
+                .ok()
+                .or(yaml.embeddings.model),
+            embedding_api_key: std::env::var("EMBEDDING_API_KEY")
+                .ok()
+                .or(yaml.embeddings.api_key),
+            embedding_dimensions: std::env::var("EMBEDDING_DIMENSIONS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .or(yaml.embeddings.dimensions),
+            // Anthropic API config (env var > YAML > None)
+            anthropic_api_key: std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .or(yaml.anthropic.api_key),
+            // Registry config (env var > YAML > None)
+            registry_remote_url: std::env::var("REGISTRY_REMOTE_URL")
+                .ok()
+                .or(yaml.registry.remote_url),
+            // Document storage config (env var > YAML > None ⇒ platform default)
+            documents_storage_dir: std::env::var("DOCUMENTS_STORAGE_DIR")
+                .ok()
+                .or(yaml.documents.storage_dir),
+            // Storage backend selection (env var > YAML > default)
+            log: logging::LogSettings::from_env(&yaml.log),
+            storage_backend: std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| {
+                yaml.storage
+                    .backend
+                    .unwrap_or_else(|| crate::storage::DEFAULT_BACKEND.to_string())
+            }),
+            // Neural routing config (env var overrides > YAML > defaults)
+            neural_routing: {
+                let mut nr = yaml.neural_routing;
+                if let Ok(v) = std::env::var("NEURAL_ROUTING_ENABLED") {
+                    nr.enabled = v == "true" || v == "1";
+                }
+                if let Ok(v) = std::env::var("NEURAL_ROUTING_MODE") {
+                    nr.mode = match v.as_str() {
+                        "full" => neural_routing_runtime::config::RoutingMode::Full,
+                        _ => neural_routing_runtime::config::RoutingMode::NN,
+                    };
+                }
+                if let Ok(v) = std::env::var("NEURAL_ROUTING_TRAINING_MODE") {
+                    nr.training.mode = v;
+                }
+                if let Ok(v) = std::env::var("NEURAL_ROUTING_MAX_THREADS") {
+                    if let Ok(n) = v.parse() {
+                        nr.training.max_threads = n;
+                    }
+                }
+                if let Ok(v) = std::env::var("NEURAL_ROUTING_COLLECT") {
+                    nr.collection.enabled = v == "true" || v == "1";
+                }
+                nr
+            },
+            config_yaml_path: resolved_path,
+        })
+    }
+
+    /// Try to load and parse a YAML config file. Returns defaults on any failure.
+    ///
+    /// Search order when `yaml_path` is `None`:
+    /// 1. `./config.yaml` (current working directory)
+    /// 2. Platform-specific app config dir:
+    ///    - macOS: `~/Library/Application Support/project-orchestrator/config.yaml`
+    ///    - Linux: `~/.config/project-orchestrator/config.yaml`
+    ///    - Windows: `%APPDATA%/ProjectOrchestrator/config.yaml`
+    ///
+    /// This ensures the MCP server binary (which may be spawned with an arbitrary
+    /// CWD by Claude Code) can still find the config written by the desktop app.
+    /// Load and parse a YAML config file, returning both the config and the
+    /// resolved file path (if found). The path is `None` when no config file
+    /// was found on disk.
+    fn load_yaml_with_path(
+        yaml_path: Option<&Path>,
+    ) -> Result<(YamlConfig, Option<std::path::PathBuf>)> {
+        // If an explicit path was given, use it directly.
+        if let Some(path) = yaml_path {
+            return Ok((Self::try_load_yaml(path)?, Some(path.to_path_buf())));
+        }
+
+        // Otherwise, try multiple search paths in priority order.
+        // Platform-specific app config dir is checked FIRST because the MCP
+        // server binary can be spawned with an arbitrary CWD (e.g. "/" when
+        // launched from the macOS dock). The desktop app always writes config
+        // to the platform dir, so it must take priority over CWD.
+        let mut candidates: Vec<std::path::PathBuf> = vec![];
+
+        // 1. Platform-specific app config directory (same as desktop app)
+        if let Some(config_dir) = dirs::config_dir() {
+            #[cfg(target_os = "windows")]
+            let app_dir = config_dir.join("ProjectOrchestrator");
+            #[cfg(not(target_os = "windows"))]
+            let app_dir = config_dir.join("project-orchestrator");
+            candidates.push(app_dir.join("config.yaml"));
+        }
+
+        // 2. CWD fallback (useful for dev / CLI usage)
+        candidates.push(std::path::PathBuf::from("config.yaml"));
+
+        for path in &candidates {
+            if path.exists() {
+                // We always use the first file found; a parse error is
+                // propagated rather than silently falling back to defaults.
+                let result = Self::try_load_yaml(path)?;
+                return Ok((result, Some(path.clone())));
+            }
+        }
+
+        tracing::debug!(
+            "No config file found in search paths ({:?}), using env vars / defaults",
+            candidates
+        );
+        Ok((YamlConfig::default(), None))
+    }
+
+    /// Attempt to load and parse a single YAML config file.
+    ///
+    /// An unreadable/missing file yields defaults, but a file that exists and
+    /// cannot be parsed is an error: falling back to defaults would look like
+    /// a fresh install (`setup_completed: false`).
+    fn try_load_yaml(path: &Path) -> Result<YamlConfig> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => match crate::yaml::from_str(&contents) {
+                Ok(config) => {
+                    tracing::info!("Loaded config from {}", path.display());
+                    Ok(config)
+                }
+                Err(e) => Err(anyhow::anyhow!(
+                    "Failed to parse config file {}: {}",
+                    path.display(),
+                    e
+                )),
+            },
+            Err(e) => {
+                tracing::debug!("Could not read {}: {}", path.display(), e);
+                Ok(YamlConfig::default())
+            }
+        }
+    }
+}
+
+/// Shared application state
+#[derive(Clone)]
+pub struct AppState {
+    pub neo4j: Arc<dyn neo4j::GraphStore>,
+    pub meili: Arc<dyn meilisearch::SearchStore>,
+    pub parser: Arc<parser::CodeParser>,
+    pub config: Arc<Config>,
+    /// Neural routing — DualTrack router (NN + policy net fallback).
+    /// Always present (build full), but only active when config.neural_routing.enabled = true.
+    pub neural_router: Arc<tokio::sync::RwLock<neural_routing_runtime::DualTrackRouter>>,
+    /// Trajectory collector — wrapped in Arc<RwLock> for lazy runtime initialization.
+    pub trajectory_collector:
+        Arc<std::sync::RwLock<Option<Arc<neural_routing_runtime::TrajectoryCollector>>>>,
+    /// Concrete Neo4j store — needed for lazy TrajectoryCollector creation.
+    /// Trajectory store — Neo4j CRUD + vector search for stored trajectories.
+    pub trajectory_store: Arc<dyn neural_routing_runtime::TrajectoryStore>,
+    /// MCP Federation registry — external MCP server connections.
+    /// Always initialized (empty registry). Servers are added/removed dynamically via API.
+    pub mcp_registry: mcp_federation::registry::SharedRegistry,
+}
+
+impl AppState {
+    /// Create new application state with all services initialized
+    pub async fn new(config: Config) -> Result<Self> {
+        let backend = crate::storage::StorageBackend::from_config(&config).await?;
+
+        let parser = Arc::new(parser::CodeParser::new()?);
+
+        let dual_router = neural_routing_runtime::DualTrackRouter::new(
+            backend.trajectories.clone(),
+            config.neural_routing.clone(),
+        );
+        if config.neural_routing.enabled {
+            tracing::info!(
+                mode = ?config.neural_routing.mode,
+                "Neural routing initialized"
+            );
+        }
+        let neural_router = Arc::new(tokio::sync::RwLock::new(dual_router));
+
+        // Initialize trajectory collector (fire-and-forget decision capture)
+        let trajectory_collector_inner = if config.neural_routing.collection.enabled {
+            let (collector, _handle) = neural_routing_runtime::TrajectoryCollector::new(
+                backend.trajectories.clone(),
+                &config.neural_routing.collection,
+                None, // use default DecisionVectorBuilder
+            );
+            tracing::info!(
+                "Trajectory collector initialized (buffer_size={})",
+                config.neural_routing.collection.buffer_size
+            );
+            Some(Arc::new(collector))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            neo4j: backend.graph,
+            meili: backend.search,
+            parser,
+            config: Arc::new(config),
+            neural_router,
+            trajectory_collector: Arc::new(std::sync::RwLock::new(trajectory_collector_inner)),
+            trajectory_store: backend.trajectories,
+            mcp_registry: mcp_federation::registry::new_shared_registry(),
+        })
+    }
+}
+
+/// Where RL5's long cumuls live.
+///
+/// A daily, weekly or monthly budget must survive a restart: a counter that
+/// silently forgets would hand out an allowance already spent. So the store sits
+/// beside the configuration when its path is known. With no known place the
+/// counters stay in memory and the process SAYS SO, rather than pretending to
+/// persist.
+fn provider_limits_store(config: &Config) -> Arc<dyn chat::provider::limits::LedgerStore> {
+    let path = config
+        .config_yaml_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(|dir| dir.join("provider-limits.json"));
+    let Some(path) = path else {
+        tracing::info!(
+            "no configuration path: rate-limit counters stay in memory for this process"
+        );
+        return Arc::new(chat::provider::limits::MemoryStore::new());
+    };
+    match chat::provider::limits::FileStore::open(&path) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "rate-limit store unavailable: counters stay in memory for this process"
+            );
+            Arc::new(chat::provider::limits::MemoryStore::new())
+        }
+    }
+}
+
+// ============================================================================
+// Server entry point (for embedding in Tauri or other hosts)
+// ============================================================================
+
+/// Start the orchestrator server with the given configuration.
+///
+/// This is the main entry point for embedding the server in another application
+/// (e.g., Tauri desktop). It initializes all services, creates the Axum router,
+/// and binds to the configured port.
+///
+/// Returns when the server shuts down (or an error occurs during startup).
+/// The phases of a normal startup, in order (see [`boot`]). Each id is started and ended in
+/// `start_server`; `boot::tests` reads this file and fails on one that is declared but never driven,
+/// because a record that shows a phase nobody updates is worse than none.
+pub const BOOT_PHASES: &[(&str, &str)] = &[
+    ("bind", "Reserving the port"),
+    ("databases", "Connecting to Neo4j and Meilisearch"),
+    ("events", "Event bus"),
+    ("orchestrator", "Starting the orchestrator"),
+    ("watchers", "Watching projects"),
+    ("chat", "Chat manager"),
+    ("claude_mcp", "Claude Code MCP setup"),
+    ("protocol_recovery", "Recovering interrupted protocols"),
+    ("runs", "Reconciling plan runs"),
+    ("chat_turns", "Resuming interrupted chat turns"),
+    ("triggers", "Plan triggers"),
+    ("migrations", "Data migrations"),
+    ("identity", "Instance identity"),
+    ("reactor", "Event reactions"),
+    ("frontend", "Web interface"),
+    ("listening", "Accepting connections"),
+];
+
+/// Say what the boot-time repair of `Project.canonical_path` did. It never fails the
+/// boot: the `File.uid` backfill that follows reports its own precondition.
+fn report_canonical_path_repair(result: Result<(usize, usize)>) {
+    match result {
+        Ok((scanned, updated)) if updated > 0 => {
+            tracing::info!(scanned, updated, "Project roots: canonical path filled")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "Project roots: canonical path repair failed"),
+    }
+}
+
+pub async fn start_server(mut config: Config) -> Result<()> {
+    use std::net::SocketAddr;
+
+    // ────────────────────────────────────────────────────────────────────
+    // Setup-only mode: if the wizard hasn't been completed yet, start a
+    // minimal server that only serves /health and /api/setup-status.
+    // This avoids connecting to Neo4j/MeiliSearch (which are likely not
+    // configured yet) and lets the frontend show the setup wizard.
+    // ────────────────────────────────────────────────────────────────────
+    if !config.setup_completed {
+        tracing::info!(
+            "Setup not completed — starting minimal setup-only server on port {}",
+            config.server_port
+        );
+        boot::tracker().finish();
+        return start_setup_server(config.server_port).await;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Normal (fully configured) server
+    // ────────────────────────────────────────────────────────────────────
+
+    let boot = boot::tracker();
+    boot.declare(BOOT_PHASES);
+
+    // Bind the port FIRST, before any initialization that has side effects.
+    //
+    // This used to be the very last step, after ~850 lines of startup that
+    // connect to Neo4j, start the file watchers and the protocol scheduler,
+    // recover "interrupted" plan runs and boot the schedule/event triggers. A
+    // duplicate instance — launchd's KeepAlive relaunching
+    // `land.ffs.orchestrator` while a hand-started server already held the
+    // port — ran all of that, THEN died on `Address already in use`, and was
+    // relaunched: 443 times in one night, a full boot every ~77s, each one
+    // free to resume plan runs the live instance owned. Binding first turns a
+    // duplicate into an immediate, side-effect-free failure whose message says
+    // what happened.
+    //
+    // Connections arriving during the rest of startup now wait in the listen
+    // backlog and are served once `axum::serve` starts, instead of being
+    // refused.
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
+    boot.start("bind");
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        let error = anyhow::anyhow!(
+            "cannot bind {addr}: {e} — another orchestrator instance is probably \
+             already serving this port (check `lsof -nP -iTCP:{} -sTCP:LISTEN`)",
+            config.server_port
+        );
+        boot.fail("bind", &error);
+        error
+    })?;
+    boot.done("bind");
+
+    use api::handlers::ServerState;
+    use tokio::sync::RwLock;
+
+    // Hash root account password at startup (if plaintext)
+    if let Some(ref mut auth) = config.auth_config {
+        auth.ensure_root_password_hashed()?;
+    }
+
+    // Fail-fast: reject an invalid remote MCP config before any expensive init.
+    // No-op when disabled, so unconfigured installs boot normally.
+    config
+        .remote_mcp
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Invalid remote_mcp config: {e}"))?;
+    config
+        .ingress
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Invalid ingress config: {e}"))?;
+    if config.ingress.enabled {
+        tracing::info!(
+            max_body_bytes = config.ingress.max_body_bytes,
+            max_concurrent = config.ingress.max_concurrent,
+            rate_per_minute = config.ingress.rate_per_minute,
+            global_rate_per_minute = config.ingress.global_rate_per_minute,
+            "Ingress ENABLED — POST /hooks/events/{{source}}/{{trigger_id}} is mounted (public, HMAC-guarded)"
+        );
+    }
+    if config.remote_mcp.enabled {
+        tracing::info!(
+            bind_addr = %config.remote_mcp.bind_addr,
+            origins = config.remote_mcp.origin_allowlist.len(),
+            "Remote MCP transport ENABLED — /mcp and OAuth 2.1 AS routes will be mounted"
+        );
+    } else {
+        tracing::info!("Remote MCP transport disabled (opt-in) — /mcp routes not mounted");
+    }
+
+    // Initialize application state
+    tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
+    tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
+
+    boot.start("databases");
+    let state = AppState::new(config.clone()).await.inspect_err(|e| {
+        boot.fail("databases", e);
+    })?;
+    boot.done("databases");
+    tracing::info!("Connected to databases");
+
+    // Create local event bus for intra-process broadcast
+    let local_bus = Arc::new(events::EventBus::default());
+
+    // Connect to NATS if configured (inter-process event sync)
+    boot.start("events");
+    let nats_emitter = if let Some(ref nats_url) = config.nats_url {
+        match events::connect_nats(nats_url).await {
+            Ok(client) => {
+                let emitter = Arc::new(events::NatsEmitter::new(client, "events"));
+                tracing::info!("NATS connected — inter-process event sync enabled");
+                boot.done("events");
+                Some(emitter)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to connect to NATS: {} — running in local-only mode",
+                    e
+                );
+                boot.fail("events", format!("NATS: {e} (running in local-only mode)"));
+                None
+            }
+        }
+    } else {
+        tracing::info!("NATS not configured — running in local-only mode");
+        boot.skip("events", "NATS not configured: local-only mode");
+        None
+    };
+
+    // Create hybrid emitter (local broadcast + optional NATS)
+    let event_bus = Arc::new(match &nats_emitter {
+        Some(nats) => events::HybridEmitter::with_nats(local_bus, nats.clone()),
+        None => events::HybridEmitter::new(local_bus),
+    });
+
+    // Workspace resolver for the coalesced `attention_changed` events
+    event_bus
+        .attention_relay()
+        .set_scope(Arc::new(events::attention::GraphAttentionScope(
+            state.neo4j.clone(),
+        )));
+
+    // Start NATS→local bridge: subscribes to NATS CRUD events and re-injects
+    // them into the local broadcast bus. This makes the local bus the single
+    // source of truth — WS handlers only need to listen to the local bus.
+    event_bus.start_nats_bridge();
+    // Same for graph events (events.graph): cross-instance graph mutations.
+    event_bus.start_graph_nats_bridge();
+
+    // Extract neural_router, trajectory_collector, trajectory_store
+    // and mcp_registry before state is moved into Orchestrator
+    let neural_router = state.neural_router.clone();
+    let trajectory_collector = state.trajectory_collector.clone();
+    let trajectory_store = state.trajectory_store.clone();
+    let mcp_registry = state.mcp_registry.clone();
+
+    // Create orchestrator with hybrid emitter
+    boot.start("orchestrator");
+    let orchestrator = Arc::new(
+        orchestrator::Orchestrator::with_event_bus(state, event_bus.clone())
+            .await
+            .inspect_err(|e| {
+                boot.fail("orchestrator", e);
+            })?,
+    );
+    boot.done("orchestrator");
+
+    // Create file watcher and auto-register projects with watch_enabled=true
+    boot.start("watchers");
+    let watcher = {
+        let mut w = orchestrator::FileWatcher::new(orchestrator.clone());
+
+        // Only auto-register projects that have watch_enabled=true (default for existing projects)
+        match orchestrator.neo4j().list_projects().await {
+            Ok(projects) => {
+                let mut registered = 0usize;
+                let mut skipped = 0usize;
+                for project in &projects {
+                    if !project.watch_enabled {
+                        tracing::debug!(
+                            "Auto-watch: skipping project '{}' — watch_enabled=false",
+                            project.slug,
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                    let Some(expanded) = project.expanded_root_path() else {
+                        tracing::debug!(
+                            "Auto-watch: skipping project '{}' — no root_path (profile={})",
+                            project.slug,
+                            project.profile.as_str(),
+                        );
+                        skipped += 1;
+                        continue;
+                    };
+                    let path = std::path::Path::new(&expanded);
+                    if !path.exists() {
+                        tracing::warn!(
+                            "Auto-watch: skipping project '{}' — path does not exist: {}",
+                            project.slug,
+                            expanded
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                    match w
+                        .register_project(path, project.id, project.slug.clone())
+                        .await
+                    {
+                        Ok(_) => registered += 1,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Auto-watch: failed to register project '{}': {}",
+                                project.slug,
+                                e
+                            );
+                            skipped += 1;
+                        }
+                    }
+                }
+                // Always start the watcher — even with 0 projects it will be
+                // ready to accept dynamically registered projects via the bridge.
+                if let Err(e) = w.start().await {
+                    tracing::warn!("Auto-watch: failed to start watcher: {}", e);
+                }
+                tracing::info!(
+                    "Auto-watch: {} projects registered, {} skipped",
+                    registered,
+                    skipped
+                );
+
+                // Spawn background analytics staleness check (non-blocking)
+                if registered > 0 {
+                    let orch_bg = orchestrator.clone();
+                    let project_ids: Vec<_> = projects
+                        .iter()
+                        .filter(|p| {
+                            p.expanded_root_path()
+                                .is_some_and(|e| std::path::Path::new(&e).exists())
+                        })
+                        .map(|p| (p.id, p.slug.clone()))
+                        .collect();
+                    tokio::spawn(async move {
+                        let mut recomputed = 0usize;
+                        for (pid, slug) in &project_ids {
+                            match orch_bg.check_analytics_staleness(*pid).await {
+                                Ok(report) if report.is_stale => {
+                                    tracing::info!(
+                                        "Analytics stale for '{}', recomputing in background...",
+                                        slug
+                                    );
+                                    orch_bg.analyze_project_safe(*pid).await;
+                                    recomputed += 1;
+                                }
+                                Ok(_) => {} // fresh, skip
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to check staleness for '{}': {}",
+                                        slug,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        if recomputed > 0 {
+                            tracing::info!(
+                                "Auto-analyze: recomputed analytics for {}/{} stale projects",
+                                recomputed,
+                                project_ids.len()
+                            );
+                        }
+                    });
+
+                    // Spawn background skill warm-up (non-blocking)
+                    // For each project: if no skills exist → run detect_skills_pipeline
+                    // (which includes auto-anchor prelude). If skills are stale (>24h),
+                    // refresh them. Both instances (8080/6600) may run this concurrently
+                    // — all operations are idempotent (MERGE-based).
+                    let orch_skills = orchestrator.clone();
+                    let skill_project_ids: Vec<_> = projects
+                        .iter()
+                        .filter(|p| {
+                            p.expanded_root_path()
+                                .is_some_and(|e| std::path::Path::new(&e).exists())
+                        })
+                        .map(|p| (p.id, p.slug.clone()))
+                        .collect();
+                    tokio::spawn(async move {
+                        use crate::skills::detection::{
+                            detect_skills_pipeline, SkillDetectionConfig,
+                        };
+
+                        let config = SkillDetectionConfig::default();
+                        let mut bootstrapped = 0usize;
+                        let mut refreshed = 0usize;
+                        let mut skipped = 0usize;
+                        let stale_threshold = chrono::Utc::now() - chrono::Duration::hours(24);
+
+                        for (pid, slug) in &skill_project_ids {
+                            let needs_run =
+                                match orch_skills.neo4j().get_skills_for_project(*pid).await {
+                                    Ok(skills) if skills.is_empty() => {
+                                        tracing::debug!(
+                                            "Skill warm-up: '{}' has no skills, bootstrapping...",
+                                            slug
+                                        );
+                                        Some(true) // bootstrap
+                                    }
+                                    Ok(skills) => {
+                                        // Check if any skill is stale (updated_at > 24h ago)
+                                        let oldest = skills
+                                            .iter()
+                                            .map(|s| s.updated_at)
+                                            .min()
+                                            .unwrap_or(chrono::Utc::now());
+                                        if oldest < stale_threshold {
+                                            tracing::debug!(
+                                            "Skill warm-up: '{}' has stale skills, refreshing...",
+                                            slug
+                                        );
+                                            Some(false) // refresh
+                                        } else {
+                                            None // fresh, skip
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Skill warm-up: failed to check skills for '{}': {}",
+                                            slug,
+                                            e
+                                        );
+                                        None
+                                    }
+                                };
+
+                            if let Some(is_bootstrap) = needs_run {
+                                match detect_skills_pipeline(
+                                    orch_skills.neo4j(),
+                                    Some(orch_skills.note_manager().as_ref()),
+                                    *pid,
+                                    &config,
+                                )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        tracing::info!(
+                                            "Skill warm-up: '{}' — status={:?}, anchors={}, skills_created={}",
+                                            slug,
+                                            result.status,
+                                            result.anchors_created,
+                                            result.skills_created,
+                                        );
+                                        if is_bootstrap {
+                                            bootstrapped += 1;
+                                        } else {
+                                            refreshed += 1;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Skill warm-up: pipeline failed for '{}': {}",
+                                            slug,
+                                            e
+                                        );
+                                        skipped += 1;
+                                    }
+                                }
+                            } else {
+                                skipped += 1;
+                            }
+                        }
+
+                        if bootstrapped > 0 || refreshed > 0 {
+                            tracing::info!(
+                                "Skill warm-up: bootstrapped {}, refreshed {}, skipped {} / {} projects",
+                                bootstrapped,
+                                refreshed,
+                                skipped,
+                                skill_project_ids.len()
+                            );
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Auto-watch: failed to list projects: {}", e);
+                boot.detail("watchers", format!("could not list projects: {e}"));
+            }
+        }
+        w
+    };
+    boot.done("watchers");
+
+    // Secrets vault — always LOCKED at start: the server cannot open it alone.
+    let vault = match vault::VaultService::open(
+        vault::Vault::default_path(),
+        vault::crypto::KdfParams::default(),
+        vault::mask::global().clone(),
+    ) {
+        Ok(v) => Arc::new(v),
+        Err(e) => {
+            // A malformed vault file must not take the server down; the vault
+            // API then reports it and nothing can be read.
+            tracing::error!("Secrets vault unavailable: {e}");
+            vault::VaultService::unavailable(e.to_string())
+        }
+    };
+
+    // One cognitive router for the whole process: the chat manager, the plan runner
+    // and the decision routes read the same store and share the same probe memory.
+    // Arms and decisions persist in the graph, so the posteriors survive a restart.
+    let cognitive_store: Arc<dyn chat::provider::cognitive::store::RoutingArmStore> = Arc::new(
+        neo4j::routing::Neo4jRoutingStore::new(orchestrator.neo4j_arc()),
+    );
+    // The live Claude model catalog, shared: the model selector serves it, and the
+    // router reads the Claude Code candidates and their windows from it.
+    let model_catalog = chat::model_catalog::ModelCatalogCache::new_with_notifier(
+        config.anthropic_api_key.clone(),
+        Some(vault.clone()),
+        event_bus.clone() as Arc<dyn events::EventEmitter>,
+        orchestrator.neo4j_arc(),
+    );
+    // What the providers say about their accounts' limits, and the refusals that date them
+    // (QUOTA): one registry for the router, the sessions and the API, persisted in the graph so a
+    // restart does not forget that an account is out until Saturday.
+    let quota_registry = Arc::new(chat::provider::quota::QuotaRegistry::new().with_store(
+        Arc::new(chat::provider::quota::GraphQuotaStore::new(
+            orchestrator.neo4j_arc(),
+        )),
+    ));
+    match quota_registry.load().await {
+        Ok(count) => tracing::info!(count, "provider quotas loaded"),
+        Err(error) => tracing::warn!(%error, "provider quotas could not be loaded; starting empty"),
+    }
+    let cognitive_routing =
+        chat::provider::cognitive::decider::CognitiveRouting::new(cognitive_store.clone())
+            .with_quota(quota_registry.clone())
+            .with_claude_code_catalog(model_catalog.clone())
+            // Episodic memory: the conversation segments and boundaries outlive the
+            // process. The store is lazy (no schema migration at startup); the field
+            // itself defaults to in-memory (`None`) for any other construction.
+            .with_segment_store(Arc::new(neo4j::segment::Neo4jSegmentStore::new(
+                orchestrator.neo4j_arc(),
+            )));
+    api::routing_handlers::set_routing_store(Some(cognitive_store.clone()));
+
+    // Create chat manager (optional — requires Claude CLI)
+    boot.start("chat");
+    let chat_manager = {
+        let mut chat_config = chat::ChatConfig::from_env();
+        // Ensure NATS URL from config.yaml is forwarded to the MCP server env.
+        // ChatConfig::from_env() reads NATS_URL from the process env, but when
+        // launched from the macOS dock the shell env is not inherited. The YAML
+        // config is the reliable source of truth.
+        if chat_config.nats_url.is_none() {
+            chat_config.nats_url = config.nats_url.clone();
+        }
+        // Override permission config from YAML if present.
+        // Priority: YAML > env vars > defaults.
+        // ChatConfig::from_env() already reads CHAT_PERMISSION_MODE etc.,
+        // but YAML config takes precedence when present.
+        if let Some(yaml_permissions) = &config.chat_permissions {
+            chat_config.permission = yaml_permissions.clone();
+        }
+        // Override chat settings from YAML if present.
+        // Priority: YAML > env var > hardcoded default.
+        if let Some(ref model) = config.chat_default_model {
+            chat_config.default_model = model.clone();
+        }
+        if let Some(max_sessions) = config.chat_max_sessions {
+            chat_config.max_sessions = max_sessions;
+        }
+        if let Some(max_turns) = config.chat_max_turns {
+            chat_config.max_turns = max_turns;
+        }
+        if let Some(timeout_secs) = config.chat_session_timeout_secs {
+            chat_config.session_timeout = std::time::Duration::from_secs(timeout_secs);
+        }
+        // Override PATH / CLI path / auto-update from YAML if present.
+        if let Some(ref path) = config.chat_process_path {
+            chat_config.process_path = Some(path.clone());
+        }
+        if let Some(ref cli) = config.chat_claude_cli_path {
+            chat_config.claude_cli_path = Some(cli.clone());
+        }
+        if let Some(auto_update) = config.chat_auto_update_cli {
+            chat_config.auto_update_cli = auto_update;
+        }
+        // Native session limits: none unless configured (ISO5).
+        chat_config.native_turn_timeout_secs = config.chat_native_turn_timeout_secs;
+        chat_config.native_session_max_tokens = config.chat_native_session_max_tokens;
+        if let Some(auto_update_app) = config.chat_auto_update_app {
+            chat_config.auto_update_app = auto_update_app;
+        }
+        apply_obscura(
+            &mut chat_config,
+            config.chat_obscura_path.as_deref(),
+            config.chat_obscura_browser,
+            chat::config::ChatConfig::obscura_on_path,
+        );
+        // Inject auth context for MCP session token generation.
+        // When auth is enabled, build_options() will generate a JWT session token
+        // and inject PO_AUTH_TOKEN + PO_SERVER_URL into the MCP server env vars.
+        chat_config.server_port = config.server_port;
+        if let Some(ref auth) = config.auth_config {
+            chat_config.jwt_secret = Some(auth.jwt_secret.clone());
+        }
+        let mut cm = chat::ChatManager::new(
+            orchestrator.neo4j_arc(),
+            orchestrator.meili_arc(),
+            chat_config,
+        )
+        .await
+        .with_document_store(documents::store::DocumentStore::from_config(&config))
+        // Native sessions resume after a restart: their transcripts live on disk (P14).
+        .with_native_transcripts(chat::provider::transcripts::default_root())
+        .with_event_emitter(event_bus.clone())
+        .with_vault(vault.clone())
+        // A default chat goes to Claude Code only when its CLI is on this machine (B2).
+        .detecting_claude_cli();
+        // Hybrid knowledge retrieval: the same embedder the note and plan managers
+        // already use feeds the dense channel of the chat's knowledge injection, so
+        // a question with no keyword in common with a note still reaches it. Without
+        // a configured provider this is skipped and retrieval stays BM25-only.
+        if let Some(provider) = orchestrator.embedding_provider() {
+            cm = cm.with_embeddings(provider.clone());
+        }
+        // Pass config.yaml path so permission changes can be persisted to disk
+        if let Some(ref yaml_path) = config.config_yaml_path {
+            cm = cm.with_config_yaml_path(yaml_path.clone());
+        }
+        // RL5: ONE admission gate for the whole process — every session counts against
+        // the same counters and breakers. Built from the configuration path so a
+        // daily/weekly/monthly budget survives a restart; an instance with no
+        // configured limit pays nothing for it.
+        cm = cm.with_provider_limits(Arc::new(
+            chat::provider::limits::Gate::from_store(
+                Arc::new(chat::provider::limits::SystemClock),
+                provider_limits_store(&config),
+            )
+            // The gate READS the quota registry the router and the sessions share.
+            .with_quota(quota_registry.clone()),
+        ));
+        if let Some(ref nats) = nats_emitter {
+            cm = cm.with_nats(nats.clone());
+        }
+        if let Some(ref tc) = *trajectory_collector.read().unwrap() {
+            cm = cm.with_trajectory_collector(tc.clone());
+        }
+        cm = cm.with_nn_router(neural_router.clone(), config.neural_routing.enabled);
+        // Without the router the provider is resolved from the declared rules only.
+        cm = cm.with_cognitive_routing(cognitive_routing.clone());
+        if let Some(re) = orchestrator.reasoning_engine() {
+            cm = cm.with_reasoning_engine(re.clone());
+        }
+        let cm = Arc::new(cm);
+        // The cap on a parent's live children is a runtime setting (PLAFOND-RT): read the stored value.
+        cm.load_delegation_limits().await;
+        // The tools the native harness defers are a runtime setting too (CTX2).
+        cm.load_deferred_tools().await;
+        // Native sessions run their `Agent` calls as child sessions through the manager (P18).
+        cm.enable_subagents();
+        // The learning side: the per-turn router, the runner's routing handle, and the
+        // store the routing routes (settings, decisions, shadow report) read.
+        chat::provider::cognitive::wiring::wire_learning(&cm);
+        if let Some(store) = cm
+            .cognitive_routing()
+            .and_then(|routing| routing.store.clone())
+        {
+            api::routing_handlers::set_routing_store(Some(store));
+        }
+        cm.start_cleanup_task();
+        // A session whose segment is Done (its mission is over) leaves the live set (SEG-1).
+        cm.start_done_release_task();
+        cm.start_dead_cli_watchdog();
+        // A turn waiting on a tool result that will never come (issue #1056): nothing else
+        // ends it — the stop watchdog needs a stop, the dead-CLI one needs a dead process.
+        cm.start_lost_tool_result_watchdog();
+        tracing::info!("Chat manager initialized");
+        boot.done("chat");
+        Some(cm)
+    };
+
+    // Auto-configure Claude Code MCP integration (idempotent — safe to call on every start).
+    // Configures ~/.claude/mcp.json with stdio mode pointing to this instance,
+    // and updates it if the config is stale (e.g., was SSE mode from an older version).
+    // Only when Claude Code is on this machine: without it, ~/.claude is left alone (M1).
+    boot.start("claude_mcp");
+    {
+        let setup_config = setup_claude::SetupConfig {
+            mcp_server_path: chat::ChatConfig::detect_mcp_server_path_public(),
+            server_port: config.server_port,
+            jwt_secret: config.auth_config.as_ref().map(|a| a.jwt_secret.clone()),
+        };
+        // The CLI the server is set to use, else the one on the machine.
+        chat::cli_version::set_configured_cli_path(config.chat_claude_cli_path.clone());
+        let cli = chat::cli_version::locate_claude_cli(config.chat_claude_cli_path.as_deref());
+        let setup = match dirs::home_dir() {
+            Some(home) => setup_claude::setup_claude_code_at_boot(&setup_config, &home, cli),
+            None => Err(anyhow::anyhow!("Cannot determine home directory")),
+        };
+        match setup {
+            Ok(setup_claude::SetupResult::SkippedCliAbsent) => {
+                tracing::info!("Claude Code absent: MCP integration skipped");
+                boot.done_with("claude_mcp", "skipped: Claude Code is not installed");
+            }
+            Ok(setup_claude::SetupResult::AlreadyConfigured { .. }) => {
+                tracing::debug!("Claude Code MCP: already configured");
+                boot.done_with("claude_mcp", "already configured");
+            }
+            Ok(setup_claude::SetupResult::Updated { path, .. }) => {
+                tracing::info!(
+                    "Claude Code MCP: updated stale config → stdio mode ({})",
+                    path.display()
+                );
+                boot.done_with("claude_mcp", "updated a stale configuration");
+            }
+            Ok(result) => {
+                tracing::info!("Claude Code MCP: {:?}", result);
+                boot.done_with("claude_mcp", format!("{result:?}"));
+            }
+            Err(e) => {
+                tracing::warn!("Claude Code MCP auto-setup failed (non-fatal): {}", e);
+                boot.fail("claude_mcp", &e);
+            }
+        }
+    }
+
+    // Create WS ticket store (in-memory, for WKWebView cookie workaround)
+    let ws_ticket_store = Arc::new(api::ws_auth::WsTicketStore::new());
+
+    // Spawn periodic cleanup of expired WS tickets (every 60s)
+    {
+        let store = ws_ticket_store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                store.cleanup_expired().await;
+            }
+        });
+    }
+
+    // Wrap watcher in Arc<RwLock<>> and spawn the event-driven bridge.
+    // The bridge listens to Project CRUD events and auto-registers/unregisters
+    // projects on the watcher, regardless of the entry point (API, MCP, NATS).
+    let watcher = Arc::new(RwLock::new(watcher));
+    orchestrator::spawn_project_watcher_bridge(
+        watcher.clone(),
+        event_bus.subscribe(),
+        orchestrator.clone(),
+    );
+
+    // Recover orphaned protocol runs from previous server instance
+    let protocol_emitter: Option<Arc<dyn events::EventEmitter>> =
+        Some(event_bus.clone() as Arc<dyn events::EventEmitter>);
+    boot.start("protocol_recovery");
+    match crate::protocol::hooks::recover_orphaned_runs(
+        orchestrator.neo4j_arc(),
+        protocol_emitter.clone(),
+    )
+    .await
+    {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!("Protocol recovery: marked {count} orphaned run(s) as failed");
+            }
+            boot.done_with(
+                "protocol_recovery",
+                format!("{count} orphaned run(s) closed"),
+            );
+        }
+        Err(e) => {
+            tracing::warn!("Protocol recovery failed (non-fatal): {}", e);
+            boot.fail("protocol_recovery", &e);
+        }
+    }
+
+    // Spawn the protocol scheduler (hourly evaluation of scheduled protocols)
+    let protocol_emitter_for_reconcile = protocol_emitter.clone();
+    crate::protocol::hooks::spawn_protocol_scheduler(orchestrator.neo4j_arc(), protocol_emitter);
+
+    // Name, once per protocol, every protocol whose `schedule` the scheduler ignores.
+    {
+        let store = orchestrator.neo4j_arc();
+        tokio::spawn(async move {
+            crate::protocol::hooks::unrecognized_schedules(&*store).await;
+        });
+    }
+
+    // Plan runner: resume what can be resumed, then reconcile. Reconciliation closes
+    // every `running` PlanRun / AgentExecution this process does not drive (boot, then
+    // every RECONCILE_INTERVAL), so a "running" state is always a real one.
+    {
+        let graph = orchestrator.neo4j_arc();
+        // The plan runner decides each attempt through the same router, with the
+        // candidates of the chat manager. Installed once for the process.
+        let routing_handle = chat_manager.as_ref().map(|cm| {
+            Arc::new(runner::routing::RoutingHandle::new(
+                cognitive_routing.decider.clone(),
+                cognitive_store.clone(),
+                Arc::new(runner::routing::ChatRoutingPool {
+                    manager: cm.clone(),
+                }),
+            ))
+        });
+        runner::routing::install(routing_handle.clone());
+        let runner = chat_manager.as_ref().map(|cm| {
+            let context_builder = orchestrator.context_builder().clone();
+            let runner_config = orchestrator.runner_config();
+            let (event_tx, _) = tokio::sync::broadcast::channel(256);
+            std::sync::Arc::new(
+                runner::PlanRunner::new(
+                    cm.clone(),
+                    graph.clone(),
+                    context_builder,
+                    runner_config,
+                    event_tx,
+                )
+                .with_event_emitter(event_bus.clone() as std::sync::Arc<dyn events::EventEmitter>)
+                .with_routing(routing_handle.clone()),
+            )
+        });
+        let protocol_emitter = protocol_emitter_for_reconcile;
+        boot.start("runs");
+        tokio::spawn(async move {
+            const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+            // An AgentExecution whose run ended this recently may still be finalized
+            // by a detached task: leave it to that task.
+            const RECONCILE_GRACE_SECS: i64 = 120;
+
+            let mut resumed = 0usize;
+            let mut recovery_failure: Option<String> = None;
+            if let Some(runner) = runner {
+                match runner.recover_interrupted_runs().await {
+                    Ok(0) => {} // no runs to recover, stay silent
+                    Ok(count) => {
+                        resumed = count;
+                        tracing::info!("PlanRunner recovery: resumed {} interrupted run(s)", count);
+                    }
+                    Err(e) => {
+                        tracing::warn!("PlanRunner recovery failed (non-fatal): {}", e);
+                        recovery_failure = Some(e.to_string());
+                    }
+                }
+            }
+            // Boot: nothing can be finalizing in the background yet.
+            runner::reconcile_stale_runs(&*graph, 0).await;
+            match recovery_failure {
+                Some(error) => boot::tracker().fail("runs", error),
+                None => boot::tracker().done_with("runs", format!("{resumed} run(s) resumed")),
+            }
+
+            let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
+            interval.tick().await; // the first tick is immediate: boot just did it
+            loop {
+                interval.tick().await;
+                runner::reconcile_stale_runs(&*graph, RECONCILE_GRACE_SECS).await;
+                if let Err(e) = crate::protocol::hooks::recover_orphaned_runs_older_than(
+                    graph.clone(),
+                    protocol_emitter.clone(),
+                    crate::protocol::hooks::ORPHAN_RUN_MAX_AGE_SECS,
+                )
+                .await
+                {
+                    tracing::warn!("Periodic protocol run reconciliation failed: {}", e);
+                }
+            }
+        });
+    }
+
+    // Agent turns cut by the restart: judged now (fast), resumed in the background, once the
+    // vault lets the providers read their keys. The startup never waits for a person.
+    boot.start("chat_turns");
+    match chat_manager.as_ref() {
+        None => boot.skip("chat_turns", "no chat manager"),
+        Some(cm) => match cm.scan_interrupted_turns().await {
+            Err(e) => boot.fail("chat_turns", e),
+            Ok((pending, scan)) => {
+                boot.done_with(
+                    "chat_turns",
+                    format!(
+                        "{} session(s) read, {} closed, {} to resume",
+                        scan.scanned,
+                        scan.closed,
+                        pending.len()
+                    ),
+                );
+                if !pending.is_empty() {
+                    let cm = cm.clone();
+                    tokio::spawn(async move {
+                        // A locked vault is waited for up to a day.
+                        let report = cm
+                            .drive_recovery(
+                                pending,
+                                std::time::Duration::from_secs(5),
+                                std::time::Duration::from_secs(24 * 3600),
+                            )
+                            .await;
+                        tracing::info!("Chat turn recovery: {:?}", report);
+                    });
+                }
+            }
+        },
+    }
+
+    // Boot trigger providers (Schedule + Event) for automatic plan execution
+    boot.start("triggers");
+    if let Some(cm) = chat_manager.as_ref() {
+        use runner::TriggerProvider; // for setup() method
+        let graph = orchestrator.neo4j_arc();
+        let engine = Arc::new(runner::TriggerEngine::new(graph.clone()));
+        // A trigger that fires starts its plan's run, through the same runner
+        // factory as POST /api/plans/{id}/run.
+        let dispatcher = Arc::new(
+            runner::TriggerDispatcher::new(
+                graph.clone(),
+                engine,
+                Arc::new(runner::PlanRunnerFactory::new(
+                    cm.clone(),
+                    graph.clone(),
+                    orchestrator.context_builder().clone(),
+                    orchestrator.runner_config(),
+                    Some(event_bus.clone() as Arc<dyn events::EventEmitter>),
+                )),
+            )
+            // Authors the access policy no longer lets in start no run.
+            .with_access_policy(config.auth_config.clone()),
+        );
+
+        // Schedule provider — evaluates cron triggers every 60s
+        let schedule_provider = runner::providers::schedule::ScheduleProvider::new(
+            graph.clone(),
+            dispatcher.clone(),
+            None, // default 60s
+        );
+        let mut trigger_failure: Option<String> = None;
+        if let Err(e) = schedule_provider.setup().await {
+            tracing::warn!("ScheduleProvider setup failed (non-fatal): {}", e);
+            trigger_failure = Some(format!("schedule: {e}"));
+        } else {
+            tracing::info!("ScheduleProvider started (60s tick)");
+        }
+        // Keep provider alive by leaking into a static — teardown on process exit
+        std::mem::forget(schedule_provider);
+
+        // Event provider — reacts to CrudEvents for plan chaining
+        let event_rx = event_bus.subscribe();
+        let event_provider =
+            runner::providers::event::EventProvider::new(graph.clone(), dispatcher, event_rx);
+        if let Err(e) = event_provider.setup().await {
+            tracing::warn!("EventProvider setup failed (non-fatal): {}", e);
+            trigger_failure = Some(format!("event: {e}"));
+        } else {
+            tracing::info!("EventProvider started (CrudEvent subscriber)");
+        }
+        std::mem::forget(event_provider);
+
+        // WebhookProvider — no setup needed, the POST /api/webhooks/:trigger_id
+        // endpoint handles validation and evaluation inline.
+        tracing::info!("TriggerEngine booted with 2 active providers (schedule, event)");
+        match trigger_failure {
+            Some(error) => boot.fail("triggers", error),
+            None => boot.done("triggers"),
+        }
+    }
+
+    // Boot HeartbeatEngine — background daemon for periodic health checks.
+    // Runs independently of chat sessions (like ScheduleProvider).
+    {
+        use heartbeat::checks::belief_revision::BeliefRevisionCheck;
+        use heartbeat::checks::{
+            architecture_drift::ArchitectureDriftCheck, consolidation::ConsolidationCheck,
+            convention_guard::ConventionGuardCheck, git_drift::GitDriftCheck,
+            homeostasis::HomeostasisCheck, maintenance::MaintenanceCheck,
+            staleness::StalenessCheck, synapse_decay::SynapseDecayCheck,
+            synapse_replenish::SynapseReplenishCheck,
+        };
+        use heartbeat::engine::HeartbeatEngine;
+
+        let graph = orchestrator.neo4j_arc();
+        let search: Option<Arc<dyn meilisearch::SearchStore>> = Some(orchestrator.meili_arc());
+        let emitter: Option<Arc<dyn events::EventEmitter>> =
+            Some(event_bus.clone() as Arc<dyn events::EventEmitter>);
+
+        let checks: Vec<Box<dyn heartbeat::HeartbeatCheck>> = vec![
+            Box::new(GitDriftCheck),
+            Box::new(StalenessCheck),
+            Box::new(SynapseDecayCheck),
+            Box::new(ConventionGuardCheck),
+            Box::new(MaintenanceCheck::new()),
+            Box::new(ConsolidationCheck),
+            Box::new(HomeostasisCheck::new()),
+            // Pure in-memory re-scoring of the classifiers on their fixtures.
+            // It lives with the bench it runs (src/evaluation), which also
+            // publishes the figures (po-cognitive-routing diagram).
+            Box::new(evaluation::heartbeat::ClassifierBenchCheck),
+            // Derives the architecture of ONE workspace per tick, rotating. It
+            // touches nothing the synapse checks care about, so its position here
+            // is free — but its per-run bound is not: the engine awaits each
+            // check inline, so an unbounded one starves the rest (PR #309).
+            Box::new(ArchitectureDriftCheck::new()),
+            // Re-vérifie les croyances (`notes::beliefs`) : sans ce cycle, une assertion
+            // démentie par le monde restait crue jusqu'au prochain redémarrage. Il ne
+            // touche AUCUNE synapse, donc sa position ici est libre — mais il doit rester
+            // avant le replenish, qui est le seul à devoir être dernier.
+            Box::new(BeliefRevisionCheck),
+            // MUST run LAST: the engine executes checks in vec order within a tick
+            // (engine.rs:88). SynapseDecayCheck and MaintenanceCheck (deep_maintenance
+            // applies an aggressive 3x decay + prune) both delete synapses; replenish
+            // has to rebuild AFTER them, otherwise at startup — when every check is due —
+            // a fresh rebuild would be wiped by the maintenance prune in the same tick.
+            Box::new(SynapseReplenishCheck),
+        ];
+
+        let engine = HeartbeatEngine::new(graph.clone(), search, emitter, checks);
+        // One-time data migrations (legacy alert backlog, duplicate and empty
+        // skills — see neo4j::data_migrations) and the replayable move of the
+        // agent attribution onto the durable self run in the background so an
+        // upgraded install repairs its data without blocking startup. The
+        // heartbeat only starts once they are done: deep maintenance evolves
+        // the same skills the migrations archive and purge.
+        boot.start("migrations");
+        tokio::spawn(async move {
+            // La racine canonique se calcule en Rust (aucun `realpath` en
+            // Cypher) : elle doit exister AVANT le backfill de `File.uid`, qui
+            // en dérive le chemin relatif — donc l'identité des fichiers.
+            report_canonical_path_repair(graph.ensure_project_canonical_paths().await);
+            let outcomes = graph.run_data_migrations().await;
+            for o in outcomes.iter().filter(|o| !o.skipped) {
+                // Une migration en échec n'arrête pas le démarrage (la suivante
+                // la rejoue) : elle est donc dite au niveau `error`, jamais
+                // noyée dans un `info`.
+                match &o.error {
+                    Some(error) => tracing::error!(
+                        id = %o.id,
+                        processed = o.processed,
+                        completed = o.completed,
+                        error = %error,
+                        "Data migration result"
+                    ),
+                    None => tracing::info!(
+                        id = %o.id,
+                        processed = o.processed,
+                        completed = o.completed,
+                        "Data migration result"
+                    ),
+                }
+            }
+            let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
+            let applied = outcomes.iter().filter(|o| !o.skipped).count();
+            if failed > 0 {
+                boot::tracker().fail(
+                    "migrations",
+                    format!("{failed} of {applied} migration(s) failed"),
+                );
+            } else {
+                boot::tracker().done_with("migrations", format!("{applied} migration(s) run"));
+            }
+            // Le socle du soi se matérialise une fois, borné et non fatal. Le corps vit
+            // dans `graph::rules::run_at_boot`, où il est testable ; ici, un appel.
+            crate::graph::rules::run_at_boot(graph.as_ref()).await;
+            // Et les croyances : une assertion dont la mesure a changé est re-vérifiée, et
+            // une réfutation confirmée est sanctionnée. Même régime : borné, non fatal.
+            crate::notes::beliefs::reverify_at_boot(graph.as_ref()).await;
+
+            let handle = engine.start_owned();
+            // Keep handle alive for the lifetime of the process
+            std::mem::forget(handle);
+            tracing::info!("HeartbeatEngine started (8 checks)");
+        });
+    }
+
+    // Pre-build OIDC client once (avoids fetching discovery document on every request)
+    let oidc_client = if let Some(ref auth_cfg) = config.auth_config {
+        match auth::oidc::OidcClient::from_auth_config(auth_cfg).await {
+            Ok(client) => {
+                tracing::info!(
+                    provider = %client.provider_name,
+                    provider_key = %client.provider_key,
+                    "OIDC client initialized at startup"
+                );
+                Some(std::sync::Arc::new(client))
+            }
+            Err(e) => {
+                // Not fatal — server can run without OIDC (password auth, Google legacy, etc.)
+                tracing::warn!("OIDC client initialization failed (auth will be unavailable): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Subscribe to the event bus BEFORE creating ServerState (the bus lives independently)
+    let reactor_receiver = event_bus.subscribe();
+
+    // Create server state
+    let server_state = Arc::new(ServerState {
+        orchestrator,
+        watcher,
+        chat_manager,
+        event_bus,
+        nats_emitter,
+        auth_config: config.auth_config.clone(),
+        serve_frontend: config.serve_frontend,
+        frontend_path: config.frontend_path.clone(),
+        setup_completed: config.setup_completed,
+        server_port: config.server_port,
+        public_url: config.public_url.clone(),
+        remote_mcp: config.remote_mcp.clone(),
+        ingress: Arc::new(ingress::IngressRuntime::new(config.ingress.clone())),
+        ws_ticket_store,
+        registry_remote_url: config.registry_remote_url.clone(),
+        neural_router: neural_router.clone(),
+        trajectory_collector: std::sync::RwLock::new(trajectory_collector.read().unwrap().clone()),
+        trajectory_store: Some(trajectory_store),
+        oidc_client,
+        identity: {
+            boot::tracker().start("identity");
+            match identity::InstanceIdentity::load_or_generate(None) {
+                Ok(id) => {
+                    tracing::info!(did = %id.did_key(), "Instance identity loaded");
+                    boot::tracker().done("identity");
+                    Some(Arc::new(id))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load instance identity: {e} — package signing disabled"
+                    );
+                    boot::tracker().fail("identity", &e);
+                    None
+                }
+            }
+        },
+        reactor_counters: std::sync::OnceLock::new(),
+        confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+        mcp_registry: mcp_registry.clone(),
+        model_catalog,
+        vault: vault.clone(),
+    });
+
+    // ── EventReactor: build, register built-in reactions, and spawn ──
+    boot.start("reactor");
+    {
+        let builder = events::ReactorBuilder::new(
+            reactor_receiver,
+            server_state.clone() as Arc<dyn std::any::Any + Send + Sync>,
+        );
+        let builder = events::register_builtin_reactions(builder, server_state.clone());
+        let (reactor, counters) = builder.build();
+
+        // Store counters in ServerState (OnceLock — safe one-time init)
+        let _ = server_state.reactor_counters.set(counters);
+
+        tokio::spawn(reactor.run());
+        tracing::info!("EventReactor started with built-in reactions");
+        boot::tracker().done("reactor");
+    }
+
+    // Seed builtin lifecycle hooks
+    {
+        let orch = server_state.orchestrator.clone();
+        tokio::spawn(async move {
+            match orch.neo4j().list_lifecycle_hooks(None).await {
+                Ok(hooks) => {
+                    let has_builtin = hooks.iter().any(|h| h.builtin);
+                    if !has_builtin {
+                        tracing::info!("Seeding builtin lifecycle hooks...");
+
+                        let mut hook = crate::lifecycle::LifecycleHook::new(
+                            "cascade-steps-on-task-complete".to_string(),
+                            crate::lifecycle::LifecycleScope::Task,
+                            "completed".to_string(),
+                            crate::lifecycle::LifecycleActionType::CascadeChildren,
+                            serde_json::json!({"target": "steps"}),
+                        );
+                        hook.builtin = true;
+                        hook.priority = 10;
+                        hook.description = Some(
+                            "Auto-complete pending steps when a task is completed".to_string(),
+                        );
+
+                        if let Err(e) = orch.neo4j().create_lifecycle_hook(&hook).await {
+                            tracing::warn!("Failed to seed builtin hook: {}", e);
+                        } else {
+                            tracing::info!("Seeded builtin lifecycle hook: {}", hook.name);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to check lifecycle hooks at startup: {}", e);
+                }
+            }
+        });
+    }
+
+    // Bootstrap MCP federated servers from Neo4j (non-blocking)
+    {
+        let registry = mcp_registry.clone();
+        let orch = server_state.orchestrator.clone();
+        tokio::spawn(async move {
+            match orch.neo4j().list_all_mcp_servers().await {
+                Ok(servers) if servers.is_empty() => {
+                    tracing::debug!("MCP federation: no saved servers to restore");
+                }
+                Ok(servers) => {
+                    // Deduplicate by server_id (multiple projects may reference the same server)
+                    let mut seen = std::collections::HashSet::new();
+                    let unique_servers: Vec<_> = servers
+                        .into_iter()
+                        .filter(|s| seen.insert(s.server_id.clone()))
+                        .collect();
+
+                    tracing::info!(
+                        "MCP federation: restoring {} saved server(s)...",
+                        unique_servers.len()
+                    );
+
+                    let mut connected = 0usize;
+                    let mut failed = 0usize;
+
+                    for server in &unique_servers {
+                        // Env vars / headers saved with the server (secrets included).
+                        let secrets: serde_json::Value = server
+                            .transport_secrets
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(s).ok())
+                            .unwrap_or_default();
+                        let saved_map = |key: &str| -> std::collections::HashMap<String, String> {
+                            secrets
+                                .get(key)
+                                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                                .unwrap_or_default()
+                        };
+                        // Rebuild McpTransport from stored fields
+                        let transport = match server.transport_type.as_str() {
+                            "stdio" => {
+                                let Some(ref command) = server.transport_command else {
+                                    tracing::warn!(
+                                        "MCP federation: skipping '{}' — stdio server missing command",
+                                        server.server_id
+                                    );
+                                    failed += 1;
+                                    continue;
+                                };
+                                let args: Vec<String> = server
+                                    .transport_args
+                                    .as_deref()
+                                    .and_then(|a| serde_json::from_str(a).ok())
+                                    .unwrap_or_default();
+                                mcp_federation::McpTransport::Stdio {
+                                    command: command.clone(),
+                                    args,
+                                    env: saved_map("env"),
+                                }
+                            }
+                            "sse" => {
+                                let Some(ref url) = server.transport_url else {
+                                    tracing::warn!(
+                                        "MCP federation: skipping '{}' — SSE server missing URL",
+                                        server.server_id
+                                    );
+                                    failed += 1;
+                                    continue;
+                                };
+                                mcp_federation::McpTransport::Sse {
+                                    url: url.clone(),
+                                    headers: saved_map("headers"),
+                                }
+                            }
+                            "streamable_http" => {
+                                let Some(ref url) = server.transport_url else {
+                                    tracing::warn!(
+                                        "MCP federation: skipping '{}' — HTTP server missing URL",
+                                        server.server_id
+                                    );
+                                    failed += 1;
+                                    continue;
+                                };
+                                mcp_federation::McpTransport::StreamableHttp {
+                                    url: url.clone(),
+                                    headers: saved_map("headers"),
+                                }
+                            }
+                            other => {
+                                tracing::warn!(
+                                    "MCP federation: skipping '{}' — unknown transport type '{}'",
+                                    server.server_id,
+                                    other
+                                );
+                                failed += 1;
+                                continue;
+                            }
+                        };
+
+                        let config = mcp_federation::McpTransportConfig {
+                            server_id: server.server_id.clone(),
+                            display_name: Some(server.display_name.clone()),
+                            transport,
+                        };
+
+                        // A few attempts with a growing pause: at boot the network, the
+                        // package runner or the PATH may not be ready on the first try.
+                        let mut attempt = 0u32;
+                        let outcome = loop {
+                            let res = tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                registry.write().await.connect(config.clone()),
+                            )
+                            .await;
+                            if matches!(res, Ok(Ok(_))) || attempt >= 2 {
+                                break res;
+                            }
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_secs(10 * attempt as u64))
+                                .await;
+                        };
+                        match outcome {
+                            Ok(Ok(_summary)) => {
+                                tracing::info!("MCP federation: restored '{}'", server.server_id);
+                                connected += 1;
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    "MCP federation: failed to restore '{}': {}",
+                                    server.server_id,
+                                    e
+                                );
+                                // Update status in Neo4j to reflect the failure
+                                let _ = orch
+                                    .neo4j()
+                                    .update_mcp_server_status(server.id, "disconnected")
+                                    .await;
+                                failed += 1;
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "MCP federation: timeout restoring '{}' (30s)",
+                                    server.server_id
+                                );
+                                let _ = orch
+                                    .neo4j()
+                                    .update_mcp_server_status(server.id, "disconnected")
+                                    .await;
+                                failed += 1;
+                            }
+                        }
+                    }
+
+                    tracing::info!(
+                        "MCP federation bootstrap: {} connected, {} failed",
+                        connected,
+                        failed
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("MCP federation: failed to load saved servers: {}", e);
+                }
+            }
+        });
+    }
+
+    // Create router
+    let app = api::create_router(server_state);
+
+    if let Some(warning) = anonymous_mode_warning(config.auth_config.is_some(), &addr) {
+        tracing::warn!("{warning}");
+    }
+
+    // Log frontend serving mode
+    boot.start("frontend");
+    if config.serve_frontend {
+        tracing::info!("Frontend serving enabled — path: {}", config.frontend_path);
+        boot.done_with("frontend", format!("served from {}", config.frontend_path));
+    } else {
+        tracing::info!("Frontend serving disabled (API-only mode)");
+        boot.skip("frontend", "API-only mode");
+    }
+
+    // Release checker (startup + every ~6h, never blocks or fails startup).
+    // Self-install of the binary is OPT-IN: only an explicit
+    // `chat.auto_update_app: true` / CHAT_AUTO_UPDATE_APP=true enables it (the
+    // chat default of `true` is about the desktop updater), and even then it
+    // only stages the new binary on disk for standalone deployments — the
+    // running process is never restarted automatically.
+    let _ = update::service::start_global(config.chat_auto_update_app == Some(true));
+
+    // Start serving. The port was bound at the top of `start_server`.
+    boot.start("listening");
+    tracing::info!("Server listening on {}", addr);
+    boot.done("listening");
+    boot.finish();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Start a minimal server for the setup wizard.
+///
+/// Serves `/health`, `/api/setup-status`, `/auth/providers`, and optionally
+/// the frontend SPA (when `SERVE_FRONTEND=true` and `FRONTEND_PATH` are set).
+/// No database connections are required — it's a lightweight Axum server
+/// that lets the Tauri frontend display the setup wizard.
+///
+/// Without frontend serving, `http://localhost:{port}/` returns 404 (white page).
+/// The Tauri desktop app sets `SERVE_FRONTEND=true` + `FRONTEND_PATH` in the
+/// `setup` callback, so the SPA loads and the React `SetupGuard` redirects to `/setup`.
+async fn start_setup_server(port: u16) -> Result<()> {
+    use axum::routing::get;
+    use serde::Serialize;
+    use std::net::SocketAddr;
+    use tower_http::cors::{Any, CorsLayer};
+    use tower_http::services::{ServeDir, ServeFile};
+
+    #[derive(Serialize)]
+    struct HealthResp {
+        status: String,
+        version: String,
+    }
+
+    #[derive(Serialize)]
+    struct SetupStatusResp {
+        configured: bool,
+    }
+
+    #[derive(Serialize)]
+    struct AuthProvidersResp {
+        auth_required: bool,
+        providers: Vec<String>,
+        allow_registration: bool,
+    }
+
+    async fn health() -> axum::Json<HealthResp> {
+        axum::Json(HealthResp {
+            status: "ok".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })
+    }
+
+    async fn setup_status() -> axum::Json<SetupStatusResp> {
+        axum::Json(SetupStatusResp { configured: false })
+    }
+
+    async fn auth_providers() -> axum::Json<AuthProvidersResp> {
+        axum::Json(AuthProvidersResp {
+            auth_required: false,
+            providers: vec![],
+            allow_registration: false,
+        })
+    }
+
+    let cors = CorsLayer::new()
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .allow_origin(Any);
+
+    let app = axum::Router::new()
+        .route("/health", get(health))
+        .route("/api/setup-status", get(setup_status))
+        .route("/auth/providers", get(auth_providers))
+        .layer(cors);
+
+    // Serve frontend SPA if enabled (Tauri desktop sets SERVE_FRONTEND=true).
+    // This is critical: without it, http://localhost:{port}/ returns 404 → white page.
+    // With it, the React app loads, SetupGuard checks /api/setup-status, and
+    // redirects to /setup (the setup wizard).
+    let serve_frontend = std::env::var("SERVE_FRONTEND")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let frontend_path = std::env::var("FRONTEND_PATH").unwrap_or_else(|_| "./dist".to_string());
+
+    let app = if serve_frontend && std::path::Path::new(&frontend_path).exists() {
+        tracing::info!("Setup server: serving frontend SPA from {}", frontend_path);
+        let index_path = format!("{}/index.html", frontend_path);
+        let serve_dir = ServeDir::new(&frontend_path).fallback(ServeFile::new(index_path));
+        app.fallback_service(serve_dir)
+    } else {
+        if serve_frontend {
+            tracing::warn!(
+                "SERVE_FRONTEND=true but frontend path does not exist: {}",
+                frontend_path
+            );
+        }
+        app
+    };
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    tracing::info!("Setup-only server listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+/// Startup warning for anonymous mode, or `None` when auth is configured.
+///
+/// The listener is always bound on 0.0.0.0, so anonymous mode is reachable
+/// from the network, not just loopback.
+fn anonymous_mode_warning(auth_configured: bool, addr: &std::net::SocketAddr) -> Option<String> {
+    if auth_configured {
+        return None;
+    }
+    Some(format!(
+        "AUTH DISABLED: no `auth` section configured — every API request is served \
+         anonymously. The server listens on {addr} (all interfaces), so anyone who can \
+         reach this port has full access. Configure `auth` (root_account or oidc) \
+         before exposing this host beyond a trusted machine."
+    ))
+}
+
+#[cfg(test)]
+mod anonymous_warning_tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    #[test]
+    fn warns_only_when_auth_is_not_configured() {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 6600));
+        let msg = anonymous_mode_warning(false, &addr).expect("must warn");
+        assert!(msg.contains("AUTH DISABLED") && msg.contains("0.0.0.0:6600"));
+        assert!(anonymous_mode_warning(true, &addr).is_none());
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use std::io::Write;
+
+    /// Serialises the tests below that read or write process-global environment
+    /// variables (`SERVER_PORT`, `NEO4J_URI`, `CHAT_PROCESS_PATH`, ...).
+    ///
+    /// `cargo test` runs the tests of one binary on parallel threads of ONE
+    /// process, and the environment is shared by all of them: without a common
+    /// lock, `test_yaml_and_env_lifecycle` setting `SERVER_PORT=7777` while
+    /// `test_explicit_config_path_bypasses_auto_detect` reads it back fails the
+    /// latter with `left: 7777, right: 1111`. Poison-tolerant on purpose: a
+    /// panicking test must not turn every later one into a spurious failure.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_yaml_config_loading() {
+        let yaml = r#"
+server:
+  port: 9090
+  workspace_path: /tmp/test
+
+neo4j:
+  uri: bolt://db:7687
+  user: admin
+  password: secret
+
+meilisearch:
+  url: http://search:7700
+  key: test-key
+
+auth:
+  google_client_id: "123.apps.googleusercontent.com"
+  google_client_secret: "secret123"
+  google_redirect_uri: "http://localhost:3000/auth/callback"
+  jwt_secret: "super-secret-key-min-32-characters!"
+  jwt_expiry_secs: 3600
+  allowed_email_domain: "ffs.holdings"
+  frontend_url: "http://localhost:3000"
+"#;
+
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        assert_eq!(config.server.port, 9090);
+        assert_eq!(config.server.workspace_path, "/tmp/test");
+        assert_eq!(config.neo4j.uri, "bolt://db:7687");
+        assert_eq!(config.meilisearch.key, "test-key");
+
+        let auth = config.auth.unwrap();
+        // Legacy Google fields are now Option<String>
+        assert_eq!(
+            auth.google_client_id,
+            Some("123.apps.googleusercontent.com".into())
+        );
+        assert_eq!(auth.access_token_expiry_secs, 3600);
+        assert_eq!(auth.allowed_email_domain, Some("ffs.holdings".into()));
+        assert_eq!(auth.frontend_url, Some("http://localhost:3000".into()));
+        // Backward compat: effective_oidc() builds from legacy fields
+        let oidc = auth.effective_oidc().expect("should have effective OIDC");
+        assert_eq!(oidc.client_id, "123.apps.googleusercontent.com");
+        assert_eq!(oidc.provider_name, "Google");
+    }
+
+    /// Remote MCP is absent from most config.yaml files → defaults to disabled.
+    /// This is the additive-migration guarantee for existing installs.
+    #[test]
+    fn test_remote_mcp_defaults_disabled_when_absent() {
+        let yaml = r#"
+server:
+  port: 8080
+neo4j:
+  uri: bolt://localhost:7687
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        assert!(!config.remote_mcp.enabled);
+        assert_eq!(config.remote_mcp.bind_addr, "127.0.0.1");
+        assert_eq!(config.remote_mcp.session_ttl_secs, 3600);
+        assert_eq!(config.remote_mcp.rate_limit.window_secs, 60);
+        assert_eq!(config.remote_mcp.rate_limit.max_requests, 120);
+        assert!(config.remote_mcp.origin_allowlist.is_empty());
+        assert!(config.remote_mcp.validate().is_ok());
+    }
+
+    /// A fully-specified remote_mcp block parses, and validate() accepts it.
+    #[test]
+    fn test_remote_mcp_enabled_parses_and_validates() {
+        let yaml = r#"
+server:
+  port: 8080
+neo4j:
+  uri: bolt://localhost:7687
+remote_mcp:
+  enabled: true
+  bind_addr: "127.0.0.1"
+  session_ttl_secs: 1800
+  rate_limit:
+    window_secs: 30
+    max_requests: 60
+  origin_allowlist:
+    - "https://claude.ai"
+    - "https://claude.com"
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        assert!(config.remote_mcp.enabled);
+        assert_eq!(config.remote_mcp.session_ttl_secs, 1800);
+        assert_eq!(
+            config.remote_mcp.origin_allowlist,
+            vec![
+                "https://claude.ai".to_string(),
+                "https://claude.com".to_string()
+            ]
+        );
+        assert!(config.remote_mcp.validate().is_ok());
+    }
+
+    /// validate() fail-fasts on nonsensical values only when enabled.
+    #[test]
+    fn test_remote_mcp_validate_rejects_bad_config() {
+        let bad_bind = RemoteMcpConfig {
+            enabled: true,
+            bind_addr: "not-an-ip".into(),
+            ..Default::default()
+        };
+        assert!(bad_bind.validate().is_err());
+
+        let bad_origin = RemoteMcpConfig {
+            enabled: true,
+            origin_allowlist: vec!["claude.ai".into()],
+            ..Default::default()
+        };
+        assert!(bad_origin.validate().is_err());
+
+        let bad_rl = RemoteMcpConfig {
+            enabled: true,
+            rate_limit: RemoteMcpRateLimit {
+                window_secs: 0,
+                max_requests: 0,
+            },
+            ..Default::default()
+        };
+        assert!(bad_rl.validate().is_err());
+
+        // The SAME bad values are ignored when disabled (no-op validation).
+        let disabled = RemoteMcpConfig {
+            enabled: false,
+            bind_addr: "not-an-ip".into(),
+            ..Default::default()
+        };
+        assert!(disabled.validate().is_ok());
+    }
+
+    #[test]
+    fn test_auth_config_absent() {
+        let yaml = r#"
+server:
+  port: 8080
+neo4j:
+  uri: bolt://localhost:7687
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        assert!(config.auth.is_none());
+    }
+
+    #[test]
+    fn test_yaml_defaults() {
+        let config = YamlConfig::default();
+        assert_eq!(config.server.port, 8080);
+        assert_eq!(config.server.workspace_path, ".");
+        assert_eq!(config.neo4j.uri, "bolt://localhost:7687");
+        assert_eq!(config.neo4j.user, "neo4j");
+        assert_eq!(config.meilisearch.url, "http://localhost:7700");
+        assert!(config.auth.is_none());
+    }
+
+    /// No config file → setup_completed defaults to false (needs setup wizard).
+    /// With a config.yaml that omits the field → serde default = true (backward compat).
+    #[test]
+    fn test_setup_completed_defaults() {
+        // derive(Default) → false: no config file means setup wizard needed
+        let no_config = YamlConfig::default();
+        assert!(
+            !no_config.setup_completed,
+            "Without config.yaml, setup_completed must be false (needs setup)"
+        );
+
+        // serde default → true: existing config.yaml without the field is already set up
+        let yaml = "server:\n  port: 9090\n";
+        let parsed: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        assert!(
+            parsed.setup_completed,
+            "Existing config.yaml missing the field should default to true (backward compat)"
+        );
+
+        // Explicit false in config.yaml → respected
+        let yaml_explicit = "setup_completed: false\n";
+        let parsed_explicit: YamlConfig = crate::yaml::from_str(yaml_explicit).unwrap();
+        assert!(
+            !parsed_explicit.setup_completed,
+            "Explicit setup_completed: false must be respected"
+        );
+    }
+
+    #[test]
+    fn test_access_token_expiry_default() {
+        let yaml = r#"
+auth:
+  google_client_id: "id"
+  google_client_secret: "secret"
+  google_redirect_uri: "http://localhost/callback"
+  jwt_secret: "min-32-chars-secret-key-for-test!"
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert_eq!(auth.access_token_expiry_secs, 900); // 15min default
+        assert_eq!(auth.refresh_token_expiry_secs, 604800); // 7 days default
+        assert!(auth.allowed_email_domain.is_none());
+        assert!(auth.frontend_url.is_none());
+    }
+
+    #[test]
+    fn test_jwt_expiry_secs_alias_backward_compat() {
+        // Old config files use `jwt_expiry_secs` — the alias should still work
+        let yaml = r#"
+auth:
+  jwt_secret: "min-32-chars-secret-key-for-test!"
+  jwt_expiry_secs: 3600
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert_eq!(auth.access_token_expiry_secs, 3600);
+    }
+
+    /// Combined test for YAML file loading, env var overrides, and backward compat.
+    /// Runs as a single test to avoid parallel env var race conditions.
+    #[test]
+    fn test_yaml_and_env_lifecycle() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Helper to clear all config env vars
+        fn clear_env() {
+            for var in &[
+                "NEO4J_URI",
+                "NEO4J_USER",
+                "NEO4J_PASSWORD",
+                "MEILISEARCH_URL",
+                "MEILISEARCH_KEY",
+                "WORKSPACE_PATH",
+                "SERVER_PORT",
+                "SERVE_FRONTEND",
+                "FRONTEND_PATH",
+            ] {
+                std::env::remove_var(var);
+            }
+        }
+
+        // --- Phase 1: YAML values loaded correctly ---
+        let yaml = r#"
+server:
+  port: 9999
+neo4j:
+  uri: bolt://yaml-host:7687
+  user: yaml-user
+  password: yaml-pass
+meilisearch:
+  url: http://yaml-search:7700
+  key: yaml-key
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("config.yaml");
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        clear_env();
+
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert_eq!(config.server_port, 9999);
+        assert_eq!(config.neo4j_uri, "bolt://yaml-host:7687");
+        assert_eq!(config.neo4j_user, "yaml-user");
+        assert_eq!(config.meilisearch_key, "yaml-key");
+        assert!(config.auth_config.is_none());
+
+        // --- Phase 2: Env vars override YAML ---
+        std::env::set_var("NEO4J_URI", "bolt://env-host:7687");
+        std::env::set_var("SERVER_PORT", "7777");
+
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert_eq!(config.neo4j_uri, "bolt://env-host:7687");
+        assert_eq!(config.server_port, 7777);
+        // YAML value still used where no env override
+        assert_eq!(config.neo4j_user, "yaml-user");
+
+        clear_env();
+
+        // --- Phase 3: No YAML file → defaults ---
+        let nonexistent = Path::new("/tmp/nonexistent-config-12345.yaml");
+        let config = Config::from_yaml_and_env(Some(nonexistent)).unwrap();
+        assert_eq!(config.server_port, 8080);
+        assert_eq!(config.neo4j_uri, "bolt://localhost:7687");
+        assert!(config.auth_config.is_none());
+        // Frontend defaults when no YAML
+        assert!(config.serve_frontend);
+        assert_eq!(config.frontend_path, "./dist");
+
+        // --- Phase 4: Frontend env var overrides ---
+        let frontend_yaml = r#"
+server:
+  port: 8080
+  serve_frontend: true
+  frontend_path: "./dist"
+"#;
+        let dir2 = tempfile::tempdir().unwrap();
+        let frontend_file = dir2.path().join("config.yaml");
+        let mut f2 = std::fs::File::create(&frontend_file).unwrap();
+        f2.write_all(frontend_yaml.as_bytes()).unwrap();
+
+        clear_env();
+        std::env::set_var("SERVE_FRONTEND", "false");
+        std::env::set_var("FRONTEND_PATH", "/custom/dist");
+
+        let config = Config::from_yaml_and_env(Some(&frontend_file)).unwrap();
+        assert!(!config.serve_frontend);
+        assert_eq!(config.frontend_path, "/custom/dist");
+
+        clear_env();
+
+        // Without env overrides → YAML values used
+        let config = Config::from_yaml_and_env(Some(&frontend_file)).unwrap();
+        assert!(config.serve_frontend);
+        assert_eq!(config.frontend_path, "./dist");
+
+        clear_env();
+    }
+
+    /// Explicit config path (--config flag) bypasses the platform-specific
+    /// auto-detect order. This is the core guarantee: when a user passes
+    /// `--config ./config.yaml`, they get THAT file regardless of what
+    /// exists in ~/Library/Application Support/.
+    #[test]
+    fn test_explicit_config_path_bypasses_auto_detect() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fn clear_env() {
+            for var in &[
+                "NEO4J_URI",
+                "NEO4J_USER",
+                "NEO4J_PASSWORD",
+                "MEILISEARCH_URL",
+                "MEILISEARCH_KEY",
+                "WORKSPACE_PATH",
+                "SERVER_PORT",
+                "SERVE_FRONTEND",
+                "FRONTEND_PATH",
+            ] {
+                std::env::remove_var(var);
+            }
+        }
+
+        clear_env();
+
+        // Create two config files with distinct values
+        let dir_a = tempfile::tempdir().unwrap();
+        let path_a = dir_a.path().join("config.yaml");
+        std::fs::write(
+            &path_a,
+            "server:\n  port: 1111\nneo4j:\n  uri: bolt://host-a:7687\n",
+        )
+        .unwrap();
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let path_b = dir_b.path().join("config.yaml");
+        std::fs::write(
+            &path_b,
+            "server:\n  port: 2222\nneo4j:\n  uri: bolt://host-b:7687\n",
+        )
+        .unwrap();
+
+        // Explicit path_a → loads path_a values
+        let config_a = Config::from_yaml_and_env(Some(&path_a)).unwrap();
+        assert_eq!(config_a.server_port, 1111);
+        assert_eq!(config_a.neo4j_uri, "bolt://host-a:7687");
+
+        // Explicit path_b → loads path_b values (not path_a)
+        let config_b = Config::from_yaml_and_env(Some(&path_b)).unwrap();
+        assert_eq!(config_b.server_port, 2222);
+        assert_eq!(config_b.neo4j_uri, "bolt://host-b:7687");
+
+        // Explicit path to non-existent file → falls back to defaults (not auto-detect)
+        let bogus = dir_a.path().join("does-not-exist.yaml");
+        let config_default = Config::from_yaml_and_env(Some(&bogus)).unwrap();
+        assert_eq!(config_default.server_port, 8080); // default, not from path_a or path_b
+
+        clear_env();
+    }
+
+    // ========================================================================
+    // New auth config format tests
+    // ========================================================================
+
+    #[test]
+    fn test_new_auth_format_root_account_only() {
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  root_account:
+    email: "admin@example.com"
+    name: "Admin"
+    password_hash: "$2b$12$LJ3m4ys1fFNwNkfMjkLx3u"
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert!(auth.has_password_auth());
+        assert!(!auth.has_oidc());
+        assert!(!auth.allow_registration);
+
+        let root = auth.root_account.unwrap();
+        assert_eq!(root.email, "admin@example.com");
+        assert_eq!(root.name, "Admin");
+        assert!(root.password_hash.starts_with("$2b$"));
+    }
+
+    #[test]
+    fn test_new_auth_format_oidc_only() {
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  oidc:
+    discovery_url: "https://accounts.google.com/.well-known/openid-configuration"
+    client_id: "my-client-id"
+    client_secret: "my-secret"
+    redirect_uri: "http://localhost:3000/auth/callback"
+    provider_name: "Google"
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert!(!auth.has_password_auth());
+        assert!(auth.has_oidc());
+
+        let oidc = auth.effective_oidc().unwrap();
+        assert_eq!(oidc.client_id, "my-client-id");
+        assert_eq!(oidc.provider_name, "Google");
+        assert_eq!(oidc.scopes, "openid email profile"); // default
+    }
+
+    #[test]
+    fn test_new_auth_format_both_providers() {
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  allow_registration: true
+  allowed_email_domain: "example.com"
+  frontend_url: "http://localhost:3000"
+  root_account:
+    email: "admin@example.com"
+    name: "Admin"
+    password_hash: "plaintext-will-be-hashed"
+  oidc:
+    client_id: "oidc-client"
+    client_secret: "oidc-secret"
+    redirect_uri: "http://localhost:3000/auth/callback"
+    provider_name: "Okta"
+    auth_endpoint: "https://okta.example.com/authorize"
+    token_endpoint: "https://okta.example.com/token"
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert!(auth.has_password_auth());
+        assert!(auth.has_oidc());
+        assert!(auth.allow_registration);
+        assert_eq!(auth.allowed_email_domain, Some("example.com".into()));
+        assert_eq!(auth.frontend_url, Some("http://localhost:3000".into()));
+
+        let oidc = auth.effective_oidc().unwrap();
+        assert_eq!(oidc.provider_name, "Okta");
+        assert_eq!(
+            oidc.auth_endpoint,
+            Some("https://okta.example.com/authorize".into())
+        );
+    }
+
+    #[test]
+    fn test_retro_compat_google_format() {
+        // Legacy format: google_* fields without oidc section
+        let yaml = r#"
+auth:
+  google_client_id: "legacy-id.apps.googleusercontent.com"
+  google_client_secret: "legacy-secret"
+  google_redirect_uri: "http://localhost:3000/auth/callback"
+  jwt_secret: "super-secret-key-min-32-characters!"
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+
+        // No explicit oidc section
+        assert!(auth.oidc.is_none());
+        // But effective_oidc() should build from legacy fields
+        assert!(auth.has_oidc());
+        let oidc = auth.effective_oidc().unwrap();
+        assert_eq!(oidc.client_id, "legacy-id.apps.googleusercontent.com");
+        assert_eq!(oidc.client_secret, "legacy-secret");
+        assert_eq!(oidc.provider_name, "Google");
+        assert!(oidc.auth_endpoint.is_some()); // Google hardcoded URLs
+    }
+
+    #[test]
+    fn test_oidc_takes_priority_over_legacy_google() {
+        // When both oidc and google_* are present, oidc wins
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  google_client_id: "legacy-id"
+  google_client_secret: "legacy-secret"
+  google_redirect_uri: "http://localhost/callback"
+  oidc:
+    client_id: "explicit-oidc-id"
+    client_secret: "explicit-oidc-secret"
+    redirect_uri: "http://localhost:3000/auth/callback"
+    provider_name: "Microsoft"
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        let oidc = auth.effective_oidc().unwrap();
+        // Explicit oidc section takes priority
+        assert_eq!(oidc.client_id, "explicit-oidc-id");
+        assert_eq!(oidc.provider_name, "Microsoft");
+    }
+
+    #[test]
+    fn test_allow_registration_default_false() {
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert!(!auth.allow_registration);
+    }
+
+    #[test]
+    fn test_no_auth_section_means_open_access() {
+        // No auth section at all → auth_config is None → open access mode
+        let yaml = r#"
+server:
+  port: 8080
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        assert!(config.auth.is_none());
+        // When auth is None, the middleware should allow all requests (no-auth mode)
+    }
+
+    // ========================================================================
+    // Frontend serving config tests
+    // ========================================================================
+
+    #[test]
+    fn test_frontend_config_defaults() {
+        let config = ServerYamlConfig::default();
+        assert!(config.serve_frontend);
+        assert_eq!(config.frontend_path, "./dist");
+    }
+
+    #[test]
+    fn test_frontend_config_from_yaml() {
+        let yaml = r#"
+server:
+  port: 8080
+  serve_frontend: false
+  frontend_path: "/var/www/orchestrator/dist"
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        assert!(!config.server.serve_frontend);
+        assert_eq!(config.server.frontend_path, "/var/www/orchestrator/dist");
+    }
+
+    #[test]
+    fn test_frontend_config_defaults_when_absent() {
+        // serve_frontend and frontend_path should default when not in YAML
+        let yaml = r#"
+server:
+  port: 9090
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        assert!(config.server.serve_frontend); // default true
+        assert_eq!(config.server.frontend_path, "./dist"); // default
+    }
+
+    // ========================================================================
+    // is_email_allowed tests
+    // ========================================================================
+
+    fn base_auth_config() -> AuthConfig {
+        AuthConfig {
+            jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
+            access_token_expiry_secs: 900,
+            refresh_token_expiry_secs: 604800,
+            allowed_email_domain: None,
+            allowed_emails: None,
+            frontend_url: None,
+            additional_origins: vec![],
+            allow_registration: false,
+            root_account: None,
+            oidc: None,
+            google_client_id: None,
+            google_client_secret: None,
+            google_redirect_uri: None,
+        }
+    }
+
+    #[test]
+    fn test_is_email_allowed_no_restrictions() {
+        // No domain filter and no email list → everyone passes
+        let config = base_auth_config();
+        assert!(config.is_email_allowed("anyone@gmail.com"));
+        assert!(config.is_email_allowed("someone@company.org"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_domain_only() {
+        let mut config = base_auth_config();
+        config.allowed_email_domain = Some("ffs.holdings".to_string());
+
+        assert!(config.is_email_allowed("alice@ffs.holdings"));
+        assert!(!config.is_email_allowed("alice@gmail.com"));
+        // Case-insensitive: uppercase domain still matches
+        assert!(config.is_email_allowed("alice@FFS.HOLDINGS"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_domain_case_insensitive() {
+        let mut config = base_auth_config();
+        config.allowed_email_domain = Some("FFS.Holdings".to_string());
+
+        // Both email and domain should compare case-insensitively
+        assert!(config.is_email_allowed("Alice@ffs.holdings"));
+        assert!(config.is_email_allowed("BOB@FFS.HOLDINGS"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_emails_only() {
+        let mut config = base_auth_config();
+        config.allowed_emails = Some(vec![
+            "special@gmail.com".to_string(),
+            "vip@external.org".to_string(),
+        ]);
+
+        assert!(config.is_email_allowed("special@gmail.com"));
+        assert!(config.is_email_allowed("vip@external.org"));
+        assert!(!config.is_email_allowed("random@gmail.com"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_emails_case_insensitive() {
+        let mut config = base_auth_config();
+        config.allowed_emails = Some(vec!["Alice@Gmail.com".to_string()]);
+
+        assert!(config.is_email_allowed("alice@gmail.com"));
+        assert!(config.is_email_allowed("ALICE@GMAIL.COM"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_combined_domain_and_emails() {
+        let mut config = base_auth_config();
+        config.allowed_email_domain = Some("ffs.holdings".to_string());
+        config.allowed_emails = Some(vec!["partner@external.com".to_string()]);
+
+        // Domain match → OK
+        assert!(config.is_email_allowed("alice@ffs.holdings"));
+        // Email whitelist → OK even if domain doesn't match
+        assert!(config.is_email_allowed("partner@external.com"));
+        // Neither → rejected
+        assert!(!config.is_email_allowed("random@gmail.com"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_empty_emails_vec() {
+        // allowed_emails = Some(vec![]) is the same as None (no filter)
+        let mut config = base_auth_config();
+        config.allowed_emails = Some(vec![]);
+
+        // Only allowed_emails with empty vec, no domain → no restrictions active
+        assert!(config.is_email_allowed("anyone@anywhere.com"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_empty_emails_with_domain() {
+        // allowed_emails = Some(vec![]) + domain filter → only domain matters
+        let mut config = base_auth_config();
+        config.allowed_email_domain = Some("company.com".to_string());
+        config.allowed_emails = Some(vec![]);
+
+        assert!(config.is_email_allowed("user@company.com"));
+        assert!(!config.is_email_allowed("user@external.com"));
+    }
+
+    #[test]
+    fn test_allowed_emails_yaml_parsing() {
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  allowed_email_domain: "ffs.holdings"
+  allowed_emails:
+    - "partner@external.com"
+    - "consultant@agency.io"
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert_eq!(auth.allowed_email_domain, Some("ffs.holdings".into()));
+        let emails = auth.allowed_emails.as_ref().unwrap();
+        assert_eq!(emails.len(), 2);
+        assert_eq!(emails[0], "partner@external.com");
+        assert_eq!(emails[1], "consultant@agency.io");
+
+        assert!(auth.is_email_allowed("alice@ffs.holdings"));
+        assert!(auth.is_email_allowed("partner@external.com"));
+        assert!(!auth.is_email_allowed("random@gmail.com"));
+    }
+
+    #[test]
+    fn test_allowed_emails_absent_in_yaml() {
+        // When allowed_emails is not in YAML, it should default to None
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  allowed_email_domain: "ffs.holdings"
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert!(auth.allowed_emails.is_none());
+        // Domain still works
+        assert!(auth.is_email_allowed("user@ffs.holdings"));
+        assert!(!auth.is_email_allowed("user@gmail.com"));
+    }
+
+    // ========================================================================
+    // Chat config: process_path, claude_cli_path, auto_update_cli
+    // ========================================================================
+
+    #[test]
+    fn test_chat_yaml_config_new_fields() {
+        // With all new fields present
+        let yaml = r#"
+chat:
+  process_path: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+  claude_cli_path: "/opt/homebrew/bin/claude"
+  auto_update_cli: true
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.chat.process_path.as_deref(),
+            Some("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        );
+        assert_eq!(
+            config.chat.claude_cli_path.as_deref(),
+            Some("/opt/homebrew/bin/claude")
+        );
+        assert_eq!(config.chat.auto_update_cli, Some(true));
+    }
+
+    #[test]
+    fn test_chat_yaml_config_new_fields_absent() {
+        // Without new fields — backward compat: all None
+        let yaml = r#"
+chat:
+  default_model: "claude-sonnet-4-6"
+"#;
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
+        assert!(config.chat.process_path.is_none());
+        assert!(config.chat.claude_cli_path.is_none());
+        assert!(config.chat.auto_update_cli.is_none());
+        assert_eq!(
+            config.chat.default_model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn test_chat_config_env_override_yaml() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // YAML sets process_path, env var overrides it
+        let yaml = r#"
+chat:
+  process_path: "/yaml/path"
+  claude_cli_path: "/yaml/claude"
+  auto_update_cli: false
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("config.yaml");
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        // Clear first
+        std::env::remove_var("CHAT_PROCESS_PATH");
+        std::env::remove_var("CLAUDE_CLI_PATH");
+        std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+
+        // Without env overrides → YAML values used
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert_eq!(config.chat_process_path.as_deref(), Some("/yaml/path"));
+        assert_eq!(config.chat_claude_cli_path.as_deref(), Some("/yaml/claude"));
+        assert_eq!(config.chat_auto_update_cli, Some(false));
+
+        // Env vars override YAML
+        std::env::set_var("CHAT_PROCESS_PATH", "/env/path");
+        std::env::set_var("CLAUDE_CLI_PATH", "/env/claude");
+        std::env::set_var("CHAT_AUTO_UPDATE_CLI", "true");
+
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert_eq!(config.chat_process_path.as_deref(), Some("/env/path"));
+        assert_eq!(config.chat_claude_cli_path.as_deref(), Some("/env/claude"));
+        assert_eq!(config.chat_auto_update_cli, Some(true));
+
+        // Cleanup
+        std::env::remove_var("CHAT_PROCESS_PATH");
+        std::env::remove_var("CLAUDE_CLI_PATH");
+        std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+    }
+
+    /// A duplicate instance must die on the port BEFORE any initialization.
+    ///
+    /// Regression for the night launchd's KeepAlive relaunched the service 443
+    /// times against a port a hand-started server already held: each attempt
+    /// connected to Neo4j, started watchers and schedulers and recovered plan
+    /// runs, and only then failed to bind. Neo4j points at an unreachable
+    /// address here on purpose — if the bind ever moves back behind
+    /// initialization, this test fails on the timeout or on a Neo4j error
+    /// instead of silently booting a full server against a real database.
+    #[tokio::test]
+    async fn start_server_fails_on_a_taken_port_before_any_initialization() {
+        // Hold a port the way the live instance did.
+        let holder = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+
+        let mut config =
+            Config::from_yaml_and_env(Some(Path::new("/nonexistent/po-bind-first.yaml"))).unwrap();
+        // Set explicitly rather than through YAML/env: other tests in this
+        // module mutate the environment concurrently.
+        config.setup_completed = true;
+        config.server_port = port;
+        config.neo4j_uri = "bolt://127.0.0.1:1".to_string();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), start_server(config))
+            .await
+            .expect("a taken port must fail fast, not wait on initialization");
+        let err = outcome
+            .expect_err("a taken port must be an error")
+            .to_string();
+
+        assert!(err.contains("cannot bind"), "unexpected error: {err}");
+        assert!(
+            err.contains(&port.to_string()),
+            "error should name the port: {err}"
+        );
+        drop(holder);
+    }
+
+    /// A config file that exists but cannot be parsed must be reported, not
+    /// silently replaced by defaults (which would look like a first run).
+    #[test]
+    fn from_yaml_and_env_errors_on_malformed_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("config.yaml");
+        std::fs::write(&file_path, "setup_completed: [oops\n").unwrap();
+
+        let err = Config::from_yaml_and_env(Some(&file_path))
+            .expect_err("a malformed config file must be an error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&file_path.display().to_string()),
+            "error should name the file: {msg}"
+        );
+    }
+
+    #[test]
+    fn obscura_comes_from_the_configuration_and_is_the_browser_only_when_asked() {
+        let mut chat = crate::chat::ChatConfig::from_env();
+        chat.obscura_path = None;
+        chat.nexus_browser_path = None;
+        apply_obscura(&mut chat, None, Some(true), || None);
+        assert_eq!(chat.obscura_path, None);
+        assert_eq!(chat.nexus_browser_path, None, "nothing to attach");
+        apply_obscura(
+            &mut chat,
+            Some(" /opt/obscura/dsh-obscura-nav "),
+            None,
+            || None,
+        );
+        assert_eq!(
+            chat.obscura_path.as_deref(),
+            Some(std::path::Path::new("/opt/obscura/dsh-obscura-nav"))
+        );
+        assert_eq!(chat.nexus_browser_path, None, "the browser is opt-in");
+        apply_obscura(&mut chat, None, Some(true), || None);
+        assert_eq!(chat.nexus_browser_path, chat.obscura_path);
+        // A browser found as `obscura` is kept.
+        chat.nexus_browser_path = Some("/usr/bin/obscura".into());
+        apply_obscura(&mut chat, Some("/x/dsh-obscura-nav"), Some(true), || None);
+        assert_eq!(
+            chat.nexus_browser_path.as_deref(),
+            Some(std::path::Path::new("/usr/bin/obscura"))
+        );
+        // Nothing configured: the browser asked for is the `dsh-obscura-nav` of the PATH.
+        chat.obscura_path = None;
+        chat.nexus_browser_path = None;
+        apply_obscura(&mut chat, None, Some(true), || {
+            Some("/usr/local/bin/dsh-obscura-nav".into())
+        });
+        assert_eq!(
+            chat.obscura_path, None,
+            "the PATH is not the search engine's default"
+        );
+        assert_eq!(
+            chat.nexus_browser_path.as_deref(),
+            Some(std::path::Path::new("/usr/local/bin/dsh-obscura-nav"))
+        );
+    }
+
+    /// Review of #751: `OBSCURA_BROWSER=TRUE` or `yes` used to read as `false`, which then
+    /// overrode a `true` from config.yaml. The value is case-insensitive, and an unknown one is
+    /// no value at all.
+    #[test]
+    fn obscura_browser_from_the_environment_is_case_insensitive_and_an_unknown_value_keeps_the_yaml(
+    ) {
+        for yes in ["true", "TRUE", "True", "1", "yes", "YES", " on "] {
+            assert_eq!(parse_env_flag(yes), Some(true), "{yes:?}");
+            assert_eq!(env_flag_over(Some(yes), Some(false)), Some(true), "{yes:?}");
+        }
+        for no in ["false", "FALSE", "0", "no", "Off"] {
+            assert_eq!(parse_env_flag(no), Some(false), "{no:?}");
+            assert_eq!(env_flag_over(Some(no), Some(true)), Some(false), "{no:?}");
+        }
+        for unknown in ["", "maybe", "ture", "2"] {
+            assert_eq!(parse_env_flag(unknown), None, "{unknown:?}");
+            assert_eq!(
+                env_flag_over(Some(unknown), Some(true)),
+                Some(true),
+                "{unknown:?}"
+            );
+            assert_eq!(env_flag_over(Some(unknown), None), None, "{unknown:?}");
+        }
+        assert_eq!(env_flag_over(None, Some(true)), Some(true));
+    }
+
+    /// Review of #751: a relative `OBSCURA_BIN` was kept without a trace, then refused at every
+    /// opening (`tool_engine_not_installed`). It is now ignored at startup, with a warning.
+    #[test]
+    fn a_relative_obscura_path_is_ignored_at_startup_with_a_warning() {
+        let warning = relative_obscura_path_warning("bin/dsh-obscura-nav").expect("warned");
+        assert!(warning.contains("OBSCURA_BIN"), "{warning}");
+        assert!(warning.contains("bin/dsh-obscura-nav"), "{warning}");
+        assert_eq!(relative_obscura_path_warning("/opt/dsh-obscura-nav"), None);
+        assert_eq!(relative_obscura_path_warning("  "), None);
+
+        let mut chat = crate::chat::ChatConfig::from_env();
+        chat.obscura_path = None;
+        apply_obscura(&mut chat, Some("./dsh-obscura-nav"), None, || None);
+        assert_eq!(chat.obscura_path, None, "a relative path is not configured");
+    }
+}
+
+#[cfg(test)]
+mod canonical_path_repair_report_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What the boot says for one repair outcome, captured from `tracing`.
+    fn logged(result: Result<(usize, usize)>) -> String {
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || report_canonical_path_repair(result));
+        let bytes = sink.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn a_repair_that_wrote_something_is_reported() {
+        let out = logged(Ok((5, 2)));
+        assert!(out.contains("canonical path filled"), "{out}");
+        assert!(
+            out.contains("scanned=5") && out.contains("updated=2"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_repair_with_nothing_to_write_is_silent() {
+        assert_eq!(logged(Ok((5, 0))), "");
+    }
+
+    #[test]
+    fn a_failed_repair_is_a_warning_and_not_an_error() {
+        let out = logged(Err(anyhow::anyhow!("neo4j is away")));
+        assert!(out.contains("WARN"), "{out}");
+        assert!(out.contains("canonical path repair failed"), "{out}");
+        assert!(out.contains("neo4j is away"), "{out}");
+    }
+}

@@ -1,0 +1,2246 @@
+//! Knowledge Notes models and DTOs
+//!
+//! Knowledge Notes capture contextual information from conversations:
+//! guidelines, gotchas, patterns, tips, and assertions that can be
+//! linked to code entities and automatically surfaced to agents.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
+use uuid::Uuid;
+
+// ============================================================================
+// Core Enums
+// ============================================================================
+
+/// Type of knowledge note
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteType {
+    /// A rule or best practice to follow
+    Guideline,
+    /// A trap or pitfall to avoid
+    Gotcha,
+    /// An established pattern in the codebase
+    Pattern,
+    /// Temporary context (expires quickly)
+    Context,
+    /// A useful tip or suggestion
+    Tip,
+    /// A general observation
+    Observation,
+    /// A verifiable rule/assertion about the code
+    Assertion,
+    /// A Request for Comments (RFC) — lifecycle managed by Protocol FSM
+    Rfc,
+}
+
+impl fmt::Display for NoteType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Guideline => write!(f, "guideline"),
+            Self::Gotcha => write!(f, "gotcha"),
+            Self::Pattern => write!(f, "pattern"),
+            Self::Context => write!(f, "context"),
+            Self::Tip => write!(f, "tip"),
+            Self::Observation => write!(f, "observation"),
+            Self::Assertion => write!(f, "assertion"),
+            Self::Rfc => write!(f, "rfc"),
+        }
+    }
+}
+
+impl FromStr for NoteType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "guideline" => Ok(Self::Guideline),
+            "gotcha" => Ok(Self::Gotcha),
+            "pattern" => Ok(Self::Pattern),
+            "context" => Ok(Self::Context),
+            "tip" => Ok(Self::Tip),
+            "observation" => Ok(Self::Observation),
+            "assertion" => Ok(Self::Assertion),
+            "rfc" => Ok(Self::Rfc),
+            _ => Err(format!("Unknown note type: {}", s)),
+        }
+    }
+}
+
+/// Lifecycle status of a note
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteStatus {
+    /// Note is valid and active
+    #[default]
+    Active,
+    /// Code changed, note needs human review
+    NeedsReview,
+    /// Note hasn't been confirmed for a long time
+    Stale,
+    /// Note has been invalidated (code deleted, etc.)
+    Obsolete,
+    /// Note archived with history preserved
+    Archived,
+}
+
+impl fmt::Display for NoteStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Active => write!(f, "active"),
+            Self::NeedsReview => write!(f, "needs_review"),
+            Self::Stale => write!(f, "stale"),
+            Self::Obsolete => write!(f, "obsolete"),
+            Self::Archived => write!(f, "archived"),
+        }
+    }
+}
+
+impl FromStr for NoteStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "active" => Ok(Self::Active),
+            "needs_review" => Ok(Self::NeedsReview),
+            "stale" => Ok(Self::Stale),
+            "obsolete" => Ok(Self::Obsolete),
+            "archived" => Ok(Self::Archived),
+            _ => Err(format!("Unknown note status: {}", s)),
+        }
+    }
+}
+
+/// Importance level of a note
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteImportance {
+    Low,
+    #[default]
+    Medium,
+    High,
+    Critical,
+}
+
+// ============================================================================
+// Author provenance
+// ============================================================================
+
+/// Who wrote a note — and therefore what its word is worth.
+///
+/// `note_type` and `importance` are CLAIMS the author makes about the content:
+/// calling a sentence a `gotcha|critical` makes the decay law treat it as
+/// knowledge for 180 days (`Note::base_decay_days`). Until this existed, the
+/// only trace of the author was the free-text `created_by` string, which no
+/// index, filter or ranking consulted — so an automatic regex and a person had
+/// exactly the same weight in every prompt.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteAuthorKind {
+    /// A person wrote it: their word alone, and it is already a confirmation.
+    Human,
+    /// A model wrote it deliberately (an MCP tool call, a runner-feedback rule).
+    #[default]
+    Agent,
+    /// An automatic heuristic wrote it (the observation detector, the learned
+    /// pipeline). Nothing has been verified: it stays unconfirmed until a
+    /// person says otherwise.
+    System,
+}
+
+impl NoteAuthorKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::System => "system",
+        }
+    }
+
+    /// The kind a legacy note most likely had, from its `created_by` string.
+    ///
+    /// Nothing wrote this property before the provenance change: a note with no
+    /// `author_kind` is guessed from the author name the writers already used.
+    /// Anything under `system/` is a heuristic; everything else was written
+    /// deliberately.
+    pub fn infer_from_created_by(created_by: &str) -> Self {
+        let actor = created_by.trim();
+        let heuristic = actor.starts_with("system")
+            || actor.starts_with("auto-")
+            || actor == "import"
+            || actor == "skill-evolution";
+        if heuristic {
+            Self::System
+        } else {
+            // `agent:<uuid>` (see `notes::provenance`) or a name: a deliberate
+            // writer. Deliberate is not the same as human — only
+            // `Note::with_author(Human, …)` says that.
+            Self::Agent
+        }
+    }
+}
+
+impl std::fmt::Display for NoteAuthorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for NoteAuthorKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "human" => Ok(Self::Human),
+            "agent" => Ok(Self::Agent),
+            "system" => Ok(Self::System),
+            _ => Err(format!("Unknown note author kind: {}", s)),
+        }
+    }
+}
+
+// ============================================================================
+// Memory Horizon (biomimicry: Elun SleepSystem consolidation)
+// ============================================================================
+
+/// Memory horizon for multi-scale note lifecycle.
+///
+/// Inspired by Elun's `SleepSystem` — consolidation via experience replay.
+/// Notes are born with a horizon that determines their lifecycle:
+/// - Ephemeral: short-lived, auto-archived after 48h without reactivation
+/// - Operational: working knowledge, promoted on activation
+/// - Consolidated: permanent knowledge, core of the knowledge base
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryHorizon {
+    /// Short-lived notes (no project, ad-hoc observations).
+    /// Auto-archived after 48h without reactivation.
+    Ephemeral,
+    /// Working knowledge (project-scoped, active during task execution).
+    /// Promoted to Consolidated on high activation or manual confirmation.
+    #[default]
+    Operational,
+    /// Permanent knowledge (guidelines, patterns, critical gotchas).
+    /// Core of the knowledge base, never auto-archived.
+    Consolidated,
+}
+
+impl std::fmt::Display for MemoryHorizon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ephemeral => write!(f, "ephemeral"),
+            Self::Operational => write!(f, "operational"),
+            Self::Consolidated => write!(f, "consolidated"),
+        }
+    }
+}
+
+impl std::str::FromStr for MemoryHorizon {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "ephemeral" => Ok(Self::Ephemeral),
+            "operational" => Ok(Self::Operational),
+            "consolidated" => Ok(Self::Consolidated),
+            _ => Err(anyhow::anyhow!("Invalid memory horizon: {}", s)),
+        }
+    }
+}
+
+impl NoteImportance {
+    /// Get the numeric weight for scoring (0.0 - 1.0)
+    pub fn weight(&self) -> f64 {
+        match self {
+            Self::Low => 0.3,
+            Self::Medium => 0.5,
+            Self::High => 0.8,
+            Self::Critical => 1.0,
+        }
+    }
+
+    /// Get the staleness decay multiplier (lower = decays slower)
+    pub fn decay_factor(&self) -> f64 {
+        match self {
+            Self::Critical => 0.5,
+            Self::High => 0.7,
+            Self::Medium => 1.0,
+            Self::Low => 1.3,
+        }
+    }
+}
+
+impl fmt::Display for NoteImportance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Low => write!(f, "low"),
+            Self::Medium => write!(f, "medium"),
+            Self::High => write!(f, "high"),
+            Self::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+impl FromStr for NoteImportance {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "critical" => Ok(Self::Critical),
+            _ => Err(format!("Unknown importance level: {}", s)),
+        }
+    }
+}
+
+/// Type of entity a note can be anchored to
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityType {
+    Project,
+    File,
+    Module,
+    Function,
+    Struct,
+    Trait,
+    Enum,
+    Impl,
+    Task,
+    Plan,
+    Step,
+    Commit,
+    Decision,
+    Constraint,
+    Milestone,
+    Release,
+    // Workspace-related entities
+    Workspace,
+    WorkspaceMilestone,
+    Resource,
+    Component,
+    // Knowledge & Protocol entities
+    FeatureGraph,
+    Protocol,
+    ProtocolState,
+    ProtocolRun,
+    PlanRun,
+    Skill,
+    Note,
+    ChatSession,
+    Process,
+    /// An ingested document (uploaded attachment) living in the knowledge graph.
+    Document,
+}
+
+impl fmt::Display for EntityType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Project => write!(f, "project"),
+            Self::File => write!(f, "file"),
+            Self::Module => write!(f, "module"),
+            Self::Function => write!(f, "function"),
+            Self::Struct => write!(f, "struct"),
+            Self::Trait => write!(f, "trait"),
+            Self::Enum => write!(f, "enum"),
+            Self::Impl => write!(f, "impl"),
+            Self::Task => write!(f, "task"),
+            Self::Plan => write!(f, "plan"),
+            Self::Step => write!(f, "step"),
+            Self::Commit => write!(f, "commit"),
+            Self::Decision => write!(f, "decision"),
+            Self::Constraint => write!(f, "constraint"),
+            Self::Milestone => write!(f, "milestone"),
+            Self::Release => write!(f, "release"),
+            Self::Workspace => write!(f, "workspace"),
+            Self::WorkspaceMilestone => write!(f, "workspace_milestone"),
+            Self::Resource => write!(f, "resource"),
+            Self::Component => write!(f, "component"),
+            Self::FeatureGraph => write!(f, "feature_graph"),
+            Self::Protocol => write!(f, "protocol"),
+            Self::ProtocolState => write!(f, "protocol_state"),
+            Self::ProtocolRun => write!(f, "protocol_run"),
+            Self::PlanRun => write!(f, "plan_run"),
+            Self::Skill => write!(f, "skill"),
+            Self::Note => write!(f, "note"),
+            Self::ChatSession => write!(f, "chat_session"),
+            Self::Process => write!(f, "process"),
+            Self::Document => write!(f, "document"),
+        }
+    }
+}
+
+impl FromStr for EntityType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().replace("_", "").as_str() {
+            "project" => Ok(Self::Project),
+            "file" => Ok(Self::File),
+            "module" => Ok(Self::Module),
+            "function" => Ok(Self::Function),
+            "struct" => Ok(Self::Struct),
+            "trait" => Ok(Self::Trait),
+            "enum" => Ok(Self::Enum),
+            "impl" => Ok(Self::Impl),
+            "task" => Ok(Self::Task),
+            "plan" => Ok(Self::Plan),
+            "step" => Ok(Self::Step),
+            "commit" => Ok(Self::Commit),
+            "decision" => Ok(Self::Decision),
+            "constraint" => Ok(Self::Constraint),
+            "milestone" => Ok(Self::Milestone),
+            "release" => Ok(Self::Release),
+            "workspace" => Ok(Self::Workspace),
+            "workspacemilestone" => Ok(Self::WorkspaceMilestone),
+            "resource" => Ok(Self::Resource),
+            "component" => Ok(Self::Component),
+            "featuregraph" => Ok(Self::FeatureGraph),
+            "protocol" => Ok(Self::Protocol),
+            "protocolstate" => Ok(Self::ProtocolState),
+            "protocolrun" => Ok(Self::ProtocolRun),
+            "planrun" => Ok(Self::PlanRun),
+            "skill" => Ok(Self::Skill),
+            "note" => Ok(Self::Note),
+            "chatsession" => Ok(Self::ChatSession),
+            "process" => Ok(Self::Process),
+            "document" => Ok(Self::Document),
+            _ => Err(format!("Unknown entity type: {}", s)),
+        }
+    }
+}
+
+impl EntityType {
+    /// Returns the PascalCase label this entity type uses as a node label in
+    /// Neo4j. The MCP and REST surfaces use the snake_case `Display` form
+    /// (`"file"`, `"workspace_milestone"`), while Neo4j labels are PascalCase
+    /// (`:File`, `:WorkspaceMilestone`). Use this method whenever you build a
+    /// Cypher query against an entity whose label was supplied as user input,
+    /// otherwise you build a query against a label that does not exist and the
+    /// MATCH silently produces zero rows.
+    pub fn neo4j_label(&self) -> &'static str {
+        match self {
+            Self::Project => "Project",
+            Self::File => "File",
+            Self::Module => "Module",
+            Self::Function => "Function",
+            Self::Struct => "Struct",
+            Self::Trait => "Trait",
+            Self::Enum => "Enum",
+            Self::Impl => "Impl",
+            Self::Task => "Task",
+            Self::Plan => "Plan",
+            Self::Step => "Step",
+            Self::Commit => "Commit",
+            Self::Decision => "Decision",
+            Self::Constraint => "Constraint",
+            Self::Milestone => "Milestone",
+            Self::Release => "Release",
+            Self::Workspace => "Workspace",
+            Self::WorkspaceMilestone => "WorkspaceMilestone",
+            Self::Resource => "Resource",
+            Self::Component => "Component",
+            Self::FeatureGraph => "FeatureGraph",
+            Self::Protocol => "Protocol",
+            Self::ProtocolState => "ProtocolState",
+            Self::ProtocolRun => "ProtocolRun",
+            Self::PlanRun => "PlanRun",
+            Self::Skill => "Skill",
+            Self::Note => "Note",
+            Self::ChatSession => "ChatSession",
+            Self::Process => "Process",
+            Self::Document => "Document",
+        }
+    }
+
+    /// Returns the Cypher property used to look up nodes of this type by their
+    /// external identifier. Most entities are matched by `id` (UUID), but:
+    ///
+    /// - `File` is matched by `path`
+    /// - `Commit` is matched by `hash`
+    pub fn match_property(&self) -> &'static str {
+        match self {
+            Self::File => "path",
+            Self::Commit => "hash",
+            _ => "id",
+        }
+    }
+}
+
+// ============================================================================
+// Scope
+// ============================================================================
+
+/// Hierarchical scope for a note
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "path", rename_all = "snake_case")]
+pub enum NoteScope {
+    /// Applies to an entire workspace (propagates to all projects)
+    Workspace,
+    /// Applies to the entire project
+    Project,
+    /// Applies to a specific module
+    Module(String),
+    /// Applies to a specific file
+    File(String),
+    /// Applies to a specific function
+    Function(String),
+    /// Applies to a specific struct
+    Struct(String),
+    /// Applies to a specific trait
+    Trait(String),
+}
+
+impl NoteScope {
+    /// Get the scope level (higher = more specific)
+    /// Lower numbers are broader scope (workspace = -1, project = 0)
+    pub fn specificity(&self) -> i8 {
+        match self {
+            Self::Workspace => -1, // Broadest scope
+            Self::Project => 0,
+            Self::Module(_) => 1,
+            Self::File(_) => 2,
+            Self::Function(_) | Self::Struct(_) | Self::Trait(_) => 3,
+        }
+    }
+}
+
+impl fmt::Display for NoteScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Workspace => write!(f, "workspace"),
+            Self::Project => write!(f, "project"),
+            Self::Module(path) => write!(f, "module:{}", path),
+            Self::File(path) => write!(f, "file:{}", path),
+            Self::Function(name) => write!(f, "function:{}", name),
+            Self::Struct(name) => write!(f, "struct:{}", name),
+            Self::Trait(name) => write!(f, "trait:{}", name),
+        }
+    }
+}
+
+// ============================================================================
+// Anchoring
+// ============================================================================
+
+/// Semantic anchor linking a note to a code entity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteAnchor {
+    /// Type of entity this anchor points to
+    pub entity_type: EntityType,
+    /// Identifier of the entity in the graph (UUID or path)
+    pub entity_id: String,
+    /// SHA256 hash of the entity's signature (for functions, structs)
+    pub signature_hash: Option<String>,
+    /// SHA256 hash of the entity's body (for functions)
+    pub body_hash: Option<String>,
+    /// When this anchor was last verified as valid
+    pub last_verified: DateTime<Utc>,
+    /// Whether the anchor is currently valid
+    #[serde(default = "default_true")]
+    pub is_valid: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_energy() -> f64 {
+    1.0
+}
+
+impl NoteAnchor {
+    /// Create a new anchor for a code entity
+    pub fn new(entity_type: EntityType, entity_id: String) -> Self {
+        Self {
+            entity_type,
+            entity_id,
+            signature_hash: None,
+            body_hash: None,
+            last_verified: Utc::now(),
+            is_valid: true,
+        }
+    }
+
+    /// Create an anchor with semantic hashes
+    pub fn with_hashes(
+        entity_type: EntityType,
+        entity_id: String,
+        signature_hash: Option<String>,
+        body_hash: Option<String>,
+    ) -> Self {
+        Self {
+            entity_type,
+            entity_id,
+            signature_hash,
+            body_hash,
+            last_verified: Utc::now(),
+            is_valid: true,
+        }
+    }
+}
+
+// ============================================================================
+// Change History
+// ============================================================================
+
+/// Type of change in note history
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeType {
+    /// Note was created
+    Created,
+    /// Note content was updated
+    Updated,
+    /// Note was confirmed as still valid
+    Confirmed,
+    /// Note status changed
+    StatusChanged,
+    /// Note was migrated to a new entity (e.g., after rename)
+    Migrated,
+    /// Anchor was added
+    AnchorAdded,
+    /// Anchor was removed
+    AnchorRemoved,
+    /// Note was superseded by another
+    Superseded,
+    /// Note memory horizon was promoted (Ephemeral → Operational → Consolidated)
+    Promoted,
+}
+
+/// A change in the note's history
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteChange {
+    /// When the change occurred
+    pub timestamp: DateTime<Utc>,
+    /// Type of change
+    pub change_type: ChangeType,
+    /// Additional details about the change
+    pub details: Option<serde_json::Value>,
+    /// Who made the change (user ID or agent ID)
+    pub actor: String,
+}
+
+impl NoteChange {
+    /// Create a new change record
+    pub fn new(change_type: ChangeType, actor: String) -> Self {
+        Self {
+            timestamp: Utc::now(),
+            change_type,
+            details: None,
+            actor,
+        }
+    }
+
+    /// Create a change with details
+    pub fn with_details(
+        change_type: ChangeType,
+        actor: String,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            timestamp: Utc::now(),
+            change_type,
+            details: Some(details),
+            actor,
+        }
+    }
+}
+
+// ============================================================================
+// Assertions
+// ============================================================================
+
+/// Type of assertion check
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AssertionCheckType {
+    /// Check that an entity exists
+    Exists,
+    /// Check that an entity does NOT exist
+    NotExists,
+    /// Check that a signature contains specific elements
+    SignatureContains,
+    /// Check that a dependency relationship exists
+    DependsOn,
+    /// Check that a call relationship exists
+    Calls,
+    /// Check that a call relationship does NOT exist
+    NoCalls,
+    /// Check that a type implements a trait
+    Implements,
+}
+
+/// Action to take when an assertion is violated
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ViolationAction {
+    /// Just warn, don't change note status
+    Warn,
+    /// Flag the note as needing review
+    #[default]
+    FlagNote,
+    /// Block (mark note as needs_review and log warning)
+    Block,
+}
+
+/// A verifiable assertion rule
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssertionRule {
+    /// Type of check to perform
+    pub check_type: AssertionCheckType,
+    /// Target entity (e.g., "function:validate_user", "file:src/auth.rs")
+    pub target: String,
+    /// Optional file pattern to scope the check
+    pub file_pattern: Option<String>,
+    /// Additional parameters for the check
+    pub parameters: Option<serde_json::Value>,
+    /// What to do when the assertion fails
+    #[serde(default)]
+    pub on_violation: ViolationAction,
+}
+
+/// Result of verifying an assertion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssertionResult {
+    /// Whether the assertion passed
+    pub passed: bool,
+    /// Human-readable message
+    pub message: String,
+    /// Details about what was checked
+    pub details: Option<serde_json::Value>,
+    /// When the check was performed
+    pub checked_at: DateTime<Utc>,
+}
+
+impl AssertionResult {
+    /// Le verdict dit-il seulement « je n'ai pas pu vérifier » ?
+    ///
+    /// Distinct de `passed == false` : un appelant qui sanctionne sur `!passed` doit
+    /// consulter ce prédicat, sinon il transforme « inconnu » en « coupable » — le miroir
+    /// du mensonge qu'on corrige.
+    pub fn is_unverifiable(&self) -> bool {
+        self.details
+            .as_ref()
+            .and_then(|d| d.get("unverifiable"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+}
+
+impl AssertionResult {
+    pub fn passed(message: impl Into<String>) -> Self {
+        Self {
+            passed: true,
+            message: message.into(),
+            details: None,
+            checked_at: Utc::now(),
+        }
+    }
+
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            passed: false,
+            message: message.into(),
+            details: None,
+            checked_at: Utc::now(),
+        }
+    }
+}
+
+// ============================================================================
+// Main Note Struct
+// ============================================================================
+
+/// Provenance of a revision: the previous version of a note was replaced by this one.
+///
+/// A note outside its validity window (or superseded) cannot be used as is; it is
+/// REVISED — a new version carrying this record — not refused. `evidence` is
+/// mandatory and non-blank: a revision with no stated proof is a rewrite.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoteRevision {
+    /// Who revised.
+    pub revised_by: String,
+    /// When.
+    pub revised_at: DateTime<Utc>,
+    /// On what proof (a commit sha, a test, a command output, a link).
+    pub evidence: String,
+    /// The version that was replaced.
+    pub revises: Uuid,
+}
+
+/// What a plain `CreateNoteRequest` does not carry: a validity window and the
+/// provenance of a revision. `Default` = a note like any other.
+#[derive(Debug, Clone, Default)]
+pub struct NoteExtras {
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_until: Option<DateTime<Utc>>,
+    pub revision: Option<NoteRevision>,
+}
+
+/// Where a note stands against its validity window at a given instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Validity {
+    /// Inside the window (or no window).
+    Current,
+    /// The window has not opened yet.
+    NotYetValid(DateTime<Utc>),
+    /// The window has closed.
+    Expired(DateTime<Utc>),
+}
+
+/// A Knowledge Note capturing contextual information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Note {
+    /// Unique identifier
+    pub id: Uuid,
+    /// Project this note belongs to (None = global note, cross-project)
+    pub project_id: Option<Uuid>,
+    /// Type of note
+    pub note_type: NoteType,
+    /// Current lifecycle status
+    pub status: NoteStatus,
+    /// Importance level
+    pub importance: NoteImportance,
+    /// Hierarchical scope
+    pub scope: NoteScope,
+    /// The actual content/text of the note
+    pub content: String,
+    /// Tags for categorization and search
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    // Anchoring
+    /// Semantic anchors to code entities
+    #[serde(default)]
+    pub anchors: Vec<NoteAnchor>,
+
+    // Lifecycle
+    /// When the note was created
+    pub created_at: DateTime<Utc>,
+    /// Who created the note
+    pub created_by: String,
+    /// Who wrote this note, and therefore what its word is worth.
+    ///
+    /// Absent on every note written before the provenance change: [`Note::new`]
+    /// defaults it to a deliberate author, and `node_to_note` infers `System`
+    /// from a `system/…` author so a legacy detector note is never mistaken for
+    /// a person's.
+    #[serde(default)]
+    pub author_kind: NoteAuthorKind,
+    /// The confidence the AUTHOR claimed for its own content (0.0–1.0), when the
+    /// author is a heuristic. This is NOT a measure of truth: a detector that
+    /// says 0.9 says only that a regex matched.
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    /// When a PERSON vouched for this note, and who.
+    ///
+    /// Distinct from `last_confirmed_at`, which is a freshness clock set at
+    /// creation and moved by re-verification: that one used to be the only
+    /// trace of confirmation, and it was signed with the author's own name —
+    /// so a machine's note was born "confirmed by the machine". These two are
+    /// `None` until a human actually confirms.
+    #[serde(default)]
+    pub human_confirmed_at: Option<DateTime<Utc>>,
+    /// Who that person was.
+    #[serde(default)]
+    pub human_confirmed_by: Option<String>,
+    /// When the note was last confirmed as valid
+    pub last_confirmed_at: Option<DateTime<Utc>>,
+    /// Who last confirmed the note
+    pub last_confirmed_by: Option<String>,
+    /// Current staleness score (0.0 = fresh, 1.0 = very stale)
+    #[serde(default)]
+    pub staleness_score: f64,
+
+    // Neural energy (Phase 2)
+    /// Neural energy level (0.0-1.0). Represents "freshness" via exponential decay.
+    /// Starts at 1.0 on creation, decays with time constant 90 days in the stored batch decay (`update_energy_scores`, halves every ~62 days) and a true 90-day half-life in `computed_energy()`; boosted on activation.
+    /// Coexists with staleness_score for dual-run comparison (Phase 3).
+    #[serde(default = "default_energy")]
+    pub energy: f64,
+    /// When this note's neuron was last activated (retrieved/used/confirmed).
+    /// Used to compute energy decay: energy × exp(-days_idle / half_life).
+    pub last_activated: Option<DateTime<Utc>>,
+
+    // Re-activation tracking (boucle-3: knowledge route quality proxy)
+    /// Number of times this note was re-injected within 7 days of previous activation.
+    /// High reactivation_count = reliable, frequently useful knowledge route.
+    #[serde(default)]
+    pub reactivation_count: i64,
+    /// Last time this note was re-activated (injected again within 7 days).
+    pub last_reactivated: Option<DateTime<Utc>>,
+
+    // Freshness tracking (boucle-4: git → freshness signal)
+    /// Last time a file linked to this note was touched by a commit.
+    pub freshness_pinged_at: Option<DateTime<Utc>>,
+
+    // Activation tracking (T7: auto-promote and auto-archive thresholds)
+    /// Total number of times this note has been activated (retrieved/used/confirmed).
+    /// Used for automatic promotion (ephemeral->consolidated) and archival thresholds.
+    #[serde(default)]
+    pub activation_count: i64,
+
+    // Knowledge Scars (biomimicry: Elun HypersphereIdentity.Scar)
+    /// Scar intensity from negative reasoning feedback (0.0 = no scar, 1.0 = max scar).
+    /// Scarred notes are penalized in search scoring: final_score = raw_score × (1 - scar_intensity × 0.7).
+    /// Decays 20x slower than synapses via decay_synapses().
+    #[serde(default)]
+    pub scar_intensity: f64,
+
+    // Memory Horizon (biomimicry: Elun SleepSystem)
+    /// Multi-scale memory horizon controlling note lifecycle.
+    /// Ephemeral → Operational → Consolidated (promotion via activation).
+    #[serde(default)]
+    pub memory_horizon: MemoryHorizon,
+
+    // Succession
+    /// ID of the note this one supersedes (if any)
+    pub supersedes: Option<Uuid>,
+    /// ID of the note that superseded this one (if any)
+    pub superseded_by: Option<Uuid>,
+
+    // History
+    /// Change history for audit trail
+    #[serde(default)]
+    pub changes: Vec<NoteChange>,
+
+    // Assertions
+    /// Assertion rule if this is an assertion note
+    pub assertion_rule: Option<AssertionRule>,
+    /// Last assertion result (for assertion notes)
+    pub last_assertion_result: Option<AssertionResult>,
+    /// Pourquoi cette note a été RÉVISÉE par la re-vérification de ses croyances
+    /// (`notes::beliefs::reverify`). Distinct de `last_assertion_result` : celui-ci dit
+    /// ce que le monde a répondu, celui-ci dit ce que le système en a FAIT, et pourquoi.
+    /// `None` = jamais révisée.
+    #[serde(default)]
+    pub revision_reason: Option<String>,
+
+    // Validity window (PR5: preserve without forcing)
+    /// The note is knowledge only FROM this instant (None = since always).
+    #[serde(default)]
+    pub valid_from: Option<DateTime<Utc>>,
+    /// The note is knowledge only UNTIL this instant (None = no end).
+    #[serde(default)]
+    pub valid_until: Option<DateTime<Utc>>,
+    /// Who revised the previous version into this one, when, and on what evidence.
+    /// Set only by a revision; a plain `supersede` leaves it empty.
+    #[serde(default)]
+    pub revision: Option<NoteRevision>,
+
+    // Privacy / Sharing consent (RFC Privacy §2.4)
+    /// Sharing consent for P2P knowledge exchange.
+    /// Controls whether this note can be shared via the distillation pipeline.
+    #[serde(default)]
+    pub sharing_consent: crate::episodes::distill_models::SharingConsent,
+}
+
+impl Note {
+    /// Where this note stands against its validity window at `now`.
+    ///
+    /// A bound is inclusive at its start and exclusive at its end: a note valid
+    /// `[from, until)`. No window at all is always `Current`.
+    pub fn validity_at(&self, now: DateTime<Utc>) -> Validity {
+        if let Some(from) = self.valid_from {
+            if now < from {
+                return Validity::NotYetValid(from);
+            }
+        }
+        if let Some(until) = self.valid_until {
+            if now >= until {
+                return Validity::Expired(until);
+            }
+        }
+        Validity::Current
+    }
+
+    /// The label the knowledge graph shows for a note: its content, cut at 40 characters.
+    ///
+    /// ONE formula, used by the graph endpoint AND by the live `node_created` event.
+    /// Two copies drifted apart: a note created live kept its identifier as a label
+    /// until the next full reload renamed it (measured 26/10/2026, po-graph).
+    pub fn graph_label(&self) -> String {
+        if self.content.chars().count() > 40 {
+            let end = self
+                .content
+                .char_indices()
+                .nth(40)
+                .map(|(i, _)| i)
+                .unwrap_or(self.content.len());
+            format!("{}…", &self.content[..end])
+        } else {
+            self.content.clone()
+        }
+    }
+
+    /// Whether a PERSON vouched for this note.
+    ///
+    /// The only predicate a reader may use to treat a note as vouched-for
+    /// knowledge. `last_confirmed_at` is a freshness clock, not a signature —
+    /// it is set at creation, including for a machine's own notes.
+    pub fn is_human_confirmed(&self) -> bool {
+        self.human_confirmed_at.is_some()
+    }
+
+    /// Declare who wrote this note, and what that author's word is worth.
+    ///
+    /// A `Human` author is a confirmation by construction: the person writing it
+    /// is the person vouching for it. An `Agent` or `System` author signs
+    /// nothing — `last_confirmed_by` stays empty and `human_confirmed_*` stays
+    /// `None` until [`Note::confirm_by_human`] is called.
+    pub fn with_author(mut self, kind: NoteAuthorKind, who: &str) -> Self {
+        self.author_kind = kind;
+        if kind == NoteAuthorKind::Human {
+            self.human_confirmed_at = Some(self.created_at);
+            self.human_confirmed_by = Some(who.to_string());
+            self.last_confirmed_by = Some(who.to_string());
+        } else {
+            self.human_confirmed_at = None;
+            self.human_confirmed_by = None;
+            self.last_confirmed_by = None;
+        }
+        self
+    }
+
+    /// Record that a person vouched for this note, now.
+    ///
+    /// The freshness clock moves too (`last_confirmed_at`), because a person
+    /// reading a note and saying "still true" IS a verification.
+    pub fn confirm_by_human(&mut self, who: &str, now: DateTime<Utc>) {
+        self.human_confirmed_at = Some(now);
+        self.human_confirmed_by = Some(who.to_string());
+        self.last_confirmed_at = Some(now);
+        self.last_confirmed_by = Some(who.to_string());
+        self.changes.push(NoteChange::with_details(
+            ChangeType::Confirmed,
+            who.to_string(),
+            serde_json::json!({ "by": "human", "author_kind": self.author_kind.as_str() }),
+        ));
+    }
+
+    /// Create a new note with minimal fields
+    pub fn new(
+        project_id: Option<Uuid>,
+        note_type: NoteType,
+        content: String,
+        created_by: String,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            project_id,
+            note_type,
+            status: NoteStatus::Active,
+            importance: NoteImportance::Medium,
+            scope: NoteScope::Project,
+            content,
+            tags: vec![],
+            anchors: vec![],
+            created_at: now,
+            created_by: created_by.clone(),
+            author_kind: NoteAuthorKind::Agent,
+            confidence: None,
+            human_confirmed_at: None,
+            human_confirmed_by: None,
+            last_confirmed_at: Some(now),
+            // A freshness clock, not a signature: the author is NOT vouching for
+            // it here. A person's note gets its signature from `with_author`.
+            last_confirmed_by: None,
+            staleness_score: 0.0,
+            energy: 1.0,
+            last_activated: Some(now),
+            reactivation_count: 0,
+            last_reactivated: None,
+            freshness_pinged_at: None,
+            activation_count: 0,
+            scar_intensity: 0.0,
+            memory_horizon: if project_id.is_some() {
+                MemoryHorizon::Operational
+            } else {
+                MemoryHorizon::Ephemeral
+            },
+            supersedes: None,
+            superseded_by: None,
+            changes: vec![NoteChange::new(ChangeType::Created, created_by)],
+            assertion_rule: None,
+            last_assertion_result: None,
+            revision_reason: None,
+            valid_from: None,
+            valid_until: None,
+            revision: None,
+            sharing_consent: crate::episodes::distill_models::SharingConsent::NotSet,
+        }
+    }
+
+    /// Compute current energy using lazy decay formula (boucle-1).
+    /// E(t) = energy × 0.5^((now - last_activated).days / 90.0)
+    /// (true 90-day half-life; the stored batch decay uses exp(-t/90) — see
+    /// `ENERGY_HALF_LIFE_DAYS`. Kept distinct on purpose: unifying would change
+    /// prod ranking.)
+    /// Falls back to stored energy if last_activated is None.
+    pub fn computed_energy(&self) -> f64 {
+        match self.last_activated {
+            Some(last) => {
+                let days_idle = (Utc::now() - last).num_seconds() as f64 / 86400.0;
+                if days_idle <= 0.0 {
+                    self.energy
+                } else {
+                    self.energy * (0.5_f64).powf(days_idle / 90.0)
+                }
+            }
+            None => self.energy,
+        }
+    }
+
+    /// Create a new note with full configuration
+    pub fn new_full(
+        project_id: Option<Uuid>,
+        note_type: NoteType,
+        importance: NoteImportance,
+        scope: NoteScope,
+        content: String,
+        tags: Vec<String>,
+        created_by: String,
+    ) -> Self {
+        let now = Utc::now();
+        // Critical notes are immediately consolidated
+        let memory_horizon = if importance == NoteImportance::Critical {
+            MemoryHorizon::Consolidated
+        } else if project_id.is_some() {
+            MemoryHorizon::Operational
+        } else {
+            MemoryHorizon::Ephemeral
+        };
+        Self {
+            id: Uuid::new_v4(),
+            project_id,
+            note_type,
+            status: NoteStatus::Active,
+            importance,
+            scope,
+            content,
+            tags,
+            anchors: vec![],
+            created_at: now,
+            created_by: created_by.clone(),
+            author_kind: NoteAuthorKind::Agent,
+            confidence: None,
+            human_confirmed_at: None,
+            human_confirmed_by: None,
+            last_confirmed_at: Some(now),
+            // A freshness clock, not a signature — see `Note::new`.
+            last_confirmed_by: None,
+            staleness_score: 0.0,
+            energy: 1.0,
+            last_activated: Some(now),
+            reactivation_count: 0,
+            last_reactivated: None,
+            freshness_pinged_at: None,
+            activation_count: 0,
+            scar_intensity: 0.0,
+            memory_horizon,
+            supersedes: None,
+            superseded_by: None,
+            changes: vec![NoteChange::new(ChangeType::Created, created_by)],
+            assertion_rule: None,
+            last_assertion_result: None,
+            revision_reason: None,
+            valid_from: None,
+            valid_until: None,
+            revision: None,
+            sharing_consent: crate::episodes::distill_models::SharingConsent::NotSet,
+        }
+    }
+
+    /// Add an anchor to this note
+    pub fn add_anchor(&mut self, anchor: NoteAnchor, actor: &str) {
+        self.anchors.push(anchor);
+        self.changes
+            .push(NoteChange::new(ChangeType::AnchorAdded, actor.to_string()));
+    }
+
+    /// Confirm this note is still valid
+    pub fn confirm(&mut self, confirmed_by: &str) {
+        let now = Utc::now();
+        self.last_confirmed_at = Some(now);
+        self.last_confirmed_by = Some(confirmed_by.to_string());
+        self.staleness_score = 0.0;
+        self.changes.push(NoteChange::new(
+            ChangeType::Confirmed,
+            confirmed_by.to_string(),
+        ));
+    }
+
+    /// Check if the note is active and not stale
+    pub fn is_active(&self) -> bool {
+        self.status == NoteStatus::Active
+    }
+
+    /// Check if the note needs attention
+    pub fn needs_attention(&self) -> bool {
+        matches!(self.status, NoteStatus::NeedsReview | NoteStatus::Stale)
+    }
+
+    /// Get the base decay days for staleness calculation
+    pub fn base_decay_days(&self) -> f64 {
+        match self.note_type {
+            NoteType::Context => 30.0, // Expires quickly
+            NoteType::Tip => 90.0,     // Medium expiry
+            NoteType::Observation => 90.0,
+            NoteType::Gotcha => 180.0,
+            NoteType::Guideline => 365.0, // Stable for a long time
+            NoteType::Pattern => 365.0,
+            NoteType::Assertion => f64::MAX, // Never stale (verified by code)
+            NoteType::Rfc => 365.0,          // Long-lived like patterns/guidelines
+        }
+    }
+}
+
+// ============================================================================
+// Propagated Note (for context retrieval)
+// ============================================================================
+
+/// A single hop in a propagation path, distinguishing structural and neural relations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationHop {
+    /// Relation type (e.g. "IMPORTS", "CALLS", "SYNAPSE")
+    #[serde(rename = "type")]
+    pub rel_type: String,
+    /// Source of the relation: "structural" for code graph, "neural" for Hebbian synapses
+    pub source: String,
+    /// Synapse weight (only present for SYNAPSE relations)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+}
+
+impl RelationHop {
+    /// Create a structural hop (code graph relation)
+    pub fn structural(rel_type: impl Into<String>) -> Self {
+        Self {
+            rel_type: rel_type.into(),
+            source: "structural".to_string(),
+            weight: None,
+        }
+    }
+
+    /// Create a neural hop (Hebbian synapse)
+    pub fn neural(weight: f64) -> Self {
+        Self {
+            rel_type: "SYNAPSE".to_string(),
+            source: "neural".to_string(),
+            weight: Some(weight),
+        }
+    }
+}
+
+/// A note with propagation information for context retrieval
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropagatedNote {
+    /// The note itself
+    pub note: Note,
+    /// Relevance score (0.0 - 1.0)
+    pub relevance_score: f64,
+    /// Entity from which this note was propagated
+    pub source_entity: String,
+    /// Path through the graph to reach the target
+    pub propagation_path: Vec<String>,
+    /// Distance in the graph (0 = direct, 1+ = propagated)
+    pub distance: u32,
+    /// Average PageRank of nodes on the propagation path (for debug/introspection).
+    /// Higher values mean the note was propagated through structurally important hubs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_pagerank: Option<f64>,
+    /// Relation hops traversed on the propagation path, with source info (structural/neural).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub relation_path: Vec<RelationHop>,
+    /// Combined weight of all relations on the path (product of individual weights).
+    /// Higher = stronger structural connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_rel_weight: Option<f64>,
+    /// Scar intensity of the note (0.0 = no scar, 1.0 = heavily scarred).
+    /// Notes with high scar_intensity have been invalidated or superseded in the past.
+    /// The propagation score is penalized by (1 - scar_intensity * 0.5).
+    #[serde(default)]
+    pub scar_intensity: f64,
+}
+
+/// Project boundary of a note propagation (`get_propagated_notes`).
+///
+/// This is the single source of truth for which notes a propagation may
+/// return. The Cypher in `neo4j/note.rs` applies the same rule *before*
+/// `LIMIT` (so foreign neighbours can never evict local notes from the top
+/// 20), the mock applies it through [`PropagationScope::admits`], and the
+/// Rust side re-checks it as defence in depth.
+///
+/// Rule for **global notes** (`project_id` absent or empty): they are ALWAYS
+/// admitted by `Project` and `CrossProject`, because they carry cross-cutting
+/// guidelines. Only `Unscoped` is "admit everything" and it is never reachable
+/// from a chat session or from the HTTP/MCP API when a project can be resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropagationScope {
+    /// Notes of this project, plus global notes. Nothing from other projects.
+    Project(Uuid),
+    /// Like `Project`, but notes of other projects are admitted too, weighted
+    /// by pairwise coupling and dropped below [`Self::MIN_COUPLING`] (internal
+    /// callers only; `force_cross_project`).
+    CrossProject(Uuid),
+    /// No project boundary (legacy; only when no project is known at all).
+    Unscoped,
+}
+
+impl PropagationScope {
+    /// Minimum coupling below which a foreign project's notes are suppressed.
+    pub const MIN_COUPLING: f64 = 0.2;
+
+    /// Cross-project coupling rule, shared by the Neo4j client and the mock:
+    /// `None` coupling (unknown) drops the note (fail closed); a coupling below
+    /// `MIN_COUPLING` drops it; otherwise the score is weighted by the coupling
+    /// and must still reach `min_score`.
+    ///
+    /// Decision (T0f-bis): the floor applies to EVERY `CrossProject` read.
+    /// `force_cross_project` used to mean both "widen to other projects" and
+    /// "skip the floor"; as it is also the only way to reach `CrossProject`, the
+    /// floor was never applied at all, and a widened read admitted notes of
+    /// projects with zero coupling (score `0 >= min_score 0`). `force` now
+    /// only widens.
+    pub fn weigh_foreign(score: f64, coupling: Option<f64>, min_score: f64) -> Option<f64> {
+        let coupling = coupling?;
+        if coupling < Self::MIN_COUPLING {
+            return None;
+        }
+        let weighted = score * coupling;
+        (weighted >= min_score).then_some(weighted)
+    }
+
+    /// Map the historical `(source_project_id, force_cross_project)` pair.
+    pub fn from_params(source_project_id: Option<Uuid>, force_cross_project: bool) -> Self {
+        match (source_project_id, force_cross_project) {
+            (Some(p), false) => Self::Project(p),
+            (Some(p), true) => Self::CrossProject(p),
+            (None, _) => Self::Unscoped,
+        }
+    }
+
+    /// Project used as the Cypher filter (`None` = no filter in the query).
+    pub fn cypher_project(&self) -> Option<Uuid> {
+        match self {
+            Self::Project(p) => Some(*p),
+            Self::CrossProject(_) | Self::Unscoped => None,
+        }
+    }
+
+    /// Whether a note owned by `note_project` (None = global) may be returned.
+    pub fn admits(&self, note_project: Option<Uuid>) -> bool {
+        match (self, note_project) {
+            (Self::Project(p), Some(n)) => *p == n,
+            _ => true, // global notes, CrossProject, Unscoped
+        }
+    }
+}
+
+// ============================================================================
+// DTOs for API
+// ============================================================================
+
+/// Request to create a new note
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateNoteRequest {
+    /// Project ID (optional — None for global/cross-project notes)
+    pub project_id: Option<Uuid>,
+    /// Type of note
+    pub note_type: NoteType,
+    /// Content of the note
+    pub content: String,
+    /// Importance level (optional, defaults to Medium)
+    pub importance: Option<NoteImportance>,
+    /// Scope (optional, defaults to Project)
+    pub scope: Option<NoteScope>,
+    /// Tags for categorization
+    pub tags: Option<Vec<String>>,
+    /// Initial anchors to attach
+    pub anchors: Option<Vec<CreateAnchorRequest>>,
+    /// Assertion rule (for assertion notes)
+    pub assertion_rule: Option<AssertionRule>,
+    /// Optional protocol run ID — if provided, a PRODUCED_DURING relation
+    /// will be created automatically after note creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Uuid>,
+    /// Sharing consent to persist at creation (default `NotSet`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing_consent: Option<crate::episodes::distill_models::SharingConsent>,
+}
+
+/// Request to create an anchor
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAnchorRequest {
+    pub entity_type: EntityType,
+    pub entity_id: String,
+    pub signature_hash: Option<String>,
+    pub body_hash: Option<String>,
+}
+
+/// Request to update a note
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateNoteRequest {
+    pub content: Option<String>,
+    pub importance: Option<NoteImportance>,
+    pub status: Option<NoteStatus>,
+    pub tags: Option<Vec<String>>,
+}
+
+/// Request to link a note to an entity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkNoteRequest {
+    pub entity_type: EntityType,
+    pub entity_id: String,
+}
+
+/// Filters for listing notes
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NoteFilters {
+    /// Filter by status
+    pub status: Option<Vec<NoteStatus>>,
+    /// Filter by note type
+    pub note_type: Option<Vec<NoteType>>,
+    /// Filter by importance
+    pub importance: Option<Vec<NoteImportance>>,
+    /// Filter by tags (any match)
+    pub tags: Option<Vec<String>>,
+    /// Filter by scope type
+    pub scope_type: Option<String>,
+    /// Search in content
+    pub search: Option<String>,
+    /// Minimum staleness score
+    pub min_staleness: Option<f64>,
+    /// Maximum staleness score
+    pub max_staleness: Option<f64>,
+    /// Filter global notes only (no project_id)
+    pub global_only: Option<bool>,
+    /// Pagination: limit
+    pub limit: Option<i64>,
+    /// Pagination: offset
+    pub offset: Option<i64>,
+    /// Sort field
+    pub sort_by: Option<String>,
+    /// Sort order (asc/desc)
+    pub sort_order: Option<String>,
+}
+
+/// Response with contextual notes for an entity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteContextResponse {
+    /// Direct notes attached to the entity
+    pub direct_notes: Vec<Note>,
+    /// Propagated notes from related entities
+    pub propagated_notes: Vec<PropagatedNote>,
+    /// Total count of relevant notes
+    pub total_count: usize,
+}
+
+/// Unified context knowledge response combining notes, decisions, and recent commits.
+///
+/// Returned by `get_context_knowledge(entity_type, entity_id)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextKnowledge {
+    /// Direct notes attached to the entity
+    pub direct_notes: Vec<Note>,
+    /// Propagated notes from related entities
+    pub propagated_notes: Vec<PropagatedNote>,
+    /// Decisions related to this entity (via AFFECTS or task/plan linkage)
+    pub decisions: Vec<crate::neo4j::models::DecisionNode>,
+    /// Recent commits touching this entity (via TOUCHES)
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub recent_commits: Vec<crate::neo4j::models::FileHistoryEntry>,
+    /// Total count of all knowledge items
+    pub total_count: usize,
+}
+
+/// Statistics about relations traversed during propagation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationStats {
+    /// Relation type (e.g. "IMPORTS", "CALLS")
+    pub relation_type: String,
+    /// Number of notes propagated via this relation type
+    pub count: usize,
+    /// Average score of notes propagated via this relation
+    pub avg_score: f64,
+}
+
+/// Enriched propagation response with notes, decisions, and relation analytics.
+///
+/// Returned by `get_propagated_knowledge(entity_type, entity_id, ...)`.
+/// Combines `get_propagated_notes` + `get_decisions_for_entity` with
+/// per-relation statistics and score breakdowns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropagatedKnowledge {
+    /// Propagated notes with full score breakdown (distance, relation_weight, pagerank)
+    pub notes: Vec<PropagatedNote>,
+    /// Decisions propagated via task/plan linkage
+    pub decisions: Vec<crate::neo4j::models::DecisionNode>,
+    /// Total relations traversed across all propagation paths
+    pub total_relations_traversed: usize,
+    /// Per-relation-type statistics
+    pub relation_stats: Vec<RelationStats>,
+    /// Total count of knowledge items (notes + decisions)
+    pub total_count: usize,
+}
+
+/// Note search result with relevance score
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteSearchHit {
+    pub note: Note,
+    pub score: f64,
+    /// Highlighted snippets from content
+    pub highlights: Option<Vec<String>>,
+    /// Which level this hit comes from, derived at construction so a caller never
+    /// has to infer it from `note.project_id` — and so the two can never disagree.
+    pub scope: SearchScope,
+}
+
+/// Which level a hit belongs to: the instance, or one project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchScope {
+    /// The note belongs to no project: it is readable from everywhere.
+    Transverse,
+    /// The note belongs to a project.
+    Project,
+}
+
+impl NoteSearchHit {
+    /// The level a note lives at.
+    pub fn scope_of(note: &Note) -> SearchScope {
+        if note.project_id.is_none() {
+            SearchScope::Transverse
+        } else {
+            SearchScope::Project
+        }
+    }
+}
+
+/// Blend freshness into a relevance score.
+///
+/// `staleness` runs from 0 (fresh) to 1 (stale) and the penalty is bounded at
+/// 30 %: freshness reorders near-ties, it never resurrects an irrelevant note nor
+/// buries a relevant one. A score is never increased, so a stale note cannot
+/// overtake a fresher one with the same relevance.
+pub fn apply_freshness(score: f64, staleness: f64) -> f64 {
+    score * (1.0 - 0.3 * staleness.clamp(0.0, 1.0))
+}
+
+// ============================================================================
+// Status Update
+// ============================================================================
+
+/// Request to update note status with optional migration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteStatusUpdate {
+    pub note_id: Uuid,
+    pub new_status: NoteStatus,
+    pub reason: String,
+    /// New hashes if the entity changed
+    pub new_hashes: Option<(String, String)>,
+    /// Migration target if entity was renamed
+    pub migration_target: Option<MigrationTarget>,
+}
+
+/// Target for note migration (when entity is renamed)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationTarget {
+    pub entity_type: EntityType,
+    pub new_entity_id: String,
+    pub similarity_score: f64,
+}
+
+#[cfg(test)]
+mod search_scope_tests {
+    //! Two things a caller must never have to infer: which level a hit comes
+    //! from, and how much freshness moved the ranking.
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    fn note_at(project_id: Option<Uuid>) -> Note {
+        Note::new(
+            project_id,
+            NoteType::Observation,
+            "contenu".to_string(),
+            "test".to_string(),
+        )
+    }
+
+    #[test]
+    fn a_note_with_no_project_is_transverse() {
+        assert_eq!(
+            NoteSearchHit::scope_of(&note_at(None)),
+            SearchScope::Transverse
+        );
+        assert_eq!(
+            NoteSearchHit::scope_of(&note_at(Some(Uuid::new_v4()))),
+            SearchScope::Project
+        );
+    }
+
+    #[test]
+    fn a_fresh_note_keeps_its_score() {
+        assert_eq!(apply_freshness(1.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn a_stale_note_loses_at_most_thirty_percent() {
+        assert!((apply_freshness(1.0, 1.0) - 0.7).abs() < 1e-12);
+        // Bounded: a staleness beyond 1 must not penalise further.
+        assert!((apply_freshness(1.0, 5.0) - 0.7).abs() < 1e-12);
+    }
+
+    #[test]
+    fn freshness_never_increases_a_score() {
+        for staleness in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert!(
+                apply_freshness(0.42, staleness) <= 0.42,
+                "freshness must never resurrect a note"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scope_serialises_as_a_word_not_a_number() {
+        let json = serde_json::to_string(&SearchScope::Transverse).unwrap();
+        assert_eq!(json, "\"transverse\"");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The author kind is written to the graph and read back as a string: the
+    /// round-trip is the contract between `create_note` and `node_to_note`.
+    #[test]
+    fn an_author_kind_roundtrips_through_its_name() {
+        for kind in [
+            NoteAuthorKind::Human,
+            NoteAuthorKind::Agent,
+            NoteAuthorKind::System,
+        ] {
+            assert_eq!(kind.to_string(), kind.as_str());
+            assert_eq!(
+                kind.as_str().parse::<NoteAuthorKind>().unwrap(),
+                kind,
+                "written {} and read back differently",
+                kind
+            );
+        }
+        assert!(
+            "SYSTEM".parse::<NoteAuthorKind>().is_ok(),
+            "case-insensitive"
+        );
+        assert!(
+            "nobody".parse::<NoteAuthorKind>().is_err(),
+            "an unknown kind is an error, not a default"
+        );
+    }
+
+    /// A note written before the property existed is guessed from the actor
+    /// name: `system/…` is a heuristic, `agent:<uuid>` a model, a name a person
+    /// acting deliberately.
+    #[test]
+    fn a_legacy_author_is_guessed_from_its_name() {
+        assert_eq!(
+            NoteAuthorKind::infer_from_created_by("system/observation-detector"),
+            NoteAuthorKind::System
+        );
+        assert_eq!(
+            NoteAuthorKind::infer_from_created_by("skill-evolution"),
+            NoteAuthorKind::System
+        );
+        assert_eq!(
+            NoteAuthorKind::infer_from_created_by("agent:204ce865-d253-4f59-816c-5f9d8f5ff1ac"),
+            NoteAuthorKind::Agent
+        );
+        assert_eq!(
+            NoteAuthorKind::infer_from_created_by("julien"),
+            NoteAuthorKind::Agent,
+            "a name alone does not claim a person's signature"
+        );
+    }
+
+    #[test]
+    fn a_machine_note_is_born_unsigned() {
+        let note = Note::new(
+            None,
+            NoteType::Observation,
+            "texte".to_string(),
+            "system/observation-detector".to_string(),
+        )
+        .with_author(NoteAuthorKind::System, "system/observation-detector");
+
+        assert!(!note.is_human_confirmed());
+        assert_eq!(note.human_confirmed_by, None);
+        assert_eq!(
+            note.last_confirmed_by, None,
+            "the author is not the confirmer"
+        );
+        assert!(
+            note.last_confirmed_at.is_some(),
+            "the freshness clock is set"
+        );
+    }
+
+    #[test]
+    fn a_persons_note_is_confirmed_by_construction() {
+        let note = Note::new(
+            None,
+            NoteType::Gotcha,
+            "texte".to_string(),
+            "julien".to_string(),
+        )
+        .with_author(NoteAuthorKind::Human, "julien");
+        assert!(note.is_human_confirmed());
+        assert_eq!(note.human_confirmed_by.as_deref(), Some("julien"));
+    }
+
+    #[test]
+    fn confirming_by_a_person_moves_both_the_signature_and_the_clock() {
+        let mut note = Note::new(
+            None,
+            NoteType::Gotcha,
+            "texte".to_string(),
+            "agent:x".to_string(),
+        );
+        assert!(!note.is_human_confirmed());
+
+        let now = Utc::now();
+        note.confirm_by_human("julien", now);
+
+        assert!(note.is_human_confirmed());
+        assert_eq!(note.last_confirmed_at, Some(now));
+        assert!(
+            note.changes
+                .iter()
+                .any(|c| matches!(c.change_type, ChangeType::Confirmed)),
+            "the confirmation is written in the history"
+        );
+    }
+
+    #[test]
+    fn test_propagation_scope_rule_for_global_and_foreign_notes() {
+        let (me, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let project = PropagationScope::from_params(Some(me), false);
+        assert_eq!(project, PropagationScope::Project(me));
+        assert!(project.admits(Some(me)));
+        assert!(
+            project.admits(None),
+            "global notes are admitted by explicit rule"
+        );
+        assert!(!project.admits(Some(other)));
+        assert_eq!(project.cypher_project(), Some(me));
+
+        let cross = PropagationScope::from_params(Some(me), true);
+        assert!(cross.admits(Some(other)));
+        assert_eq!(cross.cypher_project(), None);
+
+        let none = PropagationScope::from_params(None, false);
+        assert_eq!(none, PropagationScope::Unscoped);
+        assert!(none.admits(Some(other)) && none.admits(None));
+    }
+
+    /// T0f-bis: the coupling floor is applied to every cross-project read
+    /// (`force` only widens), unknown coupling fails closed, and the weighted
+    /// score must still reach `min_score`.
+    #[test]
+    fn test_weigh_foreign_applies_the_coupling_floor() {
+        let w = PropagationScope::weigh_foreign;
+        assert_eq!(w(1.0, None, 0.0), None);
+        assert_eq!(w(1.0, Some(0.0), 0.0), None, "zero coupling never admitted");
+        assert_eq!(w(1.0, Some(0.19), 0.0), None);
+        assert_eq!(w(1.0, Some(0.2), 0.0), Some(0.2));
+        assert_eq!(w(0.5, Some(0.5), 0.3), None, "0.25 < min_score 0.3");
+        assert_eq!(w(0.8, Some(0.5), 0.3), Some(0.4));
+    }
+
+    #[test]
+    fn test_note_type_display_and_parse() {
+        let types = vec![
+            (NoteType::Guideline, "guideline"),
+            (NoteType::Gotcha, "gotcha"),
+            (NoteType::Pattern, "pattern"),
+            (NoteType::Context, "context"),
+            (NoteType::Tip, "tip"),
+            (NoteType::Observation, "observation"),
+            (NoteType::Assertion, "assertion"),
+            (NoteType::Rfc, "rfc"),
+        ];
+
+        for (note_type, expected) in types {
+            assert_eq!(note_type.to_string(), expected);
+            assert_eq!(NoteType::from_str(expected).unwrap(), note_type);
+        }
+    }
+
+    #[test]
+    fn test_note_type_rfc_serde_roundtrip() {
+        let rfc = NoteType::Rfc;
+        let json = serde_json::to_string(&rfc).unwrap();
+        assert_eq!(json, "\"rfc\"");
+
+        let parsed: NoteType = serde_json::from_str("\"rfc\"").unwrap();
+        assert_eq!(parsed, NoteType::Rfc);
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct TypeWrapper {
+            note_type: NoteType,
+        }
+        let wrapper = TypeWrapper {
+            note_type: NoteType::Rfc,
+        };
+        let json = serde_json::to_string(&wrapper).unwrap();
+        assert!(json.contains("\"rfc\""));
+        let parsed: TypeWrapper = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, wrapper);
+    }
+
+    #[test]
+    fn test_rfc_base_decay_days() {
+        let note = Note::new(
+            None,
+            NoteType::Rfc,
+            "RFC content".to_string(),
+            "RFC test".to_string(),
+        );
+        assert_eq!(note.base_decay_days(), 365.0);
+    }
+
+    #[test]
+    fn test_note_status_display_and_parse() {
+        let statuses = vec![
+            (NoteStatus::Active, "active"),
+            (NoteStatus::NeedsReview, "needs_review"),
+            (NoteStatus::Stale, "stale"),
+            (NoteStatus::Obsolete, "obsolete"),
+            (NoteStatus::Archived, "archived"),
+        ];
+
+        for (status, expected) in statuses {
+            assert_eq!(status.to_string(), expected);
+            assert_eq!(NoteStatus::from_str(expected).unwrap(), status);
+        }
+    }
+
+    #[test]
+    fn test_note_importance_weights() {
+        assert_eq!(NoteImportance::Low.weight(), 0.3);
+        assert_eq!(NoteImportance::Medium.weight(), 0.5);
+        assert_eq!(NoteImportance::High.weight(), 0.8);
+        assert_eq!(NoteImportance::Critical.weight(), 1.0);
+    }
+
+    #[test]
+    fn test_note_creation() {
+        let project_id = Uuid::new_v4();
+        let note = Note::new(
+            Some(project_id),
+            NoteType::Guideline,
+            "Always use Result for error handling".to_string(),
+            "claude".to_string(),
+        );
+
+        assert_eq!(note.project_id, Some(project_id));
+        assert_eq!(note.note_type, NoteType::Guideline);
+        assert_eq!(note.status, NoteStatus::Active);
+        assert_eq!(note.importance, NoteImportance::Medium);
+        assert!(note.is_active());
+        assert!(!note.needs_attention());
+        assert_eq!(note.changes.len(), 1);
+        assert_eq!(note.changes[0].change_type, ChangeType::Created);
+    }
+
+    #[test]
+    fn test_note_confirm() {
+        let mut note = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Tip,
+            "Use async/await".to_string(),
+            "user".to_string(),
+        );
+        note.staleness_score = 0.5;
+
+        note.confirm("reviewer");
+
+        assert_eq!(note.staleness_score, 0.0);
+        assert!(note.last_confirmed_by.is_some());
+        assert_eq!(note.changes.len(), 2);
+        assert_eq!(note.changes[1].change_type, ChangeType::Confirmed);
+    }
+
+    #[test]
+    fn test_note_scope_specificity() {
+        assert!(NoteScope::Project.specificity() < NoteScope::Module("foo".into()).specificity());
+        assert!(
+            NoteScope::Module("foo".into()).specificity()
+                < NoteScope::File("bar".into()).specificity()
+        );
+        assert!(
+            NoteScope::File("bar".into()).specificity()
+                < NoteScope::Function("baz".into()).specificity()
+        );
+    }
+
+    #[test]
+    fn graph_label_cuts_at_forty_characters_without_breaking_utf8() {
+        let mut note = Note::new(
+            None,
+            NoteType::Guideline,
+            "court".to_string(),
+            "t".to_string(),
+        );
+        assert_eq!(note.graph_label(), "court", "short content is the label");
+
+        note.content = "a".repeat(40);
+        assert_eq!(note.graph_label(), "a".repeat(40), "exactly 40 is not cut");
+
+        note.content = "é".repeat(41); // 2 bytes per char: a byte cut would panic
+        assert_eq!(note.graph_label(), format!("{}…", "é".repeat(40)));
+
+        note.content = "x".repeat(41);
+        assert_eq!(note.graph_label(), format!("{}…", "x".repeat(40)));
+    }
+
+    #[test]
+    fn test_note_serialization() {
+        let note = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Gotcha,
+            "Watch out for null".to_string(),
+            "agent".to_string(),
+        );
+
+        let json = serde_json::to_string(&note).unwrap();
+        let deserialized: Note = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(note.id, deserialized.id);
+        assert_eq!(note.note_type, deserialized.note_type);
+        assert_eq!(note.content, deserialized.content);
+    }
+
+    #[test]
+    fn test_assertion_result() {
+        let passed = AssertionResult::passed("Check passed");
+        assert!(passed.passed);
+
+        let failed = AssertionResult::failed("Check failed");
+        assert!(!failed.passed);
+    }
+
+    #[test]
+    fn test_base_decay_days() {
+        let context_note = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Context,
+            "temp".into(),
+            "user".into(),
+        );
+        let guideline_note = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Guideline,
+            "stable".into(),
+            "user".into(),
+        );
+        let assertion_note = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Assertion,
+            "rule".into(),
+            "user".into(),
+        );
+
+        assert!(context_note.base_decay_days() < guideline_note.base_decay_days());
+        assert!(guideline_note.base_decay_days() < assertion_note.base_decay_days());
+    }
+
+    #[test]
+    fn test_entity_type_workspace_variants_display() {
+        assert_eq!(EntityType::Workspace.to_string(), "workspace");
+        assert_eq!(
+            EntityType::WorkspaceMilestone.to_string(),
+            "workspace_milestone"
+        );
+        assert_eq!(EntityType::Resource.to_string(), "resource");
+        assert_eq!(EntityType::Component.to_string(), "component");
+    }
+
+    #[test]
+    fn test_entity_type_workspace_variants_from_str() {
+        assert_eq!(
+            EntityType::from_str("workspace").unwrap(),
+            EntityType::Workspace
+        );
+        assert_eq!(
+            EntityType::from_str("workspacemilestone").unwrap(),
+            EntityType::WorkspaceMilestone
+        );
+        assert_eq!(
+            EntityType::from_str("resource").unwrap(),
+            EntityType::Resource
+        );
+        assert_eq!(
+            EntityType::from_str("component").unwrap(),
+            EntityType::Component
+        );
+    }
+
+    #[test]
+    fn test_entity_type_plan_era_variants() {
+        // Display
+        let variants = vec![
+            (EntityType::Step, "step"),
+            (EntityType::Constraint, "constraint"),
+            (EntityType::Milestone, "milestone"),
+            (EntityType::Release, "release"),
+        ];
+        for (variant, expected) in &variants {
+            assert_eq!(variant.to_string(), *expected);
+        }
+
+        // FromStr
+        for (variant, s) in &variants {
+            assert_eq!(&EntityType::from_str(s).unwrap(), variant);
+        }
+
+        // Serde roundtrip
+        for (variant, _) in &variants {
+            let json = serde_json::to_string(variant).unwrap();
+            let deserialized: EntityType = serde_json::from_str(&json).unwrap();
+            assert_eq!(&deserialized, variant);
+        }
+    }
+
+    #[test]
+    fn test_entity_type_neo4j_label_is_pascal_case_for_every_variant() {
+        // The MCP/REST surface speaks lowercase snake_case (Display).
+        // The Neo4j label is the PascalCase variant name. The two MUST agree
+        // across every variant or we silently no-op Cypher queries.
+        let pairs = vec![
+            (EntityType::Project, "Project"),
+            (EntityType::File, "File"),
+            (EntityType::Module, "Module"),
+            (EntityType::Function, "Function"),
+            (EntityType::Struct, "Struct"),
+            (EntityType::Trait, "Trait"),
+            (EntityType::Enum, "Enum"),
+            (EntityType::Impl, "Impl"),
+            (EntityType::Task, "Task"),
+            (EntityType::Plan, "Plan"),
+            (EntityType::Step, "Step"),
+            (EntityType::Commit, "Commit"),
+            (EntityType::Decision, "Decision"),
+            (EntityType::Constraint, "Constraint"),
+            (EntityType::Milestone, "Milestone"),
+            (EntityType::Release, "Release"),
+            (EntityType::Workspace, "Workspace"),
+            (EntityType::WorkspaceMilestone, "WorkspaceMilestone"),
+            (EntityType::Resource, "Resource"),
+            (EntityType::Component, "Component"),
+            (EntityType::FeatureGraph, "FeatureGraph"),
+            (EntityType::Protocol, "Protocol"),
+            (EntityType::ProtocolState, "ProtocolState"),
+            (EntityType::ProtocolRun, "ProtocolRun"),
+            (EntityType::PlanRun, "PlanRun"),
+            (EntityType::Skill, "Skill"),
+            (EntityType::Note, "Note"),
+            (EntityType::ChatSession, "ChatSession"),
+            (EntityType::Process, "Process"),
+        ];
+        for (variant, label) in pairs {
+            assert_eq!(
+                variant.neo4j_label(),
+                label,
+                "variant {variant:?} mapped to the wrong Neo4j label"
+            );
+        }
+    }
+
+    #[test]
+    fn test_entity_type_match_property_specializations() {
+        // File and Commit have non-default match properties; everything else
+        // is keyed by `id`.
+        assert_eq!(EntityType::File.match_property(), "path");
+        assert_eq!(EntityType::Commit.match_property(), "hash");
+        for et in [
+            EntityType::Project,
+            EntityType::Function,
+            EntityType::Task,
+            EntityType::Plan,
+            EntityType::Decision,
+            EntityType::Note,
+            EntityType::ChatSession,
+            EntityType::Process,
+        ] {
+            assert_eq!(et.match_property(), "id", "{et:?} should match by id");
+        }
+    }
+
+    #[test]
+    fn test_entity_type_from_str_accepts_both_cases() {
+        // The MCP layer documents snake_case ("file") but older docs and
+        // human callers may pass PascalCase ("File"). Both must parse — this
+        // is the regression captured by gotcha e3f9a882.
+        assert_eq!(EntityType::from_str("file").unwrap(), EntityType::File);
+        assert_eq!(EntityType::from_str("File").unwrap(), EntityType::File);
+        assert_eq!(
+            EntityType::from_str("workspace_milestone").unwrap(),
+            EntityType::WorkspaceMilestone
+        );
+        assert_eq!(
+            EntityType::from_str("WorkspaceMilestone").unwrap(),
+            EntityType::WorkspaceMilestone
+        );
+        assert!(EntityType::from_str("not_a_real_type").is_err());
+    }
+
+    #[test]
+    fn test_note_scope_workspace_specificity() {
+        // Workspace is the broadest scope (specificity -1)
+        assert_eq!(NoteScope::Workspace.specificity(), -1);
+        // Workspace should be less specific than Project
+        assert!(NoteScope::Workspace.specificity() < NoteScope::Project.specificity());
+        // Workspace should be less specific than all other scopes
+        assert!(NoteScope::Workspace.specificity() < NoteScope::Module("m".into()).specificity());
+        assert!(NoteScope::Workspace.specificity() < NoteScope::File("f".into()).specificity());
+    }
+
+    #[test]
+    fn test_note_scope_workspace_display() {
+        assert_eq!(NoteScope::Workspace.to_string(), "workspace");
+    }
+
+    /// Conceptual test documenting PageRank-weighted propagation scoring.
+    ///
+    /// In Neo4j, the Cypher query computes:
+    ///   avg_path_pagerank = mean(COALESCE(node.pagerank, 0.05)) over path nodes
+    ///   score = (1/(distance+1)) * importance * (1 + avg_path_pagerank * 5)
+    ///
+    /// Expected behavior with two notes at equal distance (2 hops) and importance (high=0.8):
+    ///   - Note A propagated via hub (pagerank 0.15): multiplier = 1 + 0.15 * 5 = 1.75
+    ///     → score = (1/3) * 0.8 * 1.75 = 0.467
+    ///   - Note B propagated via leaf (pagerank 0.01): multiplier = 1 + 0.01 * 5 = 1.05
+    ///     → score = (1/3) * 0.8 * 1.05 = 0.280
+    ///   - Note A should rank higher than Note B.
+    ///
+    /// Fallback: if no pagerank on any node, avg = 0.05, multiplier = 1.25
+    ///   → score = (1/3) * 0.8 * 1.25 = 0.333 (slightly above old formula's 0.267)
+    #[test]
+    fn test_propagated_note_pagerank_scoring_documentation() {
+        // Simulate the scoring formula in Rust (mirrors the Cypher computation)
+        let distance: f64 = 2.0;
+        let importance_weight: f64 = 0.8; // "high"
+
+        // Via hub (pagerank 0.15)
+        let hub_pagerank = 0.15;
+        let hub_multiplier = 1.0 + hub_pagerank * 5.0;
+        let hub_score = (1.0 / (distance + 1.0)) * importance_weight * hub_multiplier;
+
+        // Via leaf (pagerank 0.01)
+        let leaf_pagerank = 0.01;
+        let leaf_multiplier = 1.0 + leaf_pagerank * 5.0;
+        let leaf_score = (1.0 / (distance + 1.0)) * importance_weight * leaf_multiplier;
+
+        // Via unknown node (no pagerank → default 0.05)
+        let default_pagerank = 0.05;
+        let default_multiplier = 1.0 + default_pagerank * 5.0;
+        let default_score = (1.0 / (distance + 1.0)) * importance_weight * default_multiplier;
+
+        // Old formula (without pagerank weighting)
+        let old_score = (1.0 / (distance + 1.0)) * importance_weight;
+
+        // Hub path scores higher than leaf path
+        assert!(
+            hub_score > leaf_score,
+            "Hub path ({:.3}) should score higher than leaf path ({:.3})",
+            hub_score,
+            leaf_score
+        );
+
+        // Both are higher than old formula (multiplier always >= 1.0)
+        assert!(hub_score > old_score);
+        assert!(leaf_score > old_score);
+
+        // Default (no pagerank data) is close to old formula (multiplier = 1.25)
+        assert!((default_score - old_score).abs() < 0.1_f64);
+
+        // Verify the PropagatedNote struct carries the path_pagerank field
+        let pn = PropagatedNote {
+            note: Note::new(None, NoteType::Tip, "test".to_string(), "test".to_string()),
+            relevance_score: hub_score,
+            source_entity: "hub_file".to_string(),
+            propagation_path: vec!["hub_file".to_string(), "target".to_string()],
+            distance: 2,
+            path_pagerank: Some(hub_pagerank),
+            relation_path: vec![
+                RelationHop::structural("IMPORTS"),
+                RelationHop::structural("CALLS"),
+            ],
+            path_rel_weight: Some(0.9),
+            scar_intensity: 0.0,
+        };
+        assert_eq!(pn.path_pagerank, Some(0.15));
+        assert!(pn.relevance_score > 0.4);
+    }
+
+    #[test]
+    fn test_computed_energy_fresh_note() {
+        let note = Note::new(
+            None,
+            NoteType::Guideline,
+            "fresh note".to_string(),
+            "test".to_string(),
+        );
+        let ce = note.computed_energy();
+        assert!(
+            (ce - note.energy).abs() < 0.01,
+            "Fresh note computed_energy ({}) should be ~{}",
+            ce,
+            note.energy
+        );
+    }
+
+    #[test]
+    fn test_computed_energy_90_days_old() {
+        let mut note = Note::new(
+            None,
+            NoteType::Guideline,
+            "old note".to_string(),
+            "test".to_string(),
+        );
+        note.energy = 1.0;
+        note.last_activated = Some(Utc::now() - chrono::Duration::days(90));
+        let ce = note.computed_energy();
+        assert!(
+            (ce - 0.5).abs() < 0.05,
+            "90-day-old note computed_energy ({}) should be ~0.5",
+            ce
+        );
+    }
+
+    #[test]
+    fn test_computed_energy_no_last_activated() {
+        let mut note = Note::new(
+            None,
+            NoteType::Guideline,
+            "no activation".to_string(),
+            "test".to_string(),
+        );
+        note.energy = 0.7;
+        note.last_activated = None;
+        let ce = note.computed_energy();
+        assert!(
+            (ce - 0.7).abs() < f64::EPSILON,
+            "No last_activated: computed_energy ({}) should equal stored energy (0.7)",
+            ce
+        );
+    }
+}

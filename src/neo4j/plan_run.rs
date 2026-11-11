@@ -1,0 +1,375 @@
+//! Neo4j PlanRun operations — runner execution state persistence
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use super::client::Neo4jClient;
+use crate::runner::{PlanRunStatus, RunnerState, TriggerSource};
+use anyhow::Result;
+use neo4rs::query;
+use uuid::Uuid;
+
+/// Cypher of `list_all_plan_runs_impl`. The workspace slug and the status are
+/// bound as `$ws_slug` / `$status` by the caller.
+pub(crate) fn list_all_plan_runs_cypher(by_workspace: bool, by_status: bool) -> String {
+    let mut cypher = String::new();
+    if by_workspace {
+        // Scope to workspace: traverse PlanRun->Plan<-Project->Workspace
+        cypher.push_str(
+            "MATCH (w:Workspace {slug: $ws_slug})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(plan:Plan)<-[:RUNS]-(r:PlanRun)\n",
+        );
+    } else {
+        cypher.push_str("MATCH (r:PlanRun)\n");
+    }
+    if by_status {
+        cypher.push_str("WHERE r.status = $status\n");
+    }
+    cypher.push_str(
+        "RETURN r\nORDER BY r.started_at DESC, r.run_id DESC\nSKIP $offset\nLIMIT $limit",
+    );
+    cypher
+}
+
+impl Neo4jClient {
+    // ========================================================================
+    // PlanRun operations
+    // ========================================================================
+
+    /// Create a PlanRun node and link it to the Plan via (:PlanRun)-[:RUNS]->(:Plan).
+    pub async fn create_plan_run(&self, state: &RunnerState) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $plan_id})
+            CREATE (r:PlanRun {
+                run_id: $run_id,
+                plan_id: $plan_id,
+                total_tasks: $total_tasks,
+                current_wave: $current_wave,
+                git_branch: $git_branch,
+                started_at: datetime($started_at),
+                status: $status,
+                cost_usd: $cost_usd,
+                notional_usd: $notional_usd,
+                tokens_used: $tokens_used,
+                triggered_by: $triggered_by,
+                completed_tasks: $completed_tasks,
+                failed_tasks: $failed_tasks,
+                state_json: $state_json
+            })
+            CREATE (r)-[:RUNS]->(p)
+            "#,
+        )
+        .param("run_id", state.run_id.to_string())
+        .param("plan_id", state.plan_id.to_string())
+        .param("total_tasks", state.total_tasks as i64)
+        .param("current_wave", state.current_wave as i64)
+        .param("git_branch", state.git_branch.clone())
+        .param("started_at", state.started_at.to_rfc3339())
+        .param("status", state.status.to_string())
+        .param("cost_usd", state.cost_usd)
+        .param("notional_usd", state.notional_usd)
+        .param("tokens_used", state.tokens_used as i64)
+        .param(
+            "triggered_by",
+            serde_json::to_string(&state.triggered_by).unwrap_or_default(),
+        )
+        .param(
+            "completed_tasks",
+            state
+                .completed_tasks
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+        .param(
+            "failed_tasks",
+            state
+                .failed_tasks
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+        .param(
+            "state_json",
+            serde_json::to_string(state).unwrap_or_default(),
+        );
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Update an existing PlanRun with current execution state.
+    /// Uses state_json for full fidelity (retry_counts, current_task_title, etc.).
+    pub async fn update_plan_run(&self, state: &RunnerState) -> Result<()> {
+        let mut cypher = String::from(
+            r#"
+            MATCH (r:PlanRun {run_id: $run_id})
+            SET r.current_wave = $current_wave,
+                r.status = $status,
+                r.cost_usd = $cost_usd,
+                r.notional_usd = $notional_usd,
+                r.tokens_used = $tokens_used,
+                r.total_tasks = $total_tasks,
+                r.completed_tasks = $completed_tasks,
+                r.failed_tasks = $failed_tasks,
+                r.state_json = $state_json
+            "#,
+        );
+
+        // current_task_id is a typed Uuid, but bind it anyway
+        if state.current_task_id.is_some() {
+            cypher.push_str(", r.current_task_id = $current_task_id");
+        } else {
+            cypher.push_str(", r.current_task_id = null");
+        }
+
+        if state.completed_at.is_some() {
+            cypher.push_str(", r.completed_at = datetime($completed_at)");
+        }
+
+        let q = query(&cypher)
+            .param("run_id", state.run_id.to_string())
+            .param("current_wave", state.current_wave as i64)
+            .param("status", state.status.to_string())
+            .param("cost_usd", state.cost_usd)
+            .param("notional_usd", state.notional_usd)
+            .param("tokens_used", state.tokens_used as i64)
+            .param("total_tasks", state.total_tasks as i64)
+            .param(
+                "completed_tasks",
+                state
+                    .completed_tasks
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+            .param(
+                "failed_tasks",
+                state
+                    .failed_tasks
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+            .param(
+                "state_json",
+                serde_json::to_string(state).unwrap_or_default(),
+            );
+        let q = match state.current_task_id {
+            Some(t) => q.param("current_task_id", t.to_string()),
+            None => q,
+        };
+        let q = match state.completed_at {
+            Some(c) => q.param("completed_at", c.to_rfc3339()),
+            None => q,
+        };
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get a PlanRun by its run_id.
+    pub async fn get_plan_run(&self, run_id: Uuid) -> Result<Option<RunnerState>> {
+        let q = query(
+            r#"
+            MATCH (r:PlanRun {run_id: $run_id})
+            RETURN r
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            Ok(Some(self.node_to_plan_run(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List all PlanRuns with status=running (for crash recovery).
+    pub async fn list_active_plan_runs_impl(&self) -> Result<Vec<RunnerState>> {
+        let q = query(
+            r#"
+            MATCH (r:PlanRun {status: 'running'})
+            RETURN r
+            ORDER BY r.started_at DESC
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            runs.push(self.node_to_plan_run(&node)?);
+        }
+        Ok(runs)
+    }
+
+    /// List all PlanRuns across all plans, ordered by started_at desc.
+    /// If `workspace_slug` is provided, only returns runs whose plan belongs to
+    /// a project in that workspace (via `:RUNS`→`:Plan`←`:HAS_PLAN`←`:Project`→`:BELONGS_TO_WORKSPACE`→`:Workspace`).
+    pub async fn list_all_plan_runs_impl(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<RunnerState>> {
+        let cypher = list_all_plan_runs_cypher(workspace_slug.is_some(), status.is_some());
+        let cypher_str: &str = &cypher;
+
+        // Read-only scan of PlanRun nodes: replayed on a transient error.
+        self.read_retrying(cypher_str, || async move {
+            let mut q = query(cypher_str)
+                .param("limit", limit)
+                .param("offset", offset);
+            if let Some(s) = status {
+                q = q.param("status", s.to_string());
+            }
+            if let Some(ws) = workspace_slug {
+                q = q.param("ws_slug", ws.to_string());
+            }
+
+            let mut result = self.graph.execute(q).await?;
+            let mut runs = Vec::new();
+            while let Some(row) = result.next().await? {
+                let node: neo4rs::Node = row.get("r")?;
+                runs.push(self.node_to_plan_run(&node)?);
+            }
+            Ok(runs)
+        })
+        .await
+    }
+
+    /// List all PlanRuns for a given plan.
+    pub async fn list_plan_runs_impl(&self, plan_id: Uuid, limit: i64) -> Result<Vec<RunnerState>> {
+        let q = query(
+            r#"
+            MATCH (r:PlanRun {plan_id: $plan_id})
+            RETURN r
+            ORDER BY r.started_at DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("plan_id", plan_id.to_string())
+        .param("limit", limit);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            runs.push(self.node_to_plan_run(&node)?);
+        }
+        Ok(runs)
+    }
+
+    /// Convert a Neo4j node to RunnerState.
+    ///
+    /// Prefers `state_json` (full fidelity) but falls back to individual fields
+    /// for backward compatibility.
+    fn node_to_plan_run(&self, node: &neo4rs::Node) -> Result<RunnerState> {
+        // Try state_json first (has all fields including retry_counts, current_task_title)
+        if let Ok(json_str) = node.get::<String>("state_json") {
+            if !json_str.is_empty() {
+                if let Ok(state) = serde_json::from_str::<RunnerState>(&json_str) {
+                    return Ok(state);
+                }
+            }
+        }
+
+        // Fallback: reconstruct from individual fields
+        let run_id: String = node.get("run_id")?;
+        let plan_id: String = node.get("plan_id")?;
+        let status: String = node.get("status")?;
+        let started_at: String = node.get("started_at")?;
+        let completed_at: Option<String> = node.get("completed_at").ok();
+        let current_task_id: Option<String> = node.get("current_task_id").ok();
+        let triggered_by: String = node
+            .get("triggered_by")
+            .unwrap_or_else(|_| r#""manual""#.to_string());
+
+        let completed_tasks_str: String = node.get("completed_tasks").unwrap_or_default();
+        let failed_tasks_str: String = node.get("failed_tasks").unwrap_or_default();
+
+        let parse_uuid_list = |s: &str| -> Vec<Uuid> {
+            if s.is_empty() {
+                return Vec::new();
+            }
+            s.split(',')
+                .filter_map(|id| id.trim().parse::<Uuid>().ok())
+                .collect()
+        };
+
+        let plan_run_status = match status.as_str() {
+            "running" => PlanRunStatus::Running,
+            "completed" => PlanRunStatus::Completed,
+            "completed_with_errors" => PlanRunStatus::CompletedWithErrors,
+            "failed" => PlanRunStatus::Failed,
+            "cancelled" => PlanRunStatus::Cancelled,
+            "budget_exceeded" => PlanRunStatus::BudgetExceeded,
+            "interrupted" => PlanRunStatus::Interrupted,
+            _ => PlanRunStatus::Running,
+        };
+
+        Ok(RunnerState {
+            run_id: run_id.parse()?,
+            plan_id: plan_id.parse()?,
+            total_tasks: node.get::<i64>("total_tasks").unwrap_or(0) as usize,
+            current_wave: node.get::<i64>("current_wave").unwrap_or(0) as usize,
+            current_task_id: current_task_id.and_then(|s| s.parse().ok()),
+            current_task_title: None,
+            active_agents: Vec::new(),
+            completed_tasks: parse_uuid_list(&completed_tasks_str),
+            failed_tasks: parse_uuid_list(&failed_tasks_str),
+            retry_counts: std::collections::HashMap::new(),
+            git_branch: node.get("git_branch").unwrap_or_default(),
+            started_at: started_at.parse()?,
+            completed_at: completed_at.and_then(|s| s.parse().ok()),
+            status: plan_run_status,
+            cost_usd: node.get("cost_usd").unwrap_or(0.0),
+            // Two counters (A21), flat on the node since they exist; a node
+            // written before reads as zero. The unknown count only lives in
+            // `state_json`.
+            notional_usd: node.get("notional_usd").unwrap_or(0.0),
+            tokens_used: node
+                .get::<i64>("tokens_used")
+                .ok()
+                .and_then(|v| u64::try_from(v).ok())
+                .unwrap_or(0),
+            unknown_cost_attempts: 0,
+            triggered_by: serde_json::from_str(&triggered_by).unwrap_or(TriggerSource::Manual),
+            project_id: node
+                .get::<String>("project_id")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            lifecycle_run_id: node
+                .get::<String>("lifecycle_run_id")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            // Only `state_json` carries the cwd; a node rebuilt from its flat
+            // fields predates it, so the run cannot be resumed in a known directory.
+            cwd: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::list_all_plan_runs_cypher;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    #[test]
+    fn plan_runs_query_binds_workspace_slug_and_status() {
+        let c = list_all_plan_runs_cypher(true, true);
+        assert!(c.contains("{slug: $ws_slug}"), "{c}");
+        assert!(c.contains("r.status = $status"), "{c}");
+        // no string literal can carry user data
+        assert!(!c.contains('\''), "{c}");
+        assert!(!list_all_plan_runs_cypher(false, false).contains("$ws_slug"));
+    }
+}

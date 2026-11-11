@@ -1,0 +1,2374 @@
+//! Out-of-band SDK message listener.
+//!
+//! Background tokio task spawned per chat session that consumes the
+//! long-lived `broadcast::Sender<Message>` exposed by `nexus_claude::
+//! InteractiveClient::subscribe_messages()` and surfaces "out-of-band"
+//! events into the chat event stream.
+//!
+//! ## What is an "out-of-band" event?
+//!
+//! Any SDK [`Message`] that arrives on the broadcast while no active
+//! `stream_response` is running for the session — typically:
+//!
+//! - Background tool notifications (the `Monitor` tool firing on a
+//!   matched log line, `BashOutput` from a `run_in_background` Bash
+//!   completing, sub-Agent completion events from background `Task`s)
+//! - System notifications fired by the CLI between turns
+//!
+//! ## Architecture
+//!
+//! Spawned once per session in [`super::manager::ChatManager::create_session`]
+//! and again on [`super::manager::ChatManager::resume_session`]. The task
+//! takes a brief lock on the [`InteractiveClient`] only to call
+//! `subscribe_messages()`, which returns a `'static` stream that lives
+//! independently of the lock. The task then loops on that stream and the
+//! `cancel` token.
+//!
+//! ## Interaction with `stream_response`
+//!
+//! `stream_response` itself subscribes to the same broadcast (via
+//! `send_and_receive_stream` internally). When a turn is active, BOTH
+//! subscribers receive each `Message`. The `is_streaming` flag is the
+//! coordination signal: this listener treats messages as OOB **only** when
+//! `is_streaming == false`. In-stream messages are delegated to
+//! `stream_response`'s normal handling and we silently skip them here to
+//! avoid duplicate persistence/broadcast.
+//!
+//! ## Triggering on idle
+//!
+//! When an OOB event arrives and the session is idle (no active turn),
+//! the listener:
+//!   1. Persists the event as a `ChatEventRecord` of type `background_output`
+//!      (so it appears in `chat::list_messages` history)
+//!   2. Broadcasts a `ChatEvent::BackgroundOutput` (so WebSocket clients
+//!      see it in real time)
+//!   3. Pushes a `PendingMessage::BackgroundOutput` carrying the content
+//!   4. Tries to claim the streaming flag via `compare_exchange(false, true)`
+//!      and, if it wins the race, spawns a new `stream_response` so the
+//!      LLM reacts to the event without waiting for the next user turn
+//!   5. If it loses the race (a concurrent user message claimed the
+//!      flag first), the queued `PendingMessage` will be picked up by
+//!      `drain_pending_messages` after that turn ends — no event is
+//!      dropped.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use chrono::Utc;
+use futures::StreamExt;
+use nexus_claude::{
+    AssistantMessage, ContentBlock, ContentValue, InteractiveClient, Message, UserMessage,
+};
+use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
+
+use super::agent_runtime::AgentSessionHandle;
+use super::manager::{ActiveSession, ChatManager};
+use super::types::{ChatEvent, PendingMessage};
+use crate::meilisearch::SearchStore;
+use crate::neo4j::models::ChatEventRecord;
+use crate::neo4j::GraphStore;
+
+/// Dependencies needed to trigger a fresh `stream_response` from an
+/// idle session when an OOB event arrives. These are all
+/// `ChatManager`-bound (not session-bound) and are cloned once at spawn
+/// time. Session-bound state is looked up via `active_sessions` at
+/// trigger time, mirroring the pattern used by `spawn_nats_rpc_listener`.
+pub(crate) struct OobListenerDeps {
+    pub graph: Arc<dyn GraphStore>,
+    pub active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+    pub context_injector: Option<Arc<nexus_claude::memory::ContextInjector>>,
+    pub event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
+    pub retry_config: super::config::RetryConfig,
+    pub enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
+    pub search: Arc<dyn SearchStore>,
+    /// The blobs of the attached documents (the images a turn sends inline).
+    pub documents: crate::documents::store::DocumentStore,
+    pub nats: Option<Arc<crate::events::NatsEmitter>>,
+}
+
+/// Where the turns and the OOB listener are in the CLI's output, counted in `result`s.
+///
+/// Both read the same output on subscriptions of their own, in the same order. The
+/// listener used to tell a turn's message from background output by `is_streaming`
+/// alone, read when it gets to the message: lagging behind the turn (a loaded
+/// machine), it got to the turn's last messages after the turn had ended and took them
+/// for background output (a turn's own `tool_result` then started a turn of its own,
+/// and every later turn was one `result` behind).
+///
+/// The rule is now on the listener's side, whatever its lag: a message it gets to while
+/// it has not yet reached a `result` that a turn already read comes BEFORE that
+/// `result` in the output, so it belongs to a finished turn — never background output.
+///
+/// The listener counts only the `result`s a turn reads: one met while a turn streams,
+/// or while it is behind the turns. A `result` no turn reads (out of any turn) is not
+/// counted, so the two counts stay comparable.
+#[derive(Debug, Default)]
+pub struct ResultCursor {
+    /// `result`s read by the turns of the session.
+    turn: AtomicU64,
+    /// `result`s of turns the listener got to.
+    listener: AtomicU64,
+}
+
+impl ResultCursor {
+    /// A turn read a `result` of the CLI. Called before the turn stops streaming.
+    pub(crate) fn turn_read_result(&self) {
+        self.turn.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The listener starts: the `result`s turns read before it subscribed are behind
+    /// it (it subscribes under the client lock a turn holds while it reads).
+    fn listener_starts(&self) {
+        self.listener
+            .store(self.turn.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
+
+    /// Whether the listener is behind the turns: what it gets to now precedes a
+    /// `result` a turn already read.
+    fn listener_behind(&self) -> bool {
+        self.listener.load(Ordering::SeqCst) < self.turn.load(Ordering::SeqCst)
+    }
+
+    /// The listener got to a `result`: counted when it is a turn's (`streaming`, or
+    /// already read by a turn).
+    fn listener_saw_result(&self, streaming: bool) {
+        if streaming || self.listener_behind() {
+            self.listener.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Spawn the OOB listener task for a session. Fire-and-forget — the task
+/// is owned by the tokio runtime and stops when `cancel` is fired.
+///
+/// `session_id` is used only for tracing context.
+///
+/// ## Recovery semantics (T9 of plan 9a1684b2)
+///
+/// Recovery of interrupted runs at server boot — handled by
+/// `crate::runner::runner::Runner::recover_interrupted_runs` — does **not**
+/// need a dedicated `respawn_oob_listener` API. That recovery path
+/// re-enters the normal session lifecycle:
+///
+///   `recover_interrupted_runs → execute_plan → ChatManager::create_session
+///    → spawn_oob_listener (this function)`
+///
+/// Each restored runner session therefore gets its own fresh OOB
+/// listener bound to a freshly spawned `InteractiveClient`, identical
+/// to a never-interrupted session. The original cancellation token of
+/// the pre-crash listener is gone with the process — there's nothing to
+/// cancel — so we just spawn a new one.
+///
+/// `resume_session` (used when the user reconnects to an existing
+/// `cli_session_id` mid-conversation) follows the same pattern: the old
+/// `nats_cancel` token is fired before the new session is built, so any
+/// stale listener exits cleanly before the new one starts.
+pub(crate) fn spawn_oob_listener(
+    session_id: String,
+    client: Arc<Mutex<InteractiveClient>>,
+    events_tx: broadcast::Sender<ChatEvent>,
+    is_streaming: Arc<AtomicBool>,
+    next_seq: Arc<AtomicI64>,
+    cancel: CancellationToken,
+    deps: OobListenerDeps,
+) {
+    let session_uuid = Uuid::parse_str(&session_id).ok();
+
+    tokio::spawn(async move {
+        // Briefly take the client lock to call subscribe_messages(). The
+        // returned stream is `'static` and independent of the lock.
+        // Where this listener is, for the turns of the session (see `ResultCursor`).
+        let cursor = deps
+            .active_sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|s| s.result_cursor.clone());
+        let stream = {
+            let client = client.lock().await;
+            if let Some(ref cursor) = cursor {
+                cursor.listener_starts();
+            }
+            client.subscribe_messages().await
+        };
+
+        let mut stream = match stream {
+            Some(s) => s,
+            None => {
+                warn!(
+                    session_id = %session_id,
+                    "OOB listener: subscribe_messages() returned None \
+                     (mock transport or transport not connected). \
+                     Spontaneous messages between turns will not be observed."
+                );
+                return;
+            }
+        };
+
+        info!(session_id = %session_id, "OOB listener started");
+
+        // The session's tool clock: the calls of a sub-agent outlive the turn that
+        // launched it, the ones that end between turns are timed here.
+        let tool_clock = super::tool_clock::ToolClock::for_session(&session_id);
+
+        // Tool-use ids of sub-agent launches (`Agent` / `Task`). Everything a
+        // sub-agent does is streamed with `parent_tool_use_id` = that id, and
+        // none of it is an external event the main agent must react to.
+        // Filled from every message, including in-stream ones: the launch is
+        // almost always seen while the parent turn is still streaming.
+        let mut subagent_parents: HashSet<String> = HashSet::new();
+        // Background traffic IS activity: without this, a session whose turn
+        // ended while sub-agents / background tasks kept working looked idle
+        // and was closed by the idle cleanup, killing that work. Throttled so
+        // a chatty stream does not take the sessions write lock per message.
+        let mut last_activity_touch = Instant::now()
+            .checked_sub(ACTIVITY_TOUCH_INTERVAL)
+            .unwrap_or_else(Instant::now);
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!(session_id = %session_id, "OOB listener cancelled, exiting");
+                    return;
+                }
+                next = stream.next() => {
+                    match next {
+                        Some(Ok(message)) => {
+                            #[cfg(test)]
+                            if let Some(lag) = test_lag(&session_id) {
+                                tokio::time::sleep(lag).await;
+                            }
+                            let message = ChatManager::mask_cli_message(message);
+                            // When the message arrived: the end of a call it ends, before its
+                            // output is persisted and published (`clock_oob_message`).
+                            let arrived_at = Utc::now();
+                            // A message before a `result` that a turn already read belongs
+                            // to a finished turn, whatever `is_streaming` says now
+                            // (`ResultCursor`): never background output.
+                            let of_a_finished_turn = match &cursor {
+                                Some(cursor) if matches!(message, Message::Result { .. }) => {
+                                    cursor.listener_saw_result(
+                                        is_streaming.load(Ordering::SeqCst),
+                                    );
+                                    // Handled as before (a `result` is never background output).
+                                    false
+                                }
+                                Some(cursor) => cursor.listener_behind(),
+                                None => false,
+                            };
+                            remember_subagent_launches(&message, &mut subagent_parents);
+                            // The CLI's own count of running background tasks.
+                            // Read from every message, in-stream ones included:
+                            // a task is usually launched during a turn and
+                            // finishes outside of one.
+                            if let Some(count) = cli_background_task_count(&message) {
+                                if let Some(active) =
+                                    deps.active_sessions.read().await.get(&session_id)
+                                {
+                                    active.cli_background_tasks.store(count, Ordering::Relaxed);
+                                }
+                            }
+                            if last_activity_touch.elapsed() >= ACTIVITY_TOUCH_INTERVAL {
+                                last_activity_touch = Instant::now();
+                                if let Some(active) =
+                                    deps.active_sessions.write().await.get_mut(&session_id)
+                                {
+                                    active.last_activity = Instant::now();
+                                }
+                            }
+                            // If a stream_response is currently running (or ran: the message
+                            // precedes a `result` it read), that path consumes the same
+                            // broadcast. Skip silently.
+                            if of_a_finished_turn || is_streaming.load(Ordering::Relaxed) {
+                                debug!(
+                                    session_id = %session_id,
+                                    "OOB listener: in-stream message — skipping (stream_response handles it)"
+                                );
+                                continue;
+                            }
+                            handle_oob_message(
+                                &session_id,
+                                session_uuid,
+                                &events_tx,
+                                &is_streaming,
+                                &next_seq,
+                                &client,
+                                &deps,
+                                &message,
+                                should_trigger_turn(&message, &subagent_parents),
+                            )
+                            .await;
+                            // A call of a background sub-agent that ends between two
+                            // turns: no turn times it, this listener does (`tool_clock`).
+                            for timing in clock_oob_message(&tool_clock, &message, arrived_at) {
+                                emit_oob_timing(
+                                    &session_id,
+                                    session_uuid,
+                                    &events_tx,
+                                    &next_seq,
+                                    &deps,
+                                    timing,
+                                )
+                                .await;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            warn!(
+                                session_id = %session_id,
+                                error = %e,
+                                "OOB listener: error reading from broadcast stream"
+                            );
+                        }
+                        None => {
+                            emit_subprocess_death(
+                                &session_id,
+                                session_uuid,
+                                &events_tx,
+                                &next_seq,
+                                deps.graph.as_ref(),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// What an out-of-band message says to the tool clock: its `tool_use` and
+/// `tool_result` blocks are observed (a sub-agent's call announced or ended between
+/// turns), and the timings of the calls they end are returned. A result whose call
+/// the clock no longer holds (a background Bash or Monitor of an ended turn) gives
+/// none. `at`: when the message arrived, the end of the calls it ends (taken before
+/// its output is persisted and published).
+fn clock_oob_message(
+    clock: &super::tool_clock::ToolClock,
+    message: &Message,
+    at: chrono::DateTime<Utc>,
+) -> Vec<ChatEvent> {
+    ChatManager::message_to_events(message)
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ChatEvent::ToolUse { .. } | ChatEvent::ToolResult { .. }
+            )
+        })
+        .filter_map(|event| clock.observe(event, at))
+        .collect()
+}
+
+/// Persists and broadcasts a `tool_timing` found by [`clock_oob_message`], after the
+/// background output of the result it times.
+async fn emit_oob_timing(
+    session_id: &str,
+    session_uuid: Option<Uuid>,
+    events_tx: &broadcast::Sender<ChatEvent>,
+    next_seq: &Arc<AtomicI64>,
+    deps: &OobListenerDeps,
+    timing: ChatEvent,
+) {
+    if let Some(uuid) = session_uuid {
+        let record = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: uuid,
+            seq: next_seq.fetch_add(1, Ordering::SeqCst),
+            event_type: timing.event_type().to_string(),
+            data: serde_json::to_string(&timing).unwrap_or_default(),
+            created_at: chrono::Utc::now(),
+        };
+        if let Err(e) = deps.graph.store_chat_events(uuid, vec![record]).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "OOB listener: failed to persist a tool_timing (non-fatal)"
+            );
+        }
+    }
+    let _ = events_tx.send(timing.clone());
+    if let Some(ref nats) = deps.nats {
+        nats.publish_chat_event(session_id, timing);
+    }
+}
+
+/// Handle a single OOB Message: persist, broadcast, push to queue, and
+/// try to claim the streaming flag to spawn a new turn.
+#[allow(clippy::too_many_arguments)]
+async fn handle_oob_message(
+    session_id: &str,
+    session_uuid: Option<Uuid>,
+    events_tx: &broadcast::Sender<ChatEvent>,
+    is_streaming: &Arc<AtomicBool>,
+    next_seq: &Arc<AtomicI64>,
+    _client: &Arc<Mutex<InteractiveClient>>,
+    deps: &OobListenerDeps,
+    message: &Message,
+    trigger_turn: bool,
+) {
+    let payload = extract_payload(message);
+    let Some((source, content, correlation_id)) = payload else {
+        debug!(
+            session_id = %session_id,
+            "OOB listener: message variant produced no payload — skipping"
+        );
+        return;
+    };
+
+    if content.trim().is_empty() {
+        debug!(
+            session_id = %session_id,
+            source = %source,
+            "OOB listener: empty content payload — skipping"
+        );
+        return;
+    }
+
+    // Lazy crash-recovery (plan 754a1379, T13): if this BackgroundOutput
+    // carries a correlation_id we don't currently track (because the PO
+    // server restarted while the Monitor / Bash bg subprocess was alive
+    // — the subprocess survives the PO restart, but the in-memory map
+    // doesn't), insert a recovered entry now. The frontend's toolbar
+    // pill and MonitorCard reappear via the `ActiveTasksUpdate` that
+    // `track_background_task_recovery_if_orphan` broadcasts.
+    //
+    // No-op when correlation_id is None or already known — it's an
+    // idempotent guard that runs on every BackgroundOutput.
+    let _ = crate::chat::manager::ChatManager::track_background_task_recovery_if_orphan(
+        session_id,
+        &deps.active_sessions,
+        events_tx,
+        &deps.nats,
+        correlation_id.as_deref(),
+        &source,
+    )
+    .await;
+
+    let event = ChatEvent::BackgroundOutput {
+        source: source.clone(),
+        content: content.clone(),
+        received_at: Utc::now(),
+        correlation_id,
+        // This path relays a RAW provider message between turns: it carries no
+        // structured tool call (that form only exists on the `AgentEvent` side,
+        // which `event_map::out_of_band_to_chat_events` maps and stamps).
+        tool: None,
+    };
+
+    info!(
+        session_id = %session_id,
+        source = %source,
+        oob_event_type = "background_output",
+        "OOB listener: emitting BackgroundOutput"
+    );
+
+    // 1. Persist as ChatEventRecord (so it appears in list_messages history).
+    // Time the round-trip — `oob_persistence_latency_ms` is a structured
+    // tracing field that log-based metrics pipelines (e.g. Vector/Loki/
+    // Datadog) can extract as a histogram for production monitoring (T9).
+    if let Some(uuid) = session_uuid {
+        let record = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: uuid,
+            seq: next_seq.fetch_add(1, Ordering::SeqCst),
+            event_type: event.event_type().to_string(),
+            data: serde_json::to_string(&event).unwrap_or_default(),
+            created_at: chrono::Utc::now(),
+        };
+        let persist_start = Instant::now();
+        match deps.graph.store_chat_events(uuid, vec![record]).await {
+            Ok(_) => {
+                let latency_ms = persist_start.elapsed().as_millis() as u64;
+                debug!(
+                    session_id = %session_id,
+                    source = %source,
+                    oob_persistence_latency_ms = latency_ms,
+                    "OOB listener: persisted BackgroundOutput record"
+                );
+            }
+            Err(e) => {
+                let latency_ms = persist_start.elapsed().as_millis() as u64;
+                warn!(
+                    session_id = %session_id,
+                    source = %source,
+                    oob_persistence_latency_ms = latency_ms,
+                    error = %e,
+                    "OOB listener: failed to persist BackgroundOutput record (non-fatal)"
+                );
+            }
+        }
+    }
+
+    // 2. Broadcast on local channel + NATS so all WebSocket clients see it
+    let _ = events_tx.send(event.clone());
+    if let Some(ref nats) = deps.nats {
+        nats.publish_chat_event(session_id, event);
+    }
+
+    // 3 & 4. Push to pending_messages and try to claim streaming, then
+    //         maybe trigger a new stream_response — only for events the agent
+    //         must react to (see `should_trigger_turn`). The event itself was
+    //         persisted and broadcast above either way.
+    if trigger_turn {
+        maybe_trigger_stream(session_id, content, is_streaming, deps).await;
+    } else {
+        debug!(
+            session_id = %session_id,
+            source = %source,
+            "OOB listener: not a turn trigger (own output, system status or sub-agent traffic)"
+        );
+    }
+}
+
+/// Push the OOB content as a `PendingMessage::BackgroundOutput` and, if
+/// the session is idle, atomically claim the streaming flag and spawn
+/// `stream_response` so the LLM reacts.
+///
+/// Race semantics: we use `compare_exchange(false, true)` on
+/// `is_streaming`. Whichever caller first transitions false→true owns
+/// the spawn; concurrent OOB events or user messages losing the race
+/// just leave their entries in the queue and the active stream's
+/// `drain_pending_messages` picks them up after Result.
+async fn maybe_trigger_stream(
+    session_id: &str,
+    oob_content: String,
+    is_streaming: &Arc<AtomicBool>,
+    deps: &OobListenerDeps,
+) {
+    // Look up session-bound state. If the session was just removed,
+    // there's nothing to do.
+    let session_state = {
+        let sessions = deps.active_sessions.read().await;
+        sessions.get(session_id).map(|s| {
+            (
+                s.client.clone(),
+                s.events_tx.clone(),
+                s.interrupt_flag.clone(),
+                s.memory_manager.clone(),
+                s.next_seq.clone(),
+                s.pending_messages.clone(),
+                s.is_streaming.clone(),
+                s.streaming_text.clone(),
+                s.streaming_events.clone(),
+                s.sdk_control_rx.clone(),
+                s.auto_continue.clone(),
+                s.oob_trigger_history.clone(),
+                s.oob_trigger_cap,
+                s.oob_trigger_window,
+                s.oob_capped_warned.clone(),
+            )
+        })
+    };
+
+    let Some((
+        client,
+        events_tx,
+        interrupt_flag,
+        memory_manager,
+        next_seq,
+        pending_messages,
+        sess_is_streaming,
+        streaming_text,
+        streaming_events,
+        sdk_control_rx,
+        auto_continue,
+        oob_trigger_history,
+        oob_trigger_cap,
+        oob_trigger_window,
+        oob_capped_warned,
+    )) = session_state
+    else {
+        debug!(
+            session_id = %session_id,
+            "OOB listener: session no longer in active_sessions — dropping trigger"
+        );
+        return;
+    };
+
+    // T7 — Rate cap (sliding window) on OOB-driven `stream_response` spawns.
+    // Drains entries older than the window, then either blocks (cap hit)
+    // or records a fresh timestamp. Blocking ALSO skips queueing the
+    // PendingMessage::BackgroundOutput so the queue cannot be flooded
+    // and dumped into the next user-driven turn — the OOB event is
+    // still persisted+broadcast (already done in `handle_oob_message`).
+    if check_and_record_trigger_cap(
+        session_id,
+        &events_tx,
+        &oob_trigger_history,
+        oob_trigger_cap,
+        oob_trigger_window,
+        &oob_capped_warned,
+    )
+    .await
+    {
+        // Cap hit — refuse to queue + spawn. Warning already emitted
+        // (at most once per window) by the helper.
+        return;
+    }
+
+    // T6 of plan 806c8f2c — Claim FIRST, push only on lost race.
+    //
+    // The previous logic was push-then-pop (push BG to queue, then if won
+    // race pop_front the queue to use as prompt). That was brittle: if
+    // *another* entry landed in the queue between our push and our pop
+    // (possible during the `finalize_streaming_status` window where
+    // is_streaming flips false but the queue is briefly inspected without
+    // a continuous lock), pop_front would return THAT entry — potentially
+    // a User message that should have gone through drain's
+    // priority-aware path. The bug was latent rather than active because
+    // the timing window is narrow, but eliminating the primitive removes
+    // the risk entirely. Cf companion fix in drain.rs (T2).
+    let won_race = is_streaming
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
+
+    if !won_race {
+        // Lost — leave the OOB content in the queue. drain_pending_messages
+        // will pick it up after the active turn ends, prioritised below
+        // any User/SystemHint that's also queued (cf drain.rs::pop_highest_priority).
+        let mut queue = pending_messages.lock().await;
+        queue.push_back(PendingMessage::background_output(
+            crate::refs::compose::inert(&oob_content),
+        ));
+        debug!(
+            session_id = %session_id,
+            "OOB listener: lost is_streaming race — queued for drain"
+        );
+        return;
+    }
+
+    // T9 — Structured trigger log. `oob_trigger_count` is a structured
+    // tracing field (sliding-window depth at the moment of trigger),
+    // suitable for a counter via log-based metrics. Pair with the cap
+    // for a `oob_cap_utilization = count / cap` derived metric.
+    let trigger_count = oob_trigger_history.lock().await.len();
+    info!(
+        session_id = %session_id,
+        oob_trigger_count = trigger_count,
+        oob_trigger_cap = oob_trigger_cap,
+        "OOB listener: idle session, spawning stream_response for OOB event"
+    );
+
+    // Won the race — use the OOB content directly. The queue stays
+    // untouched; any subsequent OOB events that arrive between this
+    // point and the spawn (or during the spawn) push themselves to the
+    // queue via the lost-race branch above and drain handles them after.
+    // Tool output is not a composed message: no block may ride on it.
+    let prompt = crate::refs::compose::inert(&oob_content);
+
+    // Spawn stream_response. Same call shape as in `spawn_nats_rpc_listener`.
+    let session_id_for_spawn = session_id.to_string();
+    let graph = deps.graph.clone();
+    let active_sessions = deps.active_sessions.clone();
+    let context_injector = deps.context_injector.clone();
+    let event_emitter = deps.event_emitter.clone();
+    let retry_config = deps.retry_config.clone();
+    let enrichment_pipeline = deps.enrichment_pipeline.clone();
+    let search = deps.search.clone();
+    let documents = deps.documents.clone();
+    let nats = deps.nats.clone();
+    // `client` was cloned earlier from ActiveSession but only the spawned
+    // stream_response below consumes it; touch it here to make ownership
+    // explicit without moving `sess_is_streaming`, which we still need
+    // below for the Arc::clone.
+    let _ = client.clone();
+
+    let turn_task = tokio::spawn(async move {
+        ChatManager::stream_response(
+            client,
+            events_tx,
+            prompt,
+            session_id_for_spawn,
+            graph,
+            active_sessions,
+            interrupt_flag,
+            memory_manager,
+            context_injector,
+            next_seq,
+            pending_messages,
+            // Pass the OUTER is_streaming flag — it's the same Arc as
+            // sess_is_streaming (cloned from the same source), but we
+            // already set it to true above so stream_response won't
+            // re-set it.
+            // SAFETY: same Arc<AtomicBool> across the session.
+            // NB: stream_response will set is_streaming=false at the
+            // end via post_stream::finalize_streaming_status.
+            std::sync::Arc::clone(&sess_is_streaming),
+            streaming_text,
+            streaming_events,
+            event_emitter,
+            nats,
+            sdk_control_rx,
+            auto_continue,
+            retry_config,
+            enrichment_pipeline,
+            search,
+            documents,
+            // The OOB-triggered turn reacts to background output; it does not
+            // carry the cognitive router (the manager's primary turn paths do),
+            // so an out-of-credit refusal here is reported without a cooldown.
+            None,
+        )
+        .await;
+    });
+    ChatManager::track_stream_task(&deps.active_sessions, session_id, turn_task.abort_handle())
+        .await;
+}
+
+/// Emit a `ChatEvent::SessionError` describing subprocess death and log
+/// a `warn!` (T9 of plan 9a1684b2). Extracted as a small helper so the
+/// behaviour is unit-testable without spinning up a real
+/// `InteractiveClient` and the full broadcast machinery.
+///
+/// Called from the listener loop's `None` branch — when
+/// `stream.next()` yields `None` the SDK transport's broadcast sender
+/// has been dropped, which means the CLI subprocess for this session
+/// has exited (clean shutdown OR crash). Subsequent `send_message`
+/// calls on this `session_id` will resume the session (starting a new
+/// turn and reusing the prior conversation where possible), so we
+/// surface a typed event the frontend can render prominently.
+pub(crate) async fn emit_subprocess_death(
+    session_id: &str,
+    session_uuid: Option<Uuid>,
+    events_tx: &broadcast::Sender<ChatEvent>,
+    next_seq: &AtomicI64,
+    graph: &dyn GraphStore,
+) {
+    warn!(
+        session_id = %session_id,
+        reason = "subprocess_exited",
+        "OOB listener: SDK message broadcast closed (subprocess gone); exiting"
+    );
+    let event = ChatEvent::SessionError {
+        reason: "subprocess_exited".to_string(),
+        message: "The CLI subprocess for this session has exited. \
+                  Send a message to start a new turn (will resume \
+                  the session if possible)."
+            .into(),
+        received_at: Utc::now(),
+    };
+    // Persist through the same path as the other stored events (same `seq`
+    // counter, same store): the attention cockpit reads `session_error` from
+    // the store to tell a dead CLI that died on an error from one that is
+    // merely idle. Persist BEFORE broadcasting so a client reacting to the
+    // broadcast finds it stored.
+    if let Some(uuid) = session_uuid {
+        let record = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: uuid,
+            seq: next_seq.fetch_add(1, Ordering::SeqCst),
+            event_type: event.event_type().to_string(),
+            data: serde_json::to_string(&event).unwrap_or_default(),
+            created_at: Utc::now(),
+        };
+        if let Err(e) = graph.store_chat_events(uuid, vec![record]).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "OOB listener: failed to persist SessionError record (non-fatal)"
+            );
+        }
+    }
+    let _ = events_tx.send(event);
+}
+
+/// Sliding-window rate cap for OOB-driven `stream_response` spawns
+/// (T7 of plan 9a1684b2). Returns `true` when the trigger should be
+/// **blocked** (cap hit), `false` when it can proceed.
+///
+/// Behaviour:
+/// 1. Lock the history deque, drain timestamps older than `window`.
+/// 2. If `len >= cap`: emit a `ChatEvent::SystemHint` warning **at most
+///    once per window** (gated by `capped_warned`), log a warn, return
+///    `true`.
+/// 3. Otherwise: clear the `capped_warned` flag (we're back below the
+///    cap), push `Instant::now()`, return `false`.
+async fn check_and_record_trigger_cap(
+    session_id: &str,
+    events_tx: &broadcast::Sender<ChatEvent>,
+    history: &Arc<Mutex<VecDeque<Instant>>>,
+    cap: u32,
+    window: Duration,
+    capped_warned: &Arc<AtomicBool>,
+) -> bool {
+    let mut hist = history.lock().await;
+    let now = Instant::now();
+
+    // Drain entries older than `window`. Since timestamps are pushed in
+    // chronological order, popping from the front while the head is too
+    // old is sufficient.
+    while let Some(front) = hist.front() {
+        if now.duration_since(*front) > window {
+            hist.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    if (hist.len() as u32) >= cap {
+        // Capped. Emit warning once per window via the AtomicBool gate.
+        if capped_warned
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let warn_msg = format!(
+                "⚠️ OOB auto-continue cap reached: {} background-triggered turns in the last \
+                 {}s. Further background events will be persisted but will NOT auto-restart \
+                 the agent until activity slows down. Send a message to continue manually \
+                 if needed.",
+                cap,
+                window.as_secs()
+            );
+            warn!(
+                session_id = %session_id,
+                cap = cap,
+                window_secs = window.as_secs(),
+                "OOB listener: trigger cap reached, throttling further auto-continues"
+            );
+            let _ = events_tx.send(ChatEvent::SystemHint { content: warn_msg });
+        } else {
+            debug!(
+                session_id = %session_id,
+                "OOB listener: trigger still capped (warning already emitted)"
+            );
+        }
+        return true;
+    }
+
+    // Below cap — clear the warned flag (so a new spike will re-warn)
+    // and record this trigger.
+    capped_warned.store(false, Ordering::SeqCst);
+    hist.push_back(now);
+    false
+}
+
+/// Minimum interval between two `last_activity` refreshes from background
+/// traffic — far below the idle timeout (minutes), far above message rate.
+const ACTIVITY_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long the out-of-turn pump of the agent engine waits for the rest of a
+/// provider message before it flushes what it has.
+const OOB_FLUSH: Duration = Duration::from_millis(50);
+
+/// The out-of-turn pump of the agent engine: reads
+/// `AgentSession::out_of_band()` — the events the provider emits between turns
+/// (out-of-turn permissions, background tasks, background output) — regroups
+/// what belongs to one provider message and emits it as `ChatEvent`s through
+/// [`super::agent_runtime::emit_out_of_band`]. The batch is flushed when the
+/// provider pauses, when it grows large, and when the stream ends, so each
+/// event is emitted exactly once: nothing is lost, nothing is duplicated.
+pub(crate) async fn pump_out_of_band(
+    handle: Arc<AgentSessionHandle>,
+    mut stream: nexus_claude::agent::EventStream,
+) {
+    let mut batch: Vec<nexus_claude::agent::AgentEvent> = Vec::new();
+    loop {
+        let item = if batch.is_empty() {
+            Some(stream.next().await)
+        } else {
+            tokio::time::timeout(OOB_FLUSH, stream.next()).await.ok()
+        };
+        match item {
+            Some(Some(event)) => {
+                batch.push(event);
+                if batch.len() >= 64 {
+                    super::agent_runtime::emit_out_of_band(&handle, std::mem::take(&mut batch))
+                        .await;
+                }
+            }
+            Some(None) => {
+                super::agent_runtime::emit_out_of_band(&handle, std::mem::take(&mut batch)).await;
+                break;
+            }
+            None => {
+                super::agent_runtime::emit_out_of_band(&handle, std::mem::take(&mut batch)).await;
+            }
+        }
+    }
+}
+
+/// Tests only: a delay the OOB listener of a session takes before handling each
+/// message, to play a listener that lags behind the turn (a loaded machine).
+#[cfg(test)]
+pub(crate) static TEST_LAG: std::sync::Mutex<Vec<(String, Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn test_lag(session_id: &str) -> Option<Duration> {
+    TEST_LAG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(sid, _)| sid == session_id)
+        .map(|(_, lag)| *lag)
+}
+
+/// Upper bound on remembered sub-agent launches. A session launches a handful;
+/// the cap only guards a pathological one against unbounded growth.
+const MAX_REMEMBERED_SUBAGENTS: usize = 1024;
+
+/// How many background tasks the CLI says it is running, when `message` is
+/// its `background_tasks_changed` report (sent on every start and finish, with
+/// the full current list). `None` for any other message, and for a report
+/// whose `tasks` is not a list — an unreadable report must not be read as
+/// "nothing is running".
+pub(crate) fn cli_background_task_count(message: &Message) -> Option<usize> {
+    let Message::System { subtype, data } = message else {
+        return None;
+    };
+    if subtype != "background_tasks_changed" {
+        return None;
+    }
+    data.get("tasks")?.as_array().map(Vec::len)
+}
+
+/// Record the ids of `Agent` / `Task` tool calls, at any depth: a sub-agent
+/// may launch its own sub-agent, whose traffic is parented to that launch.
+fn remember_subagent_launches(message: &Message, parents: &mut HashSet<String>) {
+    let Message::Assistant { message: m, .. } = message else {
+        return;
+    };
+    for block in &m.content {
+        if let ContentBlock::ToolUse(t) = block {
+            if t.name == "Agent" || t.name == "Task" {
+                if parents.len() >= MAX_REMEMBERED_SUBAGENTS {
+                    parents.clear();
+                }
+                parents.insert(t.id.clone());
+            }
+        }
+    }
+}
+
+/// Should an idle-time message start a new agent turn?
+///
+/// Only a genuine external event the agent has to react to: a background
+/// tool's output (a `Monitor` match, a `Bash run_in_background` result)
+/// arriving as a User + tool_result.
+///
+/// Everything else used to trigger a turn too, and each one fed the agent a
+/// phantom "user" message — observed in production as bursts of messages
+/// reading only `[tool_use: Bash]`, `[thinking]` or a JSON status blob while
+/// background sub-agents were working:
+///
+/// - **Assistant messages** are the agent's own output (or a sub-agent's).
+///   Handing the model its own words back as a new prompt is never right.
+/// - **System messages** are status traffic (`task_progress`, `status`, …).
+///   Completion notifications are injected by the CLI itself, which starts
+///   its own turn for them.
+/// - **Anything parented to a sub-agent launch** is that sub-agent's
+///   internal traffic, tool results included.
+pub(crate) fn should_trigger_turn(message: &Message, subagent_parents: &HashSet<String>) -> bool {
+    match message {
+        Message::User {
+            parent_tool_use_id, ..
+        } => !parent_tool_use_id
+            .as_ref()
+            .is_some_and(|p| subagent_parents.contains(p)),
+        Message::Assistant { .. }
+        | Message::System { .. }
+        | Message::Result { .. }
+        | Message::StreamEvent { .. } => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The native engine: which out-of-turn events WAKE the session
+// ---------------------------------------------------------------------------
+
+/// How many background events are remembered as already announced. A session runs a
+/// handful; the cap only guards a pathological one against unbounded growth, and
+/// forgetting an old key can at worst announce an old task once more.
+const MAX_ANNOUNCED_BACKGROUND: usize = 1024;
+
+/// What has already been announced to the agent, so a table sent again does not wake
+/// the same task twice (the provider sends the COMPLETE table on every change).
+#[derive(Debug, Default)]
+pub(crate) struct AnnouncedBackground {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl AnnouncedBackground {
+    /// Whether `key` is new, recording it. Bounded (see [`MAX_ANNOUNCED_BACKGROUND`]).
+    pub(crate) fn first_time(&mut self, key: String) -> bool {
+        if !self.seen.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > MAX_ANNOUNCED_BACKGROUND {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
+/// The lines an out-of-turn batch must WAKE an idle agent session for.
+///
+/// The historical engine never needs this: the CLI starts that turn itself when a
+/// background tool of its own ends — which is what [`should_trigger_turn`] guards on
+/// the `Message` side. On the native engine PO **is** the harness, so nothing else
+/// would resume the session: the end of a `Bash run_in_background` (or of a `Monitor`)
+/// was mirrored, persisted and drawn, and the agent stayed idle until a human typed
+/// something.
+///
+/// What wakes: a task that ENDED on its own (`completed` / `failed`), and a line a
+/// `Monitor` matched — each announced ONCE per session ([`AnnouncedBackground`]).
+/// Nothing wakes for a task still running (its launch result already said so, inside
+/// the turn), and nothing wakes for a task somebody STOPPED: a `TaskStop`, the end of
+/// the session or a timeout spend no turn on a task the human or the agent has already
+/// given up on — the transcript shows it ending, the next turn reads it there.
+pub(crate) fn background_wake_lines(
+    events: &[nexus_claude::agent::AgentEvent],
+    announced: &mut AnnouncedBackground,
+) -> Vec<String> {
+    use nexus_claude::agent::{AgentEvent, BackgroundTaskKind, BackgroundTaskStatus, TaskPhase};
+
+    let mut lines = Vec::new();
+    for event in events {
+        match event {
+            AgentEvent::BackgroundTasks { tasks } => {
+                for task in tasks {
+                    let status = match task.status {
+                        BackgroundTaskStatus::Running => continue,
+                        BackgroundTaskStatus::Completed => "completed",
+                        BackgroundTaskStatus::Failed => "failed",
+                        // `TaskStop`, the end of the session, a timeout: somebody already
+                        // gave up on it, the transcript says so, no turn is spent on it.
+                        BackgroundTaskStatus::Killed => continue,
+                        _ => continue,
+                    };
+                    if !announced.first_time(format!("task:{}", task.id)) {
+                        continue;
+                    }
+                    let kind = match task.kind {
+                        BackgroundTaskKind::Shell => "Bash run_in_background",
+                        BackgroundTaskKind::Monitor => "Monitor",
+                        _ => "background task",
+                    };
+                    let description = if task.description.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" `{}`", task.description)
+                    };
+                    lines.push(format!(
+                        "[background] {kind} {id}{description} {status}. Its output is the file the \
+                         launch reported: read it with Read, then carry on with what it was needed \
+                         for.",
+                        id = task.id,
+                    ));
+                }
+            }
+            AgentEvent::TaskUpdate {
+                phase: TaskPhase::Progress,
+                task_id,
+                summary: Some(line),
+                event_id,
+                ..
+            } => {
+                let key = match event_id {
+                    Some(id) => format!("line:{id}"),
+                    None => format!("line:{}:{}", task_id.as_deref().unwrap_or(""), line),
+                };
+                if !announced.first_time(key) {
+                    continue;
+                }
+                lines.push(format!("[monitor] {line}"));
+            }
+            _ => {}
+        }
+    }
+    lines
+}
+
+/// Wakes the session for what arrived out of turn and what the agent has to answer
+/// ([`background_wake_lines`] decides). Called by the out-of-turn pump of the native
+/// engine once per batch, after the events have been mirrored and broadcast.
+pub(crate) async fn wake_for_background(
+    handle: &Arc<AgentSessionHandle>,
+    events: &[nexus_claude::agent::AgentEvent],
+) {
+    if handle.closed.is_cancelled() {
+        return;
+    }
+    let lines = {
+        let mut announced = handle
+            .announced_background
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        background_wake_lines(events, &mut announced)
+    };
+    if lines.is_empty() {
+        return;
+    }
+    let content = lines.join("\n");
+    match handle.clone().wake_with_background(&content).await {
+        Ok(started) => debug!(
+            session_id = %handle.session_id,
+            started,
+            "OOB: a background event woke the session"
+        ),
+        Err(error) => warn!(
+            session_id = %handle.session_id,
+            %error,
+            "OOB: waking the session for a background event failed"
+        ),
+    }
+}
+
+/// Map a `nexus_claude::Message` variant to `(source, content, correlation_id)`
+/// suitable for `ChatEvent::BackgroundOutput`. Returns `None` for variants
+/// that should be ignored at the OOB level (e.g. `Result` end-of-turn,
+/// `StreamEvent` partial tokens — these are in-stream artefacts).
+fn extract_payload(message: &Message) -> Option<(String, String, Option<String>)> {
+    match message {
+        Message::Assistant {
+            message: m,
+            parent_tool_use_id,
+        } => Some((
+            "assistant".to_string(),
+            assistant_text(m),
+            parent_tool_use_id.clone(),
+        )),
+        Message::User {
+            message: m,
+            parent_tool_use_id,
+        } => Some((
+            user_message_source(m),
+            user_text(m),
+            parent_tool_use_id.clone(),
+        )),
+        // The account's limits (QUOTA) are read by the agent engine; the historical one shows
+        // no background output for a status the CLI repeats at every turn.
+        Message::System { subtype, .. } if subtype == "rate_limit_event" => None,
+        Message::System { subtype, data } => Some((
+            format!("system:{subtype}"),
+            serde_json::to_string_pretty(data).unwrap_or_default(),
+            None,
+        )),
+        Message::Result { .. } | Message::StreamEvent { .. } => None,
+    }
+}
+
+fn assistant_text(m: &AssistantMessage) -> String {
+    m.content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text(t) => t.text.clone(),
+            ContentBlock::Thinking(t) => format!("[thinking] {}", t.thinking),
+            ContentBlock::ToolUse(t) => format!("[tool_use: {}]", t.name),
+            ContentBlock::ToolResult(t) => format_tool_result(t),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_tool_result(t: &nexus_claude::ToolResultContent) -> String {
+    match &t.content {
+        Some(ContentValue::Text(s)) => format!("[tool_result] {s}"),
+        Some(ContentValue::Structured(blocks)) => {
+            let payload = serde_json::to_string(blocks).unwrap_or_default();
+            format!("[tool_result] {payload}")
+        }
+        None => "[tool_result]".to_string(),
+    }
+}
+
+fn user_text(m: &UserMessage) -> String {
+    if let Some(blocks) = &m.content_blocks {
+        let rendered: String = blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text(t) => t.text.clone(),
+                ContentBlock::Thinking(t) => format!("[thinking] {}", t.thinking),
+                ContentBlock::ToolUse(t) => format!("[tool_use: {}]", t.name),
+                ContentBlock::ToolResult(t) => format_tool_result(t),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !rendered.trim().is_empty() {
+            return rendered;
+        }
+    }
+    m.content.clone()
+}
+
+fn user_message_source(m: &UserMessage) -> String {
+    if let Some(blocks) = &m.content_blocks {
+        for block in blocks {
+            if matches!(block, ContentBlock::ToolResult(_)) {
+                return "tool_result".to_string();
+            }
+        }
+    }
+    "user".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    use nexus_claude::{TextContent, ToolResultContent};
+    use serde_json::json;
+
+    fn user_with_blocks(blocks: Vec<ContentBlock>) -> Message {
+        Message::User {
+            message: UserMessage {
+                content: String::new(),
+                content_blocks: Some(blocks),
+            },
+            parent_tool_use_id: Some("tool-bg-123".to_string()),
+        }
+    }
+
+    fn user_plain(text: &str) -> Message {
+        Message::User {
+            message: UserMessage {
+                content: text.to_string(),
+                content_blocks: None,
+            },
+            parent_tool_use_id: None,
+        }
+    }
+
+    #[test]
+    fn test_extract_payload_ignores_result_and_stream_event() {
+        let result_msg = Message::Result {
+            subtype: "ok".into(),
+            duration_ms: 0,
+            duration_api_ms: 0,
+            is_error: false,
+            num_turns: 1,
+            session_id: "s".into(),
+            total_cost_usd: None,
+            usage: None,
+            result: None,
+            structured_output: None,
+        };
+        assert!(extract_payload(&result_msg).is_none());
+    }
+
+    #[test]
+    fn test_extract_payload_user_tool_result_labels_source() {
+        let msg = user_with_blocks(vec![ContentBlock::ToolResult(ToolResultContent {
+            tool_use_id: "t1".into(),
+            content: Some(ContentValue::Text("epoch 50 cos=0.871".into())),
+            is_error: Some(false),
+        })]);
+        let (source, content, corr) = extract_payload(&msg).expect("user message yields payload");
+        assert_eq!(source, "tool_result");
+        assert!(
+            content.contains("epoch 50 cos=0.871"),
+            "content should include tool_result text, got: {content}"
+        );
+        assert_eq!(corr.as_deref(), Some("tool-bg-123"));
+    }
+
+    /// The CLI's report, in the shape observed on the wire: the full list of
+    /// its running background tasks, sent on every start and finish.
+    #[test]
+    fn test_cli_background_task_count_reads_the_cli_report() {
+        let report = |tasks: serde_json::Value| Message::System {
+            subtype: "background_tasks_changed".to_string(),
+            data: serde_json::json!({
+                "session_id": "ca77d9e2-03a8-40ce-b0b8-245d431fa046",
+                "uuid": "5c33ae71-bbae-4ce2-8089-b781f833a460",
+                "tasks": tasks,
+            }),
+        };
+
+        let two = report(serde_json::json!([
+            {"task_id": "bckko8e7n", "task_type": "local_bash", "description": "clippy"},
+            {"task_id": "babp3g9yp", "task_type": "local_bash", "description": "grep"},
+        ]));
+        assert_eq!(cli_background_task_count(&two), Some(2));
+        assert_eq!(
+            cli_background_task_count(&report(serde_json::json!([]))),
+            Some(0),
+            "an empty list means the last task finished"
+        );
+
+        // An unreadable report is not "nothing is running".
+        assert_eq!(
+            cli_background_task_count(&report(serde_json::json!("?"))),
+            None
+        );
+        let no_tasks = Message::System {
+            subtype: "background_tasks_changed".to_string(),
+            data: serde_json::json!({}),
+        };
+        assert_eq!(cli_background_task_count(&no_tasks), None);
+
+        // Any other message says nothing about background tasks.
+        let other = Message::System {
+            subtype: "task_notification".to_string(),
+            data: serde_json::json!({"tasks": [1, 2, 3]}),
+        };
+        assert_eq!(cli_background_task_count(&other), None);
+        assert_eq!(cli_background_task_count(&user_plain("hello")), None);
+    }
+
+    #[test]
+    fn test_extract_payload_user_plain_string() {
+        let msg = user_plain("hello world");
+        let (source, content, _) = extract_payload(&msg).expect("user message yields payload");
+        assert_eq!(source, "user");
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn test_extract_payload_system_renders_data() {
+        let msg = Message::System {
+            subtype: "notification".into(),
+            data: json!({"level": "info", "text": "training done"}),
+        };
+        let (source, content, _) = extract_payload(&msg).expect("system message yields payload");
+        assert_eq!(source, "system:notification");
+        assert!(content.contains("training done"));
+    }
+
+    #[test]
+    fn test_assistant_text_concatenates_blocks() {
+        let m = AssistantMessage {
+            content: vec![
+                ContentBlock::Text(TextContent {
+                    text: "Hello".into(),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "world".into(),
+                }),
+            ],
+        };
+        assert_eq!(assistant_text(&m), "Hello\nworld");
+    }
+
+    // ── T7: trigger cap (sliding window) tests ──────────────────────────
+
+    /// Subscribe to the broadcast and collect all SystemHint warnings
+    /// received during the closure's execution.
+    async fn collect_warnings(
+        events_tx: &broadcast::Sender<ChatEvent>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let mut rx = events_tx.subscribe();
+        let (tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if let ChatEvent::SystemHint { content } = ev {
+                    let _ = tx.send(content);
+                }
+            }
+        });
+        out_rx
+    }
+
+    #[tokio::test]
+    async fn test_trigger_cap_blocks_after_cap_and_warns_once() {
+        let (events_tx, _rx_keep) = broadcast::channel(64);
+        let mut warn_rx = collect_warnings(&events_tx).await;
+        let history = Arc::new(Mutex::new(VecDeque::<Instant>::new()));
+        let cap: u32 = 3;
+        let window = Duration::from_secs(60);
+        let warned = Arc::new(AtomicBool::new(false));
+
+        // First `cap` calls: all allowed, no warning.
+        for _ in 0..cap {
+            let blocked = check_and_record_trigger_cap(
+                "test-session",
+                &events_tx,
+                &history,
+                cap,
+                window,
+                &warned,
+            )
+            .await;
+            assert!(!blocked, "first {cap} triggers must not be blocked");
+        }
+
+        // Next 50 calls: all blocked, warning emitted exactly once.
+        for _ in 0..50 {
+            let blocked = check_and_record_trigger_cap(
+                "test-session",
+                &events_tx,
+                &history,
+                cap,
+                window,
+                &warned,
+            )
+            .await;
+            assert!(blocked, "calls beyond cap must be blocked");
+        }
+
+        // Drain warnings — give the spawn loop a tick to flush.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut warnings = Vec::new();
+        while let Ok(w) = warn_rx.try_recv() {
+            warnings.push(w);
+        }
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning emitted per window, got: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("OOB auto-continue cap reached"),
+            "warning content unexpected: {}",
+            warnings[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trigger_cap_drops_old_entries() {
+        let (events_tx, _rx_keep) = broadcast::channel(16);
+        let history = Arc::new(Mutex::new(VecDeque::<Instant>::new()));
+        let cap: u32 = 2;
+        // Tiny window so we can age entries out in test time.
+        let window = Duration::from_millis(50);
+        let warned = Arc::new(AtomicBool::new(false));
+
+        // Fill the window.
+        for _ in 0..cap {
+            assert!(
+                !check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned)
+                    .await
+            );
+        }
+        assert!(
+            check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned).await,
+            "cap should be hit"
+        );
+
+        // Wait past the window.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // Now the window is empty again — should accept fresh triggers
+        // and re-arm the warning gate.
+        assert!(
+            !check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned).await,
+            "after window expiry, triggers should be accepted again"
+        );
+        assert!(
+            !warned.load(Ordering::SeqCst),
+            "warned flag must reset when below cap again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trigger_cap_warning_rearms_after_recovery() {
+        let (events_tx, _rx_keep) = broadcast::channel(16);
+        let mut warn_rx = collect_warnings(&events_tx).await;
+        let history = Arc::new(Mutex::new(VecDeque::<Instant>::new()));
+        let cap: u32 = 1;
+        let window = Duration::from_millis(50);
+        let warned = Arc::new(AtomicBool::new(false));
+
+        // Hit the cap — first call OK, second blocked + warns.
+        assert!(
+            !check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned).await
+        );
+        assert!(
+            check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned).await
+        );
+        // Wait past window so entries drop.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        // First post-recovery call accepted, clears warned.
+        assert!(
+            !check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned).await
+        );
+        // Hit cap again — should re-warn (not silently swallow).
+        assert!(
+            check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned).await
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut warnings = Vec::new();
+        while let Ok(w) = warn_rx.try_recv() {
+            warnings.push(w);
+        }
+        assert_eq!(
+            warnings.len(),
+            2,
+            "expected two warnings (one per cap-hit episode), got: {warnings:?}"
+        );
+    }
+
+    // ── T8: end-to-end via MockTransport ────────────────────────────────
+
+    /// Build a fully-wired OOB listener spawn using `MockTransport` so we
+    /// can drive the entire pipeline (transport broadcast → listener →
+    /// persist → events_tx) without launching a real Claude CLI.
+    ///
+    /// Returns: (events_rx, mock_graph, handle, cancel_token).
+    /// Caller must `cancel_token.cancel()` to stop the listener after the
+    /// test or rely on the test's tokio runtime tearing it down.
+    async fn spawn_listener_with_mock_transport() -> (
+        broadcast::Receiver<ChatEvent>,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        nexus_claude::transport::mock::MockTransportHandle,
+        CancellationToken,
+        Uuid,
+    ) {
+        use tokio::sync::RwLock;
+
+        let (transport, handle) = nexus_claude::transport::mock::MockTransport::pair();
+        let mut client = InteractiveClient::from_transport(transport);
+        client.connect().await.expect("mock client connect");
+        let client = Arc::new(Mutex::new(client));
+
+        let (events_tx, events_rx) = broadcast::channel::<ChatEvent>(64);
+        let is_streaming = Arc::new(AtomicBool::new(false));
+        let next_seq = Arc::new(AtomicI64::new(1));
+        let cancel = CancellationToken::new();
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let enrichment_pipeline = Arc::new(crate::chat::enrichment::EnrichmentPipeline::new(
+            crate::chat::enrichment::EnrichmentConfig::default(),
+        ));
+        let active_sessions = Arc::new(RwLock::new(HashMap::new()));
+
+        let deps = OobListenerDeps {
+            graph: graph.clone(),
+            active_sessions,
+            context_injector: None,
+            event_emitter: None,
+            retry_config: crate::chat::config::RetryConfig::default(),
+            enrichment_pipeline,
+            search,
+            documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
+            nats: None,
+        };
+
+        // session_id MUST be a UUID for the persistence branch to fire
+        // (Uuid::parse_str().ok() is the gate inside handle_oob_message).
+        let session_uuid = Uuid::new_v4();
+
+        spawn_oob_listener(
+            session_uuid.to_string(),
+            client,
+            events_tx,
+            is_streaming,
+            next_seq,
+            cancel.clone(),
+            deps,
+        );
+
+        // Give the spawned task a tick to subscribe to the broadcast
+        // before we inject — otherwise the first message races and is lost
+        // on the broadcast lag.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        (events_rx, graph, handle, cancel, session_uuid)
+    }
+
+    /// Build a Message that resembles what the CLI would emit when the
+    /// `Monitor` tool fires its `match_found` notification between turns
+    /// (User message carrying a ToolResult content block keyed on the
+    /// parent tool_use_id of the original Monitor invocation).
+    fn monitor_match_message(parent: &str, line: &str) -> Message {
+        Message::User {
+            message: UserMessage {
+                content: String::new(),
+                content_blocks: Some(vec![ContentBlock::ToolResult(ToolResultContent {
+                    tool_use_id: parent.to_string(),
+                    content: Some(ContentValue::Text(line.to_string())),
+                    is_error: Some(false),
+                })]),
+            },
+            parent_tool_use_id: Some(parent.to_string()),
+        }
+    }
+
+    /// Same shape but mimicking `BashOutput` from a `Bash run_in_background`
+    /// completion — both end up routed through the User+ToolResult path
+    /// in the SDK message stream.
+    fn bash_output_message(parent: &str, output: &str) -> Message {
+        Message::User {
+            message: UserMessage {
+                content: String::new(),
+                content_blocks: Some(vec![ContentBlock::ToolResult(ToolResultContent {
+                    tool_use_id: parent.to_string(),
+                    content: Some(ContentValue::Text(output.to_string())),
+                    is_error: Some(false),
+                })]),
+            },
+            parent_tool_use_id: Some(parent.to_string()),
+        }
+    }
+
+    /// Wait for the next BackgroundOutput on the broadcast, with a hard
+    /// 500 ms ceiling (T8 acceptance criterion: events must arrive in
+    /// under 500 ms). Returns the elapsed latency.
+    async fn await_background_output(
+        rx: &mut broadcast::Receiver<ChatEvent>,
+    ) -> (ChatEvent, Duration) {
+        let start = Instant::now();
+        let event = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) if matches!(ev, ChatEvent::BackgroundOutput { .. }) => return ev,
+                    Ok(_) => continue, // skip non-OOB events (SystemHint init, etc.)
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        panic!("broadcast closed before BackgroundOutput arrived")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("BackgroundOutput must arrive within 500 ms");
+        (event, start.elapsed())
+    }
+
+    /// A background sub-agent's call, announced during the turn that launched it,
+    /// ends between two turns: the listener times it (persisted and broadcast after
+    /// its background output), its end taken when the result arrived, not after a
+    /// slow persistence of its output.
+    #[tokio::test]
+    async fn a_sub_agent_call_that_ends_between_turns_is_timed() {
+        let (mut events_rx, graph, handle, cancel, sid) =
+            spawn_listener_with_mock_transport().await;
+        graph.stall_chat_events("background_output");
+        let clock = crate::chat::tool_clock::ToolClock::for_session(&sid.to_string());
+        let started = Utc::now();
+        clock.observe(
+            &ChatEvent::ToolUse {
+                id: "sub-1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "cargo test"}),
+                parent_tool_use_id: Some("task-1".into()),
+                category: None,
+                canonical: None,
+            },
+            started,
+        );
+        clock.taken_up("sub-1", started);
+        // The turn that launched the sub-agent ends; its call is kept.
+        clock.observe(
+            &serde_json::from_value::<ChatEvent>(json!({
+                "type": "result", "session_id": "s", "duration_ms": 0,
+                "subtype": "success", "is_error": false
+            }))
+            .unwrap(),
+            started,
+        );
+
+        handle
+            .inbound_message_tx
+            .send(Message::User {
+                message: UserMessage {
+                    content: String::new(),
+                    content_blocks: Some(vec![ContentBlock::ToolResult(ToolResultContent {
+                        tool_use_id: "sub-1".into(),
+                        content: Some(ContentValue::Text("ok".into())),
+                        is_error: Some(false),
+                    })]),
+                },
+                parent_tool_use_id: Some("task-1".into()),
+            })
+            .expect("inject the sub-agent's result");
+        let sent_at = Utc::now();
+        // The output's persistence is slow; the timing waits behind it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        graph.release_chat_events("background_output");
+
+        let ended_at = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match events_rx.recv().await {
+                    Ok(ChatEvent::ToolTiming { id, ended_at, .. }) => {
+                        assert_eq!(id, "sub-1");
+                        return ended_at;
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => panic!("closed"),
+                }
+            }
+        })
+        .await
+        .expect("a tool_timing between turns");
+        let sent = crate::api::ws_chat_handler::wire_seconds(sent_at);
+        assert!(
+            ended_at < sent + 0.2,
+            "the end is when the result arrived ({ended_at}), not after the persistence (sent {sent})"
+        );
+
+        let stored = graph.get_chat_events(sid, 0, 50).await.unwrap();
+        let types: Vec<&str> = stored.iter().map(|r| r.event_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["background_output", "tool_timing"],
+            "the timing after the output it times"
+        );
+        cancel.cancel();
+    }
+
+    /// E2E — Monitor scenario. Inject a Monitor `match_found` Message
+    /// into the mock transport and verify the listener surfaces it as
+    /// `ChatEvent::BackgroundOutput` on the session broadcast within
+    /// 500 ms (acceptance criterion of T8 / plan 9a1684b2).
+    #[tokio::test]
+    async fn test_e2e_monitor_event_propagates_to_broadcast() {
+        let (mut events_rx, _graph, handle, cancel, _sid) =
+            spawn_listener_with_mock_transport().await;
+
+        // Inject — same shape the CLI would emit when Monitor matches.
+        let msg = monitor_match_message("monitor-tool-1", "epoch 50 cos=0.871");
+        handle
+            .inbound_message_tx
+            .send(msg)
+            .expect("inject Monitor message");
+
+        let (event, latency) = await_background_output(&mut events_rx).await;
+        eprintln!("[T8 latency report] Monitor → broadcast: {latency:?}");
+
+        match event {
+            ChatEvent::BackgroundOutput {
+                source,
+                content,
+                correlation_id,
+                ..
+            } => {
+                assert_eq!(source, "tool_result");
+                assert!(content.contains("epoch 50 cos=0.871"));
+                assert_eq!(correlation_id.as_deref(), Some("monitor-tool-1"));
+            }
+            other => panic!("expected BackgroundOutput, got {other:?}"),
+        }
+        assert!(
+            latency < Duration::from_millis(500),
+            "T8 latency criterion violated: {latency:?} >= 500ms"
+        );
+
+        cancel.cancel();
+    }
+
+    /// E2E — BashOutput scenario. A `Bash run_in_background` task that
+    /// completes after several seconds emits a User+ToolResult message
+    /// with the captured stdout. Same routing as Monitor. Verifies
+    /// chronological ordering of consecutive OOB events on the broadcast.
+    #[tokio::test]
+    async fn test_e2e_bash_output_chronological_ordering() {
+        let (mut events_rx, graph, handle, cancel, session_uuid) =
+            spawn_listener_with_mock_transport().await;
+
+        // Inject 3 BashOutput events in sequence. The listener must
+        // surface them in order, with monotonically-increasing seq_num
+        // captured by ChatEventRecord (verified via the mock graph).
+        for i in 0..3 {
+            let msg = bash_output_message("bash-bg-42", &format!("background bash line {i}"));
+            handle
+                .inbound_message_tx
+                .send(msg)
+                .expect("inject BashOutput message");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut received_contents: Vec<String> = Vec::new();
+        for _ in 0..3 {
+            let (event, latency) = await_background_output(&mut events_rx).await;
+            eprintln!("[T8 latency report] BashOutput → broadcast: {latency:?}");
+            if let ChatEvent::BackgroundOutput { content, .. } = event {
+                received_contents.push(content);
+            }
+        }
+
+        assert_eq!(received_contents.len(), 3);
+        for (i, content) in received_contents.iter().enumerate() {
+            assert!(
+                content.contains(&format!("background bash line {i}")),
+                "out-of-order: position {i} content was {content:?}"
+            );
+        }
+
+        // Persistence check: the mock graph should have received exactly
+        // 3 ChatEventRecords on the persist branch. Allow a brief settle
+        // time for the persist write to complete after the broadcast.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stored = {
+            let map = graph.chat_events.read().await;
+            map.get(&session_uuid).map(|v| v.len()).unwrap_or(0)
+        };
+        assert_eq!(
+            stored, 3,
+            "expected exactly 3 ChatEventRecord persisted, got {stored}"
+        );
+
+        // Verify the persisted records have monotonically-increasing seq
+        // — this is the chronological ordering invariant on which
+        // chat::list_messages depends.
+        let seqs: Vec<i64> = {
+            let map = graph.chat_events.read().await;
+            map.get(&session_uuid)
+                .map(|v| v.iter().map(|r| r.seq).collect())
+                .unwrap_or_default()
+        };
+        for w in seqs.windows(2) {
+            assert!(w[0] < w[1], "seq must be strictly increasing, got {seqs:?}");
+        }
+
+        cancel.cancel();
+    }
+
+    // ── Phantom turns: which idle-time messages may start a turn ────────
+
+    fn assistant_with(parent: Option<&str>, blocks: Vec<ContentBlock>) -> Message {
+        Message::Assistant {
+            message: AssistantMessage { content: blocks },
+            parent_tool_use_id: parent.map(str::to_string),
+        }
+    }
+
+    fn tool_use(id: &str, name: &str) -> ContentBlock {
+        ContentBlock::ToolUse(nexus_claude::ToolUseContent {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: json!({}),
+        })
+    }
+
+    #[test]
+    fn test_background_tool_output_triggers_a_turn() {
+        // The legitimate case the listener exists for.
+        let none = HashSet::new();
+        assert!(should_trigger_turn(
+            &monitor_match_message("monitor-1", "epoch 50"),
+            &none
+        ));
+        assert!(should_trigger_turn(
+            &bash_output_message("bash-bg-1", "done"),
+            &none
+        ));
+    }
+
+    #[test]
+    fn test_assistant_output_never_triggers_a_turn() {
+        // Exactly what surfaced as "[tool_use: Bash]" / "[thinking]" user
+        // messages while sub-agents ran in the background.
+        let none = HashSet::new();
+        let own = assistant_with(None, vec![tool_use("t1", "Bash")]);
+        let sub = assistant_with(Some("agent-1"), vec![tool_use("t2", "Bash")]);
+        assert!(!should_trigger_turn(&own, &none));
+        assert!(!should_trigger_turn(&sub, &none));
+    }
+
+    #[test]
+    fn test_system_status_never_triggers_a_turn() {
+        let status = Message::System {
+            subtype: "status".to_string(),
+            data: json!({"estimated_tokens": 50, "estimated_tokens_delta": 50}),
+        };
+        assert!(!should_trigger_turn(&status, &HashSet::new()));
+    }
+
+    #[test]
+    fn test_subagent_tool_results_do_not_trigger_a_turn() {
+        let mut parents = HashSet::new();
+        remember_subagent_launches(
+            &assistant_with(None, vec![tool_use("agent-7", "Agent")]),
+            &mut parents,
+        );
+        // A tool result inside the sub-agent: same shape as a Monitor match.
+        let inner = bash_output_message("agent-7", "grep output of the sub-agent");
+        assert!(!should_trigger_turn(&inner, &parents));
+        // A genuine background Bash of the main agent still triggers.
+        assert!(should_trigger_turn(
+            &bash_output_message("bash-bg-9", "x"),
+            &parents
+        ));
+    }
+
+    #[test]
+    fn test_agent_launches_are_remembered_at_any_depth() {
+        let mut parents = HashSet::new();
+        remember_subagent_launches(
+            &assistant_with(None, vec![tool_use("b1", "Bash"), tool_use("t1", "Task")]),
+            &mut parents,
+        );
+        // A sub-agent launching its own sub-agent: that one's traffic is
+        // parented to "nested" and must not trigger turns either.
+        remember_subagent_launches(
+            &assistant_with(Some("t1"), vec![tool_use("nested", "Agent")]),
+            &mut parents,
+        );
+        assert_eq!(
+            parents,
+            HashSet::from(["t1".to_string(), "nested".to_string()])
+        );
+        assert!(!should_trigger_turn(
+            &bash_output_message("nested", "deep result"),
+            &parents
+        ));
+    }
+
+    // ── T9: subprocess death detection ──────────────────────────────────
+
+    /// `emit_subprocess_death` must publish exactly one
+    /// `ChatEvent::SessionError` with `reason = "subprocess_exited"` and
+    /// a non-empty user-facing message. The frontend uses the `reason`
+    /// field for routing (e.g., "transport_lost" vs "broadcast_dropped"
+    /// in future variants), so the string is part of the public contract.
+    #[tokio::test]
+    async fn test_emit_subprocess_death_emits_session_error() {
+        let (events_tx, mut rx) = broadcast::channel(8);
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        emit_subprocess_death("session-123", None, &events_tx, &AtomicI64::new(0), &graph).await;
+
+        // The send must have produced exactly one event.
+        let received = rx.try_recv().expect("expected one event on broadcast");
+        match received {
+            ChatEvent::SessionError {
+                reason,
+                message,
+                received_at,
+            } => {
+                assert_eq!(reason, "subprocess_exited");
+                assert!(
+                    message.contains("CLI subprocess"),
+                    "message must mention the subprocess for the user, got: {message}"
+                );
+                // Sanity: timestamp is within the last second.
+                let age = chrono::Utc::now()
+                    .signed_duration_since(received_at)
+                    .num_milliseconds()
+                    .unsigned_abs();
+                assert!(age < 1000, "received_at must be ~now, got age = {age}ms");
+            }
+            other => panic!("expected SessionError, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no further events expected");
+    }
+
+    /// The death is persisted by the production path (same `seq` counter,
+    /// same store) and the cockpit's grouped read + derivation then see the
+    /// session as stuck on an error, dated by the death itself.
+    #[tokio::test]
+    async fn test_emit_subprocess_death_persists_and_feeds_the_attention_derivation() {
+        use crate::chat::attention::{derive_session_attention, SessionAttentionInput};
+        let (events_tx, mut rx) = broadcast::channel(8);
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        let sid = Uuid::new_v4();
+        let next_seq = AtomicI64::new(7);
+        emit_subprocess_death(&sid.to_string(), Some(sid), &events_tx, &next_seq, &graph).await;
+
+        assert!(matches!(rx.try_recv(), Ok(ChatEvent::SessionError { .. })));
+        assert_eq!(next_seq.load(Ordering::SeqCst), 8, "seq counter advanced");
+        let stored = graph.get_attention_events(&[sid]).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].event_type, "session_error");
+        assert_eq!(stored[0].seq, 7);
+
+        let input = SessionAttentionInput {
+            session_id: sid,
+            workspace: "ws".into(),
+            thread_id: None,
+            alive: false,
+            pending_in_memory: HashSet::new(),
+        };
+        let d = derive_session_attention(&input, &stored, Utc::now());
+        assert_eq!(d.errors.len(), 1);
+        assert_eq!(d.errors[0].reason, "subprocess_exited");
+        // a non-UUID session id persists nothing
+        let other = crate::neo4j::mock::MockGraphStore::new();
+        emit_subprocess_death("not-a-uuid", None, &events_tx, &next_seq, &other).await;
+        assert_eq!(next_seq.load(Ordering::SeqCst), 8);
+    }
+
+    // ── What wakes an idle native session (WAKE-BG) ────────────────────────
+
+    fn bg_task(
+        id: &str,
+        kind: nexus_claude::agent::BackgroundTaskKind,
+        status: nexus_claude::agent::BackgroundTaskStatus,
+        description: &str,
+    ) -> nexus_claude::agent::BackgroundTask {
+        nexus_claude::agent::BackgroundTask {
+            id: id.to_string(),
+            kind,
+            description: description.to_string(),
+            status,
+            started_at_ms: None,
+            tool_call_id: None,
+            parent: None,
+            pid: None,
+        }
+    }
+
+    /// The regression the user reported: nothing woke the session for a finished
+    /// background task, so the agent waited for a human message.
+    #[test]
+    fn a_finished_background_task_wakes_the_session_once() {
+        use nexus_claude::agent::{AgentEvent, BackgroundTaskKind, BackgroundTaskStatus as Status};
+
+        let mut announced = AnnouncedBackground::default();
+        let ended = vec![AgentEvent::BackgroundTasks {
+            tasks: vec![bg_task(
+                "bg-7",
+                BackgroundTaskKind::Shell,
+                Status::Completed,
+                "cargo build",
+            )],
+        }];
+
+        let lines = background_wake_lines(&ended, &mut announced);
+        assert_eq!(lines.len(), 1, "one line for the ended task: {lines:?}");
+        assert!(
+            lines[0].contains("bg-7") && lines[0].contains("completed"),
+            "the line names the task and its end: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("cargo build"),
+            "the line carries what was run: {}",
+            lines[0]
+        );
+
+        // The provider repeats the COMPLETE table on every change: the same end
+        // announced twice would start a second, pointless turn.
+        assert!(
+            background_wake_lines(&ended, &mut announced).is_empty(),
+            "the same task is announced once"
+        );
+    }
+
+    /// A task still running is what the launch result already said, inside the turn.
+    #[test]
+    fn a_running_background_task_announces_nothing() {
+        use nexus_claude::agent::{AgentEvent, BackgroundTaskKind, BackgroundTaskStatus as Status};
+
+        let mut announced = AnnouncedBackground::default();
+        let running = vec![AgentEvent::BackgroundTasks {
+            tasks: vec![
+                bg_task(
+                    "bg-1",
+                    BackgroundTaskKind::Shell,
+                    Status::Running,
+                    "sleep 900",
+                ),
+                bg_task(
+                    "bg-2",
+                    BackgroundTaskKind::Monitor,
+                    Status::Running,
+                    "tail -f",
+                ),
+            ],
+        }];
+        assert!(background_wake_lines(&running, &mut announced).is_empty());
+
+        // It ends later: the same table now wakes.
+        let ended = vec![AgentEvent::BackgroundTasks {
+            tasks: vec![bg_task(
+                "bg-2",
+                BackgroundTaskKind::Monitor,
+                Status::Failed,
+                "tail -f",
+            )],
+        }];
+        let lines = background_wake_lines(&ended, &mut announced);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("failed"), "{}", lines[0]);
+    }
+
+    /// A task somebody STOPPED spends no turn: the agent or the human gave up on it,
+    /// the transcript shows it ending, the next turn reads it there.
+    #[test]
+    fn a_task_somebody_stopped_announces_nothing() {
+        use nexus_claude::agent::{AgentEvent, BackgroundTaskKind, BackgroundTaskStatus as Status};
+
+        let mut announced = AnnouncedBackground::default();
+        let stopped = vec![AgentEvent::BackgroundTasks {
+            tasks: vec![bg_task(
+                "bg-4",
+                BackgroundTaskKind::Shell,
+                Status::Killed,
+                "cargo test",
+            )],
+        }];
+        assert!(
+            background_wake_lines(&stopped, &mut announced).is_empty(),
+            "a killed task does not wake the session"
+        );
+        // A later completion of the same id (a retry reusing it) still wakes.
+        let retried = vec![AgentEvent::BackgroundTasks {
+            tasks: vec![bg_task(
+                "bg-5",
+                BackgroundTaskKind::Shell,
+                Status::Completed,
+                "cargo test",
+            )],
+        }];
+        assert_eq!(background_wake_lines(&retried, &mut announced).len(), 1);
+    }
+
+    /// A `Monitor` match is the tool whose whole point is to resume the agent.
+    #[test]
+    fn a_monitor_line_wakes_once_per_line() {
+        use nexus_claude::agent::{AgentEvent, TaskPhase};
+
+        let mut announced = AnnouncedBackground::default();
+        let line = |event_id: Option<&str>, text: &str| {
+            vec![AgentEvent::TaskUpdate {
+                phase: TaskPhase::Progress,
+                task_id: Some("bg-3".to_string()),
+                tool_call_id: None,
+                description: None,
+                status: None,
+                summary: Some(text.to_string()),
+                event_id: event_id.map(str::to_string),
+                data: json!({}),
+            }]
+        };
+
+        let first = background_wake_lines(&line(Some("e1"), "LISTEN"), &mut announced);
+        assert_eq!(first, vec!["[monitor] LISTEN".to_string()]);
+        // Replayed (the same event id): not a second turn.
+        assert!(background_wake_lines(&line(Some("e1"), "LISTEN"), &mut announced).is_empty());
+        // A new line: a new turn.
+        assert_eq!(
+            background_wake_lines(&line(Some("e2"), "READY"), &mut announced),
+            vec!["[monitor] READY".to_string()]
+        );
+    }
+
+    /// The memory of what was announced is bounded (a long session cannot grow it
+    /// without limit); forgetting the oldest key only costs a repeated announcement.
+    #[test]
+    fn the_announced_memory_is_bounded() {
+        let mut announced = AnnouncedBackground::default();
+        for i in 0..(MAX_ANNOUNCED_BACKGROUND + 10) {
+            assert!(announced.first_time(format!("task:{i}")));
+        }
+        assert_eq!(announced.order.len(), MAX_ANNOUNCED_BACKGROUND);
+        assert!(announced.first_time("task:new".to_string()));
+        assert_eq!(announced.order.len(), MAX_ANNOUNCED_BACKGROUND);
+        // The most recent keys are still remembered.
+        assert!(!announced.first_time(format!("task:{}", MAX_ANNOUNCED_BACKGROUND + 9)));
+    }
+}
+
+/// The agent engine's out-of-turn pump (`pump_out_of_band`): the events the
+/// provider emits between turns (out-of-turn permissions, background tasks,
+/// background output) become `ChatEvent`s, drained exactly once.
+#[cfg(test)]
+mod agent_path_tests {
+    use super::super::agent_runtime::fake::FakeProvider;
+    use super::super::agent_runtime::{AgentRuntime, AgentSessionHandle};
+    use super::super::types::ChatEvent;
+    use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::GraphStore;
+    use nexus_claude::agent::{
+        AgentEvent, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+
+    /// A live agent session on the fake provider: `adopt` takes the provider's
+    /// `out_of_band()` stream and spawns the pump (`pump_out_of_band`).
+    async fn rig() -> (FakeProvider, Arc<AgentSessionHandle>) {
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        (provider, handle)
+    }
+
+    /// The first event matching `pred`, within a hard deadline.
+    async fn next_matching(
+        rx: &mut broadcast::Receiver<ChatEvent>,
+        pred: impl Fn(&ChatEvent) -> bool,
+    ) -> ChatEvent {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(event)) if pred(&event) => return event,
+                Ok(Ok(_)) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    panic!("broadcast closed before the event arrived")
+                }
+                Err(_) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for an event"
+                ),
+            }
+        }
+    }
+
+    /// A provider background task WITHOUT a pid (what the agent engine holds:
+    /// the pid, when there is one, belongs to the Claude Code adapter).
+    fn bg_task(id: &str, tool_call: Option<&str>) -> BackgroundTask {
+        BackgroundTask {
+            id: id.into(),
+            kind: BackgroundTaskKind::Shell,
+            description: "sleep 30".into(),
+            status: BackgroundTaskStatus::Running,
+            started_at_ms: Some(1_700_000_000_000),
+            tool_call_id: tool_call.map(str::to_string),
+            parent: None,
+            pid: None,
+        }
+    }
+
+    /// WAKE-BG (regression): the end of a background task, received OUT OF TURN,
+    /// starts the turn by itself.
+    ///
+    /// On the native engine PO *is* the harness: no CLI is behind to start that
+    /// turn when a background tool of its own ends. Before the fix the event was
+    /// mirrored, persisted and drawn, and the session stayed idle until the next
+    /// human message — the reported "tu ne te relances jamais tout seul".
+    #[tokio::test]
+    async fn a_background_task_that_ends_out_of_turn_starts_a_turn() {
+        let (provider, handle) = rig().await;
+        let mut rx = handle.events_tx.subscribe();
+
+        let mut ended = bg_task("nt-9", Some("c9"));
+        ended.status = BackgroundTaskStatus::Completed;
+        provider
+            .state
+            .push_oob(AgentEvent::BackgroundTasks { tasks: vec![ended] });
+
+        // The wake starts ONE turn, whose prompt is the announcement itself.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let turns = provider.state.turns_started.lock().unwrap().clone();
+            if let Some(first) = turns.first() {
+                assert!(
+                    first.contains("nt-9"),
+                    "the prompt of the woken turn names the task: {first}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no turn was started for a background task that ended: the session stays \
+                 idle until a human message"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // And the transcript says why the agent went on: the announcement.
+        let event =
+            next_matching(&mut rx, |e| matches!(e, ChatEvent::BackgroundOutput { .. })).await;
+        assert!(
+            matches!(&event, ChatEvent::BackgroundOutput { content, .. } if content.contains("nt-9")),
+            "{event:?}"
+        );
+    }
+
+    /// Criterion 1 + 3: an out-of-band event scripted by the fake provider is
+    /// received by the pump and emitted as a `ChatEvent`; a typed
+    /// `BackgroundTasks` snapshot becomes an `ActiveTasksUpdate` WITHOUT any pid.
+    #[tokio::test]
+    async fn an_out_of_band_background_tasks_snapshot_is_an_active_tasks_update_without_pid() {
+        let (provider, handle) = rig().await;
+        let mut rx = handle.events_tx.subscribe();
+        provider.state.push_oob(AgentEvent::BackgroundTasks {
+            tasks: vec![bg_task("nt-1", Some("c7"))],
+        });
+        let event = next_matching(&mut rx, |e| {
+            matches!(e, ChatEvent::ActiveTasksUpdate { .. })
+        })
+        .await;
+        let ChatEvent::ActiveTasksUpdate { tasks } = event else {
+            unreachable!()
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "c7", "keyed by its tool_use");
+        assert_eq!(tasks[0].pid, None, "no PID on the agent path");
+    }
+
+    /// Criterion 1: an out-of-band `Text` becomes a `BackgroundOutput`.
+    #[tokio::test]
+    async fn an_out_of_band_text_is_emitted_as_background_output() {
+        let (provider, handle) = rig().await;
+        let mut rx = handle.events_tx.subscribe();
+        provider.state.push_oob(AgentEvent::Text {
+            text: "a background line".into(),
+            seq: Some(1),
+            parent: None,
+        });
+        let event =
+            next_matching(&mut rx, |e| matches!(e, ChatEvent::BackgroundOutput { .. })).await;
+        assert!(
+            matches!(
+                event,
+                ChatEvent::BackgroundOutput {
+                    ref source,
+                    ref content,
+                    correlation_id: None,
+                    ..
+                } if source == "assistant" && content == "a background line"
+            ),
+            "{event:?}"
+        );
+    }
+
+    /// Criterion 2: `drain` empties the out-of-band stream at the end — every
+    /// event is emitted exactly once, nothing lost, nothing duplicated.
+    #[tokio::test]
+    async fn the_out_of_band_stream_is_drained_without_loss_or_duplication() {
+        let (provider, handle) = rig().await;
+        let mut rx = handle.events_tx.subscribe();
+        // Three events of three distinct provider messages: each becomes its own
+        // `background_output` group. Pushed synchronously so the pump batches
+        // them, then the stream ends.
+        for (i, seq) in [(1u32, 7u64), (2, 8), (3, 9)] {
+            provider.state.push_oob(AgentEvent::Text {
+                text: format!("line {i}"),
+                seq: Some(seq),
+                parent: None,
+            });
+        }
+        // End the stream: the pump flushes the tail and stops.
+        provider.state.oob_tx.lock().unwrap().take();
+
+        let mut received: Vec<String> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while received.len() < 3 {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Ok(ChatEvent::BackgroundOutput { content, .. })) => received.push(content),
+                Ok(Ok(_)) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Err(_) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out; received {received:?}"
+                ),
+            }
+        }
+        assert_eq!(
+            received,
+            vec!["line 1", "line 2", "line 3"],
+            "each event once, in order"
+        );
+
+        // No duplication: nothing further arrives after a short settle.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while let Ok(event) = rx.try_recv() {
+            if let ChatEvent::BackgroundOutput { content, .. } = event {
+                panic!("unexpected extra background output: {content}");
+            }
+        }
+    }
+}

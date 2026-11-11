@@ -1,0 +1,199 @@
+%% name: po-spawn-envelope
+%% covers: backend:src/chat/{envelope,delegation_limits,subagents,mirror,session_pool,cancelled_parents}.rs backend:src/auth/{agent_tokens,jwt,jwt_crypto,tool_profile}.rs
+%% verified: 9e701d31
+%% ---
+%% PROUVE : ce qu'une session ouverte PAR UN AGENT a le droit d'être (décisions A17, A25, A34),
+%%   tel que le code le fait sur la branche integration/harness-multi-provider (base 84804df0,
+%%   tranches B20/B21/B22) : jeton de session lié et révocable, routes réservées à un humain,
+%%   enveloppe d'une session enfant.
+%% ---
+%% SOURCES LUES :
+%%   src/auth/jwt.rs          — generate_session_token, agent_session_binding, AgentSessionBinding,
+%%                              Claims::is_agent_session, Claims::is_human
+%%   src/auth/jwt_crypto.rs   — HmacOnly (signer_factory, verifier_factory), install, encode, decode :
+%%                              le seul fournisseur JWT du binaire, HS256/384/512 ; RS/ES/EdDSA refusés
+%%   src/auth/agent_tokens.rs — register, is_live, revoke_session, register_tools, tools_live (jeton de profil nexus-tools, B40 : révoqué avec la session)
+%%   src/auth/tool_profile.rs — ToolProfile (from_name, from_unverified_token, filter_tools,
+%%                              allows_action, route_forbidden) ; src/mcp/server.rs — profile_refusal
+%%   src/auth/middleware.rs   — require_auth, enforce_token_policy, is_human_only_mutation (po-api)
+%%   src/chat/subagents.rs    — SubagentHooks (outil Agent du harnais natif, P18), ChatManager::run_subagent,
+%%                              reuse_for, open_child, open_wait_close, answer_from_floor
+%%   src/chat/session_pool.rs — SessionPool (claim, release, abandon), WarmKey, WarmFacts,
+%%                              WarmSession::eligibility, Refusal, fingerprint (CACHE-POOL)
+%%   src/chat/mirror.rs       — MirrorTap (spawn follows_out_of_turn, observe, turn_ended), MirrorRegistry (claim, bind, closed,
+%%                              forget_owner, deleted), MirrorReadOnly ; ChatManager::refuse_if_mirror, mirror_tap,
+%%                              agent_mirror_tap ; ManagerTurnServices::observe_out_of_turn (P18c, P18c-suite)
+%%   src/chat/envelope.rs     — identify_caller, resolve_envelope, resolve_envelope_for_opening,
+%%                              ChildOpenings / OpeningTicket / SpawnCaller::reserve_opening (P18-suite point 6), ParentEnvelope::apply,
+%%                              restrict_permission_mode, is_within, ensure_child_of
+%%   src/api/chat_handlers.rs — create_session ; src/api/handlers.rs — delegate_task,
+%%                              delegation_chat_request
+%%   src/chat/manager.rs      — build_options (frappe du jeton), close_session (révocation),
+%%                              close_session_with_cascade (B36), delete_session / delete_one_session
+%%                              (suppression d'un parent, P18-suite point 9) ; refuse_legacy_activation,
+%%                              finish_agent_open (refus B36-RACE)
+%%   src/chat/cancelled_parents.rs — CancelledParents (mark, admit), ParentCancelled, parent_of (B36-RACE)
+%%   src/chat/agent_runtime.rs — AgentRuntime::adopt_admitting (B36-RACE)
+%%   src/neo4j/chat.rs        — get_session_children (parent inexistant = aucun enfant), delete_chat_session ;
+%%                              src/neo4j/mock.rs (même règle) ; src/api/chat_handlers.rs — delete_session
+%%   src/api/handlers.rs      — listen_delegation_result, DelegationExecution, DelegationEnd,
+%%                              run_of_session ; src/runner/state.rs — RunnerState::owns_delegation (B36)
+%%   src/api/handlers.rs      — DelegationClosure::finish, end_of_result, result_after_interrupt,
+%%                              delegation_stop_reason, DelegationHalt (interrupt, close), HaltSession,
+%%                              put_delegation_caps (PYSR-3b) ; src/neo4j/traits.rs — interrupt_task
+%%   src/chat/subagents.rs    — ChatManager::session_limits_of, session_costs, open_wait_close (délai) (PYSR-3b)
+%%   src/runner/models.rs     — DelegationLimits (of_runner, request_caps, after_spending), EXHAUSTED_USD
+%%   src/chat/manager.rs      — reopen_agent_session_with (plafonds à la reprise), open (host_missing des
+%%                              plafonds retirés), refuse_a_model_that_drops_the_cost_cap, set_session_model_inner
+%%   src/chat/provider/policy.rs — enforceable_limits, model_change_drops_the_cost_cap ;
+%%                              src/chat/agent_runtime.rs — COST_CAP_FEATURE, TOKEN_CAP_FEATURE, dropped_cap_features
+%%   src/api/chat_handlers.rs — get_session (children_cost_usd, aggregated_cost_usd)
+%% ---
+%% NON ETABLI :
+%%   aucun test de bout en bout avec un vrai CLI : la règle est testée sur ses fonctions et sur
+%%   le middleware (MockGraphStore, routeur de test) ;
+%%   budget de l'enfant = reste du parent : écrit pour un sous-agent de l'outil Agent sous une
+%%   délégation (PYSR-3b) ; une délégation delegate_task repart de son PROPRE plafond ; un
+%%   changement de modèle AUTOMATIQUE (directive de tour, bascule après limite) ne revérifie pas
+%%   le prix — seul set_session_model est gardé côté backend ; nexus ne revérifie qu'à l'ouverture ; la cascade et le coût d'une
+%%   délégation au run de son exécuteur sont écrits (nœud B36_TREE), testés sur MockGraphStore ;
+%%   sans authentification (auth_config absent) le parent vient de l'en-tête X-Session-Id : indice,
+%%   pas frontière ;
+%%   CACHE-POOL : le gain de cache_creation (environ 30 500 jetons réécrits par ouverture) est
+%%   MESURÉ À LA MAIN seulement — il demande le vrai CLI ; aucun test ne compare des jetons.
+%%   Ce que les tests prouvent : la décision du pool (même moteur + modèle → même session
+%%   chaude ; fait différent → session neuve) et la lecture de la réponse du tour repris.
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit
+%%   🔴 défaut constaté (raison dans le nœud)  ⚪ amont ou autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié par test"]
+        L2["🟠 écrit, sans test"]
+        L3["⚪ autre domaine"]
+    end
+
+    subgraph token["Jeton de session (PO_AUTH_TOKEN)"]
+        MINT["✅ build_options → generate_session_token<br/>scope signé : session:&lt;id&gt; ceiling:&lt;mode&gt; tools:&lt;profil&gt;<br/>jti unique<br/>test : session_token_is_bound_to_its_session_and_carries_a_jti"]
+        REG["✅ agent_tokens::register(jti, session)<br/>liste d'AUTORISATION en mémoire ;<br/>un nouveau jeton remplace ceux de la session<br/>test : a_new_token_for_a_session_supersedes_the_previous_one"]
+        REVOKE["✅ close_session → agent_tokens::revoke_session<br/>test : agent_token_of_a_closed_session_is_refused"]
+        LIFT["✅ levée du périmètre de fichiers (décision fce98b8a) : Claims::may_lift_file_scope = une PERSONNE (jamais agent_session, jeton MCP, compte du serveur, anonyme) ;<br/>agent_tokens::set_launched_unscoped / set_scope_lift_live / must_confine_unscoped / is_scope_lifted : un nexus-tools lancé --unscoped dont la session a quitté le trust est borné par ses hooks ; revoke_session efface<br/>test : only_a_person_opening_a_session_in_trust_lifts_its_file_scope, leaving_trust_ends_a_persons_lift_of_the_file_scope"]
+        REVOKE -.-> LIFT
+        MINT --> REG
+        REG -.fermeture.-> REVOKE
+    end
+
+    subgraph mw["require_auth / enforce_token_policy"]
+        LIVE{"✅ jeton agent_session :<br/>jti encore enregistré ?"}
+        R401["✅ 401 — session fermée, jeton inconnu<br/>ou frappé avant un redémarrage<br/>test : agent_token_never_registered_is_refused"]
+        WS{"✅ chemin /auth/ws-ticket ?"}
+        R403WS["✅ 403 — pas de WebSocket pour un agent<br/>(réponses aux permissions, changement de mode)<br/>test : agent_token_gets_no_websocket_ticket"]
+        HUMAN{"✅ is_human_only_mutation(méthode, chemin) ?<br/>/auth/mcp-tokens, /api/chat/config*,<br/>/api/chat/providers*, /api/chat/roles,<br/>/api/chat/model-policy, /api/chat/model-aliases,<br/>/api/projects/*/llm-*,<br/>/api/chat/sessions/*/permissions/*"}
+        R403["✅ 403 — réservé à un humain<br/>test : agent_token_cannot_mutate_human_only_routes"]
+        PASS["✅ Claims injectés ; lectures et travail courant ouverts"]
+        LIVE -- non --> R401
+        LIVE -- oui --> WS
+        WS -- oui --> R403WS
+        WS -- non --> HUMAN
+        PROFILE{"✅ profil d'outils signé dans le jeton (tools:&lt;profil&gt;) :<br/>ToolProfile::route_forbidden(méthode, chemin) ?<br/>restricted : /api/admin*, /api/mcp-federation*, /api/lifecycle-hooks*,<br/>POST /api/chat/sessions, /api/plans/*/run*, …/delegate, déclencheurs<br/>absent = full ; nom inconnu = restricted"}
+        R403P["✅ 403 tool_not_in_profile<br/>test : a_restricted_profile_token_is_refused_the_routes_behind_withheld_tools"]
+        HUMAN -- "oui (hors GET)" --> R403
+        HUMAN -- non --> PROFILE
+        PROFILE -- oui --> R403P
+        PROFILE -- non --> PASS
+    end
+
+    REG --> LIVE
+    REVOKE --> R401
+
+    subgraph mcpproc["Sous-processus MCP (présentation, pas frontière)"]
+        MCPLIST["✅ McpServer::handle_tools_list : ToolProfile::filter_tools(all_tools())<br/>profil lu du jeton par McpHttpClient::tool_profile (sans vérifier la signature)<br/>test : the_restricted_profile_has_no_way_to_open_a_session_or_run_a_plan"]
+        MCPCALL["✅ McpServer::handle_tools_call : profile_refusal → erreur tool_not_in_profile<br/>test : a_restricted_session_is_refused_the_withheld_calls"]
+        NOMINT["✅ le profil restreint est une LISTE BLANCHE (22 outils ; en REST : DÉFAUT REFUSÉ, seuls les préfixes de routes des outils gardés sont ouverts — ALLOWED_ROUTE_PREFIXES / CLOSED_ROUTE_PREFIXES, plus long préfixe gagnant ; test route_table_is_classified : une route de routes.rs non classée fait échouer la CI ; test every_classification_entry_matches_a_real_route : pas d'entrée morte ; vault, admin, mcp_federation, lifecycle_hook, protocol, sharing, environment, neural_routing, trajectory absents ; un outil ajouté demain est retenu par défaut), les routes /api/vault* lui sont fermées ; build_agent_spec frappe tools:restricted pour tout provider non-Claude (po_mcp_env)<br/>test : the_restricted_profile_has_no_way_to_open_a_session_or_run_a_plan, the_vault_routes_are_closed_to_a_restricted_token_reads_included, calls_are_decided_by_tool_and_action<br/>✅ frontière sur les routes de session : un jeton agent_session n est admis que sur les sessions qu il a ENGENDRÉES (ensure_child_of sur toute écriture /api/chat/sessions/{id}/*, hors annotation de sa propre session)<br/>test : an_agent_token_cannot_write_to_a_session_it_did_not_spawn"]
+    end
+    MINT -.-> MCPLIST
+    MINT -.-> NOMINT
+
+    subgraph caller["Qui demande une session ? — identify_caller"]
+        C1["✅ jeton agent_session lié → Agent(session signée, plafond signé)<br/>l'en-tête X-Session-Id est ignoré<br/>test : the_parent_comes_from_the_signed_token_not_from_a_header"]
+        C2["✅ jeton agent sans session → 403 envelope_unbound_token<br/>test : an_unbound_agent_token_cannot_spawn"]
+        C3["✅ autre jeton → Human (aucune enveloppe)<br/>test : a_human_is_not_enveloped_…"]
+        C4["✅ sans authentification : en-tête X-Session-Id → Agent<br/>test : without_auth_the_header_names_the_parent"]
+    end
+
+    PASS --> ENTRY
+    ENTRY["⚪ POST /api/chat/sessions (create_session)<br/>⚪ POST /api/plans/{p}/tasks/{t}/delegate (delegate_task)"]
+    ENTRY --> C1 & C2 & C3 & C4
+
+    subgraph env["Enveloppe — resolve_envelope puis ParentEnvelope::apply"]
+        DEPTH{"✅ le parent a-t-il lui-même un parent ?<br/>(spawned_by.parent_session_id)"}
+        E_DEPTH["✅ 403 envelope_depth_exceeded (profondeur 1)<br/>test : a_spawned_session_cannot_spawn"]
+        FAN{"✅ enfants VIVANTS du parent ≥ plafond COURANT (réglage runtime GET/PUT/DELETE /api/chat/delegation-limits, root seul, 1..=32, défaut 4, PLAFOND-RT ; plus de variable d environnement) ?<br/>(get_session_children × is_session_active) ;<br/>sous-agents (P18) : créneau SubagentSlot pris AVANT ce compte, tenu jusqu'à la fin<br/>✅ P18-suite point 6 : + les OUVERTURES EN VOL du même parent prises AVANT celle-ci (ChildOpenings : un ticket par ouverture, TOUS chemins — outil Agent dans le créneau, create_session REST/MCP et delegate_task —, pris avant le compte, lu AVANT les enfants vivants, rendu dès que l'enfant est vivant ou que l'ouverture a échoué) ; compter seulement les tickets ANTÉRIEURS donne la place au premier (deux ouvertures ne se refusent pas mutuellement) ; un double compte ne dure que l'instant entre l'enfant vivant et le ticket rendu (refus en trop, jamais un enfant de trop)<br/>test : mcp_children_and_parallel_agent_calls_share_one_live_children_cap (3 enfants MCP + 2 appels Agent simultanés → le 5e refusé ; rouge sans le correctif : 5 enfants), openings_in_flight_count_toward_the_cap_in_the_order_they_were_taken, only_an_agent_caller_reserves_an_opening<br/>🟠 delegate_task en worktree éphémère (T5) : le ticket est rendu à la mise en attente ; l'ouverture confirmée plus tard ne recompte pas l'enveloppe<br/>test : parallel_calls_open_at_most_four_children_and_a_dropped_call_closes_its_child<br/>test : the_live_children_cap_is_configurable_and_names_the_env_var"}
+        E_FAN["✅ 403 envelope_too_many_children<br/>test : a_fifth_live_child_is_refused_…"]
+        CEIL["✅ plafond = min(mode vivant | persisté | défaut global, plafond signé) ; mode vivant d'une session native (moteur agent) : agent_modes, gardé et persisté par set_session_permission_mode (P18)<br/>test : a_child_is_capped_at_the_parents_current_mode<br/>test : the_live_mode_and_the_signed_ceiling_both_clamp"]
+        DIRS{"✅ cwd et add_dirs sous cwd/add_dirs du parent ?<br/>(is_within : composants entiers, .. replié, liens résolus) ;<br/>seule exception : parent en trust (rang 4 : trust OU bypassPermissions, jamais le littéral) → cwd permis dans un WORKTREE git d'un dépôt sous les racines du parent (fichier .git → worktrees/&lt;nom&gt;, lien retour gitdir vérifié, commondir sous une racine ; aucune commande git) dont la racine n'est ni /, ni le home ou un de ses ancêtres, ni un ancêtre d'un chemin refusé (too_broad_for_a_worktree ; test : a_worktree_faked_at_the_home_is_refused) ; add_dirs hors racines TOUJOURS refusés<br/>test : a_parent_in_trust_may_open_its_child_in_a_worktree_of_its_repository_whatever_the_spelling, a_parent_in_trust_cannot_open_its_child_anywhere_else, extra_directories_never_leave_the_parents_even_in_trust, a_planted_git_file_does_not_borrow_the_parents_repository"}
+        E_DIRS["✅ 403 envelope_cwd_outside_parent /<br/>envelope_add_dir_outside_parent<br/>test : cwd_outside_the_parent_is_refused"]
+        PROJ{"✅ workspace = celui du parent ?<br/>projet = celui du parent ?<br/>(ENV-WS : si le projet du parent a été DÉDUIT du cwd en mode « tous les projets »,<br/>tout projet de SON workspace ; marque posée par le serveur seul, absente = choisi)"}
+        E_PROJ["✅ 403 envelope_project_mismatch /<br/>envelope_workspace_mismatch"]
+        MODE["✅ permission_mode = restrict_permission_mode(plafond, demandé | défaut)<br/>plan &lt; default &lt; acceptEdits &lt; auto &lt; bypassPermissions ; inconnu = default<br/>test : a_child_is_never_more_permissive_than_its_parent"]
+        DEPTH -- oui --> E_DEPTH
+        DEPTH -- non --> FAN
+        FAN -- oui --> E_FAN
+        FAN -- non --> CEIL --> DIRS
+        DIRS -- non --> E_DIRS
+        DIRS -- oui --> PROJ
+        PROJ -- non --> E_PROJ
+        PROJ -- oui --> MODE
+    end
+
+    C1 --> DEPTH
+    C4 --> DEPTH
+
+    MODE --> SPAWN_CHAT["✅ create_session : spawned_by = SpawnedBy::Conversation{parent du jeton}<br/>🟠 pas de test de handler (demande un ChatManager avec CLI)"]
+    MODE --> SPAWN_DEL["✅ delegate_task : delegation_chat_request<br/>demande bypassPermissions, bornée par le plafond ;<br/>spawned_by = SpawnedBy::Delegation{plan, tâche, parent du jeton}<br/>test : a_session_in_ask_mode_cannot_delegate_to_a_bypass_child"]
+    C3 --> HUMAN_PATH["✅ humain : comportement antérieur<br/>(delegate_task en bypassPermissions, parent du corps accepté)<br/>test : a_person_delegating_keeps_the_previous_behaviour"]
+
+    RESUME["✅ agent + session_id (envoi à une session existante) :<br/>ensure_child_of — seulement une session qu'il a ouverte<br/>test : an_agent_only_reaches_sessions_it_saw"]
+    C1 --> RESUME
+
+    WAKE["✅ DELEG-WAKE — la fin d'une délégation RÉVEILLE la session qui l'a lancée :<br/>DelegationExecution::close (le point de clôture UNIQUE : résultat, échec, délai) → DelegationWake::notify → ChatManager::wake_with_notification<br/>→ moteur agent : AgentSessionHandle::wake_with_background (tour de type BackgroundOutput, annonce affichée et persistée, en file si un tour tourne) ;<br/>moteur historique : inject_hint. Message : &lt;task-notification task_id status&gt; + durée, coût, arrêt éventuel, et où lire la réponse.<br/>PAS de réveil : délégation d'un run de plan (waking_parent exige run_id None — l'exécuteur du run lit la tâche et pilote le plan), et le Drop (délégation coupée, pas terminée).<br/>tests : only_a_session_that_delegated_is_woken, the_delegation_notification_names_the_task_and_its_end, closing_a_delegation_wakes_the_session_that_delegated (rouge sans le notify)"]
+    PYSR3 --> WAKE
+
+    LATER["🟠 B36 : budget de l'enfant = reste du parent — ÉCRIT pour un sous-agent de l'outil Agent sous une délégation (PYSR-3b, session_limits_of) ;<br/>une délégation delegate_task lancée PAR une délégation repart de son PROPRE plafond (pas du reste) ; un frère ouvert pendant qu'un sous-agent tourne ne voit pas encore sa dépense (imputée à la fin de l'appel)"]
+    SPAWN_DEL -.-> LATER
+    B36_TREE["✅ B36 arbre de sessions :<br/>close_session_with_cascade DE HAUT EN BAS : une session est fermée AVANT que ses enfants soient lus (elle ne peut plus déléguer),<br/>puis l'arbre est relu jusqu'à ce qu'une passe ne trouve rien de neuf (délégation en vol qui atterrit après la lecture) ;<br/>✅ B36-RACE délégation en vol (nœud écrit, provider encore en ouverture, vue INACTIVE par la cascade) : pierre tombale « parent annulé »<br/>(CancelledParents, 5 min, balayée à chaque accès) posée sur chaque session de la cascade AVANT sa fermeture donc avant la lecture de ses enfants ;<br/>chaque activation d'une session dont spawned_by nomme un parent la vérifie DANS la section critique qui l'insère dans la table vivante<br/>(verrou d'écriture d'active_sessions : create_session_resolved, reopen_legacy_session ; verrou du runtime agent : finish_agent_open → adopt_admitting,<br/>création, reprise ET reprise d'un enfant chaud par le pool CACHE-POOL) : insérée avant → la cascade la voit vivante et la ferme ;<br/>insérée après → refusée (jamais insérée, provider fermé, jeton révoqué) avec ParentCancelled (409 parent_cancelled) ; aucune attente ajoutée<br/>tests : a_delegation_in_flight_when_its_parent_is_cancelled_is_refused_at_activation (ordre de production, rouge sans le correctif),<br/>resuming_a_child_of_a_cancelled_parent_is_refused, a_warm_child_of_a_cancelled_parent_is_not_resumed, sessions_whose_parent_was_not_cancelled_open_as_before,<br/>a_cancel_without_a_delegation_in_flight_adds_no_wait, cancelled_parents::tests::*<br/>🟠 moteur historique (CLI Claude Code) couvert par lecture seulement (pas de CLI en test) ; une personne qui reprend un enfant de l'arbre annulé<br/>dans les 5 min est refusée aussi (reprendre le parent lève sa pierre tombale)<br/>un descendant déjà inactif n'est pas refermé (ses enfants vivants sont atteints) ; chaque session fermée perd son répertoire neutre ;<br/>annuler un run ferme en cascade les enfants de ses exécuteurs<br/>coût : la délégation n'est imputée au RUNNER_STATE que si son parent est un exécuteur de CE run (run lu au lancement, run_of_session,<br/>ou parent dans active_agents) — une délégation manuelle ou d'un run précédent ne débite pas le run ; tokens entrée+sortie imputés<br/>AgentExecution de la délégation fermée UNE fois (garde DelegationExecution, après l'écriture du nœud ouvert) : Result → statut, coût,<br/>cost_basis (base du provider, sinon reported si montant, sinon unknown — jamais un reported 0), tokens, modèle, tours ;<br/>sans Result (prompt non envoyé, canal fermé, filet d'1 h, panique) → failed, coût unknown<br/>tests : cascade_closes_a_child_that_lands_after_the_listing, cascade_skips_a_closed_descendant_and_reaches_its_children,<br/>cascade_removes_each_closed_descendants_neutral_directory, closing_a_parent_with_cascade_closes_its_delegated_children,<br/>cancelling_a_run_closes_the_executors_delegated_children, a_manual_delegation_during_a_run_does_not_charge_it,<br/>a_delegation_of_an_earlier_run_does_not_charge_the_next_one, a_delegation_of_the_runs_executor_charges_cost_and_tokens,<br/>delegation_execution_closed_with_cost_basis_tokens_and_model, a_delegation_without_a_price_is_closed_unknown_not_reported_zero,<br/>a_delegation_whose_channel_closes_without_result_is_closed_failed, a_delegation_past_the_safety_net_is_closed_failed,<br/>a_delegation_dropped_before_listening_is_closed_failed<br/>🟠 seul l'enfant DIRECT d'un exécuteur est imputé au run (un petit-enfant ne l'est pas) ; parent_session_id d'un corps humain non vérifié<br/>contre un propriétaire ; run_id de l'AgentExecution d'une délégation = nil"]
+    SPAWN_DEL --> B36_TREE
+    PYSR3["✅ PYSR-3 délai et budget PROPRES à une délégation (delegate_task) ; coût des sous-agents (outil Agent) remonté au parent :<br/>DelegationLimits (runner/models.rs) = les constantes du PlanRunner (DEFAULT_TASK_TIMEOUT_SECS 10800 s, DEFAULT_MAX_COST_USD 50 $, max_tokens aucun) — UNE source, RunnerConfig::default les lit aussi ; launch_delegation les pose sur la requête (ChatRequest.max_cost_usd / max_tokens → SessionLimits : le moteur coupe avec StopReason::BudgetExceeded) et listen_delegation_result tient le délai : au bout, DelegationHalt interrompt l'enfant puis la clôture COMMUNE le ferme (PYSR-3b) (l'ancien filet fixe de 1 h n'arrêtait que l'ÉCOUTE), StopReason::Interrupted, exécution fermée « timeout » ; un Result sur budget (stop_reason budget_exceeded, sous-type error_max_budget*, ou dépense / jetons au-dessus du plafond) = BudgetExceeded, exécution « failed » ; 0 = illimité<br/>l'outil Agent (run_subagent) : voir PYSR-3b (un enfant d'une délégation reçoit le RESTE de son budget ; un enfant d'une session sans plafond n'en reçoit aucun, ISO5) ; le coût de l'enfant est ajouté au coût ENFANTS du parent à la fin de l'appel (charge_children_cost, delta depuis la base d'une session chaude reprise) ; ChatManager::aggregated_cost_usd = propre + enfants, le total_cost_usd PROPRE du parent reste intact (sa décision de routage se ferme sur le coût propre, l'enfant porte le sien : AUTO-SUB, pas de double compte)<br/>NE CHANGE PAS le découpage par vagues : les conflits d'affected_files ne se comparent qu'à l'intérieur d'un niveau de dépendance (neo4j/plan.rs), le retirer créerait des collisions de fichiers<br/>test : a_delegation_past_its_own_delay_is_halted_and_interrupted, a_delegation_over_its_own_budget_ends_budget_exceeded, the_engines_budget_stop_is_a_budget_stop, a_delegations_defaults_are_the_plan_runners, a_sub_agents_cost_is_in_the_parents_aggregate_not_in_its_own_cost, a_resumed_children_earlier_turns_are_not_charged_again<br/>🟠 le coût d'un enfant est exposé par GET /api/chat/sessions/{id} (PYSR-3b), pas encore affiché par l'interface ; le plafond n'est pas réglable par requête ; aucun test avec un vrai moteur : un moteur qui ne sait pas appliquer le plafond en cours de route (SUPPOSÉ pour les harnais autres que natif et Claude Code) n'est jugé qu'à son Result, après coup"]
+    SPAWN_DEL --> PYSR3
+    PYSR3B["✅ PYSR-3b clôture UNIQUE et plafonds qui suivent la délégation :<br/>DelegationClosure::finish (api/handlers.rs) est le seul chemin de fin — Result propre, arrêt sur budget, délai : décision de routage fermée, dépense imputée au run (owns_delegation),<br/>tâche marquée Interrupted avec la raison (interrupt_task, « interrupted: … » / « budget_exceeded: … », nom du StopReason d'abord ; un travail fini n'est pas touché), AgentExecution fermée (→ réveil DELEG-WAKE),<br/>événement delegation_failed avec stop_reason, commits des worktrees d'agents récupérés, puis — arrêt par ses limites seulement — DelegationHalt::close = close_session_with_cascade(enfant, true) : les petits-enfants sont fermés ;<br/>au délai : interrupt, puis attente bornée (INTERRUPT_RESULT_GRACE 30 s) du Result du tour coupé, qui donne la dépense ; sans lui, coût unknown<br/>ChatManager::session_limits_of (subagents.rs) : délégation = DelegationLimits::default() moins sa dépense agrégée (propre + enfants) ; enfant de l'outil Agent = ce qu'il reste à la délégation racine ; autre session = aucune limite (ISO5) —<br/>utilisé à l'ouverture d'un sous-agent (run_subagent, plafonds + délai propre dans open_wait_close) et à la REPRISE (reopen_agent_session_with : l'ancien max_cost_usd: None perdait le plafond) ;<br/>un plafond que le moteur ne sait pas tenir (enforceable_limits) est retiré ET dit : degraded_features cost_cap / token_cap au system_init (ouverture et reprise), jamais un refus du moteur (pas de « no candidate ») ;<br/>set_session_model d'une session vivante plafonnée vers un modèle sans prix : refusé unsupported(«cost») (refuse_a_model_that_drops_the_cost_cap), le modèle en cours reste<br/>GET /api/chat/sessions/{id} : children_cost_usd et aggregated_cost_usd (session_costs, lecture d'UNE session seulement)<br/>tests : a_delegation_stopped_by_its_delay_goes_through_the_normal_closure, a_delegation_stopped_by_its_delay_without_a_last_result_is_closed_unknown, a_delegation_stopped_by_its_budget_marks_its_task_and_closes_its_tree,<br/>a_delegation_that_ends_on_its_own_is_not_stopped, halting_a_delegation_closes_its_grandchildren, a_resumed_delegation_keeps_its_cap, a_resumed_session_of_its_own_stays_uncapped,<br/>a_cap_the_engine_cannot_hold_is_announced_in_degraded_features, a_capped_session_is_not_moved_to_a_model_without_a_price, an_uncapped_session_moves_to_a_model_without_a_price,<br/>a_sub_agent_of_a_capped_delegation_runs_under_what_is_left_of_its_budget, a_sub_agent_of_an_uncapped_session_gets_no_cap, the_session_read_shows_its_childrens_cost_and_the_aggregate,<br/>a_delegations_budget_after_spending_is_what_is_left_of_it, a_delegations_defaults_are_the_plan_runners<br/>🟠 un changement de modèle AUTOMATIQUE n'est pas gardé : directive de tour du routeur (agent_hooks::directive_for_turn, appliquée par nexus) et bascule après limite (ManagerTurnServices::model_after_limit → set_model_after_limit) ; le harnais nexus ne contrôle le plafond qu'à l'ouverture (native/mod.rs), pas à NativeSession::set_model"]
+    PYSR3 --> PYSR3B
+    PYSR3B --> WAKE
+    DEL_TREE["✅ P18-suite point 9 — DELETE /api/chat/sessions/{id} → ChatManager::delete_session d'un PARENT :<br/>close_session_with_cascade(id, true) (B36 ci-dessus : tout l'arbre fermé de haut en bas, délégation en vol refusée à l'activation),<br/>puis les descendants SUPPRIMÉS (transcript puis nœud, delete_one_session), les plus profonds d'abord, le parent en dernier ;<br/>un descendant qui ne se supprime pas fait échouer la suppression AVANT le parent (un nouvel essai retrouve l'arbre).<br/>Supprimés plutôt que rattachés ailleurs : une session engendrée n'est listée que sous son parent (les listes cachent toute session à spawned_by),<br/>un enfant survivant ne serait plus atteignable et son spawned_by nommerait une session disparue.<br/>get_session_children d'un parent INEXISTANT = aucun enfant (Neo4j : MATCH du parent d'abord ; le DETACH DELETE a pris les arêtes SPAWNED_BY<br/>et le repli JSON spawned_by CONTAINS rendait sinon les enfants d'une session supprimée ; MockGraphStore : même règle)<br/>tests : deleting_a_parent_closes_and_deletes_its_descendants, a_deleted_parent_has_no_children_left_by_the_spawned_by_fallback (MockGraphStore, rouges sans le correctif),<br/>test_a_deleted_parent_has_no_children_left_by_the_spawned_by_fallback (tests/neo4j_store_tests.rs, vrai Neo4j)<br/>🟠 le chemin sans ChatManager (graphe seul) supprime le parent seul : ses enfants restent, invisibles ; seul le parent reçoit un événement CRUD deleted"]
+    B36_TREE --> DEL_TREE
+
+    subgraph sub["Sous-agent d'une session native (P18, subagents.rs) — repli A18"]
+        SUBHOST["✅ build_agent_spec_with_access : SubagentHooks (runs_subagents) seulement pour une session native locale<br/>dont le nœud n'a pas de spawned_by, et si enable_subagents a été appelé ; le harnais nexus offre alors Agent.<br/>Session native ENGENDRÉE : SessionSpec::lineage profondeur 1 (garde du harnais armée) et deny AskUserQuestion ;<br/>un enfant garde son spawned_by quand il change de provider (relais)<br/>tests : only_a_native_session_nothing_spawned_runs_subagents (rouge sans la garde spawned_by), a_child_session_stays_a_child_when_it_moves"]
+        SUBSLOT["✅ SubagentSlot::take(parent) : ChatManager::max_live_children() créneaux par parent (réglage runtime, défaut 4, PLAFOND-4 / PLAFOND-RT ; test : the_live_children_cap_is_set_at_runtime_and_names_where_to_raise_it, the_root_account_changes_the_live_children_cap_without_a_restart rouges sans le correctif), pris avant resolve_envelope, rendus à la fin ou à l'abandon de l'appel<br/>(les appels Agent d'une étape tournent en parallèle)<br/>test : parallel_calls_open_at_most_four_children_and_a_dropped_call_closes_its_child (rouge sans le créneau)<br/>test : the_live_children_cap_is_configurable_and_names_the_env_var"]
+        SUBRUN["✅ run_subagent : resolve_envelope(parent) puis ParentEnvelope::apply (plafond = mode COURANT du parent), provider, modèle et accès du parent,<br/>spawned_by = SpawnedBy::Conversation{parent, tool_use_id}, message inerte ;<br/>attend le premier result (vivant ou persisté) → tool_result coupé à 64 Ki caractères ; une question de l'enfant fait échouer l'appel ;<br/>enfant fermé après la réponse, une erreur ou l'abandon de l'appel (CloseOnDrop)<br/>tests : a_child_is_capped_at_the_parents_current_mode, a_failed_child_is_an_error_and_is_closed, subagents::tests, engine_parity_tests (subagents)"]
+        SUBWAIT["🟠 attente bornée par le délai du tour du parent, et par le délai PROPRE de l'enfant quand son parent a des limites (PYSR-3b, open_wait_close) : un enfant en mode qui demande des permissions<br/>affiche sa demande dans sa propre session (documenté, non surveillé)"]
+        SUBWARM["✅ CACHE-POOL, session_pool.rs : avant d'ouvrir, la délégation demande au pool la session CHAUDE de (moteur, modèle)<br/>de CETTE conversation. Éligible seulement si TOUT est identique à l'ouverture de l'entrée : projet, propriétaire, cwd, accès,<br/>mode de permission, répertoires ajoutés, workspace, empreinte de la politique d'outils, empreinte du consentement durable (règles « always »).<br/>Sinon : refus nommé (another project / another tool policy / consent changed / expired…), entrée laissée en place, session NEUVE.<br/>Un enfant repris repart de sa PROPRE enveloppe, de son propre consentement, de sa propre politique : rien n'est hérité.<br/>Rien n'est adapté. Reprise refusée par le provider → entrée jetée, session neuve. Pool vide ou désactivé (PO_WARM_POOL=off) → session neuve.<br/>La réponse du tour repris est lue AU-DESSUS de la séquence de fil atteinte à l'ouverture (answer_from_floor).<br/>Rendu au pool SEULEMENT si la délégation a répondu : un enfant annulé ou en erreur (fil arrêté sur un tour inachevé) est jeté, jamais reproposé (Reuse::finish).<br/>tests : a_child_that_did_not_answer_is_never_given_back_warm (rouge si finish rend toujours l'enfant), a_second_delegation_of_the_same_conversation_reuses_the_warm_session, another_project_gets_no_warm_session,<br/>another_tool_policy_gets_no_warm_session, a_changed_consent_gets_no_warm_session, another_model_gets_no_warm_session,<br/>a_routed_delegation_never_consults_the_pool, a_resumed_child_reads_only_its_own_turn (rouge sans le plancher), session_pool::tests"]
+        SUBHOST --> SUBSLOT --> SUBRUN
+        SUBRUN --> SUBWARM
+        SUBWARM -.-> SUBWAIT
+    end
+    SUBRUN --> DEPTH
+    SUBRUN -.-> LATER
+
+    subgraph mirror["Sous-agent de Claude Code (P18c, mirror.rs) — miroir en lecture seule"]
+        MTAP["✅ MirrorTap::observe : PASSIF, après émission (moteur agent : ManagerTurnServices::observe, kind claude_code seulement ;<br/>moteur historique : emit_chat de stream_response + turn_ended) ; ne clone que les événements des appels Task/Agent suivis<br/>test : the_parents_stream_is_the_same_with_and_without_the_tap, a_native_session_gets_no_mirror"]
+        MCLAIM["✅ MirrorRegistry::claim (parent, tool_use_id) atomique, jeton du tap : un seul écrivain, jamais deux miroirs ;<br/>graphe consulté avant d'écrire ; un tap ne ferme / n'oublie que ce qu'il possède (forget_owner à sa fin)<br/>test : a_second_live_tap_never_writes_into_a_mirror_the_first_holds, a_replay_never_writes_a_second_mirror"]
+        MNODE["✅ nœud enfant : spawned_by = SpawnedBy::Conversation{parent, tool_use_id}, mirror_of = claude_code,<br/>provider / modèle / cwd / projet / propriétaire du parent ; created (payload commun) puis is_streaming true/false ;<br/>fermé au tool_result de l'appel (sauf lancement run_in_background), à la fin du tour ou du parent ; updated_at tamponné à la fermeture<br/>test : a_task_call_gets_one_mirror_holding_its_events_closed_by_its_result, a_background_agent_call_keeps_its_mirror_open_past_its_launch"]
+        MBG["✅ sous-agent EN ARRIÈRE-PLAN (moteur agent) : suivi au-delà du tour ; pump_out_of_band → TurnServices::observe_out_of_turn<br/>→ event_map::structured_out_of_turn (forme d'un tour, jamais émise : le parent garde background_output) ;<br/>fermé par task_notification (tool_use_id, sinon task_id de task_started) : completed = succès, killed/stopped = interrompu, sinon échec, summary = résultat ;<br/>au plus tard à la fermeture du parent ou au redémarrage ; moteur historique : fermé en fin de tour (oob_listener non observé)<br/>test : a_background_sub_agent_is_mirrored_out_of_turn_until_its_notification (fake_claude), a_background_sub_agent_is_followed_past_the_turn_until_its_notification"]
+        MRO["✅ lecture seule : 409 mirror_read_only (message, reprise, switch-provider, modèle, mode, permission ; trame WS plate) ;<br/>jamais repris par la recovery ; supprimé ouvert → abandonné par son tap<br/>test : a_mirror_refuses_every_rest_write_with_409_mirror_read_only, a_cut_mirror_of_a_claude_code_sub_agent_is_closed_at_boot_never_resumed, deleting_an_open_mirror_stops_its_tap"]
+        MTAP --> MCLAIM --> MNODE --> MRO
+        MNODE --> MBG
+    end
+    MNODE -.pas d'enveloppe : aucun processus.-> LATER

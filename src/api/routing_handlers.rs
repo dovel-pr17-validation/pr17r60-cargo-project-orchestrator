@@ -1,0 +1,1606 @@
+//! Routing mode settings API (decision R2): `GET/PUT /api/chat/routing` and
+//! `GET/PUT/DELETE /api/projects/{slug}/routing`.
+//!
+//! The settings decide how much of the provider and model choice the user
+//! delegates to PO (`primary | executors_only | full`) and how far the learnt choices
+//! are trusted (`shadow | advisory | auto`). They are stored as `LlmSetting`
+//! documents (scope `global` or `project:<slug>`, key `routing`) and read with
+//! a default: no document means `primary` + `shadow`, the current behaviour.
+//!
+//! Every mutation is reserved to a human session: `auth::middleware` refuses
+//! an `agent_session` token on these paths and each handler checks again with
+//! `require_human`, so the rule survives a route being moved. A refused body
+//! answers 400 with a typed `code` (`invalid_routing_mode`,
+//! `invalid_learning_stage`, `invalid_routing_weight`, ...), never echoing the
+//! value that was sent.
+//!
+//! The shadow report and the decision log are read here too:
+//! `GET /api/chat/routing/decisions` (newest first, paginated) and
+//! `GET /api/chat/routing/report`. Both are reserved to a human session (an
+//! agent must not read how it is routed, nor tune itself against the report).
+//! They read an `Arc<dyn RoutingArmStore>` installed once at boot with
+//! [`set_routing_store`]; until the Neo4j adapter is installed they answer an
+//! empty page and an empty report. The store lives in a process-wide slot, not
+//! in `ServerState`, so adding it does not touch every state constructor.
+//!
+//! Nothing here takes a routing decision: the settings are stored and shown
+//! (also summarised in `GET /api/chat/providers`), the resolver ignores them
+//! until the cognitive router lands.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use std::sync::{Arc, RwLock};
+
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    Extension, Json,
+};
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
+use serde_json::Value;
+
+use super::handlers::{AppError, OrchestratorState};
+use super::provider_handlers::require_human;
+use crate::auth::jwt::Claims;
+use crate::chat::provider::cognitive::candidates::ModelFacts;
+use crate::chat::provider::cognitive::decision::Pick;
+use crate::chat::provider::cognitive::report::{
+    build_report_with, PickPrice, PriceLookup, RoutingDecisionView, RoutingReport,
+};
+use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
+use crate::chat::provider::cognitive::{
+    self, parse_routing_settings, EffectiveRouting, RoutingError, RoutingScope, RoutingSettings,
+    ROUTING_KEY,
+};
+use crate::chat::provider::errors::OpenFailure;
+use crate::chat::provider::settings::{project_scope, GLOBAL};
+
+/// A refused body: 400 with the stable `code` of the rule that failed.
+fn routing_error(e: RoutingError) -> AppError {
+    AppError::Provider(Box::new(OpenFailure {
+        status: StatusCode::BAD_REQUEST.as_u16(),
+        code: e.code(),
+        message: e.to_string(),
+        provider_id: None,
+        action: None,
+        retryable: false,
+        retry_after_ms: None,
+        resets_at_ms: None,
+        fallbacks: None,
+        consent_scope: None,
+        candidates: None,
+    }))
+}
+
+async fn effective(
+    state: &OrchestratorState,
+    project_slug: Option<&str>,
+) -> Result<Json<EffectiveRouting>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    cognitive::load_routing(graph.as_ref(), project_slug)
+        .await
+        .map(|e| Json(EffectiveRouting::from(e)))
+        .map_err(AppError::Internal)
+}
+
+async fn store(
+    state: &OrchestratorState,
+    claims: &Claims,
+    scope: &str,
+    body: &Value,
+) -> Result<RoutingSettings, AppError> {
+    require_human(state, claims)?;
+    let settings = parse_routing_settings(body).map_err(routing_error)?;
+    let document = serde_json::to_string(&settings).map_err(|e| AppError::Internal(e.into()))?;
+    state
+        .orchestrator
+        .neo4j_arc()
+        .put_llm_setting(scope, ROUTING_KEY, &document)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(settings)
+}
+
+/// GET /api/chat/routing — the global settings (scope `global`, or `default`
+/// when nothing is stored).
+pub async fn get_routing(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<EffectiveRouting>, AppError> {
+    effective(&state, None).await
+}
+
+/// PUT /api/chat/routing — replaces the global settings (human only).
+pub async fn put_routing(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<EffectiveRouting>, AppError> {
+    let settings = store(&state, &claims, GLOBAL, &body).await?;
+    Ok(Json(EffectiveRouting::new(settings, RoutingScope::Global)))
+}
+
+/// GET /api/projects/{slug}/routing — the settings that apply to the project
+/// and where they come from (`project | global | default`).
+pub async fn get_project_routing(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+) -> Result<Json<EffectiveRouting>, AppError> {
+    effective(&state, Some(&slug)).await
+}
+
+/// PUT /api/projects/{slug}/routing — sets the project's override (human only).
+pub async fn put_project_routing(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(slug): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<EffectiveRouting>, AppError> {
+    let settings = store(&state, &claims, &project_scope(&slug), &body).await?;
+    Ok(Json(EffectiveRouting::new(settings, RoutingScope::Project)))
+}
+
+/// DELETE /api/projects/{slug}/routing — removes the project's override, so the
+/// global settings apply again (human only). 404 when there was none.
+pub async fn delete_project_routing(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(slug): Path<String>,
+) -> Result<StatusCode, AppError> {
+    require_human(&state, &claims)?;
+    let removed = state
+        .orchestrator
+        .neo4j_arc()
+        .delete_llm_setting(&project_scope(&slug), ROUTING_KEY)
+        .await
+        .map_err(AppError::Internal)?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound(format!(
+            "project '{slug}' has no routing override"
+        )))
+    }
+}
+
+/// Body of `PUT /api/chat/delegation-limits`; also what `GET` and `DELETE` answer (PLAFOND-RT).
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationLimitsBody {
+    /// How many children of one parent may be alive at once.
+    pub max_live_children: usize,
+}
+
+/// What `GET`, `PUT` and `DELETE /api/chat/delegation-limits` answer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DelegationLimitsView {
+    /// The cap in force now.
+    pub max_live_children: usize,
+    /// The cap when nothing is set.
+    pub default_max_live_children: usize,
+    /// Smallest and largest cap that can be set.
+    pub min_live_children: usize,
+    pub max_live_children_ceiling: usize,
+}
+
+impl DelegationLimitsView {
+    fn of(max_live_children: usize) -> Self {
+        Self {
+            max_live_children,
+            default_max_live_children: crate::chat::envelope::MAX_LIVE_CHILDREN,
+            min_live_children: crate::chat::delegation_limits::MIN_LIVE_CHILDREN,
+            max_live_children_ceiling: crate::chat::delegation_limits::MAX_LIVE_CHILDREN_CEILING,
+        }
+    }
+}
+
+fn invalid_delegation_limits(message: String) -> AppError {
+    AppError::Provider(Box::new(OpenFailure {
+        status: StatusCode::BAD_REQUEST.as_u16(),
+        code: "invalid_delegation_limits",
+        message,
+        provider_id: None,
+        action: None,
+        retryable: false,
+        retry_after_ms: None,
+        resets_at_ms: None,
+        fallbacks: None,
+        consent_scope: None,
+        candidates: None,
+    }))
+}
+
+fn chat_manager_of(state: &OrchestratorState) -> Result<&Arc<crate::chat::ChatManager>, AppError> {
+    state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("chat is not enabled")))
+}
+
+/// GET /api/chat/delegation-limits — the cap on a parent's live children in force now, with
+/// its default and bounds. Readable by anyone signed in: it is the number an agent is
+/// refused with anyway.
+pub async fn get_delegation_limits(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<DelegationLimitsView>, AppError> {
+    let manager = chat_manager_of(&state)?;
+    Ok(Json(DelegationLimitsView::of(manager.max_live_children())))
+}
+
+/// PUT /api/chat/delegation-limits `{ "max_live_children": N }` — sets the cap for the NEXT
+/// delegations, no restart (PLAFOND-RT). The root account only: a server-wide resource
+/// decision, never an agent's (a model must not raise its own ceiling). Live children are
+/// never closed by a lower value.
+pub async fn put_delegation_limits(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<DelegationLimitsBody>,
+) -> Result<Json<DelegationLimitsView>, AppError> {
+    super::provider_handlers::require_root(&state, &claims)?;
+    let manager = chat_manager_of(&state)?;
+    let stored = manager
+        .set_max_live_children(body.max_live_children)
+        .await
+        .map_err(|bad| {
+            invalid_delegation_limits(format!(
+                "max_live_children must be between {} and {}, got {bad}",
+                crate::chat::delegation_limits::MIN_LIVE_CHILDREN,
+                crate::chat::delegation_limits::MAX_LIVE_CHILDREN_CEILING,
+            ))
+        })?
+        .map_err(AppError::Internal)?;
+    Ok(Json(DelegationLimitsView::of(stored)))
+}
+
+/// DELETE /api/chat/delegation-limits — back to the default cap (root account only).
+pub async fn delete_delegation_limits(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<DelegationLimitsView>, AppError> {
+    super::provider_handlers::require_root(&state, &claims)?;
+    let manager = chat_manager_of(&state)?;
+    let cap = manager
+        .reset_max_live_children()
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(DelegationLimitsView::of(cap)))
+}
+
+// ── CTX2: the tools the native harness defers behind `ToolSearch` ───────────────────
+
+/// Body of `PUT /api/chat/deferred-tools`.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeferredToolsBody {
+    /// Exact tool names or prefixes ending in `*`. Empty = defer nothing.
+    pub tools: Vec<String>,
+}
+
+/// What `GET`, `PUT` and `DELETE /api/chat/deferred-tools` answer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeferredToolsView {
+    /// The list in force for the native providers built from now on.
+    pub tools: Vec<String>,
+    /// The list when nothing is set.
+    pub default_tools: Vec<String>,
+    /// `true` when the list in force is the default one.
+    pub is_default: bool,
+    /// Most patterns a list may hold.
+    pub max_patterns: usize,
+}
+
+impl DeferredToolsView {
+    fn of(tools: Vec<String>) -> Self {
+        let default_tools = crate::chat::deferred_tools::default_deferred_tools();
+        Self {
+            is_default: tools == default_tools,
+            tools,
+            default_tools,
+            max_patterns: crate::chat::deferred_tools::MAX_PATTERNS,
+        }
+    }
+}
+
+fn invalid_deferred_tools(message: String) -> AppError {
+    AppError::Provider(Box::new(OpenFailure {
+        status: StatusCode::BAD_REQUEST.as_u16(),
+        code: "invalid_deferred_tools",
+        message,
+        provider_id: None,
+        action: None,
+        retryable: false,
+        retry_after_ms: None,
+        resets_at_ms: None,
+        fallbacks: None,
+        consent_scope: None,
+        candidates: None,
+    }))
+}
+
+/// GET /api/chat/deferred-tools — the tools the native harness withholds behind
+/// `ToolSearch` for the sessions opened from now on, with the default. Readable by anyone
+/// signed in: the model is told the same by the error of a deferred call.
+pub async fn get_deferred_tools(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<DeferredToolsView>, AppError> {
+    let manager = chat_manager_of(&state)?;
+    Ok(Json(DeferredToolsView::of(
+        (*manager.deferred_tools()).clone(),
+    )))
+}
+
+/// PUT /api/chat/deferred-tools `{ "tools": [...] }` — sets the list for the native providers
+/// built next (a running session keeps its own), no restart (CTX2). The root account only:
+/// what a model is offered is a server-wide decision, never an agent's. An empty list
+/// defers nothing.
+pub async fn put_deferred_tools(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<DeferredToolsBody>,
+) -> Result<Json<DeferredToolsView>, AppError> {
+    super::provider_handlers::require_root(&state, &claims)?;
+    let manager = chat_manager_of(&state)?;
+    let stored = manager
+        .set_deferred_tools(&body.tools)
+        .await
+        .map_err(|bad| invalid_deferred_tools(bad.to_string()))?
+        .map_err(AppError::Internal)?;
+    Ok(Json(DeferredToolsView::of(stored)))
+}
+
+/// DELETE /api/chat/deferred-tools — back to the default list (root account only).
+pub async fn delete_deferred_tools(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<DeferredToolsView>, AppError> {
+    super::provider_handlers::require_root(&state, &claims)?;
+    let manager = chat_manager_of(&state)?;
+    let tools = manager
+        .reset_deferred_tools()
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(DeferredToolsView::of(tools)))
+}
+
+/// Most pairs a person's Auto list may hold.
+pub const MAX_AUTO_MODELS: usize = 500;
+
+/// The person whose "models Auto may use" these claims read or write (AUTO-L): a person
+/// signed in with their own session token, never an agent session's, an MCP token, a vault
+/// token, the server's account or the anonymous user (as for the lasting approvals). A
+/// global or shared scope would let one person steer everybody's Auto (review of #722).
+fn auto_models_person(claims: &Claims) -> Result<String, AppError> {
+    if claims.may_keep_lasting_approvals() {
+        Ok(claims.sub.clone())
+    } else {
+        Err(AppError::Forbidden(
+            "the models Auto may use are set by their person only, signed in".to_string(),
+        ))
+    }
+}
+
+/// Body of `PUT /api/chat/auto-models`; also what `GET` answers.
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoModelsBody {
+    /// The pairs Auto may choose among. Empty (or absent) = every available model.
+    #[serde(default)]
+    pub models: Vec<crate::chat::types::RoutingPoolEntry>,
+}
+
+/// What `GET`/`PUT /api/chat/auto-models` answer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutoModelsView {
+    /// The person's list, in the order given; empty when unset.
+    pub models: Vec<crate::chat::types::RoutingPoolEntry>,
+    /// `true` when no list is set: Auto chooses among every available model.
+    pub all_available: bool,
+}
+
+impl AutoModelsView {
+    fn of(models: Vec<crate::chat::types::RoutingPoolEntry>) -> Self {
+        Self {
+            all_available: models.is_empty(),
+            models,
+        }
+    }
+}
+
+fn invalid_auto_models(message: String) -> AppError {
+    AppError::Provider(Box::new(OpenFailure {
+        status: StatusCode::BAD_REQUEST.as_u16(),
+        code: "invalid_auto_models",
+        message,
+        provider_id: None,
+        action: None,
+        retryable: false,
+        retry_after_ms: None,
+        resets_at_ms: None,
+        fallbacks: None,
+        consent_scope: None,
+        candidates: None,
+    }))
+}
+
+/// GET /api/chat/auto-models — the models the caller's Auto may use (AUTO-L). Their own
+/// list only; `all_available: true` when none is set.
+pub async fn get_auto_models(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<AutoModelsView>, AppError> {
+    let person = auto_models_person(&claims)?;
+    let graph = state.orchestrator.neo4j_arc();
+    let models = cognitive::auto_models::load(graph.as_ref(), &person)
+        .await
+        .map_err(AppError::Internal)?
+        .unwrap_or_default();
+    Ok(Json(AutoModelsView::of(models)))
+}
+
+/// PUT /api/chat/auto-models `{ "models": [{provider, model}] }` — replaces the caller's own
+/// list (human only). An empty list removes it: Auto uses every available model again. A
+/// listed model need not exist now: one that is not available is simply not a candidate.
+pub async fn put_auto_models(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<AutoModelsBody>,
+) -> Result<Json<AutoModelsView>, AppError> {
+    require_human(&state, &claims)?;
+    let person = auto_models_person(&claims)?;
+    if body.models.len() > MAX_AUTO_MODELS {
+        return Err(invalid_auto_models(format!(
+            "at most {MAX_AUTO_MODELS} models"
+        )));
+    }
+    let models = crate::chat::types::settle_routing_pool(&body.models).map_err(|index| {
+        invalid_auto_models(format!("models[{index}] needs a provider and a model"))
+    })?;
+    let graph = state.orchestrator.neo4j_arc();
+    cognitive::auto_models::store(graph.as_ref(), &person, &models)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(AutoModelsView::of(models)))
+}
+
+static ROUTING_STORE: RwLock<Option<Arc<dyn RoutingArmStore>>> = RwLock::new(None);
+
+/// Installs the store the decision log and the report read (at boot).
+pub fn set_routing_store(store: Option<Arc<dyn RoutingArmStore>>) {
+    *ROUTING_STORE.write().unwrap_or_else(|e| e.into_inner()) = store;
+}
+
+fn routing_store() -> Option<Arc<dyn RoutingArmStore>> {
+    ROUTING_STORE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+const DEFAULT_LIMIT: usize = 50;
+const MAX_LIMIT: usize = 200;
+
+/// Query of `GET /api/chat/routing/decisions`.
+#[derive(Debug, Deserialize)]
+pub struct DecisionsQuery {
+    /// Only this project's decisions.
+    pub project_slug: Option<String>,
+    /// Page size, 1..=200, default 50.
+    pub limit: Option<usize>,
+    /// Page offset.
+    pub offset: Option<usize>,
+    /// Only decisions at or after this RFC 3339 time.
+    pub since: Option<DateTime<Utc>>,
+}
+
+/// Query of `GET /api/chat/routing/report`.
+#[derive(Debug, Deserialize)]
+pub struct ReportQuery {
+    /// Only this project's decisions.
+    pub project_slug: Option<String>,
+    /// Window start (RFC 3339).
+    pub from: Option<DateTime<Utc>>,
+    /// Window end (RFC 3339).
+    pub to: Option<DateTime<Utc>>,
+}
+
+/// One page of decisions, newest first. `has_more` is true when another page
+/// follows; the store does not count, so there is no `total`.
+pub async fn decisions_page(
+    store: Option<&dyn RoutingArmStore>,
+    query: &DecisionsQuery,
+) -> anyhow::Result<Value> {
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let mut found = match store {
+        Some(store) => {
+            store
+                .decisions(&DecisionFilter {
+                    project_slug: query.project_slug.clone(),
+                    since: query.since,
+                    session_id: None,
+                    limit: Some(limit + 1),
+                    offset,
+                })
+                .await?
+        }
+        None => vec![],
+    };
+    let has_more = found.len() > limit;
+    found.truncate(limit);
+    let items: Vec<RoutingDecisionView> = found.iter().map(RoutingDecisionView::from).collect();
+    Ok(serde_json::json!({
+        "items": items,
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+    }))
+}
+
+/// GET /api/chat/routing/decisions (human only).
+pub async fn list_decisions(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<DecisionsQuery>,
+) -> Result<Json<Value>, AppError> {
+    require_human_reader(&state, &claims)?;
+    let store = routing_store();
+    decisions_page(store.as_deref(), &query)
+        .await
+        .map(Json)
+        .map_err(AppError::Internal)
+}
+
+/// GET /api/chat/routing/report (human only).
+pub async fn get_report(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<ReportQuery>,
+) -> Result<Json<RoutingReport>, AppError> {
+    require_human_reader(&state, &claims)?;
+    report_from(routing_store(), state.chat_manager.as_ref(), &query)
+        .await
+        .map(Json)
+}
+
+/// The report for a store and the chat manager whose pool prices it. The store is an
+/// argument, not read from the process-wide slot, so a test can drive it without
+/// racing the tests that expect the slot empty.
+async fn report_from(
+    store: Option<Arc<dyn RoutingArmStore>>,
+    chat_manager: Option<&Arc<crate::chat::ChatManager>>,
+    query: &ReportQuery,
+) -> Result<RoutingReport, AppError> {
+    let Some(store) = store else {
+        return Ok(cognitive::report::summarise(
+            &[],
+            &cognitive::report::NoPrices,
+        ));
+    };
+    let prices = PoolPrices(match chat_manager {
+        Some(manager) => {
+            manager
+                .routing_pool_known(query.project_slug.as_deref())
+                .await
+        }
+        None => Vec::new(),
+    });
+    build_report_with(
+        store.as_ref(),
+        &prices,
+        query.project_slug.as_deref(),
+        query.from,
+        query.to,
+    )
+    .await
+    .map_err(AppError::Internal)
+}
+
+/// Prices read from the candidates the router sees now: the nexus catalogue of each
+/// instance. The price is today's, not the one in force when a decision was taken, so
+/// an estimate computed from it is labelled as such by the report.
+struct PoolPrices(Vec<ModelFacts>);
+
+impl PriceLookup for PoolPrices {
+    fn price(&self, pick: &Pick) -> Option<PickPrice> {
+        let fact = self
+            .0
+            .iter()
+            .find(|f| f.provider_id == pick.provider_id && f.model == pick.model)?;
+        let price = fact.price?;
+        Some(PickPrice {
+            input_per_mtok: price.input_per_mtok,
+            output_per_mtok: price.output_per_mtok,
+            basis: fact.cost_basis,
+        })
+    }
+}
+
+fn require_human_reader(state: &OrchestratorState, claims: &Claims) -> Result<(), AppError> {
+    if state.auth_config.is_none() || claims.is_human() {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "the routing log can only be read by a signed-in user".to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::handlers::{OrchestratorState, ServerState};
+    use crate::api::routes::create_router;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    use crate::orchestrator::{FileWatcher, Orchestrator};
+    use crate::test_helpers::{mock_app_state, test_bearer_token};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    async fn state() -> OrchestratorState {
+        state_with(None, crate::test_helpers::test_auth_config()).await
+    }
+
+    async fn state_with(
+        chat_manager: Option<Arc<crate::chat::ChatManager>>,
+        auth_config: crate::AuthConfig,
+    ) -> OrchestratorState {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(auth_config),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
+        })
+    }
+
+    async fn app() -> axum::Router {
+        create_router(state().await)
+    }
+
+    fn req(token: &str, method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
+        let b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", token);
+        match body {
+            Some(v) => b
+                .header("content-type", "application/json")
+                .body(Body::from(v.to_string()))
+                .unwrap(),
+            None => b.body(Body::empty()).unwrap(),
+        }
+    }
+
+    fn human(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
+        req(&test_bearer_token(), method, uri, body)
+    }
+
+    /// A bound, live agent token (restricted profile, like a third party's).
+    fn agent_bearer() -> String {
+        let session = Uuid::new_v4();
+        let claims = crate::auth::jwt::Claims::service_account("agent");
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: session.to_string(),
+            ceiling: Some("default".into()),
+            tool_profile: Some("restricted".into()),
+            third_party: false,
+        };
+        let (token, jti) = crate::auth::jwt::generate_session_token(
+            &claims,
+            Some(&binding),
+            &crate::test_helpers::test_auth_config().jwt_secret,
+            3600,
+        )
+        .unwrap();
+        crate::auth::agent_tokens::register(&jti, Some(&session.to_string()));
+        format!("Bearer {token}")
+    }
+
+    async fn call(app: &axum::Router, request: Request<Body>) -> (StatusCode, Value) {
+        let resp = app.clone().oneshot(request).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        (status, body)
+    }
+
+    fn assert_default(body: &Value, scope: &str) {
+        assert_eq!(body["mode"], "primary");
+        assert_eq!(body["stage"], "shadow");
+        assert_eq!(body["exploration_epsilon"], 0.05);
+        assert_eq!(body["cost_weight"], 0.3);
+        assert_eq!(body["latency_weight"], 0.1);
+        assert_eq!(body["demote_after"], 20);
+        assert!(body.get("primary").is_none(), "{body}");
+        assert_eq!(body["scope"], scope);
+    }
+
+    #[tokio::test]
+    async fn routing_get_without_a_setting_is_the_default() {
+        let app = app().await;
+        let (status, body) = call(&app, human("GET", "/api/chat/routing", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_default(&body, "default");
+        let (status, body) = call(&app, human("GET", "/api/projects/p/routing", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_default(&body, "default");
+    }
+
+    #[tokio::test]
+    async fn routing_put_valid_is_stored_and_read_back() {
+        let app = app().await;
+        let want = json!({"mode": "executors_only", "stage": "advisory", "exploration_epsilon": 0.1,
+                          "primary": {"provider": "claude-code", "alias": "deep"}});
+        let (status, body) = call(&app, human("PUT", "/api/chat/routing", Some(want))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["mode"], "executors_only");
+        assert_eq!(body["stage"], "advisory");
+        assert_eq!(body["exploration_epsilon"], 0.1);
+        assert_eq!(body["cost_weight"], 0.3, "absent knob = default");
+        assert_eq!(body["primary"]["alias"], "deep");
+        assert_eq!(body["scope"], "global");
+        let (_, got) = call(&app, human("GET", "/api/chat/routing", None)).await;
+        assert_eq!(got, body, "GET returns exactly what PUT stored");
+        // A PUT replaces the document: a knob left out goes back to its default.
+        let (status, body) = call(
+            &app,
+            human("PUT", "/api/chat/routing", Some(json!({"mode": "full"}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["mode"], "full");
+        assert_eq!(body["stage"], "shadow");
+        assert_eq!(body["exploration_epsilon"], 0.05);
+        assert!(body.get("primary").is_none());
+    }
+
+    #[tokio::test]
+    async fn routing_put_invalid_is_a_typed_400_and_stores_nothing() {
+        let app = app().await;
+        for (body, code) in [
+            (json!({"mode": "turbo"}), "invalid_routing_mode"),
+            (json!({"mode": "Primary"}), "invalid_routing_mode"),
+            (json!({"stage": "yolo"}), "invalid_learning_stage"),
+            (
+                json!({"exploration_epsilon": 0.5}),
+                "invalid_routing_weight",
+            ),
+            (json!({"cost_weight": 1.5}), "invalid_routing_weight"),
+            (json!({"latency_weight": -0.1}), "invalid_routing_weight"),
+            (json!({"demote_after": 1}), "invalid_routing_weight"),
+            (
+                json!({"primary": {"provider": "x", "model": "m", "alias": "a"}}),
+                "invalid_routing_primary",
+            ),
+            (json!({"cost_weight": "a lot"}), "invalid_routing_settings"),
+            (json!([]), "invalid_routing_settings"),
+        ] {
+            for uri in ["/api/chat/routing", "/api/projects/p/routing"] {
+                let (status, got) = call(&app, human("PUT", uri, Some(body.clone()))).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body} -> {got}");
+                assert_eq!(got["code"], code, "{uri} {body} -> {got}");
+                assert!(got["error"].is_string());
+                assert!(
+                    !got.to_string().contains("turbo") && !got.to_string().contains("yolo"),
+                    "a refused value is never echoed: {got}"
+                );
+            }
+        }
+        let (_, body) = call(&app, human("GET", "/api/projects/p/routing", None)).await;
+        assert_default(&body, "default");
+    }
+
+    #[tokio::test]
+    async fn routing_mutations_are_refused_to_an_agent_token() {
+        let app = app().await;
+        let agent = agent_bearer();
+        let body = json!({"mode": "full", "stage": "auto"});
+        for (method, uri) in [
+            ("PUT", "/api/chat/routing"),
+            ("PUT", "/api/projects/p/routing"),
+            ("DELETE", "/api/projects/p/routing"),
+        ] {
+            let payload = (method == "PUT").then(|| body.clone());
+            let (status, got) = call(&app, req(&agent, method, uri, payload)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri} -> {got}");
+        }
+        // Nothing was stored: a person still sees the default.
+        let (_, body) = call(&app, human("GET", "/api/projects/p/routing", None)).await;
+        assert_default(&body, "default");
+    }
+
+    #[tokio::test]
+    async fn routing_project_override_wins_and_delete_returns_to_global() {
+        let app = app().await;
+        let (status, _) = call(
+            &app,
+            human(
+                "PUT",
+                "/api/chat/routing",
+                // A client not updated yet still says `mixed`: stored and read back as `executors_only`.
+                Some(json!({"mode": "mixed", "stage": "advisory"})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // Without an override the project inherits the global document.
+        let (_, body) = call(&app, human("GET", "/api/projects/p/routing", None)).await;
+        assert_eq!(body["mode"], "executors_only");
+        assert_eq!(body["scope"], "global");
+        // The override wins for that project only.
+        let (status, body) = call(
+            &app,
+            human(
+                "PUT",
+                "/api/projects/p/routing",
+                Some(json!({"mode": "full", "stage": "shadow", "cost_weight": 0.6})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["scope"], "project");
+        let (_, body) = call(&app, human("GET", "/api/projects/p/routing", None)).await;
+        assert_eq!(body["mode"], "full");
+        assert_eq!(body["cost_weight"], 0.6);
+        assert_eq!(body["scope"], "project");
+        let (_, other) = call(&app, human("GET", "/api/projects/q/routing", None)).await;
+        assert_eq!(other["mode"], "executors_only");
+        assert_eq!(other["scope"], "global");
+        let (_, global) = call(&app, human("GET", "/api/chat/routing", None)).await;
+        assert_eq!(global["mode"], "executors_only");
+        assert_eq!(global["scope"], "global");
+        // DELETE returns the project to the global document.
+        let (status, _) = call(&app, human("DELETE", "/api/projects/p/routing", None)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = call(&app, human("GET", "/api/projects/p/routing", None)).await;
+        assert_eq!(body["mode"], "executors_only");
+        assert_eq!(body["scope"], "global");
+        let (status, _) = call(&app, human("DELETE", "/api/projects/p/routing", None)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "nothing left to remove");
+    }
+
+    #[tokio::test]
+    async fn routing_listing_carries_the_effective_mode_stage_and_scope() {
+        let app = app().await;
+        let (status, body) = call(&app, human("GET", "/api/chat/providers", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["routing"],
+            json!({"mode": "primary", "stage": "shadow", "scope": "default"})
+        );
+        call(
+            &app,
+            human(
+                "PUT",
+                "/api/projects/p/routing",
+                Some(json!({"mode": "full", "stage": "advisory"})),
+            ),
+        )
+        .await;
+        let (_, body) = call(
+            &app,
+            human("GET", "/api/chat/providers?project_slug=p", None),
+        )
+        .await;
+        assert_eq!(
+            body["routing"],
+            json!({"mode": "full", "stage": "advisory", "scope": "project"})
+        );
+        let (_, body) = call(&app, human("GET", "/api/chat/providers", None)).await;
+        assert_eq!(body["routing"]["scope"], "default", "no project asked");
+    }
+
+    #[tokio::test]
+    async fn the_log_and_the_report_are_empty_without_a_store_and_human_only() {
+        let app = app().await;
+        let (status, body) = call(&app, human("GET", "/api/chat/routing/decisions", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["items"], json!([]));
+        assert_eq!(body["has_more"], false);
+        let (status, body) = call(&app, human("GET", "/api/chat/routing/report", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["decisions"], 0);
+        assert!(body["agreement_rate"].is_null());
+        assert!(body["estimated_cost_delta_usd"].is_null());
+        assert_eq!(body["by_class"], json!([]));
+        let (status, _) = call(
+            &app,
+            human(
+                "GET",
+                "/api/chat/routing/report?from=2026-10-01T00:00:00Z&to=2026-10-07T00:00:00Z",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &app,
+            human("GET", "/api/chat/routing/report?from=nope", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let agent = agent_bearer();
+        for uri in ["/api/chat/routing/decisions", "/api/chat/routing/report"] {
+            let (status, _) = call(&app, req(&agent, "GET", uri, None)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn decisions_come_newest_first_in_pages_filtered_by_project() {
+        use crate::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
+        use crate::chat::provider::cognitive::mode::{LearningStage, ProviderRoutingMode};
+        use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
+        use crate::chat::provider::cognitive::store::{InMemoryRoutingStore, RoutingArmStore};
+
+        let store = InMemoryRoutingStore::new();
+        for (i, project) in ["p", "p", "p", "q"].into_iter().enumerate() {
+            let d = CognitiveDecision {
+                snapshot: None,
+                arms_snapshot: Vec::new(),
+                id: Uuid::new_v4(),
+                at: chrono::Utc::now() - chrono::Duration::seconds(100 - i as i64),
+                signature: TaskSignature::utility(TaskClass::Simple, 9_000, Some(project)),
+                chosen: Some(Pick::new("prov", "model")),
+                score: Some(0.5),
+                explored: false,
+                exploration_epsilon: 0.0,
+                confidence: None,
+                reason: format!("d{i}"),
+                alternatives: vec![],
+                applied: false,
+                mode: ProviderRoutingMode::ExecutorsOnly,
+                stage: LearningStage::Shadow,
+                session_id: None,
+                task_id: None,
+                run_id: None,
+                turn_index: None,
+                outcome: None,
+                used: None,
+            };
+            store.put_decision(&d).await.unwrap();
+        }
+        let query = |project: &str, limit, offset| super::DecisionsQuery {
+            project_slug: Some(project.into()),
+            limit: Some(limit),
+            offset: Some(offset),
+            since: None,
+        };
+        let page = super::decisions_page(Some(&store), &query("p", 2, 0))
+            .await
+            .unwrap();
+        assert_eq!(page["items"][0]["reason"], "d2", "newest first");
+        assert_eq!(page["items"][1]["reason"], "d1");
+        assert_eq!(page["has_more"], true);
+        let page = super::decisions_page(Some(&store), &query("p", 2, 2))
+            .await
+            .unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["reason"], "d0");
+        assert_eq!(page["has_more"], false);
+        let page = super::decisions_page(Some(&store), &query("p", 10_000, 0))
+            .await
+            .unwrap();
+        assert_eq!(page["limit"], 200, "the page size is bounded");
+    }
+
+    /// The decision log carries the cause of a `window_unknown` rejection (B-R3), so
+    /// the frontend can say "catalog offline"; other alternatives have no `why` key.
+    #[tokio::test]
+    async fn the_decision_log_says_why_a_window_is_unknown() {
+        use crate::chat::provider::cognitive::candidates::{RejectReason, UnknownWindow};
+        use crate::chat::provider::cognitive::decision::{
+            CognitiveDecision, DecisionAlternative, Pick,
+        };
+        use crate::chat::provider::cognitive::mode::{LearningStage, ProviderRoutingMode};
+        use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
+        use crate::chat::provider::cognitive::store::{InMemoryRoutingStore, RoutingArmStore};
+
+        let alternative = |model: &str, score, rejected| DecisionAlternative {
+            pick: Pick::new("claude-code", model),
+            score,
+            rejected,
+            p_top1: None,
+            propensity: None,
+        };
+        let store = InMemoryRoutingStore::new();
+        store
+            .put_decision(&CognitiveDecision {
+                snapshot: None,
+                arms_snapshot: Vec::new(),
+                id: Uuid::new_v4(),
+                at: chrono::Utc::now(),
+                signature: TaskSignature::utility(TaskClass::Simple, 9_000, Some("p")),
+                chosen: None,
+                score: None,
+                explored: false,
+                exploration_epsilon: 0.0,
+                confidence: None,
+                reason: "no_candidate".into(),
+                alternatives: vec![
+                    alternative("claude-opus-5-5", Some(0.4), None),
+                    alternative(
+                        "claude-sonnet-4-6",
+                        None,
+                        Some(RejectReason::WindowUnknown {
+                            need: 9_000,
+                            why: UnknownWindow::CatalogOffline,
+                        }),
+                    ),
+                    alternative(
+                        "claude-zeta-9-9",
+                        None,
+                        Some(RejectReason::WindowUnknown {
+                            need: 9_000,
+                            why: UnknownWindow::NotInCatalog,
+                        }),
+                    ),
+                    alternative(
+                        "claude-haiku-4-5",
+                        None,
+                        Some(RejectReason::ContextTooSmall {
+                            need: 9_000,
+                            have: Some(4_000),
+                        }),
+                    ),
+                ],
+                applied: false,
+                mode: ProviderRoutingMode::Full,
+                stage: LearningStage::Shadow,
+                session_id: None,
+                task_id: None,
+                run_id: None,
+                turn_index: None,
+                outcome: None,
+                used: None,
+            })
+            .await
+            .unwrap();
+        let query = super::DecisionsQuery {
+            project_slug: Some("p".into()),
+            limit: None,
+            offset: None,
+            since: None,
+        };
+        let page = super::decisions_page(Some(&store), &query).await.unwrap();
+        assert_eq!(
+            page["items"][0]["alternatives"],
+            json!([
+                {"provider_id": "claude-code", "model": "claude-opus-5-5", "score": 0.4, "rejected": null},
+                {"provider_id": "claude-code", "model": "claude-sonnet-4-6", "score": null,
+                 "rejected": "window_unknown", "why": "catalog_offline"},
+                {"provider_id": "claude-code", "model": "claude-zeta-9-9", "score": null,
+                 "rejected": "window_unknown", "why": "not_in_catalog"},
+                {"provider_id": "claude-code", "model": "claude-haiku-4-5", "score": null,
+                 "rejected": "context_too_small"},
+            ])
+        );
+    }
+
+    /// A chat manager with no cognitive router wired: its pool is empty.
+    fn bare_manager() -> Arc<crate::chat::ChatManager> {
+        let state = mock_app_state();
+        Arc::new(crate::chat::ChatManager::new_without_memory(
+            state.neo4j,
+            state.meili,
+            crate::chat::config::ChatConfig::default(),
+        ))
+    }
+
+    async fn stored_decision(
+        store: &crate::chat::provider::cognitive::store::InMemoryRoutingStore,
+        project: &str,
+    ) {
+        use crate::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
+        use crate::chat::provider::cognitive::mode::{LearningStage, ProviderRoutingMode};
+        use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+
+        store
+            .put_decision(&CognitiveDecision {
+                snapshot: None,
+                arms_snapshot: Vec::new(),
+                id: Uuid::new_v4(),
+                at: chrono::Utc::now(),
+                signature: TaskSignature::utility(TaskClass::Simple, 9_000, Some(project)),
+                chosen: Some(Pick::new("prov", "model")),
+                score: Some(0.5),
+                explored: false,
+                exploration_epsilon: 0.0,
+                confidence: None,
+                reason: "r".into(),
+                alternatives: vec![],
+                applied: false,
+                mode: ProviderRoutingMode::ExecutorsOnly,
+                stage: LearningStage::Shadow,
+                session_id: None,
+                task_id: None,
+                run_id: None,
+                turn_index: None,
+                outcome: None,
+                used: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_report_reads_the_store_it_is_given_and_prices_from_the_manager_pool() {
+        use crate::chat::provider::cognitive::store::{InMemoryRoutingStore, RoutingArmStore};
+
+        let store = Arc::new(InMemoryRoutingStore::new());
+        stored_decision(&store, "p").await;
+        stored_decision(&store, "q").await;
+        let shared: Arc<dyn RoutingArmStore> = store;
+        let query = |project: Option<&str>| super::ReportQuery {
+            project_slug: project.map(str::to_owned),
+            from: None,
+            to: None,
+        };
+
+        // With a manager: the pool prices the report. No router is wired, so the pool
+        // is empty and nothing is priced: the estimate stays absent, never zero.
+        let manager = bare_manager();
+        let all = super::report_from(Some(shared.clone()), Some(&manager), &query(None))
+            .await
+            .unwrap();
+        assert_eq!(all.decisions, 2);
+        assert!(
+            all.estimated_cost_delta_usd.is_none(),
+            "no price, no estimate"
+        );
+        let one = super::report_from(Some(shared.clone()), Some(&manager), &query(Some("p")))
+            .await
+            .unwrap();
+        assert_eq!(one.decisions, 1, "the project filter reaches the store");
+
+        // Without a manager the report is the same: the prices are just empty.
+        let bare = super::report_from(Some(shared), None, &query(None))
+            .await
+            .unwrap();
+        assert_eq!(bare.decisions, 2);
+
+        // Without a store: an empty report, whatever the manager.
+        let empty = super::report_from(None, Some(&manager), &query(None))
+            .await
+            .unwrap();
+        assert_eq!(empty.decisions, 0);
+    }
+
+    #[test]
+    fn the_report_prices_a_pick_from_the_pool_or_not_at_all() {
+        use crate::chat::provider::cognitive::candidates::ModelFacts;
+        use crate::chat::provider::cognitive::decision::Pick;
+        use crate::chat::provider::cognitive::report::PriceLookup;
+        use nexus_claude::agent::{CostBasis, ModelPrice};
+
+        let fact = |provider: &str, model: &str, price: Option<ModelPrice>| ModelFacts {
+            provider_id: provider.into(),
+            model: model.into(),
+            supports_tools: true,
+            supports_images: false,
+            context_window: Some(100_000),
+            window_unknown: None,
+            price,
+            cost_basis: CostBasis::Priced,
+            healthy: Some(true),
+            allowed_for_project: true,
+            sandboxed: false,
+            quota_exhausted: None,
+            quota_utilization: None,
+        };
+        let priced = ModelPrice {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+            cache_read_per_mtok: None,
+            cache_write_per_mtok: None,
+        };
+        let lookup = super::PoolPrices(vec![
+            fact("cloud", "big", Some(priced)),
+            fact("cloud", "unknown", None),
+        ]);
+
+        let known = lookup
+            .price(&Pick::new("cloud", "big"))
+            .expect("a priced model is priced");
+        assert_eq!(known.input_per_mtok, 3.0);
+        assert_eq!(known.output_per_mtok, 15.0);
+        assert_eq!(known.basis, CostBasis::Priced);
+        // Unknown price stays unknown; a model the pool does not list is unknown too.
+        assert!(lookup.price(&Pick::new("cloud", "unknown")).is_none());
+        assert!(lookup.price(&Pick::new("cloud", "absent")).is_none());
+        assert!(lookup.price(&Pick::new("other", "big")).is_none());
+    }
+
+    // ── AUTO-L: the models a person lets their Auto choose among ─────────────
+
+    /// A signed-in person with a fixed identity (`test_bearer_token` draws a new one per call).
+    fn person_bearer(sub: Uuid) -> String {
+        let token = crate::auth::jwt::encode_jwt(
+            sub,
+            "person@ffs.holdings",
+            "A Person",
+            &crate::test_helpers::test_auth_config().jwt_secret,
+            3600,
+        )
+        .unwrap();
+        format!("Bearer {token}")
+    }
+
+    #[tokio::test]
+    async fn auto_models_are_the_persons_own_and_unset_means_every_model() {
+        let app = app().await;
+        let (a, b) = (person_bearer(Uuid::new_v4()), person_bearer(Uuid::new_v4()));
+        let uri = "/api/chat/auto-models";
+        // Unset: every available model.
+        let (status, body) = call(&app, req(&a, "GET", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, json!({"models": [], "all_available": true}));
+        // A sets a list (blanks trimmed, duplicates dropped).
+        let list = json!({"models": [
+            {"provider": "claude-code", "model": "opus"},
+            {"provider": " deepseek ", "model": "flash"},
+            {"provider": "claude-code", "model": "opus"},
+        ]});
+        let (status, body) = call(&app, req(&a, "PUT", uri, Some(list))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let expected = json!({"models": [
+            {"provider": "claude-code", "model": "opus"},
+            {"provider": "deepseek", "model": "flash"},
+        ], "all_available": false});
+        assert_eq!(body, expected);
+        let (_, body) = call(&app, req(&a, "GET", uri, None)).await;
+        assert_eq!(body, expected);
+        // B's Auto is untouched by A's list.
+        let (_, body) = call(&app, req(&b, "GET", uri, None)).await;
+        assert_eq!(body, json!({"models": [], "all_available": true}));
+        // An empty list returns A to every model.
+        let (status, body) = call(&app, req(&a, "PUT", uri, Some(json!({"models": []})))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["all_available"], true);
+        let (_, body) = call(&app, req(&a, "GET", uri, None)).await;
+        assert_eq!(body, json!({"models": [], "all_available": true}));
+    }
+
+    #[tokio::test]
+    async fn auto_models_are_never_read_nor_written_by_an_agent_token() {
+        let app = app().await;
+        let person = person_bearer(Uuid::new_v4());
+        let agent = agent_bearer();
+        let uri = "/api/chat/auto-models";
+        let list = json!({"models": [{"provider": "local", "model": "m"}]});
+        let (status, got) = call(&app, req(&agent, "PUT", uri, Some(list))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{got}");
+        let (status, got) = call(&app, req(&agent, "GET", uri, None)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{got}");
+        // Nothing was stored anywhere a person reads.
+        let (_, body) = call(&app, req(&person, "GET", uri, None)).await;
+        assert_eq!(body["all_available"], true);
+    }
+
+    #[tokio::test]
+    async fn a_blank_auto_models_entry_is_refused_with_a_typed_code() {
+        let app = app().await;
+        let person = person_bearer(Uuid::new_v4());
+        let uri = "/api/chat/auto-models";
+        for body in [
+            json!({"models": [{"provider": "local", "model": " "}]}),
+            json!({"models": [], "scope": "global"}),
+        ] {
+            let (status, got) = call(&app, req(&person, "PUT", uri, Some(body.clone()))).await;
+            assert!(
+                status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
+                "{body} -> {status} {got}"
+            );
+        }
+        let (status, got) = call(
+            &app,
+            req(
+                &person,
+                "PUT",
+                uri,
+                Some(json!({"models": [{"provider": "", "model": "m"}]})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(got["code"], "invalid_auto_models");
+    }
+
+    const ROOT_EMAIL: &str = "root@ffs.holdings";
+
+    /// A server with a chat manager and a configured root account; returns the router, the
+    /// manager and the root account's bearer token.
+    async fn app_with_root() -> (axum::Router, Arc<crate::chat::ChatManager>, String) {
+        let mut auth = crate::test_helpers::test_auth_config();
+        auth.root_account = Some(crate::RootAccountConfig {
+            email: ROOT_EMAIL.to_string(),
+            name: "Root".to_string(),
+            password_hash: String::new(),
+        });
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn crate::neo4j::GraphStore> = graph;
+        let manager = Arc::new(crate::chat::ChatManager::new_without_memory(
+            dyn_graph,
+            mock_app_state().meili,
+            Default::default(),
+        ));
+        let root = Uuid::new_v5(&Uuid::NAMESPACE_URL, ROOT_EMAIL.as_bytes());
+        let app = create_router(state_with(Some(manager.clone()), auth).await);
+        (app, manager, person_bearer(root))
+    }
+
+    #[tokio::test]
+    async fn the_root_account_changes_the_live_children_cap_without_a_restart() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/delegation-limits";
+        let (status, body) = call(&app, req(&root, "GET", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["max_live_children"], 4);
+        assert_eq!(body["default_max_live_children"], 4);
+        assert_eq!(manager.max_live_children(), 4);
+        let (status, body) = call(
+            &app,
+            req(&root, "PUT", uri, Some(json!({"max_live_children": 12}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["max_live_children"], 12);
+        // The running manager answers with the new cap at once: the next delegation uses it.
+        assert_eq!(manager.max_live_children(), 12);
+        // Lowering is allowed too (it never closes a live child, it refuses the next opening).
+        let (status, _) = call(
+            &app,
+            req(&root, "PUT", uri, Some(json!({"max_live_children": 2}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(manager.max_live_children(), 2);
+        // DELETE returns to the default.
+        let (status, body) = call(&app, req(&root, "DELETE", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["max_live_children"], 4);
+        assert_eq!(manager.max_live_children(), 4);
+    }
+
+    #[tokio::test]
+    async fn the_stored_cap_is_read_again_after_a_restart() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/delegation-limits";
+        let (status, _) = call(
+            &app,
+            req(&root, "PUT", uri, Some(json!({"max_live_children": 9}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // A new manager over the same graph, as after a restart: it starts at the default
+        // and reads the stored document.
+        let restarted = crate::chat::ChatManager::new_without_memory(
+            manager.graph.clone(),
+            mock_app_state().meili,
+            Default::default(),
+        );
+        assert_eq!(restarted.max_live_children(), 4);
+        restarted.load_delegation_limits().await;
+        assert_eq!(restarted.max_live_children(), 9);
+    }
+
+    // ── CTX2: the deferred tools ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn the_root_account_changes_the_deferred_tools_without_a_restart() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/deferred-tools";
+        let default = crate::chat::deferred_tools::default_deferred_tools();
+        let (status, body) = call(&app, req(&root, "GET", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["is_default"], true);
+        assert_eq!(body["tools"], json!(default));
+        assert_eq!(body["default_tools"], json!(default));
+        assert_eq!(*manager.deferred_tools(), default);
+
+        // An explicit list: in force at once for the providers built next.
+        let (status, body) = call(
+            &app,
+            req(
+                &root,
+                "PUT",
+                uri,
+                Some(json!({"tools": ["mcp__project-orchestrator__admin", " mcp__nexus__Web* "]})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["tools"],
+            json!(["mcp__project-orchestrator__admin", "mcp__nexus__Web*"])
+        );
+        assert_eq!(body["is_default"], false);
+        assert_eq!(
+            *manager.deferred_tools(),
+            vec![
+                "mcp__project-orchestrator__admin".to_string(),
+                "mcp__nexus__Web*".to_string()
+            ]
+        );
+        // An EMPTY list is the switch off: nothing deferred, every definition sent.
+        let (status, body) = call(&app, req(&root, "PUT", uri, Some(json!({"tools": []})))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["tools"], json!([]));
+        assert!(manager.deferred_tools().is_empty());
+        // DELETE returns to the default.
+        let (status, body) = call(&app, req(&root, "DELETE", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["is_default"], true);
+        assert_eq!(*manager.deferred_tools(), default);
+    }
+
+    #[tokio::test]
+    async fn the_stored_deferred_tools_are_read_again_after_a_restart() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/deferred-tools";
+        let (status, _) = call(
+            &app,
+            req(
+                &root,
+                "PUT",
+                uri,
+                Some(json!({"tools": ["mcp__project-orchestrator__vault"]})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let restarted = crate::chat::ChatManager::new_without_memory(
+            manager.graph.clone(),
+            mock_app_state().meili,
+            Default::default(),
+        );
+        assert_eq!(
+            *restarted.deferred_tools(),
+            crate::chat::deferred_tools::default_deferred_tools()
+        );
+        restarted.load_deferred_tools().await;
+        assert_eq!(
+            *restarted.deferred_tools(),
+            vec!["mcp__project-orchestrator__vault".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_deferred_list_is_refused_with_a_typed_code_and_changes_nothing() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/deferred-tools";
+        let default = crate::chat::deferred_tools::default_deferred_tools();
+        for bad in [json!(["*"]), json!(["a b"]), json!([""]), json!(["x/y"])] {
+            let (status, got) =
+                call(&app, req(&root, "PUT", uri, Some(json!({"tools": bad})))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {got}");
+            assert_eq!(got["code"], "invalid_deferred_tools");
+        }
+        // An unknown field is refused by the body itself.
+        let (status, _) = call(
+            &app,
+            req(
+                &root,
+                "PUT",
+                uri,
+                Some(json!({"tools": [], "strict": true})),
+            ),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+        assert_eq!(*manager.deferred_tools(), default, "nothing changed");
+    }
+
+    /// What a model is offered is a server-wide decision: an agent token neither writes
+    /// nor resets the list (it may read it: the error of a deferred call tells it as much).
+    #[tokio::test]
+    async fn an_agent_token_cannot_change_the_deferred_tools() {
+        let (app, manager, _root) = app_with_root().await;
+        let uri = "/api/chat/deferred-tools";
+        let agent = agent_bearer();
+        for (method, payload) in [("PUT", Some(json!({"tools": []}))), ("DELETE", None)] {
+            let (status, got) = call(&app, req(&agent, method, uri, payload)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} -> {got}");
+        }
+        assert_eq!(
+            *manager.deferred_tools(),
+            crate::chat::deferred_tools::default_deferred_tools()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cap_out_of_bounds_is_refused_with_a_typed_code_and_changes_nothing() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/delegation-limits";
+        for bad in [0, 33, 500] {
+            let (status, got) = call(
+                &app,
+                req(&root, "PUT", uri, Some(json!({"max_live_children": bad}))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {got}");
+            assert_eq!(got["code"], "invalid_delegation_limits");
+        }
+        let (status, _) = call(
+            &app,
+            req(
+                &root,
+                "PUT",
+                uri,
+                Some(json!({"max_live_children": 4, "scope": "x"})),
+            ),
+        )
+        .await;
+        assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(manager.max_live_children(), 4);
+    }
+
+    #[tokio::test]
+    async fn neither_an_agent_nor_another_person_can_change_the_cap() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/delegation-limits";
+        let body = json!({"max_live_children": 30});
+        let agent = agent_bearer();
+        let other = person_bearer(Uuid::new_v4());
+        for token in [&agent, &other] {
+            for method in ["PUT", "DELETE"] {
+                let sent = if method == "PUT" {
+                    Some(body.clone())
+                } else {
+                    None
+                };
+                let (status, got) = call(&app, req(token, method, uri, sent)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {got}");
+            }
+        }
+        assert_eq!(
+            manager.max_live_children(),
+            4,
+            "no refused call changed the cap"
+        );
+        // Reading stays open to anyone signed in, and the root account still writes.
+        let (status, got) = call(&app, req(&agent, "GET", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        let (status, _) = call(&app, req(&root, "PUT", uri, Some(body))).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}

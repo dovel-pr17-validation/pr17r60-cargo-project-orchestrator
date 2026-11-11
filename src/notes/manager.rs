@@ -1,0 +1,4550 @@
+//! Note Manager - CRUD operations for Knowledge Notes
+//!
+//! Provides high-level operations for creating, reading, updating, and deleting notes,
+//! including linking notes to entities and managing note lifecycle.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use super::models::*;
+use super::retrieval_ledger;
+use crate::embeddings::EmbeddingProvider;
+use crate::events::graph::{GraphEvent, GraphEventType, GraphLayer};
+use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter};
+use crate::meilisearch::indexes::NoteDocument;
+use crate::meilisearch::SearchStore;
+use crate::neo4j::GraphStore;
+
+#[allow(unused_imports)]
+use crate::utils::reciprocal_rank_fusion;
+use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::Arc;
+use uuid::Uuid;
+
+/// Most files read when resolving a relative path by suffix (enough to tell
+/// "one project" from "several" without scanning a large monorepo).
+const RELATIVE_PATH_MATCH_LIMIT: usize = 50;
+
+/// Who owns an entity, as far as the server can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityOwner {
+    /// Exactly one project.
+    Project(Uuid),
+    /// Not resolvable (not a file/project, unknown path, file without project).
+    Unknown,
+    /// A relative file path that matches files of several projects (or a file
+    /// without project besides a project's): the listed candidate projects.
+    Ambiguous(Vec<Uuid>),
+}
+
+/// Normalize a client-supplied relative path: `\` becomes `/`, empty and `.`
+/// components are dropped. A path with a `..` component (or nothing left) is
+/// refused: it identifies no stored file.
+fn normalize_relative_path(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            p => parts.push(p),
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+/// Owner of a relative path from the `(path, project_id)` of the files it matches.
+fn owner_of_matches(matches: &[(String, Option<Uuid>)]) -> EntityOwner {
+    let mut projects: Vec<Uuid> = matches.iter().filter_map(|(_, p)| *p).collect();
+    projects.sort();
+    projects.dedup();
+    let has_unowned = matches.iter().any(|(_, p)| p.is_none());
+    match (projects.as_slice(), has_unowned) {
+        ([], _) => EntityOwner::Unknown,
+        ([only], false) => EntityOwner::Project(*only),
+        _ => EntityOwner::Ambiguous(projects),
+    }
+}
+
+/// Configuration for automatic synapse creation between similar notes.
+#[derive(Debug, Clone)]
+pub struct SynapseConfig {
+    /// Minimum cosine similarity score to create a synapse (default: 0.75)
+    pub min_weight: f64,
+    /// Maximum number of neighbors to connect per note (default: 10)
+    pub max_neighbors: usize,
+    /// Whether auto-synapse creation is enabled (default: true)
+    pub enabled: bool,
+}
+
+impl Default for SynapseConfig {
+    fn default() -> Self {
+        Self {
+            min_weight: 0.75,
+            max_neighbors: 10,
+            enabled: true,
+        }
+    }
+}
+
+/// Manager for Knowledge Notes operations
+pub struct NoteManager {
+    neo4j: Arc<dyn GraphStore>,
+    meilisearch: Arc<dyn SearchStore>,
+    event_emitter: Option<Arc<dyn EventEmitter>>,
+    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    synapse_config: SynapseConfig,
+}
+
+impl NoteManager {
+    /// Create a new NoteManager
+    pub fn new(neo4j: Arc<dyn GraphStore>, meilisearch: Arc<dyn SearchStore>) -> Self {
+        Self {
+            neo4j,
+            meilisearch,
+            event_emitter: None,
+            embedding_provider: None,
+            synapse_config: SynapseConfig::default(),
+        }
+    }
+
+    /// Create a new NoteManager with an event emitter
+    pub fn with_event_emitter(
+        neo4j: Arc<dyn GraphStore>,
+        meilisearch: Arc<dyn SearchStore>,
+        emitter: Arc<dyn EventEmitter>,
+    ) -> Self {
+        Self {
+            neo4j,
+            meilisearch,
+            event_emitter: Some(emitter),
+            embedding_provider: None,
+            synapse_config: SynapseConfig::default(),
+        }
+    }
+
+    /// Add an embedding provider to this NoteManager (builder pattern).
+    ///
+    /// When set, notes will be automatically embedded on creation and update.
+    /// Embedding failures are logged but do not block the note operation.
+    pub fn with_embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embedding_provider = Some(provider);
+        self
+    }
+
+    /// Set synapse configuration (builder pattern).
+    pub fn with_synapse_config(mut self, config: SynapseConfig) -> Self {
+        self.synapse_config = config;
+        self
+    }
+
+    /// Emit a CRUD event (no-op if event_emitter is None)
+    fn emit(&self, event: crate::events::CrudEvent) {
+        if let Some(emitter) = &self.event_emitter {
+            emitter.emit(event);
+        }
+    }
+
+    /// Emit a graph event for real-time visualization (no-op if event_emitter is None)
+    fn emit_graph_event(&self, event: crate::events::GraphEvent) {
+        if let Some(emitter) = &self.event_emitter {
+            emitter.emit_graph(event);
+        }
+    }
+
+    /// Generate and store an embedding for a note's content.
+    ///
+    /// This is a best-effort operation: if the embedding provider is not configured
+    /// or the embedding fails, the note is still created/updated successfully.
+    /// Embedding errors are logged at warn level but never propagated.
+    async fn embed_note(&self, note_id: Uuid, content: &str) {
+        let provider = match &self.embedding_provider {
+            Some(p) => p,
+            None => return,
+        };
+
+        match provider.embed_text(content).await {
+            Ok(embedding) => {
+                let model = provider.model_name().to_string();
+                if let Err(e) = self
+                    .neo4j
+                    .set_note_embedding(note_id, &embedding, &model)
+                    .await
+                {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "Failed to store note embedding"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    note_id = %note_id,
+                    error = %e,
+                    "Failed to generate note embedding"
+                );
+            }
+        }
+    }
+
+    /// Automatically create synapses between a note and its semantically similar neighbors.
+    ///
+    /// This is a best-effort, fire-and-forget operation: it runs after the note is
+    /// created/embedded. Failures are logged at warn level but never block the caller.
+    ///
+    /// Process:
+    /// 1. Get the note's embedding from the provider
+    /// 2. Vector search for K nearest neighbors (filtered by project_id)
+    /// 3. Filter by min_weight threshold
+    /// 4. Create bidirectional synapses via GraphStore
+    fn spawn_auto_connect_synapses(&self, note_id: Uuid, content: &str, project_id: Option<Uuid>) {
+        // Skip if no embedding provider or synapses disabled
+        let provider = match &self.embedding_provider {
+            Some(p) if self.synapse_config.enabled => p.clone(),
+            _ => return,
+        };
+
+        let neo4j = self.neo4j.clone();
+        let emitter = self.event_emitter.clone();
+        let min_weight = self.synapse_config.min_weight;
+        let max_neighbors = self.synapse_config.max_neighbors;
+        let content = content.to_string();
+
+        tokio::spawn(async move {
+            // Step 1: Embed the note's content
+            let embedding = match provider.embed_text(&content).await {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "Auto-synapse: failed to embed note content"
+                    );
+                    return;
+                }
+            };
+
+            // Step 2: Vector search for nearest neighbors
+            let candidates = match neo4j
+                .vector_search_notes(&embedding, max_neighbors + 1, project_id, None, None)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "Auto-synapse: vector search failed"
+                    );
+                    return;
+                }
+            };
+
+            // Step 3: Filter — exclude self, apply min_weight, limit to max_neighbors
+            let neighbors: Vec<(Uuid, f64)> = candidates
+                .into_iter()
+                .filter(|(note, score)| note.id != note_id && *score >= min_weight)
+                .take(max_neighbors)
+                .map(|(note, score)| (note.id, score))
+                .collect();
+
+            if neighbors.is_empty() {
+                tracing::debug!(
+                    note_id = %note_id,
+                    "Auto-synapse: no neighbors above threshold {:.2}",
+                    min_weight
+                );
+                return;
+            }
+
+            // Step 4: Create bidirectional synapses
+            match neo4j.create_synapses(note_id, &neighbors).await {
+                Ok(count) => {
+                    tracing::debug!(
+                        note_id = %note_id,
+                        neighbors = neighbors.len(),
+                        synapse_count = count,
+                        "Auto-synapse: created synapses"
+                    );
+                    // Emit graph events for each new synapse edge
+                    if let Some(ref emitter) = emitter {
+                        if let Some(pid) = project_id {
+                            let pid_str = pid.to_string();
+                            for (neighbor_id, weight) in &neighbors {
+                                emitter.emit_graph(
+                                    GraphEvent::edge(
+                                        GraphEventType::EdgeCreated,
+                                        GraphLayer::Neural,
+                                        note_id.to_string(),
+                                        neighbor_id.to_string(),
+                                        "SYNAPSE",
+                                        &pid_str,
+                                    )
+                                    .with_delta(serde_json::json!({"weight": weight})),
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "Auto-synapse: failed to create synapses"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Automatically create LINKED_TO anchors from file paths mentioned in note content.
+    ///
+    /// Fire-and-forget: extracts file paths from the note's content and links
+    /// them via LINKED_TO relations. This enables the contextual scoring system
+    /// to use anchor-based signals for better relevance ranking.
+    fn spawn_auto_anchor(&self, note: &Note) {
+        let neo4j = self.neo4j.clone();
+        let note_clone = note.clone();
+
+        tokio::spawn(async move {
+            // Resolve project root_path for absolute file path matching.
+            // File nodes use absolute paths, but extract_file_paths_from_content
+            // returns relative — we need root_path to bridge the gap.
+            let root_path = if let Some(pid) = note_clone.project_id {
+                match neo4j.get_project(pid).await {
+                    Ok(Some(proj)) => proj.root_path_opt().map(str::to_string),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            match crate::skills::activation::auto_anchor_note(
+                &*neo4j,
+                &note_clone,
+                root_path.as_deref(),
+            )
+            .await
+            {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::debug!(
+                            note_id = %note_clone.id,
+                            anchors = count,
+                            "Auto-anchor: created file anchors from content"
+                        );
+                    } else if let Some(pid) = note_clone.project_id {
+                        // Content mentioned no file paths → fall back to semantic
+                        // anchoring against the note's embedding so "concept" notes
+                        // don't become graph orphans. The embedding was awaited
+                        // before this task was spawned, so it is available here.
+                        match neo4j.semantic_anchor_note(note_clone.id, pid, 0.7).await {
+                            Ok(n) if n > 0 => tracing::debug!(
+                                note_id = %note_clone.id,
+                                anchors = n,
+                                "Auto-anchor: created semantic anchors (content had no file paths)"
+                            ),
+                            Ok(_) => tracing::debug!(
+                                note_id = %note_clone.id,
+                                "Auto-anchor: no content or semantic anchor found"
+                            ),
+                            Err(e) => tracing::warn!(
+                                note_id = %note_clone.id,
+                                error = %e,
+                                "Auto-anchor: semantic fallback failed"
+                            ),
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_clone.id,
+                        error = %e,
+                        "Auto-anchor: failed to anchor note to files"
+                    );
+                }
+            }
+        });
+    }
+
+    // ========================================================================
+    // RFC Template
+    // ========================================================================
+
+    /// Default template for RFC notes with structured sections.
+    pub const RFC_TEMPLATE: &'static str = "## Problem\n\n\
+<!-- Describe the problem or opportunity this RFC addresses -->\n\n\
+## Proposed Solution\n\n\
+<!-- Describe your proposed approach -->\n\n\
+## Alternatives\n\n\
+<!-- What other approaches were considered? Why were they rejected? -->\n\n\
+## Impact\n\n\
+<!-- What files, modules, or systems are affected? What are the risks? -->\n\n\
+## Decision\n\n\
+<!-- Final decision and rationale (filled after review) -->\n";
+
+    // ========================================================================
+    // CRUD Operations
+    // ========================================================================
+
+    /// Create a new note
+    pub async fn create_note(&self, input: CreateNoteRequest, created_by: &str) -> Result<Note> {
+        let author_kind = crate::notes::NoteAuthorKind::infer_from_created_by(created_by);
+        self.create_note_as_with(input, created_by, author_kind, NoteExtras::default())
+            .await
+    }
+
+    /// Creation by someone who knows who is writing.
+    ///
+    /// The `created_by` string cannot say "a person" — this can, and it is the
+    /// only way a human signature enters a new note (see `Note::with_author`).
+    pub async fn create_note_as(
+        &self,
+        input: CreateNoteRequest,
+        created_by: &str,
+        author_kind: crate::notes::NoteAuthorKind,
+    ) -> Result<Note> {
+        self.create_note_as_with(input, created_by, author_kind, NoteExtras::default())
+            .await
+    }
+
+    /// [`Self::create_note`] with the validity window and revision provenance a
+    /// plain creation never carries. Kept apart so that the 17 sites building a
+    /// `CreateNoteRequest` do not all change for a feature most notes do not use.
+    pub async fn create_note_with(
+        &self,
+        input: CreateNoteRequest,
+        created_by: &str,
+        extras: NoteExtras,
+    ) -> Result<Note> {
+        let author_kind = crate::notes::NoteAuthorKind::infer_from_created_by(created_by);
+        self.create_note_as_with(input, created_by, author_kind, extras)
+            .await
+    }
+
+    /// The one place a note is built: provenance, secrets scan, throttled energy,
+    /// assertion rule, sharing consent.
+    pub async fn create_note_as_with(
+        &self,
+        input: CreateNoteRequest,
+        created_by: &str,
+        author_kind: crate::notes::NoteAuthorKind,
+        extras: NoteExtras,
+    ) -> Result<Note> {
+        // RFC auto-template: use structured template if content is empty
+        let content = if input.note_type == NoteType::Rfc && input.content.trim().is_empty() {
+            Self::RFC_TEMPLATE.to_string()
+        } else {
+            input.content
+        };
+
+        // L3 scan: block persistence of secrets (RFC Privacy §2.3).
+        // This is non-disableable — no flag can bypass it.
+        if let Err(e) = crate::episodes::anonymize::scan_for_l3(&content) {
+            return Err(anyhow::anyhow!(
+                "Content contains secrets ({}). Remove them before saving.",
+                e.patterns.join(", ")
+            ));
+        }
+
+        let mut note = Note::new_full(
+            input.project_id,
+            input.note_type,
+            input.importance.unwrap_or_default(),
+            input.scope.unwrap_or(NoteScope::Project),
+            content,
+            input.tags.unwrap_or_default(),
+            created_by.to_string(),
+        )
+        .with_author(author_kind, created_by);
+        if let Some(consent) = input.sharing_consent {
+            note.sharing_consent = consent;
+        }
+        note.valid_from = extras.valid_from;
+        note.valid_until = extras.valid_until;
+        note.revision = extras.revision;
+
+        // Apply project-level default_note_energy if set (homeostasis throttle).
+        // When note_density is high, homeostasis sets a lower initial energy
+        // so new notes start "cooler" and must prove their worth via activation.
+        if let Some(project_id) = input.project_id {
+            if let Ok(Some(project)) = self.neo4j.get_project(project_id).await {
+                if let Some(energy) = project.default_note_energy {
+                    note.energy = energy;
+                }
+            }
+        }
+
+        // Store in Neo4j
+        self.neo4j.create_note(&note).await?;
+
+        // Index in Meilisearch
+        let doc = self.note_to_document(&note, None).await?;
+        self.meilisearch.index_note(&doc).await?;
+
+        // Add initial anchors if provided
+        if let Some(anchors) = input.anchors {
+            for anchor_req in anchors {
+                self.neo4j
+                    .link_note_to_entity(
+                        note.id,
+                        &anchor_req.entity_type,
+                        &anchor_req.entity_id,
+                        anchor_req.signature_hash.as_deref(),
+                        anchor_req.body_hash.as_deref(),
+                    )
+                    .await?;
+            }
+        }
+
+        // Generate embedding (best-effort, non-blocking for note creation)
+        self.embed_note(note.id, &note.content).await;
+
+        // Auto-connect synapses to semantically similar notes (fire-and-forget)
+        self.spawn_auto_connect_synapses(note.id, &note.content, note.project_id);
+
+        // Auto-anchor to files mentioned in content (fire-and-forget)
+        self.spawn_auto_anchor(&note);
+
+        // RFC auto-start: find rfc-lifecycle protocol and start a run
+        if note.note_type == NoteType::Rfc {
+            if let Some(project_id) = note.project_id {
+                match self.auto_start_rfc_lifecycle(&mut note, project_id).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %e,
+                            "RFC auto-start: failed to start rfc-lifecycle run"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    note_id = %note.id,
+                    "RFC auto-start: skipped — note has no project_id"
+                );
+            }
+        }
+
+        let project_id_str = note.project_id.map(|id| id.to_string()).unwrap_or_default();
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Created,
+                note.id.to_string(),
+            )
+            .with_payload(serde_json::json!({"note_type": note.note_type.to_string()}))
+            .with_project_id(project_id_str.clone()),
+        );
+        // Graph event: new knowledge node
+        if !project_id_str.is_empty() {
+            self.emit_graph_event(
+                GraphEvent::node(
+                    GraphEventType::NodeCreated,
+                    GraphLayer::Knowledge,
+                    note.id.to_string(),
+                    &project_id_str,
+                )
+                .with_delta(serde_json::json!({
+                    "label": note.graph_label(),
+                    "note_type": note.note_type.to_string(),
+                    "importance": note.importance.to_string(),
+                })),
+            );
+        }
+
+        Ok(note)
+    }
+
+    /// Auto-start an rfc-lifecycle protocol run for an RFC note.
+    ///
+    /// Looks up the `rfc-lifecycle` protocol in the note's project, starts a run,
+    /// and stores the run ID in the note's tags as `rfc-run:<uuid>`.
+    /// Non-fatal: if the protocol doesn't exist or the run can't be started,
+    /// the note is still created successfully.
+    async fn auto_start_rfc_lifecycle(&self, note: &mut Note, project_id: Uuid) -> Result<()> {
+        // Find the rfc-lifecycle protocol in this project
+        let (protocols, _) = self
+            .neo4j
+            .list_protocols(Some(project_id), None, 100, 0)
+            .await?;
+        let protocol = protocols.iter().find(|p| p.name == "rfc-lifecycle");
+
+        let protocol = match protocol {
+            Some(p) => p,
+            None => {
+                tracing::debug!(
+                    project_id = %project_id,
+                    "RFC auto-start: no rfc-lifecycle protocol found in project"
+                );
+                return Ok(());
+            }
+        };
+
+        // Start the run
+        let run = crate::protocol::engine::start_run(
+            self.neo4j.as_ref(),
+            protocol.id,
+            None,
+            None,
+            Some("rfc-note-creation"),
+        )
+        .await?;
+
+        tracing::info!(
+            note_id = %note.id,
+            run_id = %run.id,
+            protocol_id = %protocol.id,
+            "RFC auto-start: started rfc-lifecycle run"
+        );
+
+        // Add rfc-run tag to the note
+        let run_tag = format!("rfc-run:{}", run.id);
+        note.tags.push(run_tag);
+
+        // Persist the updated tags
+        self.neo4j
+            .update_note(note.id, None, None, None, Some(note.tags.clone()), None)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Get a note by ID
+    pub async fn get_note(&self, id: Uuid) -> Result<Option<Note>> {
+        let note = self.neo4j.get_note(id).await?;
+
+        // Load anchors if note exists
+        if let Some(mut note) = note {
+            note.anchors = self.neo4j.get_note_anchors(id).await?;
+            Ok(Some(note))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update a note
+    pub async fn update_note(&self, id: Uuid, input: UpdateNoteRequest) -> Result<Option<Note>> {
+        let content_changed = input.content.is_some();
+
+        // L3 scan on updated content: block persistence of secrets (RFC Privacy §2.3).
+        if let Some(ref content) = input.content {
+            if let Err(e) = crate::episodes::anonymize::scan_for_l3(content) {
+                return Err(anyhow::anyhow!(
+                    "Content contains secrets ({}). Remove them before saving.",
+                    e.patterns.join(", ")
+                ));
+            }
+        }
+
+        let updated = self
+            .neo4j
+            .update_note(
+                id,
+                input.content,
+                input.importance,
+                input.status,
+                input.tags,
+                None,
+            )
+            .await?;
+
+        // Update Meilisearch index
+        if let Some(ref note) = updated {
+            let doc = self.note_to_document(note, None).await?;
+            self.meilisearch.index_note(&doc).await?;
+
+            // Re-embed if content changed (best-effort)
+            if content_changed {
+                self.embed_note(id, &note.content).await;
+
+                // Content changed → delete old synapses and re-connect.
+                // CRITICAL: only delete when we can actually RECREATE — i.e. when
+                // an embedding provider is present. `spawn_auto_connect_synapses`
+                // silently returns if `embedding_provider` is None, so without this
+                // guard a content update on a provider-less server would DELETE the
+                // note's synapses and recreate nothing — every edit bleeds the
+                // synapse graph toward zero (breaking skill detection). Better to
+                // keep slightly-stale synapses than to wipe them irrecoverably;
+                // the SynapseReplenishCheck refreshes them from stored embeddings.
+                if self.synapse_config.enabled && self.embedding_provider.is_some() {
+                    if let Err(e) = self.neo4j.delete_synapses(id).await {
+                        tracing::warn!(
+                            note_id = %id,
+                            error = %e,
+                            "Failed to delete old synapses during update"
+                        );
+                    }
+                    self.spawn_auto_connect_synapses(id, &note.content, note.project_id);
+                }
+
+                // Re-anchor to files mentioned in updated content (fire-and-forget)
+                self.spawn_auto_anchor(note);
+            }
+
+            self.emit(
+                CrudEvent::new(EventEntityType::Note, CrudAction::Updated, id.to_string())
+                    .with_project_id(note.project_id.map(|id| id.to_string()).unwrap_or_default()),
+            );
+        }
+
+        Ok(updated)
+    }
+
+    /// Delete a note
+    pub async fn delete_note(&self, id: Uuid) -> Result<bool> {
+        // Capture project_id before deletion for event emission
+        let project_id_str = if let Ok(Some(note)) = self.neo4j.get_note(id).await {
+            note.project_id.map(|pid| pid.to_string())
+        } else {
+            None
+        };
+
+        // Delete from Neo4j (DETACH DELETE also removes SYNAPSE relationships)
+        let deleted = self.neo4j.delete_note(id).await?;
+
+        // Delete from Meilisearch
+        if deleted {
+            self.meilisearch.delete_note(&id.to_string()).await?;
+            let mut event =
+                CrudEvent::new(EventEntityType::Note, CrudAction::Deleted, id.to_string());
+            if let Some(ref pid) = project_id_str {
+                event = event.with_project_id(pid.clone());
+            }
+            self.emit(event);
+
+            // Graph event: knowledge node removed (synapses implicitly removed by
+            // DETACH DELETE). `NodeDeleted`, not `NodeUpdated`: an update makes a
+            // client redraw the node, so a removal reported that way left a
+            // ghost on screen — the node was never taken away.
+            if let Some(pid) = project_id_str {
+                self.emit_graph_event(
+                    GraphEvent::node(
+                        GraphEventType::NodeDeleted,
+                        GraphLayer::Knowledge,
+                        id.to_string(),
+                        pid,
+                    )
+                    .with_delta(serde_json::json!({"node_type": "note"})),
+                );
+            }
+        }
+
+        Ok(deleted)
+    }
+
+    /// List notes with filters and pagination
+    pub async fn list_notes(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        filters: &NoteFilters,
+    ) -> Result<(Vec<Note>, usize)> {
+        self.neo4j
+            .list_notes(project_id, workspace_slug, filters)
+            .await
+    }
+
+    /// List notes for a specific project
+    pub async fn list_project_notes(
+        &self,
+        project_id: Uuid,
+        filters: &NoteFilters,
+    ) -> Result<(Vec<Note>, usize)> {
+        self.neo4j.list_notes(Some(project_id), None, filters).await
+    }
+
+    // ========================================================================
+    // Linking Operations
+    // ========================================================================
+
+    /// Link a note to an entity
+    pub async fn link_note_to_entity(&self, note_id: Uuid, entity: &LinkNoteRequest) -> Result<()> {
+        self.neo4j
+            .link_note_to_entity(note_id, &entity.entity_type, &entity.entity_id, None, None)
+            .await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Note, CrudAction::Linked, note_id.to_string())
+                .with_payload(serde_json::json!({"entity_type": entity.entity_type.to_string(), "entity_id": &entity.entity_id})),
+        );
+        // Graph event: LINKED_TO edge created
+        if let Ok(Some(note)) = self.neo4j.get_note(note_id).await {
+            if let Some(pid) = note.project_id {
+                self.emit_graph_event(GraphEvent::edge(
+                    GraphEventType::EdgeCreated,
+                    GraphLayer::Knowledge,
+                    note_id.to_string(),
+                    &entity.entity_id,
+                    "LINKED_TO",
+                    pid.to_string(),
+                ));
+            }
+        }
+
+        // Event-driven propagation: when linking to high-level entities,
+        // immediately propagate the note to their member files (fire-and-forget)
+        match &entity.entity_type {
+            EntityType::FeatureGraph | EntityType::Protocol | EntityType::Skill => {
+                let neo4j = self.neo4j.clone();
+                let entity_type = entity.entity_type.clone();
+                let entity_id = entity.entity_id.clone();
+                tokio::spawn(async move {
+                    let result = match &entity_type {
+                        EntityType::FeatureGraph => {
+                            neo4j
+                                .propagate_note_via_feature_graph(note_id, &entity_id)
+                                .await
+                        }
+                        EntityType::Skill => {
+                            neo4j.propagate_note_via_skill(note_id, &entity_id).await
+                        }
+                        EntityType::Protocol => {
+                            neo4j.propagate_note_via_protocol(note_id, &entity_id).await
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Err(e) = result {
+                        tracing::warn!(
+                            %note_id,
+                            entity_type = %entity_type,
+                            entity_id = %entity_id,
+                            error = %e,
+                            "Event-driven propagation failed (non-blocking)"
+                        );
+                    }
+                });
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Link a note to an entity with semantic hashes
+    pub async fn link_note_with_hashes(
+        &self,
+        note_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+        signature_hash: Option<&str>,
+        body_hash: Option<&str>,
+    ) -> Result<()> {
+        self.neo4j
+            .link_note_to_entity(note_id, entity_type, entity_id, signature_hash, body_hash)
+            .await
+    }
+
+    /// Unlink a note from an entity
+    pub async fn unlink_note_from_entity(
+        &self,
+        note_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<()> {
+        self.neo4j
+            .unlink_note_from_entity(note_id, entity_type, entity_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Unlinked,
+                note_id.to_string(),
+            )
+            .with_payload(
+                serde_json::json!({"entity_type": entity_type.to_string(), "entity_id": entity_id}),
+            ),
+        );
+        // Graph event: LINKED_TO edge removed
+        if let Ok(Some(note)) = self.neo4j.get_note(note_id).await {
+            if let Some(pid) = note.project_id {
+                self.emit_graph_event(GraphEvent::edge(
+                    GraphEventType::EdgeRemoved,
+                    GraphLayer::Knowledge,
+                    note_id.to_string(),
+                    entity_id,
+                    "LINKED_TO",
+                    pid.to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Get all anchors for a note
+    pub async fn get_note_anchors(&self, note_id: Uuid) -> Result<Vec<NoteAnchor>> {
+        self.neo4j.get_note_anchors(note_id).await
+    }
+
+    // ========================================================================
+    // Lifecycle Operations
+    // ========================================================================
+
+    /// Confirm a note is still valid
+    pub async fn confirm_note(&self, note_id: Uuid, confirmed_by: &str) -> Result<Option<Note>> {
+        let note = self.neo4j.confirm_note(note_id, confirmed_by).await?;
+
+        // Update Meilisearch
+        if let Some(ref note) = note {
+            let doc = self.note_to_document(note, None).await?;
+            self.meilisearch.index_note(&doc).await?;
+
+            let project_id_str = note.project_id.map(|id| id.to_string()).unwrap_or_default();
+            self.emit(
+                CrudEvent::new(
+                    EventEntityType::Note,
+                    CrudAction::Updated,
+                    note_id.to_string(),
+                )
+                .with_payload(serde_json::json!({"confirmed_by": confirmed_by}))
+                .with_project_id(project_id_str.clone()),
+            );
+            // Graph event: confirmation boosts energy by +0.3
+            if !project_id_str.is_empty() {
+                self.emit_graph_event(GraphEvent::reinforcement(
+                    note_id.to_string(),
+                    0.3,
+                    &project_id_str,
+                ));
+            }
+        }
+
+        Ok(note)
+    }
+
+    /// Invalidate a note (mark as obsolete)
+    pub async fn invalidate_note(
+        &self,
+        note_id: Uuid,
+        reason: &str,
+        invalidated_by: &str,
+    ) -> Result<Option<Note>> {
+        let updated = self
+            .neo4j
+            .update_note(note_id, None, None, Some(NoteStatus::Obsolete), None, None)
+            .await?;
+
+        // Update Meilisearch
+        if updated.is_some() {
+            self.meilisearch
+                .update_note_status(&note_id.to_string(), "obsolete")
+                .await?;
+        }
+
+        // Log the invalidation reason (could be stored as a change)
+        tracing::info!(
+            "Note {} invalidated by {}: {}",
+            note_id,
+            invalidated_by,
+            reason
+        );
+
+        if updated.is_some() {
+            self.emit(
+                CrudEvent::new(
+                    EventEntityType::Note,
+                    CrudAction::Updated,
+                    note_id.to_string(),
+                )
+                .with_payload(serde_json::json!({"status": "obsolete", "reason": reason})),
+            );
+        }
+
+        Ok(updated)
+    }
+
+    /// Supersede an old note with a new one
+    pub async fn supersede_note(
+        &self,
+        old_note_id: Uuid,
+        new_note_input: CreateNoteRequest,
+        created_by: &str,
+    ) -> Result<Note> {
+        // Create the new note
+        let mut new_note = self.create_note(new_note_input, created_by).await?;
+        new_note.supersedes = Some(old_note_id);
+
+        // Mark the old note as superseded
+        self.neo4j.supersede_note(old_note_id, new_note.id).await?;
+
+        // Update old note in Meilisearch
+        self.meilisearch
+            .update_note_status(&old_note_id.to_string(), "archived")
+            .await?;
+
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Updated,
+                old_note_id.to_string(),
+            )
+            .with_payload(
+                serde_json::json!({"status": "archived", "superseded_by": new_note.id.to_string()}),
+            ),
+        );
+
+        Ok(new_note)
+    }
+
+    /// Revise a note: the new version replaces `old_note_id` and carries WHO revised,
+    /// WHEN and on WHAT EVIDENCE.
+    ///
+    /// This is how a note outside its validity window (or already superseded) comes
+    /// back into use: not refused, revised. A revision with no evidence is refused —
+    /// it would be a silent rewrite, the very thing the window exists to prevent.
+    /// The new version opens a fresh window (`valid_from` / `valid_until` as given;
+    /// both `None` = unbounded).
+    pub async fn revise_note(
+        &self,
+        old_note_id: Uuid,
+        new_note_input: CreateNoteRequest,
+        revised_by: &str,
+        evidence: &str,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Note> {
+        let evidence = evidence.trim();
+        if evidence.is_empty() {
+            anyhow::bail!(
+                "a revision needs its evidence (a commit, a test, an output): none was given"
+            );
+        }
+        if let (Some(from), Some(until)) = (valid_from, valid_until) {
+            if until <= from {
+                anyhow::bail!("valid_until must be after valid_from");
+            }
+        }
+        if self.neo4j.get_note(old_note_id).await?.is_none() {
+            anyhow::bail!("note {old_note_id} not found: nothing to revise");
+        }
+        let extras = NoteExtras {
+            valid_from,
+            valid_until,
+            revision: Some(NoteRevision {
+                revised_by: revised_by.to_string(),
+                revised_at: chrono::Utc::now(),
+                evidence: evidence.to_string(),
+                revises: old_note_id,
+            }),
+        };
+        let mut new_note = self
+            .create_note_with(new_note_input, revised_by, extras)
+            .await?;
+        new_note.supersedes = Some(old_note_id);
+        self.neo4j.supersede_note(old_note_id, new_note.id).await?;
+        self.meilisearch
+            .update_note_status(&old_note_id.to_string(), "archived")
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Updated,
+                old_note_id.to_string(),
+            )
+            .with_payload(serde_json::json!({
+                "status": "archived",
+                "superseded_by": new_note.id.to_string(),
+                "revised_by": revised_by,
+            })),
+        );
+        Ok(new_note)
+    }
+
+    /// Get notes that need review
+    pub async fn get_notes_needing_review(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<Note>> {
+        self.neo4j
+            .get_notes_needing_review(project_id, workspace_slug)
+            .await
+    }
+
+    /// Update staleness scores for all active notes
+    pub async fn update_staleness_scores(&self) -> Result<usize> {
+        self.neo4j.update_staleness_scores().await
+    }
+
+    /// Apply exponential energy decay to all active notes.
+    ///
+    /// Formula: `energy = energy × exp(-days_idle / half_life)`
+    /// where `days_idle = (now - last_activated).days()`.
+    ///
+    /// Temporally idempotent: result depends only on elapsed time since
+    /// `last_activated`, not on call frequency.
+    pub async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        self.neo4j.update_energy_scores(half_life_days).await
+    }
+
+    // ========================================================================
+    // Search Operations
+    // ========================================================================
+
+    /// Search notes using semantic search
+    pub async fn search_notes(
+        &self,
+        query: &str,
+        filters: &NoteFilters,
+    ) -> Result<Vec<NoteSearchHit>> {
+        self.search_notes_with_trigger(query, filters, retrieval_ledger::Trigger::Explicit)
+            .await
+    }
+
+    /// [`Self::search_notes`] (BM25, Meilisearch), avec le motif déclaré par
+    /// l'appelant. C'est le seul point d'entrée BM25 : il enregistre une ligne de
+    /// registre par appel, réussite comme échec.
+    pub async fn search_notes_with_trigger(
+        &self,
+        query: &str,
+        filters: &NoteFilters,
+        trigger: retrieval_ledger::Trigger,
+    ) -> Result<Vec<NoteSearchHit>> {
+        let started = std::time::Instant::now();
+        let out = self.search_notes_inner(query, filters).await;
+        let (items, ok) = match &out {
+            Ok(hits) => (note_items(hits), true),
+            Err(_) => (Vec::new(), false),
+        };
+        retrieval_ledger::record(
+            retrieval_ledger::Source::Bm25,
+            trigger,
+            query,
+            items,
+            ok,
+            started.elapsed().as_millis() as u64,
+        );
+        out
+    }
+
+    /// Le corps de la recherche BM25, sans registre : appelé par l'enveloppe
+    /// instrumentée et par le canal lexical de la recherche fusionnée, qui ne doit
+    /// pas compter une seconde récupération.
+    async fn search_notes_inner(
+        &self,
+        query: &str,
+        filters: &NoteFilters,
+    ) -> Result<Vec<NoteSearchHit>> {
+        let project_slug = filters.search.as_deref(); // This is a simplification
+        let note_type = filters
+            .note_type
+            .as_ref()
+            .and_then(|v| v.first())
+            .map(|t| t.to_string());
+        let status = filters
+            .status
+            .as_ref()
+            .and_then(|v| v.first())
+            .map(|s| s.to_string());
+        let importance = filters
+            .importance
+            .as_ref()
+            .and_then(|v| v.first())
+            .map(|i| i.to_string());
+
+        let limit = filters.limit.unwrap_or(20) as usize;
+
+        let hits = self
+            .meilisearch
+            .search_notes_with_scores(
+                query,
+                limit,
+                project_slug,
+                note_type.as_deref(),
+                status.as_deref(),
+                importance.as_deref(),
+            )
+            .await?;
+
+        // Convert to NoteSearchHit
+        let mut results = Vec::new();
+        for hit in hits {
+            // Get full note from Neo4j for complete data
+            if let Ok(Some(note)) = self.neo4j.get_note(hit.document.id.parse()?).await {
+                results.push(NoteSearchHit {
+                    scope: NoteSearchHit::scope_of(&note),
+                    note,
+                    score: hit.score,
+                    highlights: None,
+                });
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Search notes using vector similarity (cosine) via Neo4j HNSW index.
+    ///
+    /// Embeds the query text using the configured embedding provider, then
+    /// performs a vector similarity search against stored note embeddings.
+    /// Falls back to BM25 text search (Meilisearch) if no embedding provider
+    /// is configured.
+    ///
+    /// # Arguments
+    /// * `query` - Natural language search query
+    /// * `project_id` - Optional filter by project UUID
+    /// * `workspace_slug` - Optional filter by workspace (includes all projects in workspace + global notes)
+    /// * `limit` - Maximum number of results (default 20)
+    ///
+    /// Entrée instrumentée : comportement identique, plus une ligne de registre.
+    /// Le registre ne peut pas faire échouer l'appel (voir retrieval_ledger::record).
+    pub async fn semantic_search_notes(
+        &self,
+        query: &str,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: Option<usize>,
+        min_similarity: Option<f64>,
+        profile: Option<&str>,
+    ) -> Result<Vec<NoteSearchHit>> {
+        self.semantic_search_notes_with_trigger(
+            query,
+            project_id,
+            workspace_slug,
+            limit,
+            min_similarity,
+            profile,
+            retrieval_ledger::Trigger::Explicit,
+        )
+        .await
+    }
+
+    /// [`Self::semantic_search_notes`], avec le motif de déclenchement déclaré par
+    /// l'appelant (champ (1) du registre). Le motif par défaut est « explicite » :
+    /// une récupération que personne n'a déclenchée ne doit pas se dire telle.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn semantic_search_notes_with_trigger(
+        &self,
+        query: &str,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: Option<usize>,
+        min_similarity: Option<f64>,
+        profile: Option<&str>,
+        trigger: retrieval_ledger::Trigger,
+    ) -> Result<Vec<NoteSearchHit>> {
+        let limit = limit.unwrap_or(20);
+        let started = std::time::Instant::now();
+
+        if let Some(profile_name) = profile {
+            tracing::debug!(
+                profile = profile_name,
+                query = query,
+                "semantic_search_notes: intent-adaptive profile active"
+            );
+        }
+
+        // If no embedding provider, fall back to BM25 text search
+        let provider = match &self.embedding_provider {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "semantic_search_notes: no embedding provider configured, falling back to BM25 text search"
+                );
+                let filters = NoteFilters {
+                    limit: Some(limit as i64),
+                    ..Default::default()
+                };
+                // The fallback is a BM25 retrieval and is recorded as such, with
+                // the caller's motif: recording it twice, once as semantic, would
+                // invent an index call that never happened.
+                return self
+                    .search_notes_with_trigger(query, &filters, trigger)
+                    .await;
+            }
+        };
+
+        // Embed the query text
+        let query_embedding = match provider.embed_text(query).await {
+            Ok(embedding) => embedding,
+            Err(e) => {
+                // An embedding that fails is a retrieval that returned nothing:
+                // the registry must say "failed", not "empty".
+                retrieval_ledger::record(
+                    retrieval_ledger::Source::Semantic,
+                    trigger,
+                    query,
+                    Vec::new(),
+                    false,
+                    started.elapsed().as_millis() as u64,
+                );
+                return Err(anyhow::anyhow!("Failed to embed search query: {}", e));
+            }
+        };
+
+        // Channel 1 — dense cosine over the note embeddings, scoped by
+        // project_id / workspace_slug in the Cypher and floored by min_similarity.
+        let dense = match self
+            .neo4j
+            .vector_search_notes(
+                &query_embedding,
+                limit,
+                project_id,
+                workspace_slug,
+                min_similarity,
+            )
+            .await
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                retrieval_ledger::record(
+                    retrieval_ledger::Source::Semantic,
+                    trigger,
+                    query,
+                    Vec::new(),
+                    false,
+                    started.elapsed().as_millis() as u64,
+                );
+                return Err(e);
+            }
+        };
+
+        // Channel 2 — lexical BM25. It is fetched unscoped, then confined to the
+        // *same* scope as the dense channel: fusing an unscoped lexical list
+        // would reintroduce the cross-project leak that project_id closes.
+        // A Meilisearch hiccup must not sink the dense answer, hence
+        // `unwrap_or_default` (degrade to dense-only).
+        //
+        // `search_notes_inner`, et non `search_notes` : le canal lexical est un
+        // moyen interne de CETTE récupération, pas une seconde récupération. Le
+        // compter comme telle doublerait le nombre d'appels et rendrait le coût
+        // par résultat non vide ininterprétable.
+        let lexical: Vec<NoteSearchHit> = self
+            .search_notes_inner(
+                query,
+                &NoteFilters {
+                    limit: Some(limit as i64),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|hit| note_in_scope(hit.note.project_id, project_id, workspace_slug.is_some()))
+            .collect();
+
+        let fused = fuse_dense_and_lexical(dense, lexical, limit);
+        retrieval_ledger::record(
+            retrieval_ledger::Source::Semantic,
+            trigger,
+            query,
+            note_items(&fused),
+            true,
+            started.elapsed().as_millis() as u64,
+        );
+        Ok(fused)
+    }
+
+    // ========================================================================
+    // Context Operations
+    // ========================================================================
+
+    /// Get notes for a specific entity (directly attached)
+    pub async fn get_direct_notes(&self, entity_id: &str) -> Result<Vec<Note>> {
+        // Try to parse as UUID first (for Task, Plan, etc.)
+        if let Ok(uuid) = entity_id.parse::<Uuid>() {
+            // Could be Task, Plan, or other UUID-based entity
+            // For now, we'll search by entity_id across different types
+            let mut all_notes = Vec::new();
+
+            for entity_type in [EntityType::Task, EntityType::Plan, EntityType::Project] {
+                let notes = self
+                    .neo4j
+                    .get_notes_for_entity(&entity_type, &uuid.to_string())
+                    .await?;
+                all_notes.extend(notes);
+            }
+
+            Ok(all_notes)
+        } else {
+            // Likely a file path
+            self.neo4j
+                .get_notes_for_entity(&EntityType::File, entity_id)
+                .await
+        }
+    }
+
+    /// Get propagated notes for an entity (via graph traversal).
+    ///
+    /// `relation_types` controls which graph relations to traverse.
+    /// `None` → default (CONTAINS|IMPORTS|CALLS).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_propagated_notes(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+        max_depth: u32,
+        min_score: f64,
+        relation_types: Option<&[String]>,
+        source_project_id: Option<Uuid>,
+        force_cross_project: bool,
+    ) -> Result<Vec<PropagatedNote>> {
+        self.neo4j
+            .get_propagated_notes(
+                entity_type,
+                entity_id,
+                max_depth,
+                min_score,
+                relation_types,
+                source_project_id,
+                force_cross_project,
+            )
+            .await
+    }
+
+    /// Get contextual notes for an entity (direct + propagated)
+    pub async fn get_context_notes(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+        max_depth: u32,
+        min_score: f64,
+    ) -> Result<NoteContextResponse> {
+        // Get direct notes
+        let direct_notes = self
+            .neo4j
+            .get_notes_for_entity(entity_type, entity_id)
+            .await?;
+
+        // Scoped to the owning project when it can be resolved (project + global notes).
+        // An ambiguous relative path yields no propagated notes rather than the
+        // notes of every project.
+        let mut propagated_notes = match self.resolve_entity_owner(entity_type, entity_id).await {
+            EntityOwner::Ambiguous(_) => {
+                tracing::warn!(
+                    entity_id,
+                    "ambiguous relative path: no propagated notes (would span projects)"
+                );
+                Vec::new()
+            }
+            owner => {
+                let owner_project = match owner {
+                    EntityOwner::Project(p) => Some(p),
+                    _ => None,
+                };
+                self.neo4j
+                    .get_propagated_notes(
+                        entity_type,
+                        entity_id,
+                        max_depth,
+                        min_score,
+                        None,
+                        owner_project,
+                        false,
+                    )
+                    .await?
+            }
+        };
+
+        // If entity is a Project, also get workspace-level notes
+        // These propagate from the parent workspace with a decay factor
+        if *entity_type == EntityType::Project {
+            if let Ok(project_id) = entity_id.parse::<uuid::Uuid>() {
+                const WORKSPACE_PROPAGATION_FACTOR: f64 = 0.8;
+                let workspace_notes = self
+                    .neo4j
+                    .get_workspace_notes_for_project(project_id, WORKSPACE_PROPAGATION_FACTOR)
+                    .await?;
+
+                // Filter by min_score and add to propagated notes
+                for note in workspace_notes {
+                    if note.relevance_score >= min_score {
+                        propagated_notes.push(note);
+                    }
+                }
+            }
+        }
+
+        // Sort propagated notes by relevance score (descending)
+        propagated_notes.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let total_count = direct_notes.len() + propagated_notes.len();
+
+        Ok(NoteContextResponse {
+            direct_notes,
+            propagated_notes,
+            total_count,
+        })
+    }
+
+    /// Get unified context knowledge for an entity.
+    ///
+    /// Combines:
+    /// 1. Direct + propagated notes (same as `get_context_notes`)
+    /// 2. Decisions related to the entity (via AFFECTS or task linkage)
+    /// 3. Recent commits touching the entity (via TOUCHES, for File entities)
+    pub async fn get_context_knowledge(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+        max_depth: u32,
+        min_score: f64,
+    ) -> Result<crate::notes::ContextKnowledge> {
+        // 1. Notes (reuse existing get_context_notes)
+        let notes = self
+            .get_context_notes(entity_type, entity_id, max_depth, min_score)
+            .await?;
+
+        // 2. Decisions related to this entity
+        let entity_label = match entity_type {
+            EntityType::File => "File",
+            EntityType::Function => "Function",
+            EntityType::Struct => "Struct",
+            EntityType::Trait => "Trait",
+            _ => "File", // fallback
+        };
+        let decisions = self
+            .neo4j
+            .get_decisions_for_entity(entity_label, entity_id, 10)
+            .await
+            .unwrap_or_default();
+
+        // 3. Recent commits (only for File entities, via TOUCHES)
+        let recent_commits = if *entity_type == EntityType::File {
+            self.neo4j
+                .get_file_history(entity_id, Some(10))
+                .await
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        let total_count = notes.direct_notes.len()
+            + notes.propagated_notes.len()
+            + decisions.len()
+            + recent_commits.len();
+
+        Ok(crate::notes::ContextKnowledge {
+            direct_notes: notes.direct_notes,
+            propagated_notes: notes.propagated_notes,
+            decisions,
+            recent_commits,
+            total_count,
+        })
+    }
+
+    /// Project that owns an entity, when it can be determined server-side
+    /// (a `Project` is itself; a `File` belongs to the project that CONTAINS it,
+    /// including when given as a relative path that identifies ONE file).
+    /// Other entity kinds, unknown files and ambiguous relative paths return `None`.
+    pub async fn resolve_entity_project(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Option<Uuid> {
+        match self.resolve_entity_owner(entity_type, entity_id).await {
+            EntityOwner::Project(p) => Some(p),
+            EntityOwner::Unknown | EntityOwner::Ambiguous(_) => None,
+        }
+    }
+
+    /// Like [`Self::resolve_entity_project`], but tells an unknown entity from a
+    /// relative file path that matches files of several projects (or a file
+    /// without project): the latter must never be treated as "no project".
+    pub async fn resolve_entity_owner(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> EntityOwner {
+        match entity_type {
+            EntityType::Project => entity_id
+                .parse::<Uuid>()
+                .map(EntityOwner::Project)
+                .unwrap_or(EntityOwner::Unknown),
+            EntityType::File => {
+                if let Some(file) = self.neo4j.get_file(entity_id).await.ok().flatten() {
+                    return file
+                        .project_id
+                        .map(EntityOwner::Project)
+                        .unwrap_or(EntityOwner::Unknown);
+                }
+                if entity_id.starts_with('/') {
+                    return EntityOwner::Unknown;
+                }
+                // Relative path: the stored paths are absolute, so resolve by
+                // normalized suffix, the same match `get_propagated_notes` uses.
+                let Some(rel) = normalize_relative_path(entity_id) else {
+                    return EntityOwner::Unknown;
+                };
+                let matches = self
+                    .neo4j
+                    .find_files_by_path_suffix(&format!("/{rel}"), RELATIVE_PATH_MATCH_LIMIT)
+                    .await
+                    .unwrap_or_default();
+                owner_of_matches(&matches)
+            }
+            _ => EntityOwner::Unknown,
+        }
+    }
+
+    /// Decide the project scope of a propagation requested by an API/MCP client.
+    ///
+    /// The HTTP API has no caller identity, so a client-supplied
+    /// `source_project_id` is never trusted to *widen* anything:
+    /// - the project that owns the entity (resolved server-side) wins; a client
+    ///   value that names another project is rejected (`Err`), not honoured;
+    /// - if the owner cannot be resolved, the client value is used as a
+    ///   single-project narrowing scope (it can only restrict to one project,
+    ///   never cross projects);
+    /// - with neither, the propagation is unscoped (legacy).
+    ///
+    /// `force_cross_project` is NOT accepted from clients; see the handlers.
+    pub async fn resolve_propagation_scope(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+        requested: Option<Uuid>,
+    ) -> std::result::Result<Option<Uuid>, String> {
+        match self.resolve_entity_owner(entity_type, entity_id).await {
+            EntityOwner::Project(o) => match requested {
+                Some(r) if o != r => Err(format!(
+                    "source_project_id {r} does not match the project {o} that owns the entity"
+                )),
+                _ => Ok(Some(o)),
+            },
+            // A relative path shared by several projects: never widen. The client
+            // may only narrow to one of the candidates; otherwise it is refused.
+            EntityOwner::Ambiguous(candidates) => match requested {
+                Some(r) if candidates.contains(&r) => Ok(Some(r)),
+                _ => Err(format!(
+                    "path `{entity_id}` is ambiguous: it matches files of {} projects; \
+                     use the absolute path or a source_project_id of one of them",
+                    candidates.len().max(1)
+                )),
+            },
+            EntityOwner::Unknown => Ok(requested),
+        }
+    }
+
+    /// Get enriched propagated knowledge for an entity.
+    ///
+    /// Unlike `get_context_notes` (direct + propagated notes only), this returns:
+    /// - Propagated notes with full score breakdown (distance, relation_weight, pagerank)
+    /// - Decisions propagated via task/plan linkage
+    /// - Per-relation-type statistics
+    ///
+    /// Accepts `relation_types` to control which relation types to traverse.
+    pub async fn get_propagated_knowledge(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+        max_depth: u32,
+        min_score: f64,
+        relation_types: Option<&[String]>,
+        source_project_id: Option<Uuid>,
+    ) -> Result<crate::notes::PropagatedKnowledge> {
+        // Cap max_depth at 3 to prevent unbounded traversal
+        let capped_depth = max_depth.min(3);
+
+        // 1. Get propagated notes with full scoring
+        let propagated_notes = self
+            .get_propagated_notes(
+                entity_type,
+                entity_id,
+                capped_depth,
+                min_score,
+                relation_types,
+                source_project_id,
+                false,
+            )
+            .await?;
+
+        // 2. Get decisions related to this entity
+        let entity_label = match entity_type {
+            EntityType::File => "File",
+            EntityType::Function => "Function",
+            EntityType::Struct => "Struct",
+            EntityType::Trait => "Trait",
+            _ => "File", // fallback
+        };
+        let decisions = self
+            .neo4j
+            .get_decisions_for_entity(entity_label, entity_id, 10)
+            .await
+            .unwrap_or_default();
+
+        // 3. Compute relation statistics from propagated notes
+        let mut rel_map: std::collections::HashMap<String, (usize, f64)> =
+            std::collections::HashMap::new();
+        let mut total_relations_traversed: usize = 0;
+
+        for note in &propagated_notes {
+            for hop in &note.relation_path {
+                total_relations_traversed += 1;
+                let entry = rel_map.entry(hop.rel_type.clone()).or_insert((0, 0.0));
+                entry.0 += 1;
+                entry.1 += note.relevance_score;
+            }
+        }
+
+        let mut relation_stats: Vec<crate::notes::RelationStats> = rel_map
+            .into_iter()
+            .map(
+                |(relation_type, (count, total_score))| crate::notes::RelationStats {
+                    relation_type,
+                    count,
+                    avg_score: if count > 0 {
+                        total_score / count as f64
+                    } else {
+                        0.0
+                    },
+                },
+            )
+            .collect();
+        relation_stats.sort_by(|a, b| b.count.cmp(&a.count));
+
+        let total_count = propagated_notes.len() + decisions.len();
+
+        Ok(crate::notes::PropagatedKnowledge {
+            notes: propagated_notes,
+            decisions,
+            total_relations_traversed,
+            relation_stats,
+            total_count,
+        })
+    }
+
+    // ========================================================================
+    // History Operations
+    // ========================================================================
+
+    /// Get the change history for a note
+    pub async fn get_note_history(&self, note_id: Uuid) -> Result<Vec<NoteChange>> {
+        if let Some(note) = self.get_note(note_id).await? {
+            Ok(note.changes)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    // ========================================================================
+    // Helper Functions
+    // ========================================================================
+
+    /// Convert a Note to a NoteDocument for Meilisearch indexing
+    async fn note_to_document(
+        &self,
+        note: &Note,
+        project_slug: Option<&str>,
+    ) -> Result<NoteDocument> {
+        // Get project slug if not provided
+        let slug = if let Some(s) = project_slug {
+            s.to_string()
+        } else {
+            // Try to get from project (if project_id is present)
+            if let Some(pid) = note.project_id {
+                if let Ok(Some(project)) = self.neo4j.get_project(pid).await {
+                    project.slug
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new() // Global note, no project slug
+            }
+        };
+
+        // Get anchor entity IDs
+        let anchors = self
+            .neo4j
+            .get_note_anchors(note.id)
+            .await
+            .unwrap_or_default();
+        let anchor_entities: Vec<String> = anchors
+            .iter()
+            .map(|a| format!("{}:{}", a.entity_type, a.entity_id))
+            .collect();
+
+        Ok(NoteDocument {
+            id: note.id.to_string(),
+            project_id: note.project_id.map(|id| id.to_string()).unwrap_or_default(),
+            project_slug: slug,
+            note_type: note.note_type.to_string(),
+            status: note.status.to_string(),
+            importance: note.importance.to_string(),
+            scope_type: match &note.scope {
+                NoteScope::Workspace => "workspace".to_string(),
+                NoteScope::Project => "project".to_string(),
+                NoteScope::Module(_) => "module".to_string(),
+                NoteScope::File(_) => "file".to_string(),
+                NoteScope::Function(_) => "function".to_string(),
+                NoteScope::Struct(_) => "struct".to_string(),
+                NoteScope::Trait(_) => "trait".to_string(),
+            },
+            scope_path: match &note.scope {
+                NoteScope::Workspace | NoteScope::Project => String::new(),
+                NoteScope::Module(p) | NoteScope::File(p) => p.clone(),
+                NoteScope::Function(n) | NoteScope::Struct(n) | NoteScope::Trait(n) => n.clone(),
+            },
+            content: note.content.clone(),
+            tags: note.tags.clone(),
+            anchor_entities,
+            created_at: note.created_at.timestamp(),
+            created_by: note.created_by.clone(),
+            staleness_score: note.staleness_score,
+            author_kind: note.author_kind.as_str().to_string(),
+            human_confirmed: note.is_human_confirmed(),
+            memory_horizon: note.memory_horizon.to_string(),
+        })
+    }
+
+    // ========================================================================
+    // Embedding Backfill
+    // ========================================================================
+
+    /// Backfill embeddings for all notes that don't have one yet.
+    ///
+    /// Processes notes in batches, generating embeddings and storing them.
+    /// This operation is **idempotent**: re-running it only processes notes
+    /// that still lack an embedding.
+    ///
+    /// Returns a `BackfillProgress` with the final counts.
+    ///
+    /// # Arguments
+    /// * `batch_size` - Number of notes to process per batch (default: 50)
+    /// * `cancel` - Optional cancellation flag; set to `true` to stop early
+    pub async fn backfill_embeddings(
+        &self,
+        batch_size: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<BackfillProgress> {
+        let provider = match &self.embedding_provider {
+            Some(p) => p,
+            None => anyhow::bail!("No embedding provider configured"),
+        };
+
+        let batch_size = if batch_size == 0 { 50 } else { batch_size };
+
+        // Get total count first
+        let (_, total) = self.neo4j.list_notes_without_embedding(0, 0).await?;
+        if total == 0 {
+            tracing::info!("Backfill: all notes already have embeddings");
+            return Ok(BackfillProgress {
+                total,
+                processed: 0,
+                errors: 0,
+                skipped: 0,
+            });
+        }
+
+        tracing::info!("Backfill: {total} notes need embeddings");
+        let mut processed = 0usize;
+        let mut errors = 0usize;
+
+        loop {
+            // Check cancellation
+            if let Some(flag) = cancel {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("Backfill cancelled at {processed}/{total}");
+                    break;
+                }
+            }
+
+            // Fetch next batch (always offset 0 because processed notes disappear)
+            let (batch, remaining) = self
+                .neo4j
+                .list_notes_without_embedding(batch_size, 0)
+                .await?;
+            if batch.is_empty() || remaining == 0 {
+                break;
+            }
+
+            // Collect texts for batch embedding
+            let texts: Vec<String> = batch.iter().map(|n| n.content.clone()).collect();
+            let note_ids: Vec<Uuid> = batch.iter().map(|n| n.id).collect();
+
+            match provider.embed_batch(&texts).await {
+                Ok(embeddings) => {
+                    let model = provider.model_name().to_string();
+                    for (i, embedding) in embeddings.into_iter().enumerate() {
+                        if let Err(e) = self
+                            .neo4j
+                            .set_note_embedding(note_ids[i], &embedding, &model)
+                            .await
+                        {
+                            tracing::warn!(
+                                note_id = %note_ids[i],
+                                error = %e,
+                                "Backfill: failed to store embedding"
+                            );
+                            errors += 1;
+                        } else {
+                            processed += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Batch embedding failed — try one by one as fallback
+                    tracing::warn!(
+                        error = %e,
+                        batch_size = texts.len(),
+                        "Backfill: batch embedding failed, falling back to individual"
+                    );
+                    for (i, text) in texts.iter().enumerate() {
+                        match provider.embed_text(text).await {
+                            Ok(embedding) => {
+                                let model = provider.model_name().to_string();
+                                if let Err(e) = self
+                                    .neo4j
+                                    .set_note_embedding(note_ids[i], &embedding, &model)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        note_id = %note_ids[i],
+                                        error = %e,
+                                        "Backfill: failed to store embedding"
+                                    );
+                                    errors += 1;
+                                } else {
+                                    processed += 1;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    note_id = %note_ids[i],
+                                    error = %e,
+                                    "Backfill: failed to embed note, skipping"
+                                );
+                                errors += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            tracing::info!("Backfill: {processed}/{total} notes embedded ({errors} errors)");
+        }
+
+        let skipped = total.saturating_sub(processed + errors);
+        tracing::info!(
+            "Backfill complete: {processed} processed, {errors} errors, {skipped} skipped"
+        );
+
+        Ok(BackfillProgress {
+            total,
+            processed,
+            errors,
+            skipped,
+        })
+    }
+
+    /// Backfill SYNAPSE relationships for notes that have embeddings but no
+    /// outgoing SYNAPSE edges yet.
+    ///
+    /// For each such note, retrieves its stored embedding, runs a vector
+    /// similarity search to find nearest neighbours, filters by
+    /// `min_similarity`, and creates bidirectional SYNAPSE relations.
+    ///
+    /// This is idempotent: notes that already have synapses are skipped
+    /// (they don't appear in `list_notes_needing_synapses`). On re-run,
+    /// only newly embedded notes or notes whose synapses were pruned are
+    /// processed.
+    ///
+    /// Also calls `init_note_energy(project_id)` first to ensure the notes in
+    /// scope have an energy value.
+    ///
+    /// Neighbour search is bounded by each note's own `project_id`
+    /// (`vector_search_notes` filters `n.project_id = $pid` when `Some`), so a
+    /// project-scoped backfill never links across tenants. Notes with no
+    /// project (`None`) are only reached by the global sweep, where their
+    /// search is intentionally unfiltered.
+    ///
+    /// `project_id`: when `Some`, scopes both note selection and the adaptive
+    /// `min_similarity` calibration to that project — used by bounded,
+    /// on-demand self-heal callers (skill detection/maintenance) so a single
+    /// call cannot balloon into a full multi-tenant rebuild. `None` preserves
+    /// the original global sweep (heartbeat replenish, homeostasis, admin
+    /// endpoint).
+    pub async fn backfill_synapses(
+        &self,
+        batch_size: usize,
+        min_similarity: f64,
+        max_neighbors: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        project_id: Option<Uuid>,
+    ) -> Result<SynapseBackfillProgress> {
+        let batch_size = if batch_size == 0 { 50 } else { batch_size };
+        let max_neighbors = if max_neighbors == 0 {
+            10
+        } else {
+            max_neighbors
+        };
+
+        // Calibrate min_similarity from existing synapse weights when no explicit
+        // value was provided (min_similarity <= 0.0).
+        //
+        // Synapse weights are initialised from cosine similarities at creation,
+        // so their distribution approximates the embedding density of this project.
+        // Using the p70 of existing weights as the floor keeps only the top-30%
+        // most similar connections — adapting to each project rather than a fixed 0.75.
+        // Falls back to 0.75 on first-ever backfill (no synapses yet).
+        let min_similarity = if min_similarity > 0.0 {
+            min_similarity
+        } else {
+            match self.neo4j.get_all_synapse_weights(project_id).await {
+                Ok(weights) if weights.len() >= 4 => {
+                    let calibrated =
+                        crate::analytics::distribution::adaptive_threshold(&weights, 0.70, 0.75);
+                    tracing::info!(
+                        calibrated_min_similarity = calibrated,
+                        n_existing_synapses = weights.len(),
+                        "backfill_synapses: min_similarity calibrated from weight distribution"
+                    );
+                    calibrated
+                }
+                _ => 0.75,
+            }
+        };
+
+        // Phase 1: init energy on all notes that don't have it yet
+        let energy_init = self.neo4j.init_note_energy(project_id).await?;
+        if energy_init > 0 {
+            tracing::info!("Synapse backfill: initialized energy on {energy_init} notes");
+        }
+
+        // Phase 2: get total count of notes needing synapses
+        let (_, total) = self
+            .neo4j
+            .list_notes_needing_synapses(0, 0, project_id)
+            .await?;
+        if total == 0 {
+            tracing::info!("Synapse backfill: all notes with embeddings already have synapses");
+            return Ok(SynapseBackfillProgress {
+                total,
+                processed: 0,
+                synapses_created: 0,
+                errors: 0,
+                skipped: 0,
+                energy_initialized: energy_init,
+            });
+        }
+
+        tracing::info!("Synapse backfill: {total} notes need synapses");
+        let mut processed = 0usize;
+        let mut synapses_created = 0usize;
+        let mut errors = 0usize;
+        // Track offset for notes that couldn't get synapses (no eligible
+        // neighbours) — they stay in the query results, so we must skip past
+        // them on subsequent iterations to avoid an infinite loop.
+        let mut skip_offset = 0usize;
+
+        loop {
+            // Check cancellation
+            if let Some(flag) = cancel {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("Synapse backfill cancelled at {processed}/{total}");
+                    break;
+                }
+            }
+
+            // Fetch next batch. Notes that got synapses disappear from
+            // results (offset 0 works for those). But notes with no eligible
+            // neighbours stay, so we skip past them with `skip_offset`.
+            let (batch, remaining) = self
+                .neo4j
+                .list_notes_needing_synapses(batch_size, skip_offset, project_id)
+                .await?;
+            if batch.is_empty() || remaining == 0 {
+                break;
+            }
+
+            for note in &batch {
+                // Check cancellation per-note for responsiveness
+                if let Some(flag) = cancel {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        tracing::info!("Synapse backfill cancelled at {processed}/{total}");
+                        let skipped = total.saturating_sub(processed + errors);
+                        return Ok(SynapseBackfillProgress {
+                            total,
+                            processed,
+                            synapses_created,
+                            errors,
+                            skipped,
+                            energy_initialized: energy_init,
+                        });
+                    }
+                }
+
+                // Get the stored embedding for this note
+                let embedding = match self.neo4j.get_note_embedding(note.id).await {
+                    Ok(Some(emb)) => emb,
+                    Ok(None) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            "Synapse backfill: note listed as needing synapses but has no embedding, skipping"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %e,
+                            "Synapse backfill: failed to get embedding"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
+                    }
+                };
+
+                // Vector search for nearest neighbours
+                let neighbors = match self
+                    .neo4j
+                    .vector_search_notes(&embedding, max_neighbors + 1, note.project_id, None, None)
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(e) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %e,
+                            "Synapse backfill: vector search failed"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
+                    }
+                };
+
+                // Filter: exclude self, apply min_similarity threshold
+                let synapse_targets: Vec<(Uuid, f64)> = neighbors
+                    .into_iter()
+                    .filter(|(n, score)| n.id != note.id && *score >= min_similarity)
+                    .map(|(n, score)| (n.id, score))
+                    .collect();
+
+                if synapse_targets.is_empty() {
+                    // No eligible neighbours — this note will stay in the
+                    // "needing synapses" list. Increment offset to skip past
+                    // it on the next iteration.
+                    tracing::debug!(
+                        note_id = %note.id,
+                        "Synapse backfill: no eligible neighbours above threshold {min_similarity}, skipping"
+                    );
+                    skip_offset += 1;
+                    processed += 1;
+                    continue;
+                }
+
+                match self.neo4j.create_synapses(note.id, &synapse_targets).await {
+                    Ok(created) => {
+                        synapses_created += created;
+                        // Note now has synapses → will NOT appear in next
+                        // query at the same offset. Don't increment skip_offset.
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %e,
+                            "Synapse backfill: failed to create synapses"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
+                    }
+                }
+
+                processed += 1;
+            }
+
+            tracing::info!(
+                "Synapse backfill: {processed}/{total} notes processed, {synapses_created} synapses created ({errors} errors, {skip_offset} skipped)"
+            );
+
+            // NOTE: we deliberately do NOT stop when a whole batch failed to
+            // connect. Un-connectable notes (isolated, or whose only neighbours
+            // are filtered out) are skipped via `skip_offset` and the loop
+            // terminates naturally once the offset exhausts the candidate list
+            // (`batch.is_empty()` above). The old `if batch_connected == 0 break`
+            // stranded connectable notes whenever un-connectable ones clustered
+            // at the front of the (created_at-ordered) list — which is why a
+            // corpus dominated by isolated notes produced ZERO synapses.
+        }
+
+        let skipped = total.saturating_sub(processed + errors);
+        tracing::info!(
+            "Synapse backfill (notes): {processed} processed, {synapses_created} synapses, {errors} errors, {skipped} skipped"
+        );
+
+        // ================================================================
+        // Phase 3: Cross-entity synapses (Decision ↔ Note, Decision ↔ Decision)
+        // ================================================================
+        let (decision_created, decision_processed, decision_errors) = self
+            .backfill_decision_synapses(batch_size, min_similarity, max_neighbors, cancel)
+            .await?;
+
+        let total_all = total + decision_processed;
+        let synapses_all = synapses_created + decision_created;
+        let errors_all = errors + decision_errors;
+        let skipped_all = total_all.saturating_sub(processed + decision_processed + errors_all);
+
+        tracing::info!(
+            "Synapse backfill complete: {total_all} total ({processed} notes + {decision_processed} decisions), {synapses_all} synapses, {errors_all} errors"
+        );
+
+        Ok(SynapseBackfillProgress {
+            total: total_all,
+            processed: processed + decision_processed,
+            synapses_created: synapses_all,
+            errors: errors_all,
+            skipped: skipped_all,
+            energy_initialized: energy_init,
+        })
+    }
+
+    /// Backfill cross-entity SYNAPSE relationships for Decision nodes.
+    ///
+    /// For each Decision with an embedding but no SYNAPSE, finds nearest neighbor
+    /// Notes (via note vector index) and creates cross-entity SYNAPSE edges.
+    ///
+    /// Returns (synapses_created, decisions_processed, errors).
+    async fn backfill_decision_synapses(
+        &self,
+        batch_size: usize,
+        min_similarity: f64,
+        max_neighbors: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(usize, usize, usize)> {
+        let (_, total) = self.neo4j.list_decisions_needing_synapses(0, 0).await?;
+        if total == 0 {
+            tracing::info!("Synapse backfill (decisions): all decisions already have synapses");
+            return Ok((0, 0, 0));
+        }
+
+        tracing::info!("Synapse backfill (decisions): {total} decisions need synapses");
+        let mut processed = 0usize;
+        let mut synapses_created = 0usize;
+        let mut errors = 0usize;
+        let mut skip_offset = 0usize;
+
+        loop {
+            if let Some(flag) = cancel {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("Synapse backfill (decisions) cancelled at {processed}/{total}");
+                    break;
+                }
+            }
+
+            let (batch, remaining) = self
+                .neo4j
+                .list_decisions_needing_synapses(batch_size, skip_offset)
+                .await?;
+            if batch.is_empty() || remaining == 0 {
+                break;
+            }
+
+            for decision in &batch {
+                if let Some(flag) = cancel {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                }
+
+                // Get the stored embedding for this decision
+                let embedding = match self.neo4j.get_decision_embedding(decision.id).await {
+                    Ok(Some(emb)) => emb,
+                    Ok(None) => {
+                        tracing::warn!(
+                            decision_id = %decision.id,
+                            "Synapse backfill: decision listed as needing synapses but has no embedding"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            decision_id = %decision.id,
+                            error = %e,
+                            "Synapse backfill: failed to get decision embedding"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
+                    }
+                };
+
+                // Search for similar Notes using the note vector index
+                let note_neighbors = match self
+                    .neo4j
+                    .vector_search_notes(&embedding, max_neighbors, None, None, None)
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(e) => {
+                        tracing::warn!(
+                            decision_id = %decision.id,
+                            error = %e,
+                            "Synapse backfill: note vector search failed for decision"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
+                    }
+                };
+
+                // Filter: apply min_similarity threshold, map to (id, score)
+                let mut synapse_targets: Vec<(uuid::Uuid, f64)> = note_neighbors
+                    .into_iter()
+                    .filter(|(_, score)| *score >= min_similarity)
+                    .map(|(n, score)| (n.id, score))
+                    .collect();
+
+                // Also search for similar Decisions via the decision vector index
+                match self
+                    .neo4j
+                    .search_decisions_by_vector(&embedding, max_neighbors, None)
+                    .await
+                {
+                    Ok(decision_results) => {
+                        for (d, score) in decision_results {
+                            // Exclude self
+                            if d.id != decision.id && score >= min_similarity {
+                                synapse_targets.push((d.id, score));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            decision_id = %decision.id,
+                            error = %e,
+                            "Synapse backfill: decision vector search failed (non-fatal)"
+                        );
+                        // Non-fatal: we still have note neighbors
+                    }
+                }
+
+                if synapse_targets.is_empty() {
+                    tracing::debug!(
+                        decision_id = %decision.id,
+                        "Synapse backfill: no eligible neighbors for decision above threshold {min_similarity}"
+                    );
+                    skip_offset += 1;
+                    processed += 1;
+                    continue;
+                }
+
+                // Create cross-entity synapses (works for Decision↔Note and Decision↔Decision)
+                match self
+                    .neo4j
+                    .create_cross_entity_synapses(decision.id, &synapse_targets)
+                    .await
+                {
+                    Ok(created) => {
+                        synapses_created += created;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            decision_id = %decision.id,
+                            error = %e,
+                            "Synapse backfill: failed to create cross-entity synapses"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
+                    }
+                }
+
+                processed += 1;
+            }
+
+            tracing::info!(
+                "Synapse backfill (decisions): {processed}/{total} processed, {synapses_created} cross-entity synapses ({errors} errors)"
+            );
+
+            // See the note-synapse loop above: do not early-stop on an
+            // all-un-connectable batch; rely on skip_offset/offset exhaustion so
+            // connectable entities after a cluster of isolated ones are reached.
+        }
+
+        Ok((synapses_created, processed, errors))
+    }
+}
+
+/// Progress report for the embedding backfill operation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackfillProgress {
+    /// Total number of notes that needed embedding at start
+    pub total: usize,
+    /// Number of notes successfully embedded
+    pub processed: usize,
+    /// Number of notes that failed embedding
+    pub errors: usize,
+    /// Number of notes skipped (cancelled before processing)
+    pub skipped: usize,
+}
+
+/// Progress report for the synapse backfill operation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SynapseBackfillProgress {
+    /// Total number of notes that needed synapses at start
+    pub total: usize,
+    /// Number of notes successfully processed
+    pub processed: usize,
+    /// Number of SYNAPSE relationships created
+    pub synapses_created: usize,
+    /// Number of notes that failed processing
+    pub errors: usize,
+    /// Number of notes skipped (cancelled before processing)
+    pub skipped: usize,
+    /// Number of notes that had energy initialized
+    pub energy_initialized: usize,
+}
+
+/// Whether a note returned by the (unscoped) lexical channel may join a search
+/// that the dense channel scoped.
+///
+/// The rule mirrors the dense Cypher exactly:
+/// - project scope: the note must belong to that very project;
+/// - workspace scope: membership cannot be checked here (the BM25 filter only
+///   knows a project slug), so the lexical channel is *skipped* rather than
+///   risk leaking a foreign note;
+/// - no scope: everything is in scope (the deliberate breadth across projects).
+fn note_in_scope(
+    note_project_id: Option<Uuid>,
+    scope_project_id: Option<Uuid>,
+    workspace_scoped: bool,
+) -> bool {
+    match (scope_project_id, workspace_scoped) {
+        (Some(pid), _) => note_project_id == Some(pid),
+        (None, true) => false,
+        (None, false) => true,
+    }
+}
+
+/// Les identifiants et scores rendus, tels que le registre les conserve
+/// (champ (3) : un compteur ne dit pas *quoi* a été rendu).
+fn note_items(hits: &[NoteSearchHit]) -> Vec<retrieval_ledger::RetrievedItem> {
+    hits.iter()
+        .map(|hit| {
+            retrieval_ledger::RetrievedItem::new(hit.note.id.to_string(), "note", Some(hit.score))
+        })
+        .collect()
+}
+
+/// Fuse the dense and lexical channels of a note search by Reciprocal Rank
+/// Fusion, then map ids back to notes and re-apply the scar penalty.
+///
+/// Fusion on ranks (not scores) is what lets a flat dense answer be re-ordered
+/// by a discriminative lexical one - cosine on closely clustered embeddings
+/// barely separates anything, while BM25 ranking one candidate first is a
+/// strong, calibratable signal. When only one channel answered, its own order
+/// and scores are kept (dense: cosine; lexical: BM25), so callers still get a
+/// sensible list before any embedding backfill.
+fn fuse_dense_and_lexical(
+    dense: Vec<(Note, f64)>,
+    lexical: Vec<NoteSearchHit>,
+    limit: usize,
+) -> Vec<NoteSearchHit> {
+    let mut dense = dense;
+    dense.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // id -> note, from whichever channel has it (dense wins on overlap).
+    let mut notes: HashMap<String, Note> = HashMap::new();
+    for (note, _) in &dense {
+        notes.insert(note.id.to_string(), note.clone());
+    }
+    for hit in &lexical {
+        notes
+            .entry(hit.note.id.to_string())
+            .or_insert_with(|| hit.note.clone());
+    }
+
+    let dense_ids: Vec<String> = dense.iter().map(|(n, _)| n.id.to_string()).collect();
+    let lexical_ids: Vec<String> = lexical.iter().map(|h| h.note.id.to_string()).collect();
+    // Keep the fused head on the cosine scale the caller already reads.
+    let anchor = dense.first().map(|(_, s)| *s).unwrap_or(0.0);
+
+    let ranked: Vec<(String, f64)> = match (dense_ids.is_empty(), lexical_ids.is_empty()) {
+        (false, false) => reciprocal_rank_fusion(&[&dense_ids, &lexical_ids], anchor),
+        (false, true) => dense.iter().map(|(n, s)| (n.id.to_string(), *s)).collect(),
+        (true, false) => lexical
+            .iter()
+            .map(|h| (h.note.id.to_string(), h.score))
+            .collect(),
+        (true, true) => Vec::new(),
+    };
+
+    let mut out: Vec<NoteSearchHit> = ranked
+        .into_iter()
+        .filter_map(|(id, score)| {
+            notes.remove(&id).map(|note| {
+                let scar_penalty = 1.0 - note.scar_intensity.clamp(0.0, 1.0) * 0.5;
+                NoteSearchHit {
+                    scope: NoteSearchHit::scope_of(&note),
+                    // Freshness last: it reorders near-ties, it does not change
+                    // what is relevant.
+                    score: crate::notes::models::apply_freshness(
+                        score * scar_penalty,
+                        note.staleness_score,
+                    ),
+                    note,
+                    highlights: None,
+                }
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out.truncate(limit);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    use crate::test_helpers::*;
+
+    // -- Registre de récupération : le branchement, pas seulement le compteur --
+
+    /// Une recherche BM25 écrit une ligne de registre. La requête est unique par
+    /// test : les compteurs sont globaux, et une assertion par delta serait
+    /// brouillée par les tests voisins.
+    // Le garde sérialise un registre GLOBAL à travers l'appel observé : le
+    // tenir pendant l'await est le but, pas un oubli.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn une_recherche_bm25_ecrit_dans_le_registre() {
+        // Le registre est global : ce test le sérialise avec les autres et
+        // agrandit le journal pour qu'aucun événement voisin ne l'évince.
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let state = mock_app_state_with_stores().0;
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let query = format!("bruit-bm25-{}", Uuid::new_v4());
+
+        let _ = mgr.search_notes(&query, &NoteFilters::default()).await;
+
+        let mine: Vec<_> = retrieval_ledger::recent(256)
+            .into_iter()
+            .filter(|e| e.query == query)
+            .collect();
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+
+        assert_eq!(mine.len(), 1, "une récupération, un événement");
+        assert_eq!(mine[0].source, retrieval_ledger::Source::Bm25);
+        assert_eq!(mine[0].trigger, retrieval_ledger::Trigger::Explicit);
+    }
+
+    /// Sans fournisseur d'embedding, la recherche « sémantique » est servie par
+    /// BM25. Le registre doit le dire : une récupération comptée deux fois, dont
+    /// une fois sous un nom qui n'a pas eu lieu, fausse tout l'agrégat.
+    // Le garde sérialise un registre GLOBAL à travers l'appel observé : le
+    // tenir pendant l'await est le but, pas un oubli.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn le_repli_bm25_ne_se_degulse_pas_en_semantique() {
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let state = mock_app_state_with_stores().0;
+        // `NoteManager::new` n'installe aucun fournisseur d'embedding.
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let query = format!("repli-{}", Uuid::new_v4());
+
+        let _ = mgr
+            .semantic_search_notes(&query, None, None, None, None, None)
+            .await;
+
+        let mine: Vec<_> = retrieval_ledger::recent(256)
+            .into_iter()
+            .filter(|e| e.query == query)
+            .collect();
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+        assert_eq!(mine.len(), 1, "une seule récupération, un seul événement");
+        assert_eq!(
+            mine[0].source,
+            retrieval_ledger::Source::Bm25,
+            "le repli est une récupération BM25, pas une récupération sémantique"
+        );
+    }
+
+    /// Le motif déclaré par l'appelant est celui qui est enregistré : c'est la
+    /// prise que le déclencheur (PR3) branchera.
+    // Le garde sérialise un registre GLOBAL à travers l'appel observé : le
+    // tenir pendant l'await est le but, pas un oubli.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn le_motif_declare_est_celui_qui_est_enregistre() {
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let state = mock_app_state_with_stores().0;
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let query = format!("frontiere-{}", Uuid::new_v4());
+
+        let _ = mgr
+            .search_notes_with_trigger(
+                &query,
+                &NoteFilters::default(),
+                retrieval_ledger::Trigger::TaskBoundary,
+            )
+            .await;
+
+        let mine: Vec<_> = retrieval_ledger::recent(256)
+            .into_iter()
+            .filter(|e| e.query == query)
+            .collect();
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].trigger, retrieval_ledger::Trigger::TaskBoundary);
+    }
+
+    // -- Retrieval failure paths: a source in error is a FAILED retrieval ------
+
+    /// An embedding provider whose call always fails (the semantic channel must
+    /// report "failed", never "empty").
+    struct FailingEmbeddingProvider;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for FailingEmbeddingProvider {
+        async fn embed_text(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            anyhow::bail!("embedder down")
+        }
+
+        async fn embed_batch(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("embedder down")
+        }
+
+        fn dimensions(&self) -> usize {
+            768
+        }
+
+        fn model_name(&self) -> &str {
+            "failing-test"
+        }
+    }
+
+    /// A Meilisearch failure surfaces as an error from `search_notes`; the
+    /// retrieval ledger records it as a FAILED BM25 retrieval.
+    #[tokio::test]
+    async fn a_bm25_search_failure_surfaces_the_error() {
+        let (state, _graph, meili) = mock_app_state_with_stores();
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        meili
+            .fail_note_search
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = mgr
+            .search_notes("bm25-will-fail", &NoteFilters::default())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("injected"), "{err}");
+    }
+
+    /// An embedding failure fails the semantic search: the error is returned
+    /// (and the ledger counts a failed semantic retrieval, not an empty one).
+    #[tokio::test]
+    async fn an_embedding_failure_fails_the_semantic_search() {
+        let state = mock_app_state_with_stores().0;
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone())
+            .with_embedding_provider(Arc::new(FailingEmbeddingProvider));
+
+        let err = mgr
+            .semantic_search_notes("needle", None, None, None, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("embed"), "{err}");
+    }
+
+    /// A vector search failure surfaces the raw graph error to the caller
+    /// (after the ledger records a failed semantic retrieval).
+    #[tokio::test]
+    async fn a_vector_search_failure_surfaces_the_error() {
+        let (state, graph, _meili) = mock_app_state_with_stores();
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone())
+            .with_embedding_provider(Arc::new(crate::embeddings::MockEmbeddingProvider::new(768)));
+        graph
+            .fail_vector_search
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = mgr
+            .semantic_search_notes("needle", None, None, None, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("injected"), "{err}");
+    }
+
+    // -- Hybrid ranking: dense ∪ lexical, fused by RRF ----------------------
+
+    #[test]
+    fn lexical_channel_is_confined_to_the_dense_scope() {
+        let me = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(
+            note_in_scope(Some(me), Some(me), false),
+            "same project kept"
+        );
+        assert!(
+            !note_in_scope(Some(other), Some(me), false),
+            "foreign project dropped"
+        );
+        assert!(
+            !note_in_scope(None, Some(me), false),
+            "global note dropped under a project scope"
+        );
+        assert!(
+            note_in_scope(Some(me), None, false),
+            "no scope keeps everything"
+        );
+        assert!(
+            !note_in_scope(Some(me), None, true),
+            "workspace scope skips lexical (membership cannot be verified here)"
+        );
+    }
+
+    #[test]
+    fn a_lexical_consensus_promotes_past_a_flat_dense_tail() {
+        let pid = Uuid::new_v4();
+        let dense_top = test_note(pid, NoteType::Gotcha, "dense lead, no lexical match");
+        let consensus = test_note(pid, NoteType::Gotcha, "matched by both channels");
+        let dense = vec![(dense_top.clone(), 0.9272), (consensus.clone(), 0.9245)];
+        let lexical = vec![NoteSearchHit {
+            scope: NoteSearchHit::scope_of(&consensus),
+            note: consensus.clone(),
+            score: 12.0,
+            highlights: None,
+        }];
+        let out = fuse_dense_and_lexical(dense, lexical, 10);
+        assert_eq!(out.len(), 2, "both notes survive");
+        assert_eq!(
+            out[0].note.id, consensus.id,
+            "the note both channels rank wins over a flat dense-only lead"
+        );
+    }
+
+    #[test]
+    fn dense_order_is_kept_when_the_lexical_channel_is_empty() {
+        let pid = Uuid::new_v4();
+        let high = test_note(pid, NoteType::Gotcha, "high cosine");
+        let low = test_note(pid, NoteType::Gotcha, "low cosine");
+        let dense = vec![(low.clone(), 0.80), (high.clone(), 0.90)];
+        let out = fuse_dense_and_lexical(dense, Vec::new(), 10);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].note.id, high.id, "higher cosine stays first");
+    }
+
+    /// Helper: build a NoteManager backed by mock stores, with a pre-seeded project.
+    /// Returns (NoteManager, project_id).
+    async fn create_note_manager() -> (NoteManager, Uuid) {
+        let state = mock_app_state();
+        let project = test_project();
+        let project_id = project.id;
+        // Seed the project so note_to_document can resolve the slug
+        state.neo4j.create_project(&project).await.unwrap();
+        let manager = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        (manager, project_id)
+    }
+
+    /// Helper: build a CreateNoteRequest with minimal required fields.
+    fn make_create_request(project_id: Uuid, content: &str) -> CreateNoteRequest {
+        CreateNoteRequest {
+            sharing_consent: None,
+            project_id: Some(project_id),
+            note_type: NoteType::Guideline,
+            content: content.to_string(),
+            importance: Some(NoteImportance::High),
+            scope: None,
+            tags: Some(vec!["test".to_string()]),
+            anchors: None,
+            assertion_rule: None,
+            run_id: None,
+        }
+    }
+
+    // ====================================================================
+    // Note CRUD
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_create_note() {
+        let (mgr, pid) = create_note_manager().await;
+        let req = make_create_request(pid, "Always use Result for errors");
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        assert_eq!(note.project_id, Some(pid));
+        assert_eq!(note.note_type, NoteType::Guideline);
+        assert_eq!(note.content, "Always use Result for errors");
+        assert_eq!(note.importance, NoteImportance::High);
+        assert_eq!(note.status, NoteStatus::Active);
+        assert_eq!(note.created_by, "agent-1");
+
+        // Verify stored in Neo4j
+        let stored = mgr.get_note(note.id).await.unwrap();
+        assert!(stored.is_some());
+        assert_eq!(stored.unwrap().id, note.id);
+    }
+
+    #[tokio::test]
+    async fn test_create_note_persists_the_explicit_sharing_consent() {
+        use crate::episodes::distill_models::SharingConsent;
+        let (mgr, pid) = create_note_manager().await;
+        let mut req = make_create_request(pid, "shared on purpose");
+        req.sharing_consent = Some(SharingConsent::ExplicitAllow);
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+        assert_eq!(note.sharing_consent, SharingConsent::ExplicitAllow);
+        let stored = mgr.get_note(note.id).await.unwrap().unwrap();
+        assert_eq!(stored.sharing_consent, SharingConsent::ExplicitAllow);
+
+        // Old callers (no field): NotSet, unchanged.
+        let plain = mgr
+            .create_note(make_create_request(pid, "plain"), "agent-1")
+            .await
+            .unwrap();
+        assert_eq!(plain.sharing_consent, SharingConsent::NotSet);
+    }
+
+    #[test]
+    fn test_create_note_request_deserializes_sharing_consent_optionally() {
+        use crate::episodes::distill_models::SharingConsent;
+        let with: CreateNoteRequest = serde_json::from_value(serde_json::json!({
+            "note_type": "guideline", "content": "c", "sharing_consent": "explicit_deny"
+        }))
+        .unwrap();
+        assert_eq!(with.sharing_consent, Some(SharingConsent::ExplicitDeny));
+        let without: CreateNoteRequest = serde_json::from_value(serde_json::json!({
+            "note_type": "guideline", "content": "c"
+        }))
+        .unwrap();
+        assert_eq!(without.sharing_consent, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_note() {
+        let (mgr, pid) = create_note_manager().await;
+        let req = make_create_request(pid, "Check all fields are returned");
+        let created = mgr.create_note(req, "agent-1").await.unwrap();
+
+        let fetched = mgr.get_note(created.id).await.unwrap().unwrap();
+
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.content, "Check all fields are returned");
+        assert_eq!(fetched.note_type, NoteType::Guideline);
+        assert_eq!(fetched.importance, NoteImportance::High);
+        assert_eq!(fetched.tags, vec!["test".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_get_note_not_found() {
+        let (mgr, _pid) = create_note_manager().await;
+        let non_existent_id = Uuid::new_v4();
+
+        let result = mgr.get_note(non_existent_id).await.unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_note() {
+        let (mgr, pid) = create_note_manager().await;
+        let req = make_create_request(pid, "Original content");
+        let created = mgr.create_note(req, "agent-1").await.unwrap();
+
+        let update = UpdateNoteRequest {
+            content: Some("Updated content".to_string()),
+            importance: Some(NoteImportance::Critical),
+            status: None,
+            tags: None,
+        };
+        let updated = mgr.update_note(created.id, update).await.unwrap().unwrap();
+
+        assert_eq!(updated.content, "Updated content");
+        assert_eq!(updated.importance, NoteImportance::Critical);
+        // Status should remain unchanged
+        assert_eq!(updated.status, NoteStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn test_delete_note() {
+        let (mgr, pid) = create_note_manager().await;
+        let req = make_create_request(pid, "To be deleted");
+        let created = mgr.create_note(req, "agent-1").await.unwrap();
+
+        let deleted = mgr.delete_note(created.id).await.unwrap();
+        assert!(deleted);
+
+        // Verify removed from Neo4j
+        let gone = mgr.get_note(created.id).await.unwrap();
+        assert!(gone.is_none());
+
+        // Deleting again returns false
+        let deleted_again = mgr.delete_note(created.id).await.unwrap();
+        assert!(!deleted_again);
+    }
+
+    // ====================================================================
+    // Note Listing
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_list_notes() {
+        let (mgr, pid) = create_note_manager().await;
+
+        // Create 3 notes
+        for i in 0..3 {
+            let req = make_create_request(pid, &format!("Note {}", i));
+            mgr.create_note(req, "agent-1").await.unwrap();
+        }
+
+        let filters = NoteFilters {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let (notes, total) = mgr.list_notes(None, None, &filters).await.unwrap();
+
+        assert_eq!(total, 3);
+        assert_eq!(notes.len(), 2); // limited to 2
+    }
+
+    #[tokio::test]
+    async fn test_list_project_notes() {
+        let state = mock_app_state();
+
+        // Create two projects
+        let project_a = test_project_named("Alpha");
+        let project_b = test_project_named("Beta");
+        state.neo4j.create_project(&project_a).await.unwrap();
+        state.neo4j.create_project(&project_b).await.unwrap();
+
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        // Create notes for each project
+        let req_a = make_create_request(project_a.id, "Alpha note");
+        let req_b = make_create_request(project_b.id, "Beta note");
+        mgr.create_note(req_a, "agent-1").await.unwrap();
+        mgr.create_note(req_b, "agent-1").await.unwrap();
+
+        let filters = NoteFilters::default();
+        let (notes, total) = mgr
+            .list_project_notes(project_a.id, &filters)
+            .await
+            .unwrap();
+
+        assert_eq!(total, 1);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].project_id, Some(project_a.id));
+    }
+
+    // ====================================================================
+    // Linking
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_link_note_to_entity() {
+        let (mgr, pid) = create_note_manager().await;
+        let req = make_create_request(pid, "Link me to a file");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        let link = LinkNoteRequest {
+            entity_type: EntityType::File,
+            entity_id: "src/main.rs".to_string(),
+        };
+        mgr.link_note_to_entity(note.id, &link).await.unwrap();
+
+        let anchors = mgr.get_note_anchors(note.id).await.unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].entity_type, EntityType::File);
+        assert_eq!(anchors[0].entity_id, "src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn test_unlink_note_from_entity() {
+        let (mgr, pid) = create_note_manager().await;
+        let req = make_create_request(pid, "Unlink me");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Link first
+        let link = LinkNoteRequest {
+            entity_type: EntityType::File,
+            entity_id: "src/lib.rs".to_string(),
+        };
+        mgr.link_note_to_entity(note.id, &link).await.unwrap();
+
+        // Verify linked
+        let anchors = mgr.get_note_anchors(note.id).await.unwrap();
+        assert_eq!(anchors.len(), 1);
+
+        // Unlink
+        mgr.unlink_note_from_entity(note.id, &EntityType::File, "src/lib.rs")
+            .await
+            .unwrap();
+
+        let anchors = mgr.get_note_anchors(note.id).await.unwrap();
+        assert!(anchors.is_empty());
+    }
+
+    // ====================================================================
+    // Lifecycle
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_confirm_note() {
+        let (mgr, pid) = create_note_manager().await;
+        let req = make_create_request(pid, "Confirm me");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        let confirmed = mgr
+            .confirm_note(note.id, "reviewer")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(confirmed.staleness_score, 0.0);
+        assert_eq!(confirmed.last_confirmed_by, Some("reviewer".to_string()));
+        assert!(confirmed.last_confirmed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_note() {
+        let (mgr, pid) = create_note_manager().await;
+        let req = make_create_request(pid, "Obsolete this note");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        let invalidated = mgr
+            .invalidate_note(note.id, "No longer relevant", "reviewer")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(invalidated.status, NoteStatus::Obsolete);
+    }
+
+    #[tokio::test]
+    async fn test_supersede_note() {
+        let (mgr, pid) = create_note_manager().await;
+        let old_req = make_create_request(pid, "Old guideline");
+        let old_note = mgr.create_note(old_req, "agent-1").await.unwrap();
+
+        let new_req = make_create_request(pid, "New improved guideline");
+        let new_note = mgr
+            .supersede_note(old_note.id, new_req, "agent-2")
+            .await
+            .unwrap();
+
+        assert_eq!(new_note.content, "New improved guideline");
+        assert_eq!(new_note.supersedes, Some(old_note.id));
+
+        // Old note should be marked as obsolete with superseded_by set
+        let old_after = mgr.get_note(old_note.id).await.unwrap().unwrap();
+        assert_eq!(old_after.status, NoteStatus::Obsolete);
+        assert_eq!(old_after.superseded_by, Some(new_note.id));
+    }
+
+    #[tokio::test]
+    async fn a_revision_records_who_when_and_on_what_evidence() {
+        let (mgr, pid) = create_note_manager().await;
+        let old = mgr
+            .create_note(make_create_request(pid, "Deploy via script A"), "agent-1")
+            .await
+            .unwrap();
+
+        let until = chrono::Utc::now() + chrono::Duration::days(30);
+        let new = mgr
+            .revise_note(
+                old.id,
+                make_create_request(pid, "Deploy via script B"),
+                "agent-2",
+                "  commit 1a2b3c4: script A removed  ",
+                None,
+                Some(until),
+            )
+            .await
+            .unwrap();
+
+        // The persisted version carries the provenance, not just the returned value.
+        let stored = mgr.get_note(new.id).await.unwrap().unwrap();
+        let rev = stored
+            .revision
+            .clone()
+            .expect("a revision must be recorded");
+        assert_eq!(rev.revised_by, "agent-2");
+        assert_eq!(rev.evidence, "commit 1a2b3c4: script A removed");
+        assert_eq!(rev.revises, old.id);
+        assert_eq!(stored.valid_until, Some(until));
+
+        let old_after = mgr.get_note(old.id).await.unwrap().unwrap();
+        assert_eq!(old_after.superseded_by, Some(new.id));
+        assert!(
+            !crate::notes::is_current_knowledge(&old_after),
+            "the replaced version no longer reaches the agent"
+        );
+        assert!(crate::notes::is_current_knowledge(&stored));
+    }
+
+    #[tokio::test]
+    async fn a_revision_without_evidence_is_refused_and_changes_nothing() {
+        let (mgr, pid) = create_note_manager().await;
+        let old = mgr
+            .create_note(make_create_request(pid, "Keep me"), "agent-1")
+            .await
+            .unwrap();
+
+        for blank in ["", "   ", "\n\t"] {
+            let err = mgr
+                .revise_note(
+                    old.id,
+                    make_create_request(pid, "Silent rewrite"),
+                    "agent-2",
+                    blank,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("evidence"), "{err}");
+        }
+        let after = mgr.get_note(old.id).await.unwrap().unwrap();
+        assert!(
+            after.superseded_by.is_none(),
+            "a refused revision must not supersede the note"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revision_of_an_unknown_note_or_an_inverted_window_is_refused() {
+        let (mgr, pid) = create_note_manager().await;
+        let missing = mgr
+            .revise_note(
+                Uuid::new_v4(),
+                make_create_request(pid, "x"),
+                "agent-2",
+                "proof",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("not found"), "{missing}");
+
+        let old = mgr
+            .create_note(make_create_request(pid, "y"), "agent-1")
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let inverted = mgr
+            .revise_note(
+                old.id,
+                make_create_request(pid, "z"),
+                "agent-2",
+                "proof",
+                Some(now),
+                Some(now - chrono::Duration::days(1)),
+            )
+            .await
+            .unwrap_err();
+        assert!(inverted.to_string().contains("valid_until"), "{inverted}");
+    }
+
+    #[tokio::test]
+    async fn a_revision_with_an_equal_validity_window_is_refused() {
+        let (mgr, pid) = create_note_manager().await;
+        let old = mgr
+            .create_note(make_create_request(pid, "y"), "agent-1")
+            .await
+            .unwrap();
+
+        // `valid_until == valid_from` is refused too: the window is closed as
+        // soon as it is not strictly positive.
+        let now = chrono::Utc::now();
+        let err = mgr
+            .revise_note(
+                old.id,
+                make_create_request(pid, "z"),
+                "agent-2",
+                "proof",
+                Some(now),
+                Some(now),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("valid_until"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_get_notes_needing_review() {
+        let (mgr, pid) = create_note_manager().await;
+
+        // Create a normal active note
+        let req1 = make_create_request(pid, "Active note");
+        mgr.create_note(req1, "agent-1").await.unwrap();
+
+        // Create a note and then mark it as needing review
+        let req2 = make_create_request(pid, "Stale note");
+        let note2 = mgr.create_note(req2, "agent-1").await.unwrap();
+        mgr.update_note(
+            note2.id,
+            UpdateNoteRequest {
+                status: Some(NoteStatus::NeedsReview),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Create another note and mark it as stale
+        let req3 = make_create_request(pid, "Also stale");
+        let note3 = mgr.create_note(req3, "agent-1").await.unwrap();
+        mgr.update_note(
+            note3.id,
+            UpdateNoteRequest {
+                status: Some(NoteStatus::Stale),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let needing_review = mgr.get_notes_needing_review(Some(pid), None).await.unwrap();
+
+        assert_eq!(needing_review.len(), 2);
+        for n in &needing_review {
+            assert!(
+                n.status == NoteStatus::NeedsReview || n.status == NoteStatus::Stale,
+                "Expected needs_review or stale, got {:?}",
+                n.status
+            );
+        }
+    }
+
+    // ====================================================================
+    // Search
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_search_notes() {
+        let (mgr, pid) = create_note_manager().await;
+
+        let req1 = make_create_request(pid, "Use async/await for all IO operations");
+        mgr.create_note(req1, "agent-1").await.unwrap();
+
+        let req2 = make_create_request(pid, "Prefer iterators over manual loops");
+        mgr.create_note(req2, "agent-1").await.unwrap();
+
+        let filters = NoteFilters::default();
+        let hits = mgr.search_notes("async", &filters).await.unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].note.content.contains("async"));
+        assert!(hits[0].score > 0.0);
+    }
+
+    // ====================================================================
+    // Context
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_context_notes() {
+        let (mgr, pid) = create_note_manager().await;
+
+        // Create a note and link it to a file
+        let req = make_create_request(pid, "Important context about main.rs");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        let link = LinkNoteRequest {
+            entity_type: EntityType::File,
+            entity_id: "src/main.rs".to_string(),
+        };
+        mgr.link_note_to_entity(note.id, &link).await.unwrap();
+
+        let ctx = mgr
+            .get_context_notes(&EntityType::File, "src/main.rs", 3, 0.0)
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.direct_notes.len(), 1);
+        assert_eq!(ctx.direct_notes[0].id, note.id);
+        // Propagated notes may be empty in the mock (no graph traversal)
+        assert_eq!(
+            ctx.total_count,
+            ctx.direct_notes.len() + ctx.propagated_notes.len()
+        );
+    }
+
+    // ====================================================================
+    // Global notes (no project_id)
+    // ====================================================================
+
+    fn make_global_request(content: &str) -> CreateNoteRequest {
+        CreateNoteRequest {
+            sharing_consent: None,
+            project_id: None,
+            note_type: NoteType::Guideline,
+            content: content.to_string(),
+            importance: Some(NoteImportance::High),
+            scope: None,
+            tags: Some(vec!["global".to_string()]),
+            anchors: None,
+            assertion_rule: None,
+            run_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_global_note() {
+        let state = mock_app_state();
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        let req = make_global_request("Always use kebab-case for slugs");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        assert!(note.project_id.is_none());
+        assert_eq!(note.note_type, NoteType::Guideline);
+        assert_eq!(note.content, "Always use kebab-case for slugs");
+    }
+
+    #[tokio::test]
+    async fn test_list_notes_global_only() {
+        let state = mock_app_state();
+        let project = test_project();
+        state.neo4j.create_project(&project).await.unwrap();
+
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        // Create a project note and a global note
+        let project_req = make_create_request(project.id, "Project-specific note");
+        let global_req = make_global_request("Global team convention");
+        mgr.create_note(project_req, "agent-1").await.unwrap();
+        mgr.create_note(global_req, "agent-1").await.unwrap();
+
+        // List all notes — should return both
+        let all_filters = NoteFilters::default();
+        let (all_notes, all_total) = mgr.list_notes(None, None, &all_filters).await.unwrap();
+        assert_eq!(all_total, 2);
+        assert_eq!(all_notes.len(), 2);
+
+        // List global only — should return only the global one
+        let global_filters = NoteFilters {
+            global_only: Some(true),
+            ..Default::default()
+        };
+        let (global_notes, global_total) =
+            mgr.list_notes(None, None, &global_filters).await.unwrap();
+        assert_eq!(global_total, 1);
+        assert_eq!(global_notes.len(), 1);
+        assert!(global_notes[0].project_id.is_none());
+        assert_eq!(global_notes[0].content, "Global team convention");
+
+        // List project-specific — should return only the project one
+        let (project_notes, project_total) = mgr
+            .list_notes(Some(project.id), None, &all_filters)
+            .await
+            .unwrap();
+        assert_eq!(project_total, 1);
+        assert_eq!(project_notes.len(), 1);
+        assert_eq!(project_notes[0].project_id, Some(project.id));
+    }
+
+    // ====================================================================
+    // Embedding integration
+    // ====================================================================
+
+    /// Helper: build a NoteManager backed by mock stores **with** a MockEmbeddingProvider.
+    /// Returns (NoteManager, project_id, Arc<MockGraphStore>) so tests can inspect embeddings.
+    async fn create_note_manager_with_embeddings(
+    ) -> (NoteManager, Uuid, Arc<crate::neo4j::mock::MockGraphStore>) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let meili = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let project = test_project();
+        let project_id = project.id;
+        graph.create_project(&project).await.unwrap();
+
+        let provider = Arc::new(crate::embeddings::MockEmbeddingProvider::new(768));
+
+        let manager = NoteManager::new(graph.clone() as Arc<dyn crate::neo4j::GraphStore>, meili)
+            .with_embedding_provider(provider);
+
+        (manager, project_id, graph)
+    }
+
+    #[tokio::test]
+    async fn test_create_note_generates_embedding() {
+        let (mgr, pid, graph) = create_note_manager_with_embeddings().await;
+        let req = make_create_request(pid, "Always handle errors with Result");
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Verify embedding was stored in the graph
+        let embeddings = graph.note_embeddings.read().await;
+        let (embedding, model) = embeddings
+            .get(&note.id)
+            .expect("embedding should be stored");
+        assert_eq!(embedding.len(), 768);
+        assert_eq!(model, "mock-hash-embedding");
+    }
+
+    #[tokio::test]
+    async fn test_update_note_content_regenerates_embedding() {
+        let (mgr, pid, graph) = create_note_manager_with_embeddings().await;
+        let req = make_create_request(pid, "Original content for embedding");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Grab original embedding
+        let original_embedding = {
+            let embeddings = graph.note_embeddings.read().await;
+            embeddings.get(&note.id).unwrap().0.clone()
+        };
+
+        // Update content — should regenerate embedding
+        let update = UpdateNoteRequest {
+            content: Some("Completely different content for re-embedding".to_string()),
+            importance: None,
+            status: None,
+            tags: None,
+        };
+        mgr.update_note(note.id, update).await.unwrap();
+
+        // Verify embedding changed (different content → different hash → different vector)
+        let embeddings = graph.note_embeddings.read().await;
+        let (new_embedding, model) = embeddings.get(&note.id).unwrap();
+        assert_eq!(new_embedding.len(), 768);
+        assert_eq!(model, "mock-hash-embedding");
+        assert_ne!(
+            &original_embedding, new_embedding,
+            "embedding should change when content changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_note_without_content_keeps_embedding() {
+        let (mgr, pid, graph) = create_note_manager_with_embeddings().await;
+        let req = make_create_request(pid, "Stable content");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Grab original embedding
+        let original_embedding = {
+            let embeddings = graph.note_embeddings.read().await;
+            embeddings.get(&note.id).unwrap().0.clone()
+        };
+
+        // Update only importance — should NOT regenerate embedding
+        let update = UpdateNoteRequest {
+            content: None,
+            importance: Some(NoteImportance::Critical),
+            status: None,
+            tags: None,
+        };
+        mgr.update_note(note.id, update).await.unwrap();
+
+        // Verify embedding is unchanged
+        let embeddings = graph.note_embeddings.read().await;
+        let (same_embedding, _) = embeddings.get(&note.id).unwrap();
+        assert_eq!(
+            &original_embedding, same_embedding,
+            "embedding should not change when content is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_note_without_provider_no_embedding() {
+        // Use the standard helper (no embedding provider)
+        let (mgr, pid) = create_note_manager().await;
+        let req = make_create_request(pid, "No embedding expected");
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // NoteManager without embedding provider — note should still be created
+        let stored = mgr.get_note(note.id).await.unwrap();
+        assert!(stored.is_some());
+        // We can't directly check embeddings in the standard helper (no Arc<MockGraphStore> access),
+        // but the fact that create_note succeeds without a provider is the key assertion.
+    }
+
+    #[tokio::test]
+    async fn test_supersede_note_embeds_new_note() {
+        let (mgr, pid, graph) = create_note_manager_with_embeddings().await;
+        let old_req = make_create_request(pid, "Old guideline content");
+        let old_note = mgr.create_note(old_req, "agent-1").await.unwrap();
+
+        let new_req = make_create_request(pid, "New improved guideline content");
+        let new_note = mgr
+            .supersede_note(old_note.id, new_req, "agent-2")
+            .await
+            .unwrap();
+
+        // Both old and new notes should have embeddings
+        let embeddings = graph.note_embeddings.read().await;
+        assert!(
+            embeddings.contains_key(&old_note.id),
+            "old note should have embedding"
+        );
+        assert!(
+            embeddings.contains_key(&new_note.id),
+            "new note should have embedding"
+        );
+
+        // Embeddings should be different (different content)
+        let old_emb = &embeddings.get(&old_note.id).unwrap().0;
+        let new_emb = &embeddings.get(&new_note.id).unwrap().0;
+        assert_ne!(
+            old_emb, new_emb,
+            "different content should produce different embeddings"
+        );
+    }
+
+    // ====================================================================
+    // Backfill
+    // ====================================================================
+
+    /// Helper: create a NoteManager WITHOUT embedding provider, create notes,
+    /// then return a new NoteManager WITH embedding provider for backfill testing.
+    async fn create_notes_then_add_embeddings(
+        count: usize,
+    ) -> (
+        NoteManager,
+        Vec<Uuid>,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+    ) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let meili = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let project = test_project();
+        let project_id = project.id;
+        graph.create_project(&project).await.unwrap();
+
+        // Create notes WITHOUT embedding provider (simulates existing notes)
+        let mgr_no_embed = NoteManager::new(
+            graph.clone() as Arc<dyn crate::neo4j::GraphStore>,
+            meili.clone(),
+        );
+        let mut note_ids = Vec::new();
+        for i in 0..count {
+            let req = make_create_request(project_id, &format!("Backfill note {i}"));
+            let note = mgr_no_embed.create_note(req, "agent-1").await.unwrap();
+            note_ids.push(note.id);
+        }
+
+        // Verify no embeddings exist
+        let embeddings = graph.note_embeddings.read().await;
+        assert_eq!(
+            embeddings.len(),
+            0,
+            "no embeddings should exist before backfill"
+        );
+        drop(embeddings);
+
+        // Now create a NoteManager WITH embedding provider
+        let provider = Arc::new(crate::embeddings::MockEmbeddingProvider::new(768));
+        let mgr = NoteManager::new(graph.clone() as Arc<dyn crate::neo4j::GraphStore>, meili)
+            .with_embedding_provider(provider);
+
+        (mgr, note_ids, graph)
+    }
+
+    #[tokio::test]
+    async fn test_backfill_embeddings_all_notes() {
+        let (mgr, note_ids, graph) = create_notes_then_add_embeddings(10).await;
+
+        let progress = mgr.backfill_embeddings(50, None).await.unwrap();
+
+        assert_eq!(progress.total, 10);
+        assert_eq!(progress.processed, 10);
+        assert_eq!(progress.errors, 0);
+
+        // Verify all notes have embeddings
+        let embeddings = graph.note_embeddings.read().await;
+        for id in &note_ids {
+            assert!(
+                embeddings.contains_key(id),
+                "note {id} should have embedding"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backfill_is_idempotent() {
+        let (mgr, _note_ids, _graph) = create_notes_then_add_embeddings(5).await;
+
+        // First backfill
+        let p1 = mgr.backfill_embeddings(50, None).await.unwrap();
+        assert_eq!(p1.processed, 5);
+
+        // Second backfill — should do nothing
+        let p2 = mgr.backfill_embeddings(50, None).await.unwrap();
+        assert_eq!(p2.total, 0);
+        assert_eq!(p2.processed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_respects_batch_size() {
+        let (mgr, _note_ids, graph) = create_notes_then_add_embeddings(7).await;
+
+        // Backfill with batch size 3 — should still process all 7
+        let progress = mgr.backfill_embeddings(3, None).await.unwrap();
+
+        assert_eq!(progress.total, 7);
+        assert_eq!(progress.processed, 7);
+
+        let embeddings = graph.note_embeddings.read().await;
+        assert_eq!(embeddings.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_cancellation() {
+        let (mgr, _note_ids, graph) = create_notes_then_add_embeddings(10).await;
+
+        // Set cancel flag immediately
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let progress = mgr.backfill_embeddings(3, Some(&cancel)).await.unwrap();
+
+        // Should have processed 0 notes (cancelled before first batch)
+        assert_eq!(progress.processed, 0);
+        let embeddings = graph.note_embeddings.read().await;
+        assert_eq!(embeddings.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_without_provider_errors() {
+        let (mgr, _pid) = create_note_manager().await;
+        let result = mgr.backfill_embeddings(50, None).await;
+        assert!(
+            result.is_err(),
+            "backfill should fail without embedding provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_global_notes_still_work_with_project_notes() {
+        let state = mock_app_state();
+        let project = test_project();
+        state.neo4j.create_project(&project).await.unwrap();
+
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        // Create both types
+        let proj_note = mgr
+            .create_note(make_create_request(project.id, "Project rule"), "agent-1")
+            .await
+            .unwrap();
+        let global_note = mgr
+            .create_note(make_global_request("Global rule"), "agent-1")
+            .await
+            .unwrap();
+
+        // Both should be retrievable by ID
+        let fetched_proj = mgr.get_note(proj_note.id).await.unwrap().unwrap();
+        let fetched_global = mgr.get_note(global_note.id).await.unwrap().unwrap();
+
+        assert_eq!(fetched_proj.project_id, Some(project.id));
+        assert!(fetched_global.project_id.is_none());
+
+        // Both should be updatable
+        let update = UpdateNoteRequest {
+            content: Some("Updated global rule".to_string()),
+            importance: None,
+            status: None,
+            tags: None,
+        };
+        let updated = mgr
+            .update_note(global_note.id, update)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.content, "Updated global rule");
+        assert!(updated.project_id.is_none());
+    }
+
+    // ====================================================================
+    // Semantic (vector) search
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_semantic_search_notes_returns_similar_notes() {
+        let (mgr, pid, _graph) = create_note_manager_with_embeddings().await;
+
+        // Create several notes with different content
+        let req1 = make_create_request(pid, "Always handle errors with Result type in Rust");
+        let note1 = mgr.create_note(req1, "agent-1").await.unwrap();
+
+        let req2 = make_create_request(pid, "Error handling best practices and conventions");
+        let note2 = mgr.create_note(req2, "agent-1").await.unwrap();
+
+        let req3 = make_create_request(pid, "Database connection pooling and timeout settings");
+        let _note3 = mgr.create_note(req3, "agent-1").await.unwrap();
+
+        // Search for error-handling related notes
+        let results = mgr
+            .semantic_search_notes("how to handle errors", None, None, Some(10), None, None)
+            .await
+            .unwrap();
+
+        // Should return results (mock provider uses deterministic hash-based embeddings)
+        assert!(!results.is_empty(), "semantic search should return results");
+
+        // Each result should have a finite score (mock cosine similarity can be near-zero
+        // for random high-dimensional vectors, which is mathematically correct)
+        for hit in &results {
+            assert!(hit.score.is_finite(), "score should be finite");
+        }
+
+        // Verify the notes we created are in results
+        let result_ids: Vec<Uuid> = results.iter().map(|h| h.note.id).collect();
+        assert!(
+            result_ids.contains(&note1.id) || result_ids.contains(&note2.id),
+            "should find at least one of the error-handling notes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_semantic_search_notes_without_provider_falls_back() {
+        let (mgr, pid) = create_note_manager().await;
+
+        // Create a note
+        let req = make_create_request(pid, "Test fallback content");
+        mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Semantic search without provider should fall back to BM25 (no panic, no error)
+        let results = mgr
+            .semantic_search_notes("test", None, None, Some(10), None, None)
+            .await;
+
+        // Should not error — falls back gracefully to Meilisearch
+        assert!(results.is_ok(), "should fall back to BM25 without error");
+    }
+
+    #[tokio::test]
+    async fn test_semantic_search_notes_with_project_filter() {
+        let (mgr, pid, _graph) = create_note_manager_with_embeddings().await;
+
+        let req = make_create_request(pid, "Project-specific guideline");
+        mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Search with project filter
+        let results = mgr
+            .semantic_search_notes("guideline", Some(pid), None, Some(10), None, None)
+            .await
+            .unwrap();
+
+        // All results should belong to the project
+        for hit in &results {
+            assert_eq!(
+                hit.note.project_id,
+                Some(pid),
+                "all results should belong to the filtered project"
+            );
+        }
+    }
+
+    // ====================================================================
+    // Graph event emission tests
+    // ====================================================================
+
+    use crate::events::graph::{GraphEvent, GraphEventType, GraphLayer};
+    use std::sync::Mutex;
+
+    /// A test-only EventEmitter that captures both CRUD and Graph events.
+    struct RecordingEmitter {
+        crud_events: Mutex<Vec<crate::events::CrudEvent>>,
+        graph_events: Mutex<Vec<GraphEvent>>,
+    }
+
+    impl RecordingEmitter {
+        fn new() -> Self {
+            Self {
+                crud_events: Mutex::new(Vec::new()),
+                graph_events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn take_graph_events(&self) -> Vec<GraphEvent> {
+            std::mem::take(&mut *self.graph_events.lock().unwrap())
+        }
+    }
+
+    impl crate::events::EventEmitter for RecordingEmitter {
+        fn emit(&self, event: crate::events::CrudEvent) {
+            self.crud_events.lock().unwrap().push(event);
+        }
+
+        fn emit_graph(&self, event: GraphEvent) {
+            self.graph_events.lock().unwrap().push(event);
+        }
+    }
+
+    /// Helper: build a NoteManager with a RecordingEmitter to capture graph events.
+    /// Returns (NoteManager, project_id, Arc<RecordingEmitter>).
+    async fn create_note_manager_with_recorder() -> (NoteManager, Uuid, Arc<RecordingEmitter>) {
+        let state = mock_app_state();
+        let project = test_project();
+        let project_id = project.id;
+        state.neo4j.create_project(&project).await.unwrap();
+        let emitter = Arc::new(RecordingEmitter::new());
+        let manager = NoteManager::with_event_emitter(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            emitter.clone() as Arc<dyn crate::events::EventEmitter>,
+        );
+        (manager, project_id, emitter)
+    }
+
+    #[tokio::test]
+    async fn test_create_note_emits_graph_node_created() {
+        let (mgr, pid, recorder) = create_note_manager_with_recorder().await;
+        let req = make_create_request(pid, "Test graph event emission");
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        let events = recorder.take_graph_events();
+        assert!(
+            !events.is_empty(),
+            "create_note should emit at least one graph event"
+        );
+
+        let node_event = events
+            .iter()
+            .find(|e| e.event_type == GraphEventType::NodeCreated)
+            .expect("should have a NodeCreated event");
+
+        assert_eq!(node_event.kind, "graph");
+        assert_eq!(node_event.layer, GraphLayer::Knowledge);
+        assert_eq!(
+            node_event.node_id.as_deref(),
+            Some(note.id.to_string().as_str())
+        );
+        assert_eq!(node_event.project_id, pid.to_string());
+        assert_eq!(node_event.delta["note_type"], "guideline");
+        assert_eq!(node_event.delta["importance"], "high");
+        // The live node must look like the one a reload builds, or a note shows its
+        // identifier until the next full load renames it.
+        assert_eq!(node_event.delta["label"], note.graph_label());
+    }
+
+    #[tokio::test]
+    async fn test_delete_note_emits_graph_node_deleted() {
+        let (mgr, pid, recorder) = create_note_manager_with_recorder().await;
+        let req = make_create_request(pid, "Note to delete");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Clear events from creation
+        recorder.take_graph_events();
+
+        // Delete
+        mgr.delete_note(note.id).await.unwrap();
+
+        let events = recorder.take_graph_events();
+        let delete_event = events
+            .iter()
+            .find(|e| e.event_type == GraphEventType::NodeDeleted)
+            .expect("delete_note should emit NodeDeleted graph event");
+
+        assert_eq!(delete_event.layer, GraphLayer::Knowledge);
+        assert_eq!(
+            delete_event.node_id.as_deref(),
+            Some(note.id.to_string().as_str())
+        );
+        assert_eq!(delete_event.project_id, pid.to_string());
+        assert_eq!(delete_event.delta["node_type"], "note");
+        // A removal must not also be reported as an update: a client redraws on
+        // update and would keep the node on screen.
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.event_type == GraphEventType::NodeUpdated),
+            "a deletion must not emit NodeUpdated"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_link_note_emits_graph_edge_created() {
+        let (mgr, pid, recorder) = create_note_manager_with_recorder().await;
+        let req = make_create_request(pid, "Note to link");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Clear events from creation
+        recorder.take_graph_events();
+
+        // Link to a file
+        let link_req = LinkNoteRequest {
+            entity_type: EntityType::File,
+            entity_id: "src/main.rs".to_string(),
+        };
+        mgr.link_note_to_entity(note.id, &link_req).await.unwrap();
+
+        let events = recorder.take_graph_events();
+        let edge_event = events
+            .iter()
+            .find(|e| e.event_type == GraphEventType::EdgeCreated)
+            .expect("link_note should emit EdgeCreated graph event");
+
+        assert_eq!(edge_event.layer, GraphLayer::Knowledge);
+        assert_eq!(
+            edge_event.node_id.as_deref(),
+            Some(note.id.to_string().as_str())
+        );
+        assert_eq!(edge_event.target_id.as_deref(), Some("src/main.rs"));
+        assert_eq!(edge_event.edge_type.as_deref(), Some("LINKED_TO"));
+    }
+
+    #[tokio::test]
+    async fn test_unlink_note_emits_graph_edge_removed() {
+        let (mgr, pid, recorder) = create_note_manager_with_recorder().await;
+        let req = make_create_request(pid, "Note to unlink");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Link first, then clear events
+        let link_req = LinkNoteRequest {
+            entity_type: EntityType::File,
+            entity_id: "src/main.rs".to_string(),
+        };
+        mgr.link_note_to_entity(note.id, &link_req).await.unwrap();
+        recorder.take_graph_events();
+
+        // Unlink
+        mgr.unlink_note_from_entity(note.id, &EntityType::File, "src/main.rs")
+            .await
+            .unwrap();
+
+        let events = recorder.take_graph_events();
+        let edge_event = events
+            .iter()
+            .find(|e| e.event_type == GraphEventType::EdgeRemoved)
+            .expect("unlink_note should emit EdgeRemoved graph event");
+
+        assert_eq!(edge_event.layer, GraphLayer::Knowledge);
+        assert_eq!(
+            edge_event.node_id.as_deref(),
+            Some(note.id.to_string().as_str())
+        );
+        assert_eq!(edge_event.target_id.as_deref(), Some("src/main.rs"));
+        assert_eq!(edge_event.edge_type.as_deref(), Some("LINKED_TO"));
+    }
+
+    #[tokio::test]
+    async fn test_confirm_note_emits_graph_reinforcement() {
+        let (mgr, pid, recorder) = create_note_manager_with_recorder().await;
+        let req = make_create_request(pid, "Note to confirm");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Clear events from creation
+        recorder.take_graph_events();
+
+        // Confirm
+        mgr.confirm_note(note.id, "agent-1").await.unwrap();
+
+        let events = recorder.take_graph_events();
+        let reinforce_event = events
+            .iter()
+            .find(|e| e.event_type == GraphEventType::Reinforcement)
+            .expect("confirm_note should emit Reinforcement graph event");
+
+        assert_eq!(reinforce_event.layer, GraphLayer::Neural);
+        assert_eq!(
+            reinforce_event.node_id.as_deref(),
+            Some(note.id.to_string().as_str())
+        );
+        // energy_delta should be 0.3 (confirmation boost)
+        let delta = reinforce_event.delta["energy_delta"].as_f64().unwrap();
+        assert!(
+            (delta - 0.3).abs() < f64::EPSILON,
+            "energy delta should be 0.3, got {}",
+            delta
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_note_without_project_no_graph_event() {
+        let state = mock_app_state();
+        let emitter = Arc::new(RecordingEmitter::new());
+        let manager = NoteManager::with_event_emitter(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            emitter.clone() as Arc<dyn crate::events::EventEmitter>,
+        );
+
+        let req = CreateNoteRequest {
+            sharing_consent: None,
+            project_id: None, // No project
+            note_type: NoteType::Tip,
+            content: "Global tip without project".to_string(),
+            importance: Some(NoteImportance::Low),
+            scope: None,
+            tags: None,
+            anchors: None,
+            assertion_rule: None,
+            run_id: None,
+        };
+
+        let _note = manager.create_note(req, "agent-1").await.unwrap();
+
+        // Graph events require a project_id — no event should be emitted
+        let events = emitter.take_graph_events();
+        let node_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == GraphEventType::NodeCreated)
+            .collect();
+        assert!(
+            node_events.is_empty(),
+            "no graph NodeCreated event for notes without project_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_graph_event_emitter_disabled() {
+        // NoteManager without event emitter should not panic on graph events
+        let (mgr, pid) = create_note_manager().await;
+        let req = make_create_request(pid, "No emitter attached");
+
+        // Should not panic — emit_graph_event is a no-op
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+        assert!(!note.content.is_empty());
+
+        let link_req = LinkNoteRequest {
+            entity_type: EntityType::File,
+            entity_id: "src/test.rs".to_string(),
+        };
+        mgr.link_note_to_entity(note.id, &link_req).await.unwrap();
+        mgr.confirm_note(note.id, "agent-1").await.unwrap();
+        mgr.delete_note(note.id).await.unwrap();
+    }
+
+    // ====================================================================
+    // RFC auto-template & auto-start
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_rfc_auto_template_empty_content() {
+        let (mgr, pid) = create_note_manager().await;
+        let req = CreateNoteRequest {
+            sharing_consent: None,
+            project_id: Some(pid),
+            note_type: NoteType::Rfc,
+            content: "".to_string(),
+            importance: Some(NoteImportance::High),
+            scope: None,
+            tags: Some(vec!["test-rfc".to_string()]),
+            anchors: None,
+            assertion_rule: None,
+            run_id: None,
+        };
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Content should be auto-filled with the RFC template
+        assert!(note.content.contains("## Problem"));
+        assert!(note.content.contains("## Proposed Solution"));
+        assert!(note.content.contains("## Alternatives"));
+        assert!(note.content.contains("## Impact"));
+        assert!(note.content.contains("## Decision"));
+    }
+
+    #[tokio::test]
+    async fn test_rfc_preserves_existing_content() {
+        let (mgr, pid) = create_note_manager().await;
+        let custom_content = "# My Custom RFC\n\nThis RFC is about X.".to_string();
+        let req = CreateNoteRequest {
+            sharing_consent: None,
+            project_id: Some(pid),
+            note_type: NoteType::Rfc,
+            content: custom_content.clone(),
+            importance: Some(NoteImportance::High),
+            scope: None,
+            tags: None,
+            anchors: None,
+            assertion_rule: None,
+            run_id: None,
+        };
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Non-empty content should be preserved as-is
+        assert_eq!(note.content, custom_content);
+    }
+
+    #[tokio::test]
+    async fn test_rfc_auto_start_lifecycle_run() {
+        let state = mock_app_state();
+        let project = test_project();
+        let project_id = project.id;
+        state.neo4j.create_project(&project).await.unwrap();
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        // Seed an rfc-lifecycle protocol with a start state
+        let start_state_id = Uuid::new_v4();
+        let mut protocol =
+            crate::protocol::Protocol::new(Some(project_id), "rfc-lifecycle", start_state_id);
+        let protocol_id = protocol.id;
+        protocol.terminal_states = vec![]; // no terminal states needed for this test
+        state.neo4j.upsert_protocol(&protocol).await.unwrap();
+
+        // Create the start state
+        let start_state = crate::protocol::ProtocolState::start(protocol_id, "draft");
+        // Override the state ID to match entry_state
+        let mut start_state = start_state;
+        start_state.id = start_state_id;
+        state
+            .neo4j
+            .upsert_protocol_state(&start_state)
+            .await
+            .unwrap();
+
+        // Create an RFC note — should auto-start the run
+        let req = CreateNoteRequest {
+            sharing_consent: None,
+            project_id: Some(project_id),
+            note_type: NoteType::Rfc,
+            content: "".to_string(),
+            importance: Some(NoteImportance::High),
+            scope: None,
+            tags: None,
+            anchors: None,
+            assertion_rule: None,
+            run_id: None,
+        };
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Verify template was applied
+        assert!(note.content.contains("## Problem"));
+
+        // Verify rfc-run tag is present
+        let rfc_run_tag = note
+            .tags
+            .iter()
+            .find(|t| t.starts_with("rfc-run:"))
+            .expect("Expected rfc-run:<uuid> tag");
+
+        // Extract run_id from tag
+        let run_id_str = rfc_run_tag.strip_prefix("rfc-run:").unwrap();
+        let run_id: Uuid = run_id_str
+            .parse()
+            .expect("rfc-run tag should contain valid UUID");
+
+        // Verify the run exists and is in running state at the draft state
+        let run = state
+            .neo4j
+            .get_protocol_run(run_id)
+            .await
+            .unwrap()
+            .expect("Protocol run should exist");
+        assert_eq!(run.protocol_id, protocol_id);
+        assert_eq!(run.status, crate::protocol::RunStatus::Running);
+        assert_eq!(run.current_state, start_state_id);
+        assert_eq!(run.triggered_by, "rfc-note-creation");
+    }
+
+    #[tokio::test]
+    async fn test_rfc_no_protocol_still_creates_note() {
+        let (mgr, pid) = create_note_manager().await;
+        // No rfc-lifecycle protocol seeded — should still create the note successfully
+
+        let req = CreateNoteRequest {
+            sharing_consent: None,
+            project_id: Some(pid),
+            note_type: NoteType::Rfc,
+            content: "".to_string(),
+            importance: Some(NoteImportance::Medium),
+            scope: None,
+            tags: None,
+            anchors: None,
+            assertion_rule: None,
+            run_id: None,
+        };
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Template should still be applied
+        assert!(note.content.contains("## Problem"));
+        // No rfc-run tag since no protocol exists
+        assert!(!note.tags.iter().any(|t| t.starts_with("rfc-run:")));
+    }
+
+    #[tokio::test]
+    async fn test_non_rfc_note_unaffected() {
+        let (mgr, pid) = create_note_manager().await;
+        let req = CreateNoteRequest {
+            sharing_consent: None,
+            project_id: Some(pid),
+            note_type: NoteType::Guideline,
+            content: "".to_string(),
+            importance: Some(NoteImportance::Medium),
+            scope: None,
+            tags: None,
+            anchors: None,
+            assertion_rule: None,
+            run_id: None,
+        };
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Non-RFC notes should NOT get the template
+        assert!(!note.content.contains("## Problem"));
+        // And no rfc-run tag
+        assert!(!note.tags.iter().any(|t| t.starts_with("rfc-run:")));
+    }
+
+    // ====================================================================
+    // T0b: project boundary of note propagation
+    // ====================================================================
+
+    const BOUNDARY_FILE: &str = "/src/boundary.rs";
+
+    /// Create an active note of the given project (None = global) and anchor it
+    /// on `BOUNDARY_FILE`. Returns its id.
+    async fn anchored_note(
+        mgr: &NoteManager,
+        project_id: Option<Uuid>,
+        importance: NoteImportance,
+        content: &str,
+    ) -> Uuid {
+        let mut req = make_create_request(Uuid::nil(), content);
+        req.project_id = project_id;
+        req.importance = Some(importance);
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+        mgr.link_note_to_entity(
+            note.id,
+            &LinkNoteRequest {
+                entity_type: EntityType::File,
+                entity_id: BOUNDARY_FILE.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        note.id
+    }
+
+    #[tokio::test]
+    async fn test_propagation_foreign_neighbours_do_not_evict_local_notes() {
+        let (mgr, local_pid) = create_note_manager().await;
+        let foreign_pid = Uuid::new_v4();
+
+        // 25 higher-scoring notes of another project, 5 weaker local ones.
+        for i in 0..25 {
+            anchored_note(
+                &mgr,
+                Some(foreign_pid),
+                NoteImportance::Critical,
+                &format!("foreign {i}"),
+            )
+            .await;
+        }
+        let mut local_ids = Vec::new();
+        for i in 0..5 {
+            local_ids.push(
+                anchored_note(
+                    &mgr,
+                    Some(local_pid),
+                    NoteImportance::Low,
+                    &format!("local {i}"),
+                )
+                .await,
+            );
+        }
+
+        let got = mgr
+            .get_propagated_notes(
+                &EntityType::File,
+                BOUNDARY_FILE,
+                2,
+                0.0,
+                None,
+                Some(local_pid),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut got_ids: Vec<Uuid> = got.iter().map(|p| p.note.id).collect();
+        got_ids.sort();
+        local_ids.sort();
+        assert_eq!(
+            got_ids, local_ids,
+            "the 5 local notes must survive the top-20 cut"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_propagation_global_notes_are_included_by_explicit_rule() {
+        let (mgr, local_pid) = create_note_manager().await;
+        let foreign_pid = Uuid::new_v4();
+
+        let local = anchored_note(&mgr, Some(local_pid), NoteImportance::Low, "local").await;
+        let global = anchored_note(&mgr, None, NoteImportance::Low, "global guideline").await;
+        let foreign =
+            anchored_note(&mgr, Some(foreign_pid), NoteImportance::Critical, "foreign").await;
+
+        let got = mgr
+            .get_propagated_notes(
+                &EntityType::File,
+                BOUNDARY_FILE,
+                2,
+                0.0,
+                None,
+                Some(local_pid),
+                false,
+            )
+            .await
+            .unwrap();
+        let ids: Vec<Uuid> = got.iter().map(|p| p.note.id).collect();
+        assert!(ids.contains(&local));
+        assert!(
+            ids.contains(&global),
+            "global notes are admitted by PropagationScope::Project"
+        );
+        assert!(!ids.contains(&foreign));
+    }
+
+    #[tokio::test]
+    async fn test_propagation_knowledge_is_scoped_to_the_given_project() {
+        let (mgr, local_pid) = create_note_manager().await;
+        let foreign_pid = Uuid::new_v4();
+        for i in 0..25 {
+            anchored_note(
+                &mgr,
+                Some(foreign_pid),
+                NoteImportance::Critical,
+                &format!("foreign {i}"),
+            )
+            .await;
+        }
+        let local = anchored_note(&mgr, Some(local_pid), NoteImportance::Low, "local").await;
+
+        let k = mgr
+            .get_propagated_knowledge(
+                &EntityType::File,
+                BOUNDARY_FILE,
+                2,
+                0.0,
+                None,
+                Some(local_pid),
+            )
+            .await
+            .unwrap();
+        let ids: Vec<Uuid> = k.notes.iter().map(|p| p.note.id).collect();
+        assert_eq!(ids, vec![local]);
+    }
+
+    #[tokio::test]
+    async fn test_chat_path_scope_is_the_session_project() {
+        // knowledge_injection calls the store with (session project, force=false).
+        let (mgr, session_pid) = create_note_manager().await;
+        let foreign_pid = Uuid::new_v4();
+        for i in 0..25 {
+            anchored_note(
+                &mgr,
+                Some(foreign_pid),
+                NoteImportance::Critical,
+                &format!("f{i}"),
+            )
+            .await;
+        }
+        let local = anchored_note(&mgr, Some(session_pid), NoteImportance::Low, "l").await;
+        let got = mgr
+            .get_propagated_notes(
+                &EntityType::File,
+                BOUNDARY_FILE,
+                2,
+                0.15,
+                None,
+                Some(session_pid),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got.iter().map(|p| p.note.id).collect::<Vec<_>>(),
+            vec![local]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_source_project_cannot_widen_scope() {
+        let (mgr, _pid) = create_note_manager().await;
+        let (owner, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let pid = owner.to_string();
+
+        // Owner resolvable (Project entity): a mismatching client value is rejected.
+        assert!(mgr
+            .resolve_propagation_scope(&EntityType::Project, &pid, Some(other))
+            .await
+            .is_err());
+        // Matching or absent client value: the owner is the scope.
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::Project, &pid, Some(owner))
+                .await,
+            Ok(Some(owner))
+        );
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::Project, &pid, None)
+                .await,
+            Ok(Some(owner))
+        );
+        // Owner unresolvable: the client value narrows to one project; none = unscoped.
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::Function, "f", Some(other))
+                .await,
+            Ok(Some(other))
+        );
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::Function, "f", None)
+                .await,
+            Ok(None)
+        );
+    }
+
+    fn file_in(path: &str, project: Option<Uuid>) -> crate::neo4j::models::FileNode {
+        crate::neo4j::models::FileNode {
+            path: path.into(),
+            language: "rust".into(),
+            hash: "h".into(),
+            last_parsed: chrono::Utc::now(),
+            project_id: project,
+        }
+    }
+
+    #[test]
+    fn test_normalize_relative_path() {
+        assert_eq!(
+            normalize_relative_path("src/a.rs").as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            normalize_relative_path("./src//a.rs").as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            normalize_relative_path("src\\a.rs").as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(normalize_relative_path("../src/a.rs"), None);
+        assert_eq!(normalize_relative_path("src/../a.rs"), None);
+        assert_eq!(normalize_relative_path("./"), None);
+    }
+
+    #[tokio::test]
+    async fn test_relative_path_resolves_to_its_single_project() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
+        graph
+            .upsert_file(&file_in("/ws/p/src/a.rs", Some(p)))
+            .await
+            .unwrap();
+        graph
+            .upsert_file(&file_in("/ws/q/src/b.rs", Some(q)))
+            .await
+            .unwrap();
+        // Not a path-component suffix of /ws/p/src/a.rs.
+        graph
+            .upsert_file(&file_in("/ws/q/xsrc/a.rs", Some(q)))
+            .await
+            .unwrap();
+        let state = crate::test_helpers::mock_app_state_with_graph(graph);
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        for path in ["src/a.rs", "./src/a.rs", "src//a.rs"] {
+            assert_eq!(
+                mgr.resolve_entity_project(&EntityType::File, path).await,
+                Some(p),
+                "{path}"
+            );
+            assert_eq!(
+                mgr.resolve_propagation_scope(&EntityType::File, path, None)
+                    .await,
+                Ok(Some(p)),
+                "{path}"
+            );
+        }
+        // A client value for another project cannot override the resolved owner.
+        assert!(mgr
+            .resolve_propagation_scope(&EntityType::File, "src/a.rs", Some(q))
+            .await
+            .is_err());
+        // Unknown or non-normalizable paths stay unresolved (legacy rule).
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::File, "nope/c.rs", None)
+                .await,
+            Ok(None)
+        );
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::File, "../src/a.rs", None)
+                .await,
+            Ok(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ambiguous_relative_path_never_widens_the_scope() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (p, q, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        graph
+            .upsert_file(&file_in("/ws/p/src/lib.rs", Some(p)))
+            .await
+            .unwrap();
+        graph
+            .upsert_file(&file_in("/ws/q/src/lib.rs", Some(q)))
+            .await
+            .unwrap();
+        let state = crate::test_helpers::mock_app_state_with_graph(graph);
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        assert_eq!(
+            mgr.resolve_entity_project(&EntityType::File, "src/lib.rs")
+                .await,
+            None
+        );
+        // No client value: refused, NOT unscoped.
+        assert!(mgr
+            .resolve_propagation_scope(&EntityType::File, "src/lib.rs", None)
+            .await
+            .is_err());
+        // A client value outside the candidates: refused.
+        assert!(mgr
+            .resolve_propagation_scope(&EntityType::File, "src/lib.rs", Some(other))
+            .await
+            .is_err());
+        // A candidate can only narrow.
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::File, "src/lib.rs", Some(q))
+                .await,
+            Ok(Some(q))
+        );
+        // The absolute path stays unambiguous.
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::File, "/ws/p/src/lib.rs", None)
+                .await,
+            Ok(Some(p))
+        );
+    }
+
+    #[test]
+    fn test_owner_of_matches() {
+        let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(owner_of_matches(&[]), EntityOwner::Unknown);
+        assert_eq!(
+            owner_of_matches(&[("/a".into(), Some(p)), ("/b".into(), Some(p))]),
+            EntityOwner::Project(p)
+        );
+        assert!(matches!(
+            owner_of_matches(&[("/a".into(), Some(p)), ("/b".into(), Some(q))]),
+            EntityOwner::Ambiguous(c) if c.len() == 2
+        ));
+        assert!(matches!(
+            owner_of_matches(&[("/a".into(), Some(p)), ("/b".into(), None)]),
+            EntityOwner::Ambiguous(_)
+        ));
+        assert_eq!(
+            owner_of_matches(&[("/a".into(), None)]),
+            EntityOwner::Unknown
+        );
+    }
+}

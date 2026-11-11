@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Project Orchestrator</title>
+  <style>
+    /* Tokens mirror the app (frontend/src/index.css): one accent, quiet surfaces, short motion. */
+    :root {
+      --surface-base: #0f1117;
+      --primary: #6366f1;
+      --primary-light: #818cf8;
+      --primary-muted: rgba(99, 102, 241, 0.15);
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --error: #ef4444;
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --text-tertiary: #64748b;
+      --text-muted: #475569;
+      --ease: cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; }
+    body {
+      position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: var(--surface-base);
+      font-family: 'Inter Variable', Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      color: var(--text-primary); overflow: hidden;
+      -webkit-user-select: none; user-select: none; -webkit-font-smoothing: antialiased;
+    }
+    body, .stage { -webkit-app-region: drag; app-region: drag; }
+
+    /* Transparent overlay, only for the small effects (particles where a row settles). The
+       background stays a flat colour. */
+    #fx { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
+
+    .stage { position: relative; display: flex; flex-direction: column; align-items: center; width: 100%; padding: 0 48px;
+      transition: opacity .3s var(--ease); }
+    body.leaving .stage { opacity: 0; }
+
+    /* The logo's place; the shader draws it. Without WebGL the plain image shows instead. */
+    .logo-container { width: 72px; height: 72px; margin-bottom: 22px; }
+    .logo-icon { width: 72px; height: 72px; display: block; opacity: 0; animation: fade .6s var(--ease) .1s forwards; }
+
+    .title { font-size: 15px; font-weight: 500; letter-spacing: -0.01em; opacity: 0; animation: rise .5s var(--ease) .25s forwards; }
+    .subtitle { font-size: 12px; color: var(--text-tertiary); margin: 4px 0 26px; opacity: 0; animation: rise .5s var(--ease) .35s forwards; }
+
+    /* Progress: one hairline. */
+    .progress { width: 160px; height: 1px; background: rgba(255,255,255,.08); margin: -10px 0 22px; opacity: 0; animation: fade .4s .5s forwards; }
+    .progress .fill { height: 100%; width: 6%; background: var(--primary-light); transition: width .5s var(--ease); }
+
+    .checklist { width: 240px; display: flex; flex-direction: column; gap: 1px; }
+    /* The icon is centred on the FIRST LINE of the label (--check-line), not on the whole row: a
+       row that gains a sub-text used to centre its icon between the two lines (14.8 px off the
+       title on a three-line row). With one line the row is the same height as before. */
+    .check-item { --check-line: 16px; display: flex; align-items: flex-start; gap: 12px; padding: 5px 0; min-height: 26px;
+      opacity: 0; transform: translateY(4px); animation: rise .45s var(--ease) forwards; }
+    .check-item:nth-child(1){animation-delay:.45s} .check-item:nth-child(2){animation-delay:.5s}
+    .check-item:nth-child(3){animation-delay:.55s} .check-item:nth-child(4){animation-delay:.6s}
+    .check-item:nth-child(5){animation-delay:.65s} .check-item:nth-child(6){animation-delay:.7s}
+    .check-item:nth-child(7){animation-delay:.75s}
+    .check-item.hidden { display: none; }
+    .check-item.skipped { opacity: .5 !important; }
+
+    .check-icon { width: 14px; height: var(--check-line); flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+    .check-icon svg { width: 14px; height: 14px; }
+    .check-icon svg circle { display: none; }
+    .check-icon svg path { stroke-dasharray: 24; stroke-dashoffset: 24; animation: draw .38s cubic-bezier(.22,1,.36,1) .04s forwards; }
+    .check-icon svg { animation: settle .38s cubic-bezier(.22,1,.36,1); }
+    .check-icon .spinner { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid rgba(129,140,248,.25);
+      border-top-color: var(--primary-light); animation: spin .9s linear infinite; }
+
+    .check-content { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+    .check-label { font-size: 12.5px; line-height: var(--check-line); color: var(--text-muted); transition: color .2s ease; }
+    .check-item.success .check-label { color: var(--text-secondary); }
+    .check-item.error .check-label { color: var(--error); }
+    .check-item.warning .check-label { color: var(--warning); }
+    .check-subtext { font-size: 11px; color: var(--text-muted); line-height: 1.3; }
+    .check-subtext.error-text { color: var(--error); opacity: .85; }
+
+    .check-action { font: inherit; font-size: 11px; color: var(--primary-light); cursor: pointer; padding: 2px 8px; border: none;
+      border-radius: 6px; background: var(--primary-muted); transition: background .15s ease; flex-shrink: 0; white-space: nowrap;
+      -webkit-app-region: no-drag; app-region: no-drag; }
+    .check-action:hover { background: rgba(99,102,241,.25); }
+
+    .footer { margin-top: 38px; display: flex; flex-direction: column; align-items: center; gap: 14px; text-align: center; width: 100%;
+      opacity: 0; animation: fade .5s var(--ease) .9s forwards; }
+    .status-text { font-size: 12px; color: var(--text-tertiary); min-height: 16px; transition: opacity .15s ease; }
+    .status-text.swap { opacity: 0; }
+    .btn-continue { display: none; padding: 6px 16px; font: inherit; font-size: 12px; font-weight: 500; color: var(--text-primary);
+      background: var(--primary); border: none; border-radius: 6px; cursor: pointer; transition: background .15s ease;
+      -webkit-app-region: no-drag; app-region: no-drag; }
+    .btn-continue:hover { background: #4f46e5; }
+    .btn-continue.visible { display: inline-block; }
+    .branding { font-size: 10px; color: var(--text-muted); margin-top: 10px; display: flex; flex-direction: column; gap: 3px; align-items: center; }
+    .branding .version { font-size: 10px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; opacity: 0; transition: opacity .4s ease; }
+    .branding .version.shown { opacity: 1; }
+
+    @keyframes fade { to { opacity: 1; } }
+    @keyframes rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes draw { to { stroke-dashoffset: 0; } }
+    @keyframes settle { 0% { transform: scale(.55); opacity: 0; } 60% { transform: scale(1.18); opacity: 1; } 100% { transform: scale(1); } }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="fx" aria-hidden="true"></canvas>
+
+  <div class="stage">
+    <div class="logo-container">
+      <img class="logo-icon" src="data:image/png;base64,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" alt="Project Orchestrator" />
+    </div>
+    <div class="title">Project Orchestrator</div>
+    <div class="subtitle">AI agent orchestrator</div>
+
+    <div class="progress"><div class="fill" id="progress-fill"></div></div>
+
+    <div class="checklist">
+      <div class="check-item" id="check-config">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">Configuration</span></div>
+      </div>
+      <div class="check-item" id="check-claude">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">Claude Code CLI</span></div>
+      </div>
+      <div class="check-item" id="check-docker">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">Docker Desktop</span></div>
+      </div>
+      <div class="check-item" id="check-neo4j">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">Neo4j</span></div>
+      </div>
+      <div class="check-item" id="check-meilisearch">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">Meilisearch</span></div>
+      </div>
+      <div class="check-item" id="check-nats">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">NATS</span></div>
+      </div>
+      <div class="check-item" id="check-backend">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">Backend server</span></div>
+      </div>
+    </div>
+
+    <div class="footer">
+      <div class="status-text" id="status">Checking dependencies...</div>
+      <button class="btn-continue" id="btn-continue" onclick="continueAnyway()">Continue anyway</button>
+      <div class="branding">Freedom From Scratch<span class="version" id="version"></span></div>
+    </div>
+  </div>
+
+  <script>
+    // ========================================================================
+    // Small effects only. The window background is a flat colour; this transparent WebGL overlay
+    // draws just the transition where a row settles: a thin ring and a burst of particles that
+    // leave the tick (green: ok, red: error, amber: warning). Without WebGL there is simply no
+    // burst; the tick still draws itself in CSS.
+    // ========================================================================
+    (function () {
+      const canvas = document.getElementById('fx');
+      const gl = canvas.getContext('webgl', { antialias: false, alpha: true, premultipliedAlpha: true, powerPreference: 'low-power' });
+      if (!gl) return;
+
+      const VS = 'attribute vec2 p; void main(){ gl_Position = vec4(p, 0., 1.); }';
+      const FS = `
+        precision highp float;
+        uniform vec2  u_res;
+        uniform float u_time, u_dpr;
+        uniform vec4  u_burst[4];      // x, y (device px, from top-left), start time, kind (0 ok, 1 error, 2 warning)
+
+        float hash(float n){ return fract(sin(n * 127.1) * 43758.5453); }
+
+        void main(){
+          vec2 frag = vec2(gl_FragCoord.x, u_res.y - gl_FragCoord.y);
+          vec3 sum = vec3(0.);
+          float alpha = 0.;
+          for (int i = 0; i < 4; i++) {
+            vec4 b = u_burst[i];
+            float age = u_time - b.z;
+            if (b.z <= 0. || age < 0. || age > 1.0) continue;
+            vec2 p = frag - b.xy;
+            float r = length(p);
+            if (r > 46. * u_dpr) continue;
+            float k = age / 1.0;
+            float out_ = 1. - pow(1. - k, 3.);                 // ease-out
+            vec3 c = b.w < .5 ? vec3(.133, .773, .369)          // --success
+                   : (b.w < 1.5 ? vec3(.937, .267, .267)        // --error
+                                : vec3(.961, .620, .043));      // --warning
+            float a = 0.;
+            // Thin ring
+            float R = (3. + 15. * out_) * u_dpr;
+            a += exp(-pow((r - R) / (.8 * u_dpr), 2.)) * (1. - k) * .55;
+            // Particles: a dozen specks fly out along their own direction and fade
+            for (int j = 0; j < 14; j++) {
+              float fj = float(j) + b.z * 7.;
+              float ang = hash(fj * 1.7) * 6.2831853;
+              float spd = 10. + hash(fj * 3.1) * 24.;
+              vec2 pos = vec2(cos(ang), sin(ang)) * spd * out_ * u_dpr;
+              pos.y += 6. * k * k * u_dpr;                     // a little weight
+              float size = (1.9 - 1.3 * k) * u_dpr;
+              float d = length(p - pos);
+              float tw = .65 + .35 * sin(u_time * 30. + fj * 5.);
+              a += smoothstep(size, size * .35, d) * (1. - k) * tw;
+            }
+            a = clamp(a, 0., 1.);
+            sum += c * a;
+            alpha = max(alpha, a);
+          }
+          gl_FragColor = vec4(sum, alpha);                      // premultiplied
+        }`;
+
+      function compile(type, src) {
+        const sh = gl.createShader(type); gl.shaderSource(sh, src); gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) { console.warn(gl.getShaderInfoLog(sh)); return null; }
+        return sh;
+      }
+      const vs = compile(gl.VERTEX_SHADER, VS), fs = compile(gl.FRAGMENT_SHADER, FS);
+      if (!vs || !fs) return;
+      const prog = gl.createProgram();
+      gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { console.warn(gl.getProgramInfoLog(prog)); return; }
+      gl.useProgram(prog);
+
+      const buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      const loc = gl.getAttribLocation(prog, 'p');
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+      const uRes = gl.getUniformLocation(prog, 'u_res'), uTime = gl.getUniformLocation(prog, 'u_time'),
+            uDpr = gl.getUniformLocation(prog, 'u_dpr'), uBurst = gl.getUniformLocation(prog, 'u_burst');
+
+      const t0 = performance.now();
+      const bursts = new Float32Array(16);
+      let nextBurst = 0, dpr = 1, running = false;
+
+      function resize() {
+        dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
+        if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; gl.viewport(0, 0, w, h); }
+      }
+      window.addEventListener('resize', resize);
+
+      // Frames are drawn only while a burst is alive: an idle splash costs nothing.
+      function frame(now) {
+        resize();
+        const time = (now - t0) / 1000;
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.uniform2f(uRes, canvas.width, canvas.height);
+        gl.uniform1f(uTime, time);
+        gl.uniform1f(uDpr, dpr);
+        gl.uniform4fv(uBurst, bursts);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        const alive = [0, 1, 2, 3].some(i => bursts[i * 4 + 2] > 0 && time - bursts[i * 4 + 2] < 1.05);
+        if (alive) requestAnimationFrame(frame); else { running = false; gl.clear(gl.COLOR_BUFFER_BIT); }
+      }
+
+      window.__fxBurst = (element, state) => {
+        const r = element.getBoundingClientRect();
+        resize();
+        bursts.set([(r.left + r.width / 2) * dpr, (r.top + r.height / 2) * dpr,
+                    (performance.now() - t0) / 1000, state === 'error' ? 1 : state === 'warning' ? 2 : 0],
+                   (nextBurst++ % 4) * 4);
+        if (!running) { running = true; requestAnimationFrame(frame); }
+      };
+    })();
+  </script>
+  <script>
+    // ========================================================================
+    // macOS Tauri 2 click fix — block touch events that interfere with mouse
+    // clicks in webviews with decorations: false.
+    // See: https://github.com/tauri-apps/tauri/discussions/11957
+    // ========================================================================
+    if (/Mac|Macintosh/i.test(navigator.userAgent)) {
+      const originalAddEventListener = EventTarget.prototype.addEventListener;
+      EventTarget.prototype.addEventListener = function(type, listener, options) {
+        if (type.match(/^touch/)) return;
+        return originalAddEventListener.call(this, type, listener, options);
+      };
+    }
+
+    // ========================================================================
+    // SVG icons
+    // ========================================================================
+    const ICON_OK   = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#22c55e" opacity="0.15"/><path d="M5 8l2 2 4-4" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    const ICON_FAIL = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#ef4444" opacity="0.15"/><path d="M6 6l4 4M10 6l-4 4" stroke="#ef4444" stroke-width="1.5" stroke-linecap="round"/></svg>';
+    const ICON_WARN = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#f59e0b" opacity="0.15"/><path d="M8 5v3M8 10h.01" stroke="#f59e0b" stroke-width="1.5" stroke-linecap="round"/></svg>';
+    const ICON_SKIP = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#6b7280" opacity="0.15"/><path d="M5 8h6" stroke="#6b7280" stroke-width="1.5" stroke-linecap="round"/></svg>';
+    const ICON_SPIN = '<div class="spinner"></div>';
+
+    // Download URLs per platform
+    const DOCKER_URLS = {
+      'macos': 'https://docs.docker.com/desktop/setup/install/mac-install/',
+      'linux': 'https://docs.docker.com/desktop/setup/install/linux/',
+      'windows': 'https://docs.docker.com/desktop/setup/install/windows-install/',
+    };
+
+    // Why a service is unreachable (from the probe_services command), by service id.
+    const probeHints = {};
+    let probeDone = Promise.resolve();
+    function hintFor(id, fallback) { return probeHints[id] || fallback; }
+
+    let platformOs = 'macos';
+    let globalStartTime = Date.now();
+
+    // A splash that is gone before its animations have played looks like a glitch, not a start.
+    // The entrance (logo, title, rows one after the other, footer) takes about 1.4 s; the last tick
+    // needs its stroke and its particles (about 0.9 s) to be seen before the exit begins. So the
+    // splash is never left sooner than MIN_SPLASH_MS after it opened, nor sooner than
+    // MIN_SETTLE_MS after the last row changed state. A user who asks to continue is not made to wait.
+    const MIN_SPLASH_MS = 1800;
+    const MIN_SETTLE_MS = 900;
+    const splashOpenedAt = Date.now();
+    let lastSettledAt = splashOpenedAt;
+    const reducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const GLOBAL_TIMEOUT = 120000; // 120s
+
+    // ========================================================================
+    // UI helpers
+    // ========================================================================
+
+    function setCheck(id, state, subtext, actionHtml) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const icon = el.querySelector('.check-icon');
+      const content = el.querySelector('.check-content');
+
+      // Update state class
+      const prevState = el.className.replace('check-item', '').trim();
+      el.className = 'check-item ' + state;
+      if (state !== prevState && ['success', 'error', 'warning', 'skipped'].includes(state)) {
+        lastSettledAt = Date.now();
+      }
+      if (state !== prevState && window.__fxBurst && ['success', 'error', 'warning'].includes(state)) {
+        window.__fxBurst(icon, state);
+      }
+
+      // Update icon
+      if (state === 'success') icon.innerHTML = ICON_OK;
+      else if (state === 'error') icon.innerHTML = ICON_FAIL;
+      else if (state === 'warning') icon.innerHTML = ICON_WARN;
+      else if (state === 'skipped') icon.innerHTML = ICON_SKIP;
+      else icon.innerHTML = ICON_SPIN; // pending / spinner
+
+      // Update subtext
+      let subtextEl = content.querySelector('.check-subtext');
+      if (subtext) {
+        if (!subtextEl) {
+          subtextEl = document.createElement('span');
+          subtextEl.className = 'check-subtext';
+          content.appendChild(subtextEl);
+        }
+        subtextEl.textContent = subtext;
+        subtextEl.className = 'check-subtext' + (state === 'error' ? ' error-text' : '');
+      } else if (subtextEl) {
+        subtextEl.remove();
+      }
+
+      // Remove old action if any
+      const oldAction = el.querySelector('.check-action');
+      if (oldAction) oldAction.remove();
+
+      if (actionHtml) {
+        el.insertAdjacentHTML('beforeend', actionHtml);
+      }
+      updateProgress();
+    }
+
+    function showItem(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.remove('hidden');
+    }
+
+    function hideItem(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.add('hidden');
+    }
+
+    function setStatus(text) {
+      const el = document.getElementById('status');
+      if (el.textContent === text) return;
+      el.classList.add('swap');
+      setTimeout(() => { el.textContent = text; el.classList.remove('swap'); }, 160);
+    }
+
+    // Progress = share of visible checks that reached a settled state.
+    function updateProgress() {
+      const items = [...document.querySelectorAll('.check-item')].filter(e => !e.classList.contains('hidden'));
+      if (!items.length) return;
+      const settled = items.filter(e => /\b(success|skipped|warning|error)\b/.test(e.className)).length;
+      const pct = Math.max(6, Math.round((settled / items.length) * 100));
+      document.getElementById('progress-fill').style.width = pct + '%';
+      if (settled === items.length) document.body.classList.add('done');
+    }
+
+    function openUrl(url) {
+      if (window.__TAURI__) {
+        window.__TAURI__.core.invoke('open_url', { url }).catch(err => {
+          console.error('open_url failed:', err);
+        });
+      }
+    }
+
+    // Every call the splash makes to Rust is reported to the app log (webview_log), once per change
+    // of outcome, so a stuck splash can be diagnosed from the terminal: release builds have no
+    // inspector, and the splash window has no console bridge.
+    const lastOutcome = {};
+    function report(level, message) {
+      try { window.__TAURI__.core.invoke('webview_log', { level, message: '[splash] ' + message }); } catch (_) {}
+    }
+    window.addEventListener('error', e => report('error', 'uncaught: ' + e.message + ' @' + e.lineno));
+    window.addEventListener('unhandledrejection', e => report('error', 'unhandled rejection: ' + e.reason));
+
+    async function invoke(cmd, args) {
+      if (!window.__TAURI__) throw new Error('Tauri not available');
+      const started = Date.now();
+      try {
+        const result = await window.__TAURI__.core.invoke(cmd, args || {});
+        const brief = JSON.stringify(result);
+        const outcome = 'ok ' + (brief || '').slice(0, 160);
+        if (cmd !== 'webview_log' && lastOutcome[cmd] !== outcome) {
+          lastOutcome[cmd] = outcome;
+          report('info', cmd + ' ' + JSON.stringify(args || {}) + ' -> ' + outcome + ' (' + (Date.now() - started) + 'ms)');
+        }
+        return result;
+      } catch (err) {
+        const outcome = 'ERR ' + String(err).slice(0, 160);
+        if (lastOutcome[cmd] !== outcome) {
+          lastOutcome[cmd] = outcome;
+          report('error', cmd + ' ' + JSON.stringify(args || {}) + ' -> ' + outcome);
+        }
+        throw err;
+      }
+    }
+
+    function isGlobalTimeout() {
+      return (Date.now() - globalStartTime) > GLOBAL_TIMEOUT;
+    }
+
+    // ========================================================================
+    // Docker install helpers
+    // ========================================================================
+
+    async function installDocker() {
+      setCheck('check-docker', '', 'Opening Docker Desktop download...');
+      setStatus('Please install Docker Desktop from the download page');
+
+      // Open the download page for the user's platform
+      const url = DOCKER_URLS[platformOs] || DOCKER_URLS['macos'];
+      openUrl(url);
+
+      // Update UI to show we're waiting for Docker
+      setCheck('check-docker', 'warning', 'Waiting for Docker to be installed...',
+        `<button class="check-action" onclick="openUrl('${url}')">Open page again</button>`);
+    }
+
+    // ========================================================================
+    // Main flow
+    // ========================================================================
+
+    async function runChecks() {
+      globalStartTime = Date.now();
+      setStatus('Checking dependencies...');
+
+      try {
+        // A hung backend call must never freeze the splash: give it a few seconds, then carry on.
+        const deps = await Promise.race([
+          invoke('check_dependencies'),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('check_dependencies timed out')), 8000)),
+        ]);
+        platformOs = deps.os === 'windows' ? 'windows' : deps.os === 'linux' ? 'linux' : 'macos';
+
+        // -- Configuration --
+        if (deps.configExists) {
+          setCheck('check-config', 'success');
+        } else {
+          setCheck('check-config', 'warning', 'Will be created by setup wizard');
+        }
+
+        // -- Claude Code CLI (informational — setup wizard handles blocking) --
+        if (deps.claudeCodeAvailable) {
+          setCheck('check-claude', 'success');
+        } else if (deps.claudeCodeOptional) {
+          // Another provider (or no config yet): Claude Code is optional.
+          setCheck('check-claude', 'skipped', 'Optional — only needed for the Claude Code provider');
+        } else {
+          setCheck('check-claude', 'warning', 'Not detected — install via setup wizard');
+        }
+
+        // -- Route based on infra_mode --
+        if (deps.infraMode === 'external') {
+          // External mode: skip Docker, but check service connectivity
+          setCheck('check-docker', 'skipped', 'External mode');
+          // Ask Rust why a service cannot be reached (refused, unreachable, macOS local-network
+          // permission...). It runs next to the health poll and only adds a reason to rows that fail.
+          probeDone = invoke('probe_services').then(results => {
+            for (const r of results || []) {
+              if (!r.ok && r.hint) probeHints['check-' + r.service] = r.hint;
+            }
+          }).catch(() => {});
+          setCheck('check-neo4j', '', 'Checking connectivity...');
+          setCheck('check-meilisearch', '', 'Checking connectivity...');
+          setCheck('check-nats', '', 'Checking connectivity...');
+          setStatus('Checking services...');
+          await pollBackendHealthWithServices();
+          return;
+        }
+
+        // -- First-time setup (no config yet) --
+        if (!deps.setupCompleted) {
+          // Backend runs in minimal mode (no DB), skip service checks
+          setCheck('check-docker', 'skipped', 'Setup pending');
+          setCheck('check-neo4j', 'skipped', 'Setup pending');
+          setCheck('check-meilisearch', 'skipped', 'Setup pending');
+          setCheck('check-nats', 'skipped', 'Setup pending');
+          setStatus('Starting backend (setup mode)...');
+          await pollBackendHealth();
+          return;
+        }
+
+        // -- Docker mode: check Docker status --
+        await handleDockerMode(deps);
+
+      } catch (err) {
+        console.error('check_dependencies failed:', err);
+        // Fallback: skip dep checks and just poll backend
+        setCheck('check-config', 'warning');
+        setCheck('check-claude', 'warning', 'Could not check');
+        setCheck('check-docker', 'warning', 'Could not check');
+        setCheck('check-neo4j', 'warning');
+        setCheck('check-meilisearch', 'warning');
+        setCheck('check-nats', 'warning');
+        setStatus('Starting backend...');
+        await pollBackendHealth();
+      }
+    }
+
+    // ========================================================================
+    // Docker mode handling
+    // ========================================================================
+
+    async function handleDockerMode(deps) {
+      const dockerStatus = deps.dockerStatus; // "running", "unresponsive", "installed", "not_installed"
+
+      if (dockerStatus === 'running') {
+        setCheck('check-docker', 'success');
+        await startServices(deps);
+
+      } else if (dockerStatus === 'unresponsive' && deps.dockerServicesReachable) {
+        // Docker's control socket does not answer, but Neo4j, Meilisearch and NATS do (each
+        // checked with its own protocol): Docker Desktop is running, only its API is stuck.
+        // The services are what the app needs, so go on exactly as in external mode, and say
+        // why Docker shows a warning. Asking the user to restart Docker would stop them.
+        setCheck('check-docker', 'warning', 'Docker Desktop is not answering its API, but your services are running');
+        setCheck('check-neo4j', '', 'Checking connectivity...');
+        setCheck('check-meilisearch', '', 'Checking connectivity...');
+        setCheck('check-nats', '', 'Checking connectivity...');
+        setStatus('Checking services...');
+        await pollBackendHealthWithServices();
+
+      } else if (dockerStatus === 'unresponsive') {
+        // Something holds Docker's socket and takes connections but never answers, and the
+        // services do not answer either: Docker Desktop is frozen (or its VM is still
+        // booting). "Open" cannot help a frozen one.
+        showDockerUnresponsive();
+        setCheck('check-neo4j', '', 'Waiting for Docker...');
+        setCheck('check-meilisearch', '', 'Waiting for Docker...');
+        setCheck('check-nats', '', 'Waiting for Docker...');
+        await pollDockerAvailability(deps);
+
+      } else if (dockerStatus === 'installed') {
+        // Docker Desktop is installed but daemon is not running
+        setCheck('check-docker', 'warning', 'Docker Desktop is not running',
+          `<button class="check-action" onclick="invoke('open_docker_desktop').catch(()=>{})">Open</button>`);
+        setCheck('check-neo4j', '', 'Waiting for Docker...');
+        setCheck('check-meilisearch', '', 'Waiting for Docker...');
+        setCheck('check-nats', '', 'Waiting for Docker...');
+        setStatus('Please start Docker Desktop');
+
+        // Poll until Docker daemon comes up
+        await pollDockerAvailability(deps);
+
+      } else {
+        // Docker not installed
+        setCheck('check-docker', 'error', 'Docker is required to run services',
+          `<button class="check-action" onclick="installDocker()">Install</button>`);
+        setCheck('check-neo4j', 'error', 'Requires Docker');
+        setCheck('check-meilisearch', 'error', 'Requires Docker');
+        setCheck('check-nats', 'error', 'Requires Docker');
+        setStatus('Docker is required');
+        document.getElementById('btn-continue').classList.add('visible');
+
+        // Still poll in case user installs Docker while splash is shown
+        await pollDockerInstall(deps);
+      }
+    }
+
+    // ========================================================================
+    // Poll for Docker daemon availability (installed but not running)
+    // ========================================================================
+
+    function showDockerUnresponsive() {
+      setCheck('check-docker', 'warning', 'Docker Desktop is not responding');
+      setStatus('Docker Desktop is not responding. If it has just started, wait; otherwise quit it (Cmd+Q, or Force Quit) and open it again.');
+    }
+
+    async function pollDockerAvailability(deps) {
+      while (!isGlobalTimeout()) {
+        await sleep(3000);
+        try {
+          const freshDeps = await invoke('check_dependencies');
+          if (freshDeps.dockerStatus === 'running') {
+            setCheck('check-docker', 'success');
+            // Use fresh deps for credentials (may have changed)
+            await startServices(freshDeps);
+            return;
+          } else if (freshDeps.dockerStatus === 'unresponsive') {
+            showDockerUnresponsive();
+          } else if (freshDeps.dockerStatus === 'installed') {
+            setCheck('check-docker', 'warning', 'Docker Desktop is not running',
+              `<button class="check-action" onclick="invoke('open_docker_desktop').catch(()=>{})">Open</button>`);
+            setStatus('Please start Docker Desktop');
+          }
+        } catch (_) { /* continue polling */ }
+      }
+
+      // Global timeout reached
+      setCheck('check-docker', 'error', 'Docker did not start in time');
+      setStatus('Timed out waiting for Docker');
+      document.getElementById('btn-continue').classList.add('visible');
+    }
+
+    // ========================================================================
+    // Poll for Docker installation (not installed)
+    // ========================================================================
+
+    async function pollDockerInstall(deps) {
+      while (!isGlobalTimeout()) {
+        await sleep(5000);
+        try {
+          const freshDeps = await invoke('check_dependencies');
+          if (freshDeps.dockerStatus === 'running') {
+            setCheck('check-docker', 'success');
+            await startServices(freshDeps);
+            return;
+          } else if (freshDeps.dockerStatus === 'installed' || freshDeps.dockerStatus === 'unresponsive') {
+            // User installed Docker but hasn't started it yet (or it is not answering)
+            setCheck('check-docker', 'warning', 'Docker Desktop is not running');
+            setStatus('Please start Docker Desktop');
+            await pollDockerAvailability(freshDeps);
+            return;
+          }
+        } catch (_) { /* continue polling */ }
+      }
+    }
+
+    // ========================================================================
+    // Start Docker services and poll their health
+    // ========================================================================
+
+    async function startServices(deps) {
+      setCheck('check-neo4j', '', 'Starting...');
+      setCheck('check-meilisearch', '', 'Starting...');
+      setCheck('check-nats', '', 'Starting...');
+      setStatus('Starting services...');
+
+      // Build config for start_docker_services
+      const config = {
+        neo4jPassword: deps.neo4jPassword || '',
+        meilisearchKey: deps.meilisearchKey || '',
+        natsEnabled: true,
+      };
+
+      try {
+        await invoke('start_docker_services', { config });
+      } catch (err) {
+        console.error('start_docker_services failed:', err);
+        setCheck('check-docker', 'error', 'Failed to start services: ' + err);
+        setStatus('Service startup failed');
+        document.getElementById('btn-continue').classList.add('visible');
+        // Still try polling health — services might have started partially
+      }
+
+      // Poll individual service health
+      await pollServicesHealth();
+    }
+
+    // ========================================================================
+    // Poll individual services health
+    // ========================================================================
+
+    async function pollServicesHealth() {
+      setStatus('Waiting for services...');
+      const serviceStartTime = Date.now();
+      const SERVICE_TIMEOUT = 60000; // 60s per-service warning
+
+      let neo4jReady = false;
+      let meiliReady = false;
+      let natsReady = false;
+
+      while (!isGlobalTimeout()) {
+        try {
+          const health = await invoke('check_services_health', { natsEnabled: true });
+
+          // -- Neo4j --
+          if (!neo4jReady) {
+            if (health.neo4j === 'healthy') {
+              setCheck('check-neo4j', 'success');
+              neo4jReady = true;
+            } else if (health.neo4j === 'starting' || health.neo4j === 'notrunning') {
+              const elapsed = Date.now() - serviceStartTime;
+              if (elapsed > SERVICE_TIMEOUT) {
+                setCheck('check-neo4j', 'warning', 'Taking longer than expected...');
+              } else {
+                setCheck('check-neo4j', '', 'Starting...');
+              }
+            } else if (health.neo4j === 'unhealthy') {
+              setCheck('check-neo4j', 'error', 'Unhealthy');
+            }
+          }
+
+          // -- Meilisearch --
+          if (!meiliReady) {
+            if (health.meilisearch === 'healthy') {
+              setCheck('check-meilisearch', 'success');
+              meiliReady = true;
+            } else if (health.meilisearch === 'starting' || health.meilisearch === 'notrunning') {
+              const elapsed = Date.now() - serviceStartTime;
+              if (elapsed > SERVICE_TIMEOUT) {
+                setCheck('check-meilisearch', 'warning', 'Taking longer than expected...');
+              } else {
+                setCheck('check-meilisearch', '', 'Starting...');
+              }
+            } else if (health.meilisearch === 'unhealthy') {
+              setCheck('check-meilisearch', 'error', 'Unhealthy');
+            }
+          }
+
+          // -- NATS --
+          if (!natsReady) {
+            if (health.nats === 'healthy') {
+              setCheck('check-nats', 'success');
+              natsReady = true;
+            } else if (health.nats === 'disabled') {
+              setCheck('check-nats', 'skipped', 'Disabled');
+              natsReady = true;
+            } else if (health.nats === 'starting' || health.nats === 'notrunning') {
+              setCheck('check-nats', '', 'Starting...');
+            } else if (health.nats === 'unhealthy') {
+              setCheck('check-nats', 'error', 'Unhealthy');
+            }
+          }
+
+          // All services ready?
+          if (neo4jReady && meiliReady && natsReady) {
+            setStatus('Services ready, starting backend...');
+            await pollBackendHealth();
+            return;
+          }
+
+        } catch (err) {
+          console.error('check_services_health error:', err);
+        }
+
+        await sleep(2000);
+      }
+
+      // Global timeout
+      setStatus('Services took too long to start');
+      document.getElementById('btn-continue').classList.add('visible');
+      // Still poll backend — it might work with partial services
+      await pollBackendHealth();
+    }
+
+    // ========================================================================
+    // Poll backend /health
+    // ========================================================================
+
+    async function pollBackendHealth() {
+      setCheck('check-backend', '', 'Starting...');
+      setStatus('Starting backend...');
+
+      const port = await resolveServerPort();
+
+      while (!isGlobalTimeout()) {
+        try {
+          const health = await invoke('check_health', { port });
+          if (health) {
+            setCheck('check-backend', 'success');
+            setStatus('Ready');
+
+            // Small delay for visual satisfaction
+            await sleep(500);
+            transitionToMain();
+            return;
+          }
+        } catch (_) { /* not ready yet */ }
+        await sleep(200);
+      }
+
+      // Global timeout
+      setCheck('check-backend', 'error', 'Failed to start within timeout');
+      setStatus('Backend did not start in time');
+      document.getElementById('btn-continue').classList.add('visible');
+    }
+
+    // External mode: poll /health and update service check-items from the response
+    async function pollBackendHealthWithServices() {
+      setCheck('check-backend', '', 'Starting...');
+
+      const port = await resolveServerPort();
+
+      while (!isGlobalTimeout()) {
+        try {
+          const health = await invoke('check_health', { port });
+          if (health) {
+            // Update service statuses from the enriched /health response
+            if (health.services) {
+              setCheck('check-neo4j',
+                health.services.neo4j === 'connected' ? 'success' : 'error',
+                health.services.neo4j === 'connected' ? 'Connected' : hintFor('check-neo4j', 'Unreachable'));
+              setCheck('check-meilisearch',
+                health.services.meilisearch === 'connected' ? 'success' : 'error',
+                health.services.meilisearch === 'connected' ? 'Connected' : hintFor('check-meilisearch', 'Unreachable'));
+              // NATS status from /health
+              if (health.services.nats === 'connected') {
+                setCheck('check-nats', 'success', 'Connected');
+              } else if (health.services.nats === 'disabled') {
+                setCheck('check-nats', 'skipped', 'Disabled');
+              } else if (health.services.nats === 'disconnected') {
+                setCheck('check-nats', 'error', hintFor('check-nats', 'Unreachable'));
+              } else {
+                setCheck('check-nats', 'skipped', 'Disabled');
+              }
+            } else {
+              // Fallback for old /health format (no services field)
+              setCheck('check-neo4j', 'skipped', 'Status unavailable');
+              setCheck('check-meilisearch', 'skipped', 'Status unavailable');
+              setCheck('check-nats', 'skipped', 'Status unavailable');
+            }
+
+            setCheck('check-backend', 'success');
+            const failed = health.services &&
+              ['neo4j', 'meilisearch', 'nats'].some(k => ['disconnected', 'unreachable'].includes(health.services[k]));
+            if (failed) {
+              // Something configured cannot be reached: say why before moving on, and leave time
+              // to read it (the main window opens either way, the app has its own error screens).
+              setStatus('Some services are unreachable');
+              await Promise.race([probeDone, sleep(3500)]);
+              const rows = { neo4j: 'check-neo4j', meilisearch: 'check-meilisearch', nats: 'check-nats' };
+              for (const [name, id] of Object.entries(rows)) {
+                if (probeHints[id] && ['disconnected', 'unreachable'].includes(health.services[name])) {
+                  setCheck(id, 'error', probeHints[id]);
+                }
+              }
+              await sleep(3000);
+            } else {
+              setStatus('Ready');
+              await sleep(500);
+            }
+            transitionToMain();
+            return;
+          }
+        } catch (_) { /* not ready yet */ }
+        await sleep(500);
+      }
+
+      // Global timeout
+      setCheck('check-backend', 'error', 'Failed to start within timeout');
+      setStatus('Backend did not start in time');
+      document.getElementById('btn-continue').classList.add('visible');
+    }
+
+    // ========================================================================
+    // Transition & utility
+    // ========================================================================
+
+    let leaving = false;
+    async function transitionToMain(options) {
+      if (leaving) return;
+      leaving = true;
+      document.getElementById('progress-fill').style.width = '100%';
+      if (!(options && options.immediate) && !reducedMotion) {
+        const now = Date.now();
+        const wait = Math.max(MIN_SPLASH_MS - (now - splashOpenedAt), MIN_SETTLE_MS - (now - lastSettledAt), 0);
+        if (wait > 0) {
+          report('info', 'holding the splash ' + wait + ' ms so its animations can play');
+          await sleep(wait);
+        }
+      }
+      document.body.classList.add('leaving');
+      await sleep(320);   // let the exit animation play before the window closes
+      // Signal the Rust backend thread to close the splash and show the main window.
+      // The Rust thread waits for this signal (SPLASH_READY flag) before calling
+      // show_main_window(). This makes the splash screen the single source of truth
+      // for when the transition should happen.
+      try {
+        await invoke('proceed_to_main');
+      } catch (err) {
+        console.error('proceed_to_main failed:', err);
+      }
+    }
+
+    // The backend thread publishes its port only after loading config.yaml.
+    // Until then get_server_port() returns 0, and probing localhost:0 can never
+    // succeed — wait for a real port instead of burning the whole timeout.
+    async function resolveServerPort() {
+      for (let i = 0; i < 150; i++) {            // up to ~30 s
+        try {
+          const p = await invoke('get_server_port');
+          if (p > 0) return p;
+        } catch (_) { /* Tauri not ready yet */ }
+        await sleep(200);
+      }
+      return 6600;
+    }
+
+    // "Continue anyway" used to only hide the button, leaving the splash stuck
+    // forever. Actually hand over to the main window.
+    function continueAnyway() {
+      setStatus('Opening app...');
+      document.getElementById('btn-continue').classList.remove('visible');
+      transitionToMain({ immediate: true });
+    }
+
+    function sleep(ms) {
+      return new Promise(r => setTimeout(r, ms));
+    }
+
+    // ========================================================================
+    // Start
+    // ========================================================================
+
+    if (window.__TAURI__) {
+      // The version of THIS build (tauri.conf.json, stamped by build-desktop.sh / the release workflow).
+      try {
+        window.__TAURI__.app.getVersion().then(v => {
+          const el = document.getElementById('version');
+          el.textContent = 'v' + v;
+          el.classList.add('shown');
+        }).catch(e => report('warn', 'getVersion failed: ' + e));
+      } catch (e) { report('warn', 'getVersion unavailable: ' + e); }
+      report('info', 'splash started, platform ' + navigator.userAgent.slice(0, 60));
+      runChecks();
+    } else {
+      window.addEventListener('DOMContentLoaded', () => {
+        setTimeout(() => {
+          if (window.__TAURI__) {
+            runChecks();
+          } else {
+            setStatus('Waiting for Tauri...');
+            const interval = setInterval(() => {
+              if (window.__TAURI__) {
+                clearInterval(interval);
+                runChecks();
+              }
+            }, 100);
+          }
+        }, 100);
+      });
+    }
+  </script>
+</body>
+</html>

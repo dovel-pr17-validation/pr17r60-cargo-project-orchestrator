@@ -1,0 +1,38 @@
+# cargo-nextest configuration (CI: `cargo nextest run --profile ci`).
+#
+# Why a per-test timeout: a test that waits on a condition that never comes held whole CI
+# jobs for one to two hours (October 2026: a Neo4j connection with nothing listening, and a
+# runner test whose global cancel flag was cleared by a sibling test). With nextest the hung
+# test is killed and NAMED after five minutes; the rest of the suite still runs.
+
+[profile.ci]
+# Report every failure, not just the first.
+fail-fast = false
+# "slow" after 60 s, killed after 5 periods (5 min). The slowest healthy tests (the engine
+# parity matrix, the agent e2e scenarios) finish well under that.
+slow-timeout = { period = "60s", terminate-after = 5 }
+# No retries: a flaky test must be seen and fixed, not hidden.
+retries = 0
+# Print the output of failing tests at the end of the run, where the log is read.
+failure-output = "immediate-final"
+
+# The parity matrix plays six engines back-to-back and starts a fleet of fake servers
+# (fake_codex, fake_mcp, fake_openai, the relay). Under nextest's default "one process per
+# test, all cores" it competes with every other test process for CPU; on a loaded runner its
+# subprocesses starve, the fake_codex watchdog (FAKE_CODEX_MAX_RUNTIME_MS = 60 s) kills the
+# fake before it emits its Result, and the column's own 90 s deadline then fires — a red on a
+# head that is fine (measured 01/11/2026 on integ/memoire-mobilisable: same head, Unit Tests
+# red, green on the next run). Reserve every core for it so it runs ALONE, which is exactly
+# the machine budget its design (its own runtime, its own fake servers) already assumes.
+# Listed before the broad override so this one wins for the matrix test whichever way nextest
+# merges matching overrides.
+[[profile.ci.overrides]]
+filter = 'test(the_same_scenario_on_both_engines_gives_the_parity_matrix)'
+threads-required = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# The engine parity matrix and the agent e2e scenarios start fake servers and play whole
+# turns on both engines: give them 10 minutes before they are killed.
+[[profile.ci.overrides]]
+filter = 'test(/engine_parity_tests|agent_e2e_tests/)'
+slow-timeout = { period = "60s", terminate-after = 10 }

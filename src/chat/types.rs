@@ -1,0 +1,4464 @@
+//! Chat types — request/response/event types for the chat system
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use crate::chat::provider::policy::SessionAccess;
+use crate::neo4j::models::ExecutionPlace;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// PermissionAnswerScope — how long a permission granted by the user lasts
+// ---------------------------------------------------------------------------
+
+/// How long an approval given to a permission request lasts (`scope` of the
+/// `permission_response` frame, of `POST .../permissions/{request_id}` and of
+/// the NATS `control_response` RPC). Absent means `once`.
+///
+/// - `once`: this call only.
+/// - `session`: the backend answers itself the later requests of THIS session the
+///   grant covers (`chat::session_grants`: the identical call; any call of a read-only
+///   built-in tool of `nexus-tools`). Never handed to the provider as a rule.
+/// - `always` (P11b): kept by the backend for the session's person and project
+///   (`chat::lasting_rules`, `session_grants::lasting_grant_for`: the identical call, stricter
+///   than `session`), offered only by a session that has both. Never handed to the provider.
+///
+/// A scope the session does not declare (`capabilities.permission_scopes`) is
+/// REFUSED with a typed error, never answered as a narrower one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionAnswerScope {
+    #[default]
+    Once,
+    Session,
+    Always,
+}
+
+impl PermissionAnswerScope {
+    /// The wire name (`once`, `session`, `always`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Session => "session",
+            Self::Always => "always",
+        }
+    }
+
+    /// Wire form of [`ChatEvent::PermissionDecision::scope`]: only an approval
+    /// that outlives the call says how long.
+    pub fn lasting(self, allow: bool) -> Option<Self> {
+        (allow && self != Self::Once).then_some(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SpawnedBy — typed origin for sessions spawned by the pipeline or runner
+// ---------------------------------------------------------------------------
+
+/// Describes how/why a session was created. Stored as JSON in Neo4j's
+/// `spawned_by` property. The enum is **backward-compatible**: the legacy
+/// `{"type":"runner", ...}` payloads are parsed via `from_json_str` with
+/// a serde fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpawnedBy {
+    /// Spawned by the classic PlanRunner (wave-based execution).
+    Runner {
+        run_id: Uuid,
+        task_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<Uuid>,
+    },
+    /// Spawned by the pipeline orchestrator.
+    Pipeline {
+        run_id: Uuid,
+        task_id: Uuid,
+        wave: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<Uuid>,
+    },
+    /// Spawned as a gate-retry (quality gate failed, re-running task).
+    Gate {
+        run_id: Uuid,
+        task_id: Uuid,
+        gate_name: String,
+        attempt: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<Uuid>,
+    },
+    /// Spawned by an external trigger or schedule.
+    Trigger {
+        trigger_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<Uuid>,
+    },
+    /// Sub-conversation spawned by a user or another agent.
+    Conversation {
+        parent_session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
+    },
+    /// A task delegated by a session (`plan(delegate_task)`) or by a person.
+    /// `parent_session_id` is the calling session as read from its signed
+    /// token — never a value taken from the request body of an agent.
+    Delegation {
+        plan_id: Uuid,
+        task_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scaffolding_level: Option<u8>,
+    },
+}
+
+impl SpawnedBy {
+    /// Serialize to a JSON string suitable for Neo4j storage.
+    pub fn to_json_string(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Parse from a JSON string. Returns `None` for empty/invalid input.
+    pub fn from_json_str(s: &str) -> Option<Self> {
+        if s.is_empty() {
+            return None;
+        }
+        serde_json::from_str(s).ok()
+    }
+
+    /// Extract the parent session ID if present.
+    pub fn parent_session_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Runner {
+                parent_session_id, ..
+            } => *parent_session_id,
+            Self::Pipeline {
+                parent_session_id, ..
+            } => *parent_session_id,
+            Self::Gate {
+                parent_session_id, ..
+            } => *parent_session_id,
+            Self::Trigger { .. } => None,
+            Self::Conversation {
+                parent_session_id, ..
+            } => Some(*parent_session_id),
+            Self::Delegation {
+                parent_session_id, ..
+            } => *parent_session_id,
+        }
+    }
+
+    /// Return a short label for the spawn type (for display/logging).
+    pub fn spawn_type(&self) -> &'static str {
+        match self {
+            Self::Runner { .. } => "runner",
+            Self::Pipeline { .. } => "pipeline",
+            Self::Gate { .. } => "gate",
+            Self::Trigger { .. } => "trigger",
+            Self::Conversation { .. } => "conversation",
+            Self::Delegation { .. } => "delegation",
+        }
+    }
+
+    /// Extract run_id if present.
+    pub fn run_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Runner { run_id, .. } => Some(*run_id),
+            Self::Pipeline { run_id, .. } => Some(*run_id),
+            Self::Gate { run_id, .. } => Some(*run_id),
+            Self::Trigger { run_id, .. } => *run_id,
+            Self::Conversation { .. } | Self::Delegation { .. } => None,
+        }
+    }
+
+    /// Extract task_id if present.
+    pub fn task_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Runner { task_id, .. } => Some(*task_id),
+            Self::Pipeline { task_id, .. } => Some(*task_id),
+            Self::Gate { task_id, .. } => Some(*task_id),
+            Self::Trigger { task_id, .. } => *task_id,
+            Self::Conversation { .. } => None,
+            Self::Delegation { task_id, .. } => Some(*task_id),
+        }
+    }
+}
+
+/// Runner-specific context passed through `ChatRequest` so that `create_session`
+/// can build a runner-specific system prompt instead of the generic PO prompt.
+///
+/// When this is `Some`, the session is an autonomous code execution agent — the
+/// system prompt will instruct Claude to write code, test, and commit without
+/// conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerContext {
+    /// Git branch the agent must commit on.
+    pub git_branch: String,
+    /// Files the agent is expected to modify.
+    pub affected_files: Vec<String>,
+    /// Files the agent must NOT modify (managed by parallel agents).
+    pub forbidden_files: Vec<String>,
+    /// Activated skill context text (pre-rendered).
+    pub skill_context: Option<String>,
+    /// Current wave number (for parallel execution awareness).
+    pub wave_number: usize,
+    /// Number of parallel agents in this wave.
+    pub parallel_agents: usize,
+    /// Scaffolding level (0-4) for adaptive prompt verbosity.
+    pub scaffolding_level: u8,
+    /// Frustration score (0.0-1.0) — high = previous attempts failed.
+    pub frustration_level: f64,
+    /// Task tags (test, refactor, security, etc.) for conditional constraints.
+    pub task_tags: Vec<String>,
+}
+
+impl RunnerContext {
+    /// Convert to the `RunnerPromptContext` used by `build_runner_system_prompt`.
+    pub fn to_prompt_context(&self) -> crate::runner::prompt::RunnerPromptContext {
+        crate::runner::prompt::RunnerPromptContext {
+            git_branch: self.git_branch.clone(),
+            task_tags: self.task_tags.clone(),
+            affected_files: self.affected_files.clone(),
+            forbidden_files: self.forbidden_files.clone(),
+            skill_context: self.skill_context.clone(),
+            frustration_level: self.frustration_level,
+            wave_number: self.wave_number,
+            parallel_agents: self.parallel_agents,
+            scaffolding_level: self.scaffolding_level,
+        }
+    }
+}
+
+/// One (provider, model) a conversation may be routed to: a model ticked in the chat menu.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingPoolEntry {
+    /// Provider instance id (`claude-code`, `local-llama`...).
+    pub provider: String,
+    /// Model id on that instance (never an alias name).
+    pub model: String,
+}
+
+/// Body of `PUT /api/chat/sessions/{id}/routing`: the chat menu of ONE existing
+/// conversation. The mode follows the ticks: `auto: true` = PO routes (`full`, the
+/// pool is ignored, a model imposed before is released); otherwise one model ticked =
+/// strict (`primary`, that model imposed), two or more = `mixed` among them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRoutingRequest {
+    /// Hand the conversation back to PO.
+    #[serde(default)]
+    pub auto: bool,
+    /// The models ticked (read when `auto` is false), same shape as `ChatRequest.routing_pool`.
+    #[serde(default)]
+    pub routing_pool: Vec<RoutingPoolEntry>,
+}
+
+/// Why `PUT /api/chat/sessions/{id}/routing` was refused (nothing was changed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRoutingError {
+    /// No such session.
+    NotFound,
+    /// Neither Auto nor any model ticked.
+    EmptyPool,
+    /// An entry without its provider or its model (index in the body).
+    BlankEntry(usize),
+    /// No ticked model is on the session's provider: a conversation runs on one
+    /// provider, moving it is `POST .../switch-provider`.
+    OtherProvider(String),
+}
+
+impl SessionRoutingError {
+    /// Stable machine code of the refusal.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound => "session_not_found",
+            Self::EmptyPool | Self::BlankEntry(_) => "invalid_routing_pool",
+            Self::OtherProvider(_) => "routing_pool_other_provider",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionRoutingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "session not found"),
+            Self::EmptyPool => write!(f, "tick at least one model, or ask for auto"),
+            Self::BlankEntry(i) => write!(f, "routing_pool[{i}] needs a provider and a model"),
+            Self::OtherProvider(provider) => write!(
+                f,
+                "no ticked model is on '{provider}', the provider of this conversation: \
+                 move it with switch-provider"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionRoutingError {}
+
+/// The ticks of a pool, without blanks or duplicates, in the order given.
+/// `Err` names the first blank entry: a pool entry must name both halves.
+pub fn settle_routing_pool(pool: &[RoutingPoolEntry]) -> Result<Vec<RoutingPoolEntry>, usize> {
+    let mut settled: Vec<RoutingPoolEntry> = Vec::with_capacity(pool.len());
+    for (index, entry) in pool.iter().enumerate() {
+        let entry = RoutingPoolEntry {
+            provider: entry.provider.trim().to_owned(),
+            model: entry.model.trim().to_owned(),
+        };
+        if entry.provider.is_empty() || entry.model.is_empty() {
+            return Err(index);
+        }
+        if !settled.contains(&entry) {
+            settled.push(entry);
+        }
+    }
+    Ok(settled)
+}
+
+/// Whether a pool names models on two providers or more. Such a conversation may be moved
+/// from one provider to another by the per-turn routing, like `full` restricted to the pool
+/// (decision R-S2), whatever the mode its ticks map to. A pool on one provider (or none)
+/// keeps the conversation on its provider: moving it is a `switch-provider` by hand, never a
+/// per-turn change.
+pub fn pool_spans_providers(pool: Option<&[RoutingPoolEntry]>) -> bool {
+    let Some(pool) = pool else {
+        return false;
+    };
+    // A pool that failed `settle_routing_pool` is kept raw (`settled_routing`): a blank
+    // provider is not a provider.
+    let mut providers: Vec<&str> = pool
+        .iter()
+        .map(|e| e.provider.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    providers.sort_unstable();
+    providers.dedup();
+    providers.len() > 1
+}
+
+impl ChatRequest {
+    /// The routing the request asks for, read the way the chat menu means it: the mode
+    /// follows the ticks. An empty pool is no pool; a pool of ONE is strict (that
+    /// provider and that model, named as if the request had named them, `primary`,
+    /// never substituted); two or more stay a pool. `None` when nothing changes.
+    pub fn settled_routing(&self) -> Option<ChatRequest> {
+        let pool = self.routing_pool.as_ref()?;
+        let settled = settle_routing_pool(pool).unwrap_or_else(|_| pool.clone());
+        let mut request = self.clone();
+        match settled.as_slice() {
+            [] => request.routing_pool = None,
+            [only] => {
+                request.provider = Some(only.provider.clone());
+                request.model = Some(only.model.clone());
+                request.routing_mode =
+                    Some(crate::chat::provider::cognitive::ConversationRoutingMode::Primary);
+                request.routing_pool = None;
+            }
+            _ if settled == *pool => return None,
+            _ => request.routing_pool = Some(settled),
+        }
+        Some(request)
+    }
+
+    /// The conversation is routed among the models ticked in the menu (two or more): its
+    /// OPENING model is a decision among them too (decision R-S4), and the `provider` /
+    /// `model` the menu names with them (its "pilot") are only the fallback when no
+    /// decision applies — never an explicit choice that the decision would have to obey.
+    ///
+    /// Only for the menu's `mixed` (or a pool without a mode): a pool sent with
+    /// `routing_mode: full` keeps its named provider/model explicit. That is also what a
+    /// conversation the ROUTER moved carries — its relayed request names the target the
+    /// router decided, with the pool and `full` read from the session — and that target is
+    /// never decided again at the opening of the new session (review of #713, C1).
+    pub fn routes_among_pool(&self) -> bool {
+        self.routing_mode != Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full)
+            && self
+                .routing_pool
+                .as_ref()
+                .is_some_and(|pool| pool.len() > 1)
+    }
+}
+
+/// Request to send a chat message
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChatRequest {
+    /// The user's message
+    pub message: String,
+    /// Ids of documents (`POST /api/documents`) attached to the message.
+    /// Folded into `message` by the API layer (see `chat::message_attachments`)
+    /// before it reaches the manager.
+    #[serde(default)]
+    pub attachments: Vec<uuid::Uuid>,
+    /// References (`#kind:id`) the message points at, as the client sent them:
+    /// raw `{kind, id}` objects, checked and folded into `message` as a
+    /// `<po-refs>` block by the API layer (see `refs::compose`). Ignored when
+    /// the `refs_v1` switch is off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<serde_json::Value>,
+    /// Session ID to resume (optional — creates new session if None)
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Working directory for Claude Code CLI. Absent or empty: the session has no
+    /// project directory and the host gives it a neutral one of its own
+    /// (`execution_place: "neutral"`, see `chat::neutral_place`).
+    #[serde(default)]
+    pub cwd: String,
+    /// Project slug to associate with the session
+    #[serde(default)]
+    pub project_slug: Option<String>,
+    /// What the session may do: `normal` or `read_only`. Absent: `read_only` for a
+    /// session that runs in a neutral directory (no `cwd`), `normal` for a project
+    /// session. A resume never widens it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<SessionAccess>,
+    /// Model override (default: from ChatConfig)
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Provider instance to open the session on. Absent: resolved (A16). On an
+    /// existing session a different provider is a 409 `provider_conflict`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Routing mode for THIS conversation (`primary` / `mixed` / `full`), replacing the
+    /// one of the settings. `mixed` is the conversation's word (PO routes among
+    /// `routing_pool`), never the settings' `executors_only` (decision R-S4). Absent: the
+    /// settings in force decide. Only read when a conversation opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_mode: Option<crate::chat::provider::cognitive::ConversationRoutingMode>,
+    /// The (provider, model) pairs PO may route THIS conversation among (the models
+    /// ticked in the menu), sent with `routing_mode: mixed`. The candidates of the open-time
+    /// decision AND of every per-turn decision are restricted to it; a named pilot is not a
+    /// pin then, nor the opening model: the opening is decided among the pool, and the pilot
+    /// (`provider` / `model`) only opens the conversation when no decision applies (R-S4).
+    /// One entry = strict (that model, never substituted); absent or empty = every
+    /// eligible model. Per turn only the entries of the session's own provider count: a
+    /// conversation runs on ONE provider, moving it is `switch-provider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_pool: Option<Vec<RoutingPoolEntry>>,
+    /// Model alias set on the task (A16 level "task"). Internal.
+    #[serde(skip)]
+    pub task_alias: Option<String>,
+    /// Model preference of the persona the task names (A16 level "persona"):
+    /// free text, only ever matched against the alias table. Internal.
+    #[serde(skip)]
+    pub persona_alias: Option<String>,
+    /// Provider named by the run (A16 level "run"). Internal.
+    #[serde(skip)]
+    pub run_provider: Option<String>,
+    /// Model named by the run. Internal.
+    #[serde(skip)]
+    pub run_model: Option<String>,
+    /// Token budget of the session (`SessionLimits::max_tokens`). Internal.
+    #[serde(skip)]
+    pub max_tokens: Option<u64>,
+    /// Spend cap of the session in USD (`SessionLimits::max_cost_usd`): a delegation's own
+    /// budget (PYSR-3). `None` = none. Internal.
+    #[serde(skip)]
+    pub max_cost_usd: Option<f64>,
+    /// Class of the task being executed (`simple`, `complex`, ...), which the
+    /// model policy reads. Internal.
+    #[serde(skip)]
+    pub task_class: Option<String>,
+    /// Permission mode override for this session (default: from ChatConfig)
+    /// Values: "default", "acceptEdits", "plan", "bypassPermissions"
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    /// Additional directories to expose to Claude Code CLI (--add-dir)
+    #[serde(default)]
+    pub add_dirs: Option<Vec<String>>,
+    /// Workspace slug — if set, the backend resolves all project root_paths
+    /// as add_dirs automatically (mutually exclusive with explicit add_dirs)
+    #[serde(default)]
+    pub workspace_slug: Option<String>,
+    /// Authenticated user claims — injected by the server (not from JSON body).
+    /// Used to generate the MCP session token (PO_AUTH_TOKEN).
+    #[serde(skip)]
+    pub user_claims: Option<crate::auth::jwt::Claims>,
+    /// Origin of the session — set by PlanRunner or sub-agent spawner.
+    /// Serialized JSON string stored as-is in Neo4j.
+    /// Not deserialized from HTTP requests (internal use only).
+    #[serde(skip)]
+    pub spawned_by: Option<String>,
+    /// A PERSON asked for this session in trust: the REST handler sets it, never the request
+    /// body (decision fce98b8a). Persisted as [`crate::neo4j::models::ChatSessionNode::file_scope_lifted`];
+    /// a native session in trust then launches `nexus-tools --unscoped`. The runner,
+    /// `delegate_task`, protocol runs and every agent caller leave it false.
+    #[serde(skip)]
+    pub file_scope_lifted: bool,
+    /// Task context for sub-agent sessions — provides the task description
+    /// to `build_system_prompt` so the routing intent detection can produce
+    /// a task-aware system prompt instead of a generic one.
+    /// Set by `delegate_task` and `PlanRunner.execute_task`.
+    /// Not deserialized from HTTP requests (internal use only).
+    #[serde(skip)]
+    pub task_context: Option<String>,
+    /// The kind of agent the model asked for in an `Agent` call (`subagent_type`),
+    /// carried from `chat::subagents::run_subagent` to the open-time routing so the
+    /// sub-task's signature can name the class the model stated. Internal only.
+    #[serde(skip)]
+    pub subagent_type: Option<String>,
+    /// PO routes this sub-agent's opening over the full pool (the parent conversation was
+    /// in Auto and PO decides the sub-agent, AUTO-SUB). Set by `run_subagent` alone; it
+    /// keeps the child's routing in PO's hands even though a spawned session normally
+    /// cannot hand its own routing over. Internal only.
+    #[serde(skip)]
+    pub route_auto: bool,
+    /// Inherited scaffolding level from parent session.
+    /// When set, overrides the auto-computed scaffolding level in `build_system_prompt`.
+    /// This ensures sub-agents inherit the same prompt complexity as their parent.
+    #[serde(skip)]
+    pub scaffolding_override: Option<u8>,
+    /// Runner-specific context — when set, `create_session` uses a runner system
+    /// prompt (autonomous code execution) instead of the generic PO assistant prompt.
+    /// Set by `PlanRunner.execute_task()` and `delegate_task()`.
+    #[serde(skip)]
+    pub runner_context: Option<RunnerContext>,
+    /// Cognitive routing decision (B-R7) taken for this session before it
+    /// opens: the runner, a delegation or a utility call decide first, and the
+    /// resolver turns the decision into the `project_rule` slot when it is
+    /// applied. Absent for a request nobody routed. Additive.
+    #[serde(default)]
+    pub routing_decision_id: Option<uuid::Uuid>,
+    /// Tool names the child is denied (ISO2: sub-agent type restrictions).
+    /// Applied as `spec.policy.deny` entries by `create_session_resolved`.
+    /// Set by `run_subagent` from the agent type registry; empty = no extra
+    /// restriction. Internal only.
+    #[serde(skip)]
+    pub denied_tools: Vec<String>,
+}
+
+/// Kind of background subprocess being tracked.
+///
+/// Currently we track tools that spawn long-living subprocesses surviving
+/// across multiple turns: `Monitor` (one stdout line = one event) and
+/// `BashBackground` (Bash with `run_in_background: true`).
+///
+/// This enum is open for extension (e.g. future SSE-based tools, watch
+/// commands) — add a new variant + extend `identify_subprocess_kind` in
+/// the recovery path (T13 of plan 754a1379).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundTaskKind {
+    /// `Monitor` tool — emits one ChatEvent per stdout line, never completes
+    /// on its own (must be cancelled or timed out).
+    Monitor,
+    /// `Bash` tool invoked with `run_in_background: true` — emits BashOutput
+    /// events as stdout chunks land, terminates when the child process exits.
+    BashBackground,
+}
+
+/// Snapshot of a single background subprocess attached to a chat session.
+///
+/// Lives in `ActiveSession::active_background_tasks` (a `HashMap` keyed by
+/// `id`). Created by the OOB listener when a `Monitor` / `Bash` background
+/// `ToolUse` is detected (plan 754a1379, T3). Removed by the periodic death
+/// poller (PID disappears from `get_descendant_pids`) or by an explicit
+/// `cancel_task` call (T7).
+///
+/// ## Identity (audit note `2482f4e0-f1b1-4b92-883c-8704a85beb9e`)
+///
+/// `id` is the SDK Claude Code tool_use ID of the originating `Monitor` /
+/// `Bash` invocation — i.e. the same value that surfaces on
+/// `ChatEvent::BackgroundOutput::correlation_id` for every event emitted by
+/// this subprocess. Three names, one value:
+///
+/// - `parent_tool_use_id` (SDK `Message` payload)
+/// - `correlation_id` (ChatEvent::BackgroundOutput)
+/// - `id` (this struct, used as map key)
+///
+/// This intentional alias is what lets the frontend group `BackgroundOutput`
+/// events under their parent `MonitorCard` without any extra wiring.
+///
+/// ## Recovery (plan 754a1379, T13)
+///
+/// When a session resumes after a server restart, the OOB listener may not
+/// know the original `parent_tool_use_id` for surviving descendants. In that
+/// case `parent_tool_use_id` is `None` and `id` is set to a synthetic
+/// `recovered-{pid}` value so the entry can still be cancelled.
+///
+/// ## Removal grace period (plan 754a1379, T12)
+///
+/// Removal is two-phase: when `cancel_task` or the death poller decides to
+/// remove an entry, it sets `pending_removal_at` instead of deleting the
+/// entry immediately. The poller purges entries older than
+/// `GRACE_PERIOD = 5s`. This absorbs in-flight `BackgroundOutput` ticks that
+/// arrive between the SIGINT and the actual subprocess death — they still
+/// match an entry in the map and are routed correctly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundTaskInfo {
+    /// SDK tool_use ID of the originating Monitor / Bash bg invocation.
+    /// Used as the map key in `active_background_tasks` and matches the
+    /// `correlation_id` on every `BackgroundOutput` produced by this
+    /// subprocess. For tasks rebuilt after a server restart (T13), this is
+    /// a synthetic `recovered-{pid}` string.
+    pub id: String,
+    /// What kind of subprocess this is.
+    pub kind: BackgroundTaskKind,
+    /// Human-readable description (typically the `description` argument
+    /// passed to the tool by the agent, e.g. "watch deploy.log for errors").
+    pub description: String,
+    /// When the OOB listener first observed this task starting. Approximate
+    /// for recovered tasks (set to recovery time, not original start).
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// PID of the root subprocess. `None` only in pathological cases where
+    /// the SDK didn't expose it; in that case `cancel_task` falls back to
+    /// killing all descendants of the CLI (degraded but safe).
+    pub pid: Option<u32>,
+    /// SDK `parent_tool_use_id` of the invoking turn — typically equal to
+    /// `id`, but kept distinct for the recovery case where `id` is synthetic
+    /// (`recovered-{pid}`) and the original tool_use is no longer known.
+    pub parent_tool_use_id: Option<String>,
+    /// Last time we observed activity for this task (the most recent
+    /// `BackgroundOutput` tick whose `correlation_id` matched, or
+    /// `started_at` if no tick has arrived yet). Used by the death
+    /// detector (T3, plan 754a1379): an entry whose `last_seen_at`
+    /// is older than `BACKGROUND_TASK_IDLE_DEATH_SECS` is marked for
+    /// removal — covers the case of a subprocess that died silently
+    /// without emitting a final tick. The default timeout is generous
+    /// (30 min) so legitimately quiet Monitors (e.g. `tail -F` on a
+    /// log that doesn't change for a long time) aren't mistakenly
+    /// reaped.
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    /// Two-phase removal marker. `None` while the task is alive; set to
+    /// `Some(now)` by `cancel_task` or the death poller; entries are
+    /// physically removed from the map by the poller after `GRACE_PERIOD`
+    /// has elapsed. Skipped on the wire — the frontend doesn't need it.
+    #[serde(skip)]
+    pub pending_removal_at: Option<std::time::Instant>,
+    /// Whether no signal may go to the task's pid any more: a stop actually sent
+    /// SIGINT to its subtree (by `cancel_task` when the pid was known, or by the
+    /// PID claim when the pid came after the stop), or the death poller found its
+    /// process gone (the pid may name another process by now). A `cancel_task`
+    /// asked again is a no-op only once this is set; before, it still has
+    /// something to do. Skipped on the wire.
+    #[serde(skip)]
+    pub signalled: bool,
+}
+
+/// What a permission request about a DESTINATION is about (N23b, CONSENT-WIRE): the answer
+/// is then about an origin, not a tool call.
+///
+/// - `once`: this call only;
+/// - `session`: every page of `subject` for the rest of the session (the harness remembers
+///   `tool\u{0}subject`);
+/// - `always`: the project's network consent for every entry of `destinations` — the same
+///   store Settings → Network tools writes, listed and revocable there.
+///
+/// `subject` is the endpoint really connected to (`https://` once nexus-tools upgraded it);
+/// `destinations` holds every form the gate judges (`http://` and its `https://` twin), which
+/// is what `always` writes. A client renders these; it never derives them from the input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsentSubject {
+    pub subject: String,
+    pub destinations: Vec<String>,
+}
+
+/// One tool call of a background stream, in the shape a client needs to draw it.
+///
+/// Why this exists: the provider flattens an out-of-turn sub-agent into TEXT
+/// lines (`[tool_use: Read]`, `[tool_result] …`). Measured on the stored chat
+/// events (week of 2026-10-24: 3 989 such markers in three days), the panel
+/// could therefore name a tool and show what it returned, but never WHAT IT WAS
+/// ASKED — no path for a `Read`, no pattern for a `Grep`, no diff for an `Edit`.
+/// The structured event was there (`AgentEvent::ToolCall { input, .. }`), it was
+/// just thrown away when flattening. This carries it across instead.
+///
+/// `input` is the call's own input, exactly as the in-turn `tool_use` event
+/// already sends it (same masking, same truncation) — nothing new is exposed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackgroundTool {
+    /// Name the provider gave the tool (`Bash`, `Read`, `Edit`, `Task`…), else
+    /// the canonical one. Empty when a result arrives with no call to name.
+    pub name: String,
+    /// The call's input, when this tick IS a call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    /// True when the tool reported a failure.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_error: bool,
+    /// What the tool returned, head only (`RESULT_HEAD_CHARS`, first lines).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_head: Option<String>,
+}
+
+impl BackgroundTool {
+    /// A tool CALL: its name and its input.
+    pub fn call(name: impl Into<String>, input: Option<serde_json::Value>) -> Self {
+        Self {
+            name: name.into(),
+            input,
+            is_error: false,
+            result_head: None,
+        }
+    }
+
+    /// A tool RESULT: what came back, and whether it failed. The name is the
+    /// call's when the mapper still knows it, empty otherwise (the client
+    /// attaches a result to the call above it).
+    pub fn result(name: impl Into<String>, head: Option<String>, is_error: bool) -> Self {
+        Self {
+            name: name.into(),
+            input: None,
+            is_error,
+            result_head: head,
+        }
+    }
+}
+
+/// Events emitted by the chat system (sent via WebSocket / broadcast)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatEvent {
+    /// A user message (emitted so multi-tab clients see it)
+    UserMessage { content: String },
+    /// What the references of the preceding `user_message` resolved to, sent
+    /// once per turn that carries references, before the first assistant
+    /// event. It belongs to the LAST `user_message` before it in the stream
+    /// (a `user_message` has no id); persisted like any event, so a replay
+    /// has it. `refs_resolved` is the wire name.
+    RefsResolved {
+        refs: Vec<crate::refs::wire::RefResolution>,
+    },
+    /// What the citations of the ANSWER resolved to, sent once per turn whose
+    /// answer cites at least one entity, after the answer. The same entries as
+    /// `refs_resolved` — one per citation, in order of appearance, `not_found`
+    /// for an id that names nothing or that the session may not read — but the
+    /// other direction: it describes what the AGENT wrote, not the user's
+    /// message above. The interface draws a chip for an `ok` entry and plain
+    /// text for anything else: never a link to an entity nobody resolved.
+    /// Persisted like any event, so a replay has it. `cites_resolved` is the
+    /// wire name. Additive: a client that does not know it ignores it.
+    CitesResolved {
+        refs: Vec<crate::refs::wire::RefResolution>,
+    },
+    /// A system-generated hint (post-compaction context, guard hints, auto-continue).
+    /// NOT a user message — frontends should render this differently (or hide it).
+    /// Does NOT increment the session's message_count.
+    SystemHint { content: String },
+    /// Text content from the assistant
+    AssistantText {
+        content: String,
+        /// When set, this event originated from a sub-agent (sidechain).
+        /// The value is the tool_use ID of the parent Task that spawned the agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
+    /// Claude is thinking (extended thinking)
+    Thinking {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
+    /// Claude is calling a tool
+    ToolUse {
+        id: String,
+        tool: String,
+        input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Neutral category (command, read, edit, search, web, mcp, agent, other), from the adapter.
+        category: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Stable alias of the tool, from the adapter.
+        canonical: Option<String>,
+    },
+    /// Result of a tool call
+    ToolResult {
+        id: String,
+        result: serde_json::Value,
+        #[serde(default)]
+        is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
+    /// Updated input for a tool_use (emitted when AssistantMessage provides full input
+    /// after ContentBlockStart already emitted a ToolUse with empty input)
+    ToolUseInputResolved {
+        id: String,
+        input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
+    /// Tool execution was cancelled by user interrupt.
+    /// Emitted for each pending ToolUse that did not receive a ToolResult
+    /// when the stream is interrupted (e.g., user clicks Stop during sleep 60).
+    ToolCancelled {
+        /// The tool_use ID that was cancelled
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
+    /// When a tool call really ran, as the engine saw it (`tool_clock`), emitted once
+    /// its result (or its cancellation) is in. Times: seconds since the epoch, the
+    /// milliseconds as the fraction (the unit of `created_at`); a time the engine
+    /// did not see is absent.
+    ToolTiming {
+        /// The tool_use ID.
+        id: String,
+        /// The model announced the call (`tool_use`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        called_at: Option<f64>,
+        /// The engine took the call up (PreToolUse hook), before any permission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<f64>,
+        /// The engine asked the user (permission or question).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_requested_at: Option<f64>,
+        /// The user answered the permission (noted before the answer reached the engine).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_resolved_at: Option<f64>,
+        /// `allowed` or `denied`; absent when no permission was answered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_outcome: Option<String>,
+        /// The tool itself started running, only as the engine saw it: the answer to
+        /// an allowed permission, else the take-up. Absent when the tool never ran
+        /// (denied, never answered, a question answered by its result), when the
+        /// engine runs no host hook, or when the timing is `incomplete`: never
+        /// estimated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_started_at: Option<f64>,
+        /// The engine had the result, or the call was cancelled.
+        ended_at: f64,
+        /// The call ended by a cancellation (`tool_cancelled`), not a result.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cancelled: bool,
+        /// The clock may have missed a wait: a permission request named no call.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        incomplete: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
+    /// Claude is asking for permission to use a tool
+    PermissionRequest {
+        id: String,
+        tool: String,
+        input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Neutral category (command, read, edit, search, web, mcp, agent, other), from the adapter.
+        category: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Stable alias of the tool, from the adapter.
+        canonical: Option<String>,
+        /// The tool_use the permission is about, when the engine gives it (the CLI's
+        /// `can_use_tool`, the agent engine's `permission_ask`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
+        /// `Some(true)` when THIS call may be answered `always` (P11b): the session keeps
+        /// lasting rules and the backend's comparator would approve this very call for good
+        /// (`session_grants::lasting_grant_for`). Absent: `always` would be refused, typed,
+        /// so a client does not offer it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        always: Option<bool>,
+        /// Present when the question is about a DESTINATION, not a tool (N23b): the page a
+        /// fetch loads or a browser opens. Asserted by PO from the CALL, by the same function
+        /// the answer path records with (`nexus_tools::consent_subject` / `destinations_of`),
+        /// never from what the model says. Absent on every ordinary tool permission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consent: Option<ConsentSubject>,
+    },
+    /// Claude Code called the AskUserQuestion tool — display the interactive
+    /// question widget instead of a permission approval dialog.
+    /// The `id` is the SDK control request_id (used for auto-allow response).
+    /// The `tool_call_id` is the tool_use ID (used by the frontend to send the
+    /// tool_result response back).
+    AskUserQuestion {
+        /// SDK control request ID (auto-responded with allow)
+        id: String,
+        /// tool_use call ID for sending the tool_result
+        tool_call_id: String,
+        /// The questions array from the tool input
+        questions: serde_json::Value,
+        /// Full tool input (for reference)
+        input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// True when the provider has no native question: the answer goes back as a user turn (A45).
+        synthetic: Option<bool>,
+    },
+    /// Conversation turn completed
+    Result {
+        session_id: String,
+        duration_ms: u64,
+        #[serde(default)]
+        cost_usd: Option<f64>,
+        /// Result subtype: "success", "error_max_turns", "error_during_execution"
+        #[serde(default)]
+        subtype: String,
+        /// Whether the result indicates an error
+        #[serde(default)]
+        is_error: bool,
+        /// Number of turns in the conversation
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        num_turns: Option<i32>,
+        /// Result text or error message
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// `{ usd?, basis }` — basis is reported|priced|free|subscription|unknown; an unknown price has no `usd` (never 0).
+        cost: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Token usage of the turn: input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, reasoning_tokens.
+        usage: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Model that actually answered.
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Neutral stop reason (completed, max_turns, max_tokens, interrupted, refusal, budget_exceeded, error).
+        stop_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Stable machine code of the provider error, when the turn failed with a
+        /// typed `ProviderError` (e.g. `endpoint_unreachable`, `rate_limited`,
+        /// `timeout`, `invalid_request`). Absent for a clean stop.
+        error_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Readable provider error message, when the turn failed with a typed
+        /// `ProviderError`. Never carries a credential, path or URL (it comes from
+        /// `errors.rs`, not the raw provider text).
+        error_message: Option<String>,
+    },
+    /// Streaming text delta (real-time token)
+    StreamDelta {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
+    /// Streaming status change (broadcast to all connected clients)
+    StreamingStatus { is_streaming: bool },
+    /// The user messages held for this session until the running turn ends.
+    ///
+    /// Always the FULL list, never a delta: sent on every change (a message
+    /// queued, edited, dropped, moved to the front, or leaving because its
+    /// turn came) and once when a client connects. Transient — never
+    /// persisted, never replayed: a held message becomes a `user_message`
+    /// event the moment it is actually delivered.
+    PendingQueue { messages: Vec<PendingQueueEntry> },
+    /// An error occurred
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+        /// Stable machine code, when the error has one (`refs_invalid`).
+        /// `message` stays the readable line older clients show.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        /// What exactly was wrong, for a client to switch on (`too_many`, `bad_id`...).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// 0-based index of the offending element of a list, when one is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        /// The permission request a refusal is about (`permission_scope_unsupported`): the
+        /// `id` of the `permission_request` / `permission_response`, so a client with
+        /// several requests waiting puts the refusal on the right one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
+    /// User's decision on a permission request (allow or deny).
+    /// Persisted alongside the original PermissionRequest so the decision
+    /// is visible when reloading a conversation.
+    PermissionDecision {
+        /// The permission request ID this decision answers
+        id: String,
+        /// Whether the tool was allowed
+        allow: bool,
+        /// How long the approval lasts, when it outlives the call (`session`,
+        /// `always`). Absent: this call only, or a refusal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<PermissionAnswerScope>,
+        /// What the approval covers, as the user is shown it, when it outlives the call
+        /// (`session`: the grant of `chat::session_grants`, e.g. `Bash: git status`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule: Option<String>,
+    },
+    /// Permission mode was changed mid-session
+    PermissionModeChanged {
+        /// Mode in the provider's own vocabulary (legacy strings stay emitted).
+        mode: String,
+        /// Neutral form: ask, auto_edits, plan_only, trust.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_mode: Option<String>,
+    },
+    /// Model was changed mid-session
+    ModelChanged {
+        model: String,
+        /// Why the model changed, when the harness knows (`limit_reached` for the
+        /// automatic switch after a model-scoped refusal). Absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Context window compaction is starting (emitted via PreCompact hook)
+    CompactionStarted {
+        /// Compaction trigger: "auto" or "manual"
+        trigger: String,
+    },
+    /// Metrics emitted after a successful post-compaction context re-injection.
+    /// Tracks the quality of the recovery: hint size, build latency, and whether
+    /// the agent continued normally (no idle warning within 60s — v1: always true
+    /// if injection succeeded).
+    CompactionRecovery {
+        /// Number of tokens in the re-injected hint (estimated: chars / 3).
+        hint_tokens: u32,
+        /// Time taken to build the compaction context (ms), including Neo4j queries.
+        build_latency_ms: u64,
+        /// Whether the agent continued the task correctly after compaction.
+        /// V1 simplification: true if injection did not fail. A 60s idle timer
+        /// will be added in v2.
+        recovery_success: bool,
+    },
+    /// Context window was compacted (automatic or manual)
+    CompactBoundary {
+        /// Compaction trigger: "auto" or "manual"
+        trigger: String,
+        /// Number of tokens before compaction (if available)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_tokens: Option<u64>,
+    },
+    /// Session initialized — metadata from the CLI init system message
+    SystemInit {
+        /// CLI session ID
+        cli_session_id: String,
+        /// Model used for this session
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// List of available tool names
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
+        /// Connected MCP servers
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mcp_servers: Vec<serde_json::Value>,
+        /// Permission mode for this session
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
+        /// `{ id, kind }` of the provider instance; absent means claude-code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<serde_json::Value>,
+        /// Capability snapshot frozen at open (agent-contract section 5).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<serde_json::Value>,
+        /// `ToolPolicy` in effect: mode, native_mode?, allow[], deny[].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_policy: Option<serde_json::Value>,
+        /// Neutral form of `permission_mode`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_mode: Option<String>,
+        /// Engine that drives the session: `agent` (provider-neutral) or
+        /// `legacy` (the historical Claude Code engine). Absent on an old frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        engine: Option<String>,
+        /// What this session does NOT do, as feature ids (`hooks`, `compaction`, `images`,
+        /// `subagents`, `project_orchestrator_tools`, `nexus_tools`...: what the provider,
+        /// the model or the installation lacks; `agent_runtime::degraded_features`,
+        /// `kind_degraded`, `manager::host_degraded`). Empty on the legacy engine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        degraded_features: Option<Vec<String>>,
+    },
+    /// Claude Code Dynamic Workflow lifecycle event (intra-task sub-agent fan-out).
+    ///
+    /// Emitted when the session's agent runs the `Workflow` tool, which spawns
+    /// background sub-agents. Carries the workflow lifecycle `subtype`
+    /// (`task_started` / `task_progress` / `task_updated` / `task_notification`)
+    /// and the full payload preserved from the CLI system message — task_id,
+    /// workflow_name, `workflow_progress[]` (per-agent fan-out state), usage,
+    /// status, output_file, patch. Passed through verbatim so the frontend can
+    /// render live fan-out progress without the backend pinning a schema.
+    Workflow {
+        /// Workflow lifecycle subtype, e.g. "task_started", "task_progress".
+        subtype: String,
+        /// Full event payload as emitted by the CLI (passed through verbatim).
+        data: serde_json::Value,
+    },
+    /// Backend auto-continue: emitted when a turn stopped on its turn limit
+    /// (error_max_turns) and is continued — always, within the cap of continuations in
+    /// a row (decision 7b95342a). Signals that a "Continue" will be sent automatically
+    /// after the delay (a Stop during the delay cancels it).
+    AutoContinue {
+        session_id: String,
+        /// Delay in milliseconds before the auto-continue message is sent
+        delay_ms: u64,
+    },
+    /// The session's auto-continue state. Auto-continue is always on (decision
+    /// 7b95342a): the WebSocket sends this frame on connect and in answer to the ignored
+    /// `set_auto_continue`, for older frontends that still show a toggle.
+    AutoContinueStateChanged { session_id: String, enabled: bool },
+    /// Backend is retrying after a transient API error (5xx).
+    /// Emitted before each retry attempt so the frontend can show a "Retrying..." indicator.
+    Retrying {
+        /// Current retry attempt (1-indexed)
+        attempt: u32,
+        /// Maximum number of retry attempts
+        max_attempts: u32,
+        /// Delay in milliseconds before this retry
+        delay_ms: u64,
+        /// The error message that triggered the retry
+        error_message: String,
+    },
+    /// **Out-of-band** event captured between turns by the permanent OOB
+    /// listener (see `chat::manager::spawn_oob_listener`).
+    ///
+    /// These are `Message`s that arrived on the SDK broadcast while no active
+    /// `stream_response` was running — typically background tool notifications
+    /// (Monitor output, BashOutput from `run_in_background`, sub-Agent
+    /// completion events, etc.).
+    ///
+    /// Frontends should render these distinctly from in-turn events (e.g. a
+    /// dedicated badge or icon on the message bubble). Persisted as
+    /// `background_output` and does NOT increment `message_count`.
+    BackgroundOutput {
+        /// Source descriptor — typically the tool name (e.g. "Monitor",
+        /// "BashOutput") or "system" for non-tool spontaneous messages.
+        source: String,
+        /// Human-readable content of the spontaneous message.
+        content: String,
+        /// ISO-8601 timestamp at which the OOB listener received the event.
+        received_at: chrono::DateTime<chrono::Utc>,
+        /// Optional correlation ID linking this event to a prior tool_use
+        /// (e.g. the background bash ID, the parent task ID).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        /// The tool call this tick IS, when the provider handed it over in its
+        /// structured form (a background sub-agent's `tool_use` / `tool_result`).
+        ///
+        /// Additive: absent when the provider only gave text (a Monitor line, a
+        /// `system:*` notice) and on every frame stored before it existed. Its
+        /// purpose is that the client draws a REAL per-tool card in the
+        /// background panel — the same one the transcript draws — instead of
+        /// guessing the tool from a flattened `[tool_use: Bash]` marker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<BackgroundTool>,
+    },
+    /// A message relayed from a peer session in the same team (TEAM-1).
+    ///
+    /// Persisted as `team_message` and broadcast to all session subscribers.
+    /// Does NOT increment `message_count`.
+    ///
+    /// `from_session_id` is asserted by the backend — it cannot be forged by
+    /// model text. Clients should render this with an agent badge distinct
+    /// from human `user_message` events.
+    TeamMessage {
+        from_session_id: Uuid,
+        from_name: String,
+        content: String,
+    },
+    /// User-initiated cancellation of running tool subprocess(es) for a
+    /// session (T4 of plan 28e9afe3). Emitted when `cancel_running_tools`
+    /// successfully sent SIGINT to descendants.
+    ///
+    /// Frontends should display a transient "Cancelled by user" badge on
+    /// any in-flight `ToolUse` that doesn't yet have a matching
+    /// `ToolResult`, and rely on the actual cancelled `ToolResult`
+    /// arriving on the broadcast right after to finalise the bubble.
+    ///
+    /// Distinct from a regular `Error` event because no error occurred
+    /// at the protocol level — this is a deliberate user action.
+    ToolsCancelled {
+        /// PID of the Claude Code CLI subprocess (for client-side display).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cli_pid: Option<u32>,
+        /// Number of descendant subprocesses that received SIGINT.
+        killed_count: usize,
+        /// Who initiated the cancel — currently always `"user"`.
+        /// Reserved for future automation paths (`"agent"`, `"timeout"`).
+        requested_by: String,
+    },
+    /// A session-level error that requires the user's attention — the CLI
+    /// subprocess is gone, the transport is broken, or the session is
+    /// otherwise unrecoverable without a fresh `create_session` /
+    /// `resume_session` round-trip.
+    ///
+    /// Distinct from `Error`, which is used for in-stream tool errors
+    /// recoverable mid-turn. `SessionError` signals that subsequent
+    /// messages on this session_id will silently no-op until the user
+    /// (or runner) explicitly restarts the session — frontends should
+    /// surface this prominently.
+    ///
+    /// T9 of plan 9a1684b2 — emitted by `chat::oob_listener` when its
+    /// stream returns `None` (broadcast closed because the SDK transport
+    /// dropped its sender).
+    SessionError {
+        /// Short machine-readable reason code (e.g. "subprocess_exited",
+        /// "transport_closed", "broadcast_dropped"). Stable across
+        /// versions for log filtering.
+        reason: String,
+        /// Human-readable message safe to show to the end user.
+        message: String,
+        /// ISO-8601 timestamp at which the error was detected.
+        received_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// Snapshot of all background subprocesses currently attached to this
+    /// session. Emitted by the lifecycle hook (T3 of plan 754a1379) on every
+    /// mutation of `ActiveSession::active_background_tasks` — i.e.:
+    ///
+    /// - INSERT — a new `Monitor` / `Bash run_in_background` `ToolUse`
+    ///   was observed by the OOB listener.
+    /// - REMOVE — a `cancel_task` request fired, or the death poller
+    ///   detected that a tracked PID disappeared from
+    ///   `get_descendant_pids(child_pid)`, or the grace period expired
+    ///   and an entry marked `pending_removal_at` was purged (T12).
+    /// - RECOVERY — `create_session` / `resume_session` rebuilt the
+    ///   tracking map from `pgrep` after a server restart (T13), so the
+    ///   frontend can re-paint its toolbar indicator and any in-progress
+    ///   `MonitorCard`s without waiting for fresh ticks.
+    ///
+    /// The frontend uses this event to drive the toolbar indicator pill
+    /// (`👀 N Monitors • ⚙ M Bash`) and the per-card status badges. Each
+    /// emission carries the **full current snapshot** — never deltas —
+    /// so a client that misses one event simply gets the next refresh.
+    ///
+    /// Ephemeral: never persisted to Neo4j, never replayed in catch-up
+    /// snapshots (frontends use `GET /api/chat/sessions/:id/background-tasks`
+    /// at connection time instead, T6 of plan 754a1379). Returns `None`
+    /// from `fingerprint()` for the same reason — there is nothing to
+    /// dedup, every event is a fresh snapshot.
+    ActiveTasksUpdate {
+        /// Current snapshot of every tracked background task on the
+        /// session. Empty `Vec` is a legitimate value (means: no
+        /// background tasks active right now) and the frontend should
+        /// render the toolbar accordingly (no pill).
+        tasks: Vec<BackgroundTaskInfo>,
+    },
+    /// The agent asked the user for a secret (MCP `vault.request_secret`).
+    /// The frontend shows a secure input card; the value goes straight to
+    /// the vault API, never through the chat. Ephemeral — pending requests are
+    /// re-read from `GET /api/vault/requests` on reconnect.
+    SecretRequest {
+        id: String,
+        name: String,
+        reason: String,
+        /// The secret already exists: the card offers to grant it instead of
+        /// asking the value again.
+        exists: bool,
+    },
+    /// A secret request was answered (`provided`, `granted` or `declined`).
+    /// Carries no value.
+    SecretRequestResolved { id: String, outcome: String },
+    /// The session was closed by the server (A45). Emitted by `close_session`.
+    SessionClosed {
+        session_id: String,
+        /// `closed`, `idle` or `error`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// The conversation moved to another provider (B-SW): on the thread of the
+    /// session it left, where it went; on the thread of the session it reached,
+    /// what was relayed ("N entries replayed, M left out"). The old session is
+    /// closed right after this event; the client follows `to_session_id`.
+    ConversationRelayed {
+        /// The session the conversation left (closed).
+        from_session_id: String,
+        /// The session that continues it.
+        to_session_id: String,
+        /// Provider instance it left.
+        from_provider: String,
+        /// Provider instance it reached.
+        to_provider: String,
+        /// Earlier entries (messages, answers, one per tool call) carried over.
+        relayed_entries: usize,
+        /// Oldest entries left out to fit the target's context window; the
+        /// omission is stated to the model, never silent.
+        omitted_entries: usize,
+        /// Who moved it: `user` (the switch route) or `auto` (the cognitive router, mode
+        /// `full` + stage `auto`, before a turn; the message of that turn is the first one
+        /// of the new session).
+        moved_by: String,
+        /// The memory conversation both sessions share (kept across the move), when
+        /// the server records one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+    },
+    /// The session's provider was re-targeted **in place** (same thread): the provider
+    /// and model changed, the `session_id` did not. The frontend renders a
+    /// "provider switched" notice on the SAME thread — the opposite of
+    /// [`ChatEvent::ConversationRelayed`], which told the client to follow a new
+    /// session. Emitted when a move leaves `from_session_id == to_session_id`.
+    ProviderSwitched {
+        /// The session the switch happened on (unchanged by the move).
+        session_id: String,
+        /// Provider instance it left.
+        from_provider: String,
+        /// Provider instance it reached.
+        to_provider: String,
+        /// The model on the new provider.
+        model: String,
+        /// Earlier entries (messages, answers, one per tool call) carried over by the
+        /// in-place relay, when the switch replayed the conversation. `None` = nothing
+        /// to carry (or the count is not stated).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relayed_entries: Option<u64>,
+        /// Oldest entries left out to fit the target's context window, when the relay
+        /// was bounded; the omission is stated to the model, never silent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        omitted_entries: Option<u64>,
+    },
+    /// A provider instance went out of service, or came back (outage detection,
+    /// `chat::provider::outage`). Persisted and attributable: the instance, the
+    /// masked cause and the start of the outage on the way down, the duration on
+    /// the way up. Emitted once per transition, never per failed call — a blip is
+    /// covered by [`ChatEvent::Retrying`], an outage is what this explains.
+    ProviderOutage {
+        /// The provider instance that went down or came back.
+        provider_id: String,
+        /// `down` when the instance was declared out of service, `up` when it returned.
+        phase: String,
+        /// Short masked cause of the outage: present on `down`, and carried on `up`
+        /// (the outage the instance recovered from). Never a URL, a path or a
+        /// credential: it comes from `errors.rs` (`safe_cause`), not the raw provider text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<String>,
+        /// Consecutive failures observed when the outage was declared (0 on `up`).
+        #[serde(default)]
+        failures: u32,
+        /// When the outage began: the first failure of the run that became an outage.
+        started_at: chrono::DateTime<chrono::Utc>,
+        /// How long the outage lasted, in milliseconds (`up` only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
+    /// An advisory from the harness about the TURN itself, that the person may
+    /// have to act on — a locked credential vault, a prompt the policy blocked, a
+    /// browser that is not installed, an instance the router left out.
+    ///
+    /// An advisory is NOT an error and does NOT end the turn: the turn may well
+    /// go on (the native harness waits for a locked vault and resumes). It is
+    /// persisted like any other event so a reloaded thread still says why a turn
+    /// waited — measured 03/11/2026: a locked vault produced 930 s of silence and
+    /// nothing in the transcript, because this advisory was dropped on the way.
+    ///
+    /// `severity` says what a client does with it: `action_required` becomes a
+    /// block in the thread with the way out, `latency` only feeds a "waiting"
+    /// state (a retry, a recovery), `diagnostic` belongs to the logs. Additive: a
+    /// client that does not know this event ignores it.
+    ProviderNotice {
+        /// The harness' own name for the advisory (`credentials_locked`, `model_retry`, ...).
+        kind: String,
+        /// Stable error-like code when the advisory has one, so the client can pick
+        /// the right card (the same `code` the provider errors use).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        /// One sentence, already safe (no URL, no path, no credential): what
+        /// happened, and what the person can do about it.
+        message: String,
+        /// `action_required` | `latency` | `diagnostic`.
+        severity: String,
+        /// The harness' structured detail (counters, delays, instance id), kept
+        /// as it came for the client and for the logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+    },
+}
+
+impl ChatEvent {
+    /// Get the event type name (used for WebSocket messages and persistence)
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            ChatEvent::UserMessage { .. } => "user_message",
+            ChatEvent::RefsResolved { .. } => "refs_resolved",
+            ChatEvent::CitesResolved { .. } => "cites_resolved",
+            ChatEvent::SystemHint { .. } => "system_hint",
+            ChatEvent::AssistantText { .. } => "assistant_text",
+            ChatEvent::Thinking { .. } => "thinking",
+            ChatEvent::ToolUse { .. } => "tool_use",
+            ChatEvent::ToolResult { .. } => "tool_result",
+            ChatEvent::ToolUseInputResolved { .. } => "tool_use_input_resolved",
+            ChatEvent::ToolCancelled { .. } => "tool_cancelled",
+            ChatEvent::ToolTiming { .. } => "tool_timing",
+            ChatEvent::PermissionRequest { .. } => "permission_request",
+            ChatEvent::AskUserQuestion { .. } => "ask_user_question",
+            ChatEvent::Result { .. } => "result",
+            ChatEvent::StreamDelta { .. } => "stream_delta",
+            ChatEvent::StreamingStatus { .. } => "streaming_status",
+            ChatEvent::PendingQueue { .. } => "pending_queue",
+            ChatEvent::Error { .. } => "error",
+            ChatEvent::PermissionDecision { .. } => "permission_decision",
+            ChatEvent::PermissionModeChanged { .. } => "permission_mode_changed",
+            ChatEvent::ModelChanged { .. } => "model_changed",
+            ChatEvent::CompactionStarted { .. } => "compaction_started",
+            ChatEvent::CompactionRecovery { .. } => "compaction_recovery",
+            ChatEvent::CompactBoundary { .. } => "compact_boundary",
+            ChatEvent::SystemInit { .. } => "system_init",
+            ChatEvent::Workflow { .. } => "workflow",
+            ChatEvent::AutoContinue { .. } => "auto_continue",
+            ChatEvent::AutoContinueStateChanged { .. } => "auto_continue_state_changed",
+            ChatEvent::Retrying { .. } => "retrying",
+            ChatEvent::BackgroundOutput { .. } => "background_output",
+            ChatEvent::TeamMessage { .. } => "team_message",
+            ChatEvent::SessionError { .. } => "session_error",
+            ChatEvent::ToolsCancelled { .. } => "tools_cancelled",
+            ChatEvent::ActiveTasksUpdate { .. } => "active_tasks_update",
+            ChatEvent::SecretRequest { .. } => "secret_request",
+            ChatEvent::SecretRequestResolved { .. } => "secret_request_resolved",
+            ChatEvent::SessionClosed { .. } => "session_closed",
+            ChatEvent::ConversationRelayed { .. } => "conversation_relayed",
+            ChatEvent::ProviderSwitched { .. } => "provider_switched",
+            ChatEvent::ProviderOutage { .. } => "provider_outage",
+            ChatEvent::ProviderNotice { .. } => "provider_notice",
+        }
+    }
+
+    /// Generate a fingerprint string for dedup during mid-stream join.
+    ///
+    /// Events with unique IDs (ToolUse, ToolResult, PermissionRequest, etc.) use
+    /// the ID as fingerprint. Events without IDs (Thinking, AssistantText) use
+    /// a hash of their content. Returns `None` for StreamDelta/StreamingStatus
+    /// (these are never in the snapshot and never need dedup).
+    pub fn fingerprint(&self) -> Option<String> {
+        match self {
+            // Events with unique IDs — use type+id
+            ChatEvent::ToolUse { id, .. } => Some(format!("tool_use:{}", id)),
+            ChatEvent::ToolResult { id, .. } => Some(format!("tool_result:{}", id)),
+            ChatEvent::ToolUseInputResolved { id, .. } => {
+                Some(format!("tool_use_input_resolved:{}", id))
+            }
+            ChatEvent::ToolCancelled { id, .. } => Some(format!("tool_cancelled:{}", id)),
+            ChatEvent::ToolTiming { id, .. } => Some(format!("tool_timing:{}", id)),
+            ChatEvent::PermissionRequest { id, .. } => Some(format!("permission_request:{}", id)),
+            ChatEvent::AskUserQuestion { id, .. } => Some(format!("ask_user_question:{}", id)),
+            ChatEvent::PermissionDecision { id, .. } => Some(format!("permission_decision:{}", id)),
+            ChatEvent::SystemInit { cli_session_id, .. } => {
+                Some(format!("system_init:{}", cli_session_id))
+            }
+            ChatEvent::Workflow { subtype, data } => {
+                // Each CLI workflow event carries a unique `uuid`; dedup on it so
+                // a replay never collapses distinct task_progress ticks. Fall back
+                // to subtype + content hash if no uuid is present.
+                if let Some(uuid) = data.get("uuid").and_then(|v| v.as_str()) {
+                    Some(format!("workflow:{}", uuid))
+                } else {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    data.to_string().hash(&mut hasher);
+                    Some(format!("workflow:{}:{}", subtype, hasher.finish()))
+                }
+            }
+
+            // Events without unique IDs — use type + content hash
+            ChatEvent::Thinking { content, .. } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                content.hash(&mut hasher);
+                Some(format!("thinking:{}", hasher.finish()))
+            }
+            ChatEvent::AssistantText { content, .. } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                content.hash(&mut hasher);
+                Some(format!("assistant_text:{}", hasher.finish()))
+            }
+            ChatEvent::UserMessage { content } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                content.hash(&mut hasher);
+                Some(format!("user_message:{}", hasher.finish()))
+            }
+            ChatEvent::RefsResolved { refs } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                serde_json::to_string(refs)
+                    .unwrap_or_default()
+                    .hash(&mut hasher);
+                Some(format!("refs_resolved:{}", hasher.finish()))
+            }
+            ChatEvent::CitesResolved { refs } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                serde_json::to_string(refs)
+                    .unwrap_or_default()
+                    .hash(&mut hasher);
+                Some(format!("cites_resolved:{}", hasher.finish()))
+            }
+            ChatEvent::SystemHint { content } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                content.hash(&mut hasher);
+                Some(format!("system_hint:{}", hasher.finish()))
+            }
+            ChatEvent::Error { message, .. } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                message.hash(&mut hasher);
+                Some(format!("error:{}", hasher.finish()))
+            }
+            ChatEvent::Result { session_id, .. } => Some(format!("result:{}", session_id)),
+            ChatEvent::PermissionModeChanged { mode, .. } => {
+                Some(format!("permission_mode_changed:{}", mode))
+            }
+            ChatEvent::ModelChanged { model, reason } => Some(format!(
+                "model_changed:{}:{}",
+                model,
+                reason.as_deref().unwrap_or("")
+            )),
+            ChatEvent::CompactionStarted { trigger } => {
+                Some(format!("compaction_started:{}", trigger))
+            }
+            ChatEvent::CompactionRecovery {
+                hint_tokens,
+                build_latency_ms,
+                recovery_success,
+            } => Some(format!(
+                "compaction_recovery:{}:{}:{}",
+                hint_tokens, build_latency_ms, recovery_success
+            )),
+            ChatEvent::CompactBoundary { trigger, .. } => {
+                Some(format!("compact_boundary:{}", trigger))
+            }
+
+            ChatEvent::AutoContinue { session_id, .. } => {
+                Some(format!("auto_continue:{}", session_id))
+            }
+            ChatEvent::AutoContinueStateChanged {
+                session_id,
+                enabled,
+            } => Some(format!(
+                "auto_continue_state_changed:{}:{}",
+                session_id, enabled
+            )),
+
+            ChatEvent::Retrying {
+                attempt,
+                max_attempts,
+                ..
+            } => Some(format!("retrying:{}:{}", attempt, max_attempts)),
+
+            // An advisory repeats (a locked vault is polled): dedup on kind and
+            // severity, and on the sentence when it changes (a wait that grew).
+            ChatEvent::ProviderNotice {
+                kind,
+                severity,
+                message,
+                ..
+            } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                message.hash(&mut hasher);
+                Some(format!(
+                    "provider_notice:{}:{}:{}",
+                    kind,
+                    severity,
+                    hasher.finish()
+                ))
+            }
+
+            ChatEvent::BackgroundOutput {
+                source,
+                received_at,
+                correlation_id,
+                ..
+            } => {
+                // (source, received_at, correlation_id) is enough to dedup OOB
+                // events: the same tool firing twice at the same instant with
+                // the same correlation is the same event. Content is excluded
+                // from the fingerprint so a retry that reformats whitespace
+                // does not duplicate the entry.
+                let corr = correlation_id.as_deref().unwrap_or("-");
+                Some(format!(
+                    "background_output:{}:{}:{}",
+                    source,
+                    received_at.timestamp_millis(),
+                    corr
+                ))
+            }
+
+            ChatEvent::ToolsCancelled {
+                cli_pid,
+                killed_count,
+                requested_by,
+            } => {
+                // (cli_pid, killed_count, requested_by) is enough to dedup
+                // — two cancels with the same exact shape at distinct times
+                // produce the same fingerprint, but those are user double-
+                // clicks the rate cap already de-dupes upstream.
+                let pid = cli_pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+                Some(format!(
+                    "tools_cancelled:{}:{}:{}",
+                    pid, killed_count, requested_by
+                ))
+            }
+            ChatEvent::SessionError {
+                reason,
+                received_at,
+                ..
+            } => {
+                // (reason, timestamp) — the same subprocess can only die
+                // once at a given instant; replays at distinct moments
+                // are distinct events.
+                Some(format!(
+                    "session_error:{}:{}",
+                    reason,
+                    received_at.timestamp_millis()
+                ))
+            }
+
+            // One relay per (from, to) pair: the same statement on both threads.
+            ChatEvent::ConversationRelayed {
+                from_session_id,
+                to_session_id,
+                ..
+            } => Some(format!(
+                "conversation_relayed:{from_session_id}:{to_session_id}"
+            )),
+
+            // StreamDelta and StreamingStatus are never in the snapshot.
+
+            // ActiveTasksUpdate is ephemeral — every emission is a fresh
+            // full snapshot, dedup is meaningless (and would actively hide
+            // useful state changes from the frontend). Plan 754a1379, T4.
+            ChatEvent::StreamDelta { .. }
+            | ChatEvent::StreamingStatus { .. }
+            | ChatEvent::PendingQueue { .. }
+            | ChatEvent::ActiveTasksUpdate { .. }
+            | ChatEvent::SecretRequest { .. }
+            | ChatEvent::SecretRequestResolved { .. }
+            | ChatEvent::SessionClosed { .. }
+            | ChatEvent::ProviderSwitched { .. }
+            | ChatEvent::ProviderOutage { .. }
+            | ChatEvent::TeamMessage { .. } => None,
+        }
+    }
+}
+
+/// Paginated list of chat events (returned by get_session_messages)
+#[derive(Debug, Clone)]
+pub struct ChatEventPage {
+    /// The events in this page (sorted by seq ASC)
+    pub events: Vec<crate::neo4j::models::ChatEventRecord>,
+    /// Total number of events for this session
+    pub total_count: usize,
+    /// Whether there are more events beyond this page
+    pub has_more: bool,
+    /// Current offset
+    pub offset: usize,
+    /// Page size limit
+    pub limit: usize,
+}
+
+/// Messages sent from the client to the server (via POST)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientMessage {
+    /// A new user message
+    UserMessage { content: String },
+    /// Response to a permission request
+    PermissionResponse {
+        allow: bool,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// Response to an input request
+    InputResponse { content: String },
+}
+
+/// Where an effective capability of a conversation was read (F-R4, decision 11cefdb2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveSource {
+    /// The capabilities snapshot of the model the session opened on (A4).
+    Snapshot,
+    /// The candidates PO may route the next turn to.
+    RoutingPool,
+}
+
+/// Why an effective capability says what it says: a stable code for the interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveCause {
+    /// The session's own model has it: nothing to route for.
+    ModelHasIt,
+    /// PO does not choose this conversation's model (primary, a model imposed or changed by
+    /// hand, a stage that applies nothing, a session that cannot switch model): the snapshot.
+    NotRouted,
+    /// No router is live for this session (session not open, or no cognitive router): the snapshot.
+    NoRouter,
+    /// PO routes, but its pool lists no model at all (not built, not probed): the snapshot.
+    /// Not probed is not absent: it says nothing about the models PO could reach.
+    PoolUnbuilt,
+    /// At least one candidate of the pool has it: PO routes the turn that needs it there.
+    PoolHasIt,
+    /// The pool is built and none of its eligible candidates has it.
+    PoolLacksIt,
+}
+
+/// One capability of a conversation as the user and the composer may rely on it: the
+/// model's snapshot when PO does not route, else what the routing candidates offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveCapability {
+    /// Whether the capability is reachable for the next turn.
+    pub value: bool,
+    /// Where it was read.
+    pub source: EffectiveSource,
+    /// Why.
+    pub cause: EffectiveCause,
+    /// The candidates that have it, when the routing pool was read (who PO can route to).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<RoutingPoolEntry>,
+}
+
+impl EffectiveCapability {
+    /// The snapshot's word, with the reason it is the one that counts.
+    pub fn snapshot(value: bool, cause: EffectiveCause) -> Self {
+        Self {
+            value,
+            source: EffectiveSource::Snapshot,
+            cause: if value {
+                EffectiveCause::ModelHasIt
+            } else {
+                cause
+            },
+            via: Vec::new(),
+        }
+    }
+}
+
+/// The capabilities of a conversation that follow its routing candidates rather than the
+/// snapshot of the model it opened on (F-R4). Only `images` for now: the one the composer
+/// gates on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveCapabilities {
+    /// Whether a turn may carry images.
+    pub images: EffectiveCapability,
+}
+
+/// Chat session metadata (persisted in Neo4j)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSession {
+    /// Internal session ID (UUID)
+    pub id: String,
+    /// Claude CLI session ID (for --resume)
+    #[serde(default)]
+    pub cli_session_id: Option<String>,
+    /// Associated project slug
+    #[serde(default)]
+    pub project_slug: Option<String>,
+    /// Associated workspace slug (if session spans a workspace)
+    #[serde(default)]
+    pub workspace_slug: Option<String>,
+    /// Working directory
+    pub cwd: String,
+    /// Where the session runs (`project` | `neutral`). Left off the wire for `project`,
+    /// which is also what every session written before the field reads as.
+    #[serde(default, skip_serializing_if = "ExecutionPlace::is_project")]
+    pub execution_place: ExecutionPlace,
+    /// `read_only` when the session may only look. Left off for `normal`.
+    #[serde(default, skip_serializing_if = "SessionAccess::is_normal")]
+    pub access: SessionAccess,
+    /// Session title (auto-generated or user-provided)
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Model used
+    pub model: String,
+    /// Creation timestamp
+    pub created_at: String,
+    /// Last update timestamp
+    pub updated_at: String,
+    /// Number of messages exchanged
+    #[serde(default)]
+    pub message_count: i64,
+    /// Total cost in USD — the session's OWN spend (its sub-agents' is apart, below).
+    #[serde(default)]
+    pub total_cost_usd: Option<f64>,
+    /// What the session's sub-agents (`Agent` tool) spent, kept apart from `total_cost_usd`
+    /// so its routing decision is not charged twice (PYSR-3). Only carried by the
+    /// single-session read (`GET /api/chat/sessions/{id}`), never by listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children_cost_usd: Option<f64>,
+    /// `total_cost_usd` + `children_cost_usd`: what the session cost with its sub-agents
+    /// (PYSR-3b). Single-session read only, like `children_cost_usd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregated_cost_usd: Option<f64>,
+    /// Nexus conversation ID (for message history)
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    /// Preview text (first user message, truncated)
+    #[serde(default)]
+    pub preview: Option<String>,
+    /// Permission mode override for this session (None = global config)
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    /// Additional directories exposed to Claude CLI (--add-dir)
+    #[serde(default)]
+    pub add_dirs: Option<Vec<String>>,
+    /// Origin of the session (runner, sub-conversation, or null for normal)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<serde_json::Value>,
+    /// Plans linked to this session (via ASSOCIATED_WITH or AgentExecution)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_plans: Vec<ChatLinkedPlan>,
+    /// Tasks linked to this session
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_tasks: Vec<ChatLinkedTask>,
+    /// RFCs transitively linked via plans
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_rfcs: Vec<ChatLinkedRfc>,
+    /// What the session is doing right now, from the live `ChatManager`.
+    /// `None` when the chat manager is not configured at all; omitted from
+    /// the wire when the session is quiet, so a listing of cold sessions
+    /// stays exactly as small as it was before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<SessionActivity>,
+    /// Provider instance serving the session; absent means `claude-code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Capability snapshot frozen at open. Only carried by the single-session
+    /// read, never by listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<serde_json::Value>,
+    /// What the conversation can really do for its next turn, given its routing (F-R4):
+    /// `capabilities` is the snapshot of the opening model, this follows the candidates PO
+    /// may route to. Only carried by the single-session read and the routing change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_capabilities: Option<EffectiveCapabilities>,
+    /// Which precedence level chose the provider (`session`, `request`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_by: Option<String>,
+    /// Routing mode of this conversation, when its request (or `PUT .../routing`) named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_mode: Option<String>,
+    /// The models PO may route this conversation among (`mixed`), as ticked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_pool: Option<Vec<RoutingPoolEntry>>,
+    /// `"claude_code"` on a READ-ONLY mirror of a Claude Code sub-agent (`chat::mirror`,
+    /// P18c): its thread is copied from its parent's stream, it has no process, a message
+    /// sent to it is refused (409 `mirror_read_only`). Omitted for every other session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_of: Option<String>,
+}
+
+/// What a chat session is doing *right now*, read from the live
+/// `ChatManager` and never from Neo4j.
+///
+/// There is no persisted truth to read: `is_streaming` lives in an
+/// `AtomicBool` inside `ActiveSession`, and nothing ever writes it to the
+/// graph. Deriving this from the in-memory map is therefore not a shortcut
+/// but the only correct source — and it self-heals, because a session that
+/// was mid-turn when the server died simply is not in the map any more and
+/// reports `live: false` instead of a "Working…" that never clears.
+///
+/// `Default` is the honest answer for a session the manager has never heard
+/// of: not live, not streaming, waiting on nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionActivity {
+    /// The Claude CLI subprocess for this session is alive.
+    pub live: bool,
+    /// A turn is being streamed right now (the session is actively working).
+    pub streaming: bool,
+    /// Permission requests still waiting for a human answer. Non-zero means
+    /// the session is blocked on the user, not idle.
+    pub pending_permissions: usize,
+    /// Active `Monitor` subprocesses — what the user calls a "watch". A
+    /// session can legitimately produce no tokens for minutes while one of
+    /// these runs, which is exactly the case that used to look dead.
+    pub monitors: usize,
+    /// Active `Bash run_in_background` subprocesses.
+    pub bash_tasks: usize,
+    /// What the session is doing in its current segment, deduced from the tail of its
+    /// events, the counts above and the clock (`chat::segment_state`): `working`,
+    /// `writing`, `reporting`, `watching`, `waiting_on_person`, `done` or `stalled`.
+    /// Additive: absent for a session that is not live (or not tapped yet), and a client
+    /// that predates it keeps reading the five fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<super::segment_state::SessionState>,
+    /// Why `state` is what it is: the rule, the event that decided and its age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_reason: Option<super::segment_state::Reason>,
+}
+
+impl SessionActivity {
+    /// Nothing at all is happening — used to decide whether the field is
+    /// worth putting on the wire.
+    pub fn is_quiet(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Total tracked background subprocesses (monitors + bash).
+    pub fn background_tasks(&self) -> usize {
+        self.monitors + self.bash_tasks
+    }
+}
+
+/// A plan linked to a chat session (API response type).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatLinkedPlan {
+    pub id: String,
+    pub title: String,
+    pub source: String,
+}
+
+/// A task linked to a chat session (API response type).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatLinkedTask {
+    pub id: String,
+    pub title: String,
+    pub source: String,
+}
+
+/// An RFC linked to a chat session (API response type).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatLinkedRfc {
+    pub id: String,
+    pub title: String,
+}
+
+/// Response when creating a session
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateSessionResponse {
+    pub session_id: String,
+    pub stream_url: String,
+    /// `neutral` when the host made the working directory (no `cwd` was given).
+    #[serde(default, skip_serializing_if = "ExecutionPlace::is_project")]
+    pub execution_place: ExecutionPlace,
+    /// `read_only` when the session was opened (or defaulted) read-only. Left off for `normal`.
+    #[serde(default, skip_serializing_if = "SessionAccess::is_normal")]
+    pub access: SessionAccess,
+    /// Things the caller should know about how the session was opened (for example
+    /// that it has no project, hence no graph context). Left off when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
+}
+
+/// Why a provider switch was refused before anything was opened (B-SW).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchProviderError {
+    /// The session id is not a UUID.
+    InvalidSession,
+    /// No such session.
+    NotFound,
+    /// A message is needed to continue the conversation on the new provider.
+    EmptyMessage,
+    /// The session is already on this provider (changing the model is another call).
+    SameProvider(String),
+}
+
+impl std::fmt::Display for SwitchProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSession => write!(f, "invalid session id"),
+            Self::NotFound => write!(f, "session not found"),
+            Self::EmptyMessage => write!(
+                f,
+                "a message is needed to continue the conversation on the new provider"
+            ),
+            Self::SameProvider(id) => write!(
+                f,
+                "the session is already on '{id}': change its model instead"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SwitchProviderError {}
+
+impl SwitchProviderError {
+    /// Stable code of a refusal the client acts on (`{error, code, retryable: false}`),
+    /// `None` for the refusals told by their status alone. The message text stays as it
+    /// was: clients that predate the codes match it.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::EmptyMessage => Some("empty_message"),
+            Self::SameProvider(_) => Some("same_provider"),
+            Self::InvalidSession | Self::NotFound => None,
+        }
+    }
+}
+
+/// Result of moving a conversation to another provider (B-SW). The move is now
+/// **in place**: the provider is re-targeted on the SAME session, so `session_id`
+/// is the id the caller already had — there is no new thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwitchProviderResponse {
+    /// The session the conversation is on — unchanged by the switch (the same
+    /// thread keeps running, on the target provider).
+    pub session_id: String,
+    pub stream_url: String,
+    /// Kept for wire compatibility: the switch re-targets the provider in place,
+    /// so this always equals `session_id` (there is no distinct previous session).
+    /// Deprecated — clients should treat `session_id` as the sole thread id.
+    pub previous_session_id: String,
+    /// Earlier entries carried over (replayed to the new provider process only;
+    /// the stored thread is continuous).
+    pub relayed_entries: usize,
+    /// Older entries left out to fit the target's context window (stated to the model).
+    pub omitted_entries: usize,
+    /// The memory conversation, the same before and after the move (absent when the
+    /// server records none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+}
+
+// ============================================================================
+// Search types
+// ============================================================================
+
+/// A single message hit from full-text search
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSearchHit {
+    /// Message ID in Meilisearch
+    pub message_id: String,
+    /// Message role (user or assistant)
+    pub role: String,
+    /// Truncated content snippet
+    pub content_snippet: String,
+    /// Turn index within the conversation
+    pub turn_index: usize,
+    /// Unix timestamp of message creation
+    pub created_at: i64,
+    /// Relevance score
+    pub score: f64,
+}
+
+/// Search results grouped by session
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSearchResult {
+    /// Session ID (UUID)
+    pub session_id: String,
+    /// Session title
+    #[serde(default)]
+    pub session_title: Option<String>,
+    /// Session preview text
+    #[serde(default)]
+    pub session_preview: Option<String>,
+    /// Associated project slug
+    #[serde(default)]
+    pub project_slug: Option<String>,
+    /// Associated workspace slug (if session was started on a workspace)
+    #[serde(default)]
+    pub workspace_slug: Option<String>,
+    /// Nexus conversation ID
+    pub conversation_id: String,
+    /// Matching messages in this session
+    pub hits: Vec<MessageSearchHit>,
+    /// Best (highest) score among hits
+    pub best_score: f64,
+}
+
+/// Truncate text to a maximum length (in characters, not bytes),
+/// preserving word boundaries and UTF-8 safety.
+pub fn truncate_snippet(text: &str, max_len: usize) -> String {
+    // Count characters, not bytes (UTF-8 safe)
+    let char_count = text.chars().count();
+    if char_count <= max_len {
+        return text.to_string();
+    }
+    // Collect up to max_len characters and find the byte boundary
+    let byte_end = text
+        .char_indices()
+        .nth(max_len)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let truncated = &text[..byte_end];
+    // Try to break at last space for cleaner output
+    if let Some(last_space) = truncated.rfind(' ') {
+        format!("{}...", &text[..last_space])
+    } else {
+        format!("{}...", truncated)
+    }
+}
+
+// ============================================================================
+// API error classification (for retry logic)
+// ============================================================================
+
+/// Classification of API errors for retry logic.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApiErrorKind {
+    /// Retryable server-side error (5xx: api_error, overloaded_error)
+    Retryable(String),
+    /// Non-retryable client-side error (4xx: invalid_request, auth, rate_limit, etc.)
+    NonRetryable(String),
+}
+
+impl ApiErrorKind {
+    /// Returns `true` if the error is retryable.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, ApiErrorKind::Retryable(_))
+    }
+}
+
+/// Known Anthropic API error types that are safe to retry.
+const RETRYABLE_ERROR_TYPES: &[&str] = &["api_error", "overloaded_error", "rate_limit_error"];
+
+/// Classify an API error message as retryable or non-retryable.
+///
+/// Parses error messages from the Anthropic API to determine if they should
+/// be retried. Handles multiple error formats:
+/// - `"API Error: 500 {"type":"error","error":{"type":"api_error",...}}"`
+/// - `"Error: {"type":"error","error":{"type":"api_error",...}}"`
+/// - Raw JSON: `{"type":"error","error":{"type":"api_error",...}}`
+/// - Plain text containing error type keywords
+///
+/// **Retryable** (5xx + rate limit): `api_error`, `overloaded_error`, `rate_limit_error`
+/// **Non-retryable** (4xx): `invalid_request_error`, `authentication_error`,
+/// `not_found_error`, `permission_error`
+///
+/// **Note:** HTTP 402 (out of credit) is deliberately NOT retryable here — the
+/// cognitive router excludes the instance instead of retrying. See
+/// [`is_out_of_credit_message`] for how the legacy engine detects that case.
+pub fn classify_api_error(error_message: &str) -> ApiErrorKind {
+    // Try to extract JSON from the error message and parse the error type
+    if let Some(json_start) = error_message.find('{') {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&error_message[json_start..])
+        {
+            // Anthropic format: {"type":"error","error":{"type":"api_error","message":"..."}}
+            if let Some(error_type) = parsed
+                .get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str())
+            {
+                if RETRYABLE_ERROR_TYPES.contains(&error_type) {
+                    return ApiErrorKind::Retryable(error_type.to_string());
+                }
+                return ApiErrorKind::NonRetryable(error_type.to_string());
+            }
+        }
+    }
+
+    // Fallback: check for known error type strings in the message text
+    for retryable in RETRYABLE_ERROR_TYPES {
+        if error_message.contains(retryable) {
+            return ApiErrorKind::Retryable(retryable.to_string());
+        }
+    }
+
+    // Check for HTTP 5xx status codes in the message (504 is a gateway timeout).
+    for code in &["500 ", "502 ", "503 ", "504 ", "529 "] {
+        if error_message.contains(code) {
+            return ApiErrorKind::Retryable("http_5xx".to_string());
+        }
+    }
+
+    // A timeout without a status ("Request timed out") is transient too.
+    if error_message.contains("timed out") {
+        return ApiErrorKind::Retryable("timeout".to_string());
+    }
+
+    ApiErrorKind::NonRetryable("unknown".to_string())
+}
+
+/// Whether a legacy engine error message looks like an out-of-credit refusal
+/// (case-insensitive): a `402` status, or text mentioning "insufficient
+/// credit" or "out of credit".
+///
+/// The legacy engine (Claude Code CLI) reports a 402 as raw TEXT — e.g.
+/// `"API Error: 402 {...}"` or JSON containing "insufficient" / "out of
+/// credit" — so the cognitive router's typed
+/// `ProviderError::InvalidRequest { detail: "HTTP 402 …" }` check does not
+/// see it. The manager calls this helper on the text instead.
+///
+/// Conservative: a bare `402` is matched only as a whole-number token, and a
+/// bare "credits" is deliberately NOT matched (it would false-positive on a
+/// 400 like "credits field is required").
+pub fn is_out_of_credit_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    contains_number_token(&lower, "402")
+        || lower.contains("insufficient credit")
+        || lower.contains("out of credit")
+}
+
+/// Whether `needle` appears in `haystack` as a whole-number token: the bytes
+/// immediately before and after the match are not ASCII digits. This keeps a
+/// bare `402` in an API error line meaningful while ignoring `402` embedded in
+/// unrelated numbers like `14025`.
+fn contains_number_token(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let needle_len = needle.len();
+    let mut start = 0;
+    while let Some(rel) = haystack[start..].find(needle) {
+        let idx = start + rel;
+        let end = idx + needle_len;
+        let prev_is_digit = idx > 0 && bytes[idx - 1].is_ascii_digit();
+        let next_is_digit = end < bytes.len() && bytes[end].is_ascii_digit();
+        if !prev_is_digit && !next_is_digit {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
+}
+
+// ============================================================================
+// PendingMessage — typed queue entry for pending_messages
+// ============================================================================
+
+/// Distinguishes user-originated messages from system-generated hints
+/// in the `pending_messages` queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingMessageKind {
+    /// Real user message — persisted as `user_message`, increments message_count
+    User,
+    /// System-generated hint (post-compaction context, guard hint, auto-continue)
+    /// — persisted as `system_hint`, does NOT increment message_count
+    SystemHint,
+    /// Out-of-band background event captured by the OOB listener while idle
+    /// (e.g. Monitor notification, BashOutput from `run_in_background`).
+    /// Persisted as `background_output`, does NOT increment message_count.
+    /// The OOB listener has ALREADY persisted+broadcasted the corresponding
+    /// `ChatEvent::BackgroundOutput` before pushing this entry — `stream_response`
+    /// must therefore NOT re-persist it (dedup via this kind).
+    BackgroundOutput,
+    /// A message relayed from a peer session in the same team (TEAM-1).
+    /// Persisted as `team_message`, does NOT increment message_count.
+    /// Delivered to the model as `[team {from_name}] {content}` so the
+    /// model can distinguish team messages from human messages.
+    TeamMessage {
+        from_session_id: Uuid,
+        from_name: String,
+    },
+}
+
+/// A typed entry in the pending_messages queue.
+///
+/// Before this, `pending_messages` was `VecDeque<String>` — all messages
+/// were treated as user messages, causing system hints (post-compaction
+/// context, guard compaction hints) to appear as if the user sent them.
+#[derive(Debug, Clone)]
+pub struct PendingMessage {
+    pub kind: PendingMessageKind,
+    pub content: String,
+    /// Identity of the entry, so a client can edit or drop one precise row.
+    pub id: Uuid,
+    pub queued_at: chrono::DateTime<chrono::Utc>,
+    /// The user asked for this message to WAIT for the running turn to end
+    /// (`ChatManager::queue_user_message`). Only held entries are shown to
+    /// clients and can be edited: every other entry is already on its way —
+    /// a user message that interrupted the turn, a hint, a background event.
+    pub held: bool,
+    /// The user moved this held message to the front ("next").
+    pub prioritized: bool,
+}
+
+/// One held user message, as clients see it (`ChatEvent::PendingQueue`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingQueueEntry {
+    pub id: Uuid,
+    /// The text the user typed, without the attachment block.
+    pub content: String,
+    /// The documents attached to it (what a chip needs to be drawn).
+    #[serde(default)]
+    pub attachments: Vec<super::message_attachments::MessageAttachment>,
+    /// The references attached to it (ids only; the label is the client's to
+    /// look up, as for any chip).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<crate::refs::EntityRef>,
+    pub queued_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub prioritized: bool,
+}
+
+impl PartialEq<&str> for PendingMessage {
+    fn eq(&self, other: &&str) -> bool {
+        self.content == *other
+    }
+}
+
+impl PendingMessage {
+    fn new(kind: PendingMessageKind, content: String) -> Self {
+        Self {
+            kind,
+            content,
+            id: Uuid::new_v4(),
+            queued_at: chrono::Utc::now(),
+            held: false,
+            prioritized: false,
+        }
+    }
+
+    pub fn user(content: String) -> Self {
+        Self::new(PendingMessageKind::User, content)
+    }
+
+    /// A user message that waits for the running turn to end instead of
+    /// interrupting it. `content` is the stored form (attachment block included).
+    pub fn held_user(content: String) -> Self {
+        Self {
+            held: true,
+            ..Self::new(PendingMessageKind::User, content)
+        }
+    }
+
+    pub fn system_hint(content: String) -> Self {
+        Self::new(PendingMessageKind::SystemHint, content)
+    }
+
+    /// Construct a `BackgroundOutput` pending entry. The OOB listener uses
+    /// this when an event arrives while the session is idle and a new
+    /// `stream_response` must be triggered to surface it to the LLM.
+    pub fn background_output(content: String) -> Self {
+        Self::new(PendingMessageKind::BackgroundOutput, content)
+    }
+
+    /// Construct a `TeamMessage` pending entry.  Called by
+    /// `ChatManager::inject_team_message` to relay a message from a peer
+    /// session into this session's queue.
+    ///
+    /// The stored `content` is the raw text; `drain` prefixes it with
+    /// `[team {from_name}]` when building the prompt sent to the model.
+    pub fn team_message(content: String, from_session_id: Uuid, from_name: String) -> Self {
+        Self::new(
+            PendingMessageKind::TeamMessage {
+                from_session_id,
+                from_name,
+            },
+            content,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SessionWorkLog — tracks work performed during a stream for continuity
+// ---------------------------------------------------------------------------
+
+/// Tracks the work performed during an active stream session.
+///
+/// Updated in real-time by parsing `ChatEvent::ToolUse` / `ChatEvent::ToolResult`
+/// events during `stream_response`. Serves as the source of truth for resumption
+/// after compaction or max_turns.
+#[derive(Debug, Clone, Default)]
+pub struct SessionWorkLog {
+    /// Files that were modified (Write/Edit tool_use)
+    pub files_modified: HashSet<String>,
+    /// Files that were read (Read/Glob tool_use)
+    pub files_read: HashSet<String>,
+    /// Steps completed (step(update) with status=completed)
+    pub steps_completed: Vec<Uuid>,
+    /// Step currently in progress (step(update) with status=in_progress)
+    pub step_in_progress: Option<Uuid>,
+    /// Short summaries of key decisions/actions
+    pub decisions_summary: Vec<String>,
+    /// Name of the last tool used
+    pub last_tool_name: Option<String>,
+    /// Total number of tool_use events processed
+    pub tool_use_count: u32,
+}
+
+/// Serializable snapshot of `SessionWorkLog` for transmission / persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWorkLogSnapshot {
+    pub files_modified: Vec<String>,
+    pub files_read: Vec<String>,
+    pub steps_completed: Vec<Uuid>,
+    pub step_in_progress: Option<Uuid>,
+    pub decisions_summary: Vec<String>,
+    pub last_tool_name: Option<String>,
+    pub tool_use_count: u32,
+}
+
+impl SessionWorkLog {
+    /// Create a serializable snapshot (sorted for deterministic output).
+    pub fn snapshot(&self) -> SessionWorkLogSnapshot {
+        let mut files_modified: Vec<String> = self.files_modified.iter().cloned().collect();
+        files_modified.sort();
+        let mut files_read: Vec<String> = self.files_read.iter().cloned().collect();
+        files_read.sort();
+        SessionWorkLogSnapshot {
+            files_modified,
+            files_read,
+            steps_completed: self.steps_completed.clone(),
+            step_in_progress: self.step_in_progress,
+            decisions_summary: self.decisions_summary.clone(),
+            last_tool_name: self.last_tool_name.clone(),
+            tool_use_count: self.tool_use_count,
+        }
+    }
+
+    /// Produce a compact markdown summary for injection into continuity prompts.
+    pub fn to_summary_markdown(&self) -> String {
+        let mut parts = Vec::new();
+
+        if !self.files_modified.is_empty() {
+            let mut files: Vec<&String> = self.files_modified.iter().collect();
+            files.sort();
+            parts.push(format!(
+                "**Files modified ({}):** {}",
+                files.len(),
+                files
+                    .iter()
+                    .map(|f| format!("`{}`", f))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        if !self.files_read.is_empty() {
+            let mut files: Vec<&String> = self.files_read.iter().collect();
+            files.sort();
+            parts.push(format!(
+                "**Files read ({}):** {}",
+                files.len(),
+                files
+                    .iter()
+                    .map(|f| format!("`{}`", f))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        if !self.steps_completed.is_empty() {
+            parts.push(format!(
+                "**Steps completed ({}):** {}",
+                self.steps_completed.len(),
+                self.steps_completed
+                    .iter()
+                    .map(|id| format!("`{}`", id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        if let Some(ref step) = self.step_in_progress {
+            parts.push(format!("**Step in progress:** `{}`", step));
+        }
+
+        if !self.decisions_summary.is_empty() {
+            parts.push(format!(
+                "**Decisions:** {}",
+                self.decisions_summary.join("; ")
+            ));
+        }
+
+        if let Some(ref tool) = self.last_tool_name {
+            parts.push(format!(
+                "**Last tool:** {} (total: {})",
+                tool, self.tool_use_count
+            ));
+        }
+
+        if parts.is_empty() {
+            return String::new();
+        }
+
+        format!("## Session Work Log\n{}", parts.join("\n"))
+    }
+
+    /// Record a tool_use event, extracting file paths from known tool inputs.
+    pub fn record_tool_use(&mut self, tool_name: &str, input: &serde_json::Value) {
+        self.tool_use_count += 1;
+        self.last_tool_name = Some(tool_name.to_string());
+
+        match tool_name {
+            "Write" | "Edit" | "NotebookEdit" => {
+                if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
+                    self.files_modified.insert(path.to_string());
+                }
+            }
+            "Read" => {
+                if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
+                    self.files_read.insert(path.to_string());
+                }
+            }
+            "Glob" => {
+                if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                    self.files_read.insert(path.to_string());
+                }
+            }
+            "Grep" => {
+                if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                    self.files_read.insert(path.to_string());
+                }
+            }
+            "Bash" => {
+                // Track bash commands as decisions for context
+                if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                    let short = if cmd.len() > 80 { &cmd[..80] } else { cmd };
+                    self.decisions_summary.push(format!("bash: {}", short));
+                    // Cap decisions to avoid unbounded growth
+                    if self.decisions_summary.len() > 20 {
+                        self.decisions_summary.remove(0);
+                    }
+                }
+            }
+            // MCP step tool — track step completions
+            _ if tool_name.contains("step") => {
+                self.record_step_update(input);
+            }
+            _ => {}
+        }
+    }
+
+    /// Parse step(update) inputs to track step_in_progress / steps_completed.
+    fn record_step_update(&mut self, input: &serde_json::Value) {
+        let action = input.get("action").and_then(|v| v.as_str());
+        let status = input.get("status").and_then(|v| v.as_str());
+        let step_id = input
+            .get("step_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+
+        if action != Some("update") {
+            return;
+        }
+
+        if let Some(id) = step_id {
+            match status {
+                Some("completed") => {
+                    if !self.steps_completed.contains(&id) {
+                        self.steps_completed.push(id);
+                    }
+                    if self.step_in_progress == Some(id) {
+                        self.step_in_progress = None;
+                    }
+                }
+                Some("in_progress") => {
+                    self.step_in_progress = Some(id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Reset the log for a new stream turn (keeps accumulated data across
+    /// streams within the same session — only clears per-stream transients).
+    pub fn reset_for_new_stream(&mut self) {
+        // Intentionally does NOT clear files_modified, files_read, steps_completed, etc.
+        // Those accumulate across the session lifetime.
+        // Only the last_tool_name is reset since it's per-stream.
+        self.last_tool_name = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn test_chat_request_deserialize() {
+        let json = r#"{
+            "message": "Hello",
+            "cwd": "/tmp",
+            "project_slug": "test-project"
+        }"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.message, "Hello");
+        assert_eq!(req.cwd, "/tmp");
+        assert_eq!(req.project_slug.as_deref(), Some("test-project"));
+        assert!(req.session_id.is_none());
+        assert!(req.model.is_none());
+    }
+
+    #[test]
+    fn test_chat_event_serialize() {
+        let event = ChatEvent::AssistantText {
+            content: "Hello!".into(),
+            parent_tool_use_id: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"assistant_text\""));
+        assert!(json.contains("Hello!"));
+        // parent_tool_use_id: None should NOT appear in JSON
+        assert!(!json.contains("parent_tool_use_id"));
+    }
+
+    #[test]
+    fn test_workflow_event_serialize_and_dedup() {
+        let event = ChatEvent::Workflow {
+            subtype: "task_progress".into(),
+            data: serde_json::json!({
+                "task_id": "wbk63ch2d",
+                "uuid": "ed4e206c-974c-4883-93d3-de4c892e12a9",
+                "workflow_progress": [{ "index": 1, "state": "start" }],
+                "usage": { "total_tokens": 7681 }
+            }),
+        };
+
+        // Serde tag + subtype + nested payload survive serialization.
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"workflow\""));
+        assert!(json.contains("\"subtype\":\"task_progress\""));
+        assert!(json.contains("wbk63ch2d"));
+        assert!(json.contains("workflow_progress"));
+
+        assert_eq!(event.event_type(), "workflow");
+
+        // Fingerprint keys on the unique per-event uuid, so distinct progress ticks
+        // are never collapsed on replay.
+        assert_eq!(
+            event.fingerprint().as_deref(),
+            Some("workflow:ed4e206c-974c-4883-93d3-de4c892e12a9")
+        );
+
+        // Without a uuid, fingerprint falls back to subtype + content hash (still Some).
+        let no_uuid = ChatEvent::Workflow {
+            subtype: "task_started".into(),
+            data: serde_json::json!({ "task_id": "x" }),
+        };
+        let key = no_uuid.fingerprint().unwrap();
+        assert!(key.starts_with("workflow:task_started:"));
+    }
+
+    #[test]
+    fn test_chat_event_types() {
+        assert_eq!(
+            ChatEvent::AssistantText {
+                content: "".into(),
+                parent_tool_use_id: None,
+            }
+            .event_type(),
+            "assistant_text"
+        );
+        assert_eq!(
+            ChatEvent::Thinking {
+                content: "".into(),
+                parent_tool_use_id: None,
+            }
+            .event_type(),
+            "thinking"
+        );
+        assert_eq!(
+            ChatEvent::ToolUse {
+                id: "".into(),
+                tool: "".into(),
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            }
+            .event_type(),
+            "tool_use"
+        );
+        assert_eq!(
+            ChatEvent::ToolCancelled {
+                id: "".into(),
+                parent_tool_use_id: None,
+            }
+            .event_type(),
+            "tool_cancelled"
+        );
+        assert_eq!(
+            ChatEvent::PermissionRequest {
+                id: "".into(),
+                tool: "".into(),
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+                tool_use_id: None,
+                always: None,
+                consent: None,
+            }
+            .event_type(),
+            "permission_request"
+        );
+        assert_eq!(
+            ChatEvent::StreamDelta {
+                text: "".into(),
+                parent_tool_use_id: None,
+            }
+            .event_type(),
+            "stream_delta"
+        );
+        assert_eq!(
+            ChatEvent::Result {
+                session_id: "".into(),
+                duration_ms: 0,
+                cost_usd: None,
+                subtype: "success".into(),
+                is_error: false,
+                num_turns: None,
+                result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
+                error_code: None,
+                error_message: None,
+            }
+            .event_type(),
+            "result"
+        );
+    }
+
+    #[test]
+    fn test_client_message_deserialize() {
+        let json = r#"{"type": "user_message", "content": "Hi"}"#;
+        let msg: ClientMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ClientMessage::UserMessage { content } if content == "Hi"));
+
+        let json = r#"{"type": "permission_response", "allow": true}"#;
+        let msg: ClientMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ClientMessage::PermissionResponse { allow: true, .. }
+        ));
+
+        let json = r#"{"type": "input_response", "content": "option B"}"#;
+        let msg: ClientMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ClientMessage::InputResponse { content } if content == "option B"));
+    }
+
+    #[test]
+    fn test_chat_event_serde_roundtrip_all_variants() {
+        let events = vec![
+            ChatEvent::AssistantText {
+                content: "Hello!".into(),
+                parent_tool_use_id: None,
+            },
+            ChatEvent::Thinking {
+                content: "Let me think...".into(),
+                parent_tool_use_id: None,
+            },
+            ChatEvent::ToolUse {
+                id: "tu_1".into(),
+                tool: "create_plan".into(),
+                input: serde_json::json!({"title": "Plan"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            },
+            ChatEvent::ToolResult {
+                id: "tu_1".into(),
+                result: serde_json::json!({"id": "abc"}),
+                is_error: false,
+                parent_tool_use_id: None,
+            },
+            ChatEvent::ToolResult {
+                id: "tu_2".into(),
+                result: serde_json::json!("Not found"),
+                is_error: true,
+                parent_tool_use_id: Some("toolu_parent_1".into()),
+            },
+            ChatEvent::ToolCancelled {
+                id: "tu_3".into(),
+                parent_tool_use_id: None,
+            },
+            ChatEvent::ToolCancelled {
+                id: "tu_4".into(),
+                parent_tool_use_id: Some("toolu_parent_3".into()),
+            },
+            ChatEvent::PermissionRequest {
+                id: "pr_1".into(),
+                tool: "bash".into(),
+                input: serde_json::json!({"command": "rm -rf /"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+                tool_use_id: None,
+                always: None,
+                consent: None,
+            },
+            ChatEvent::Result {
+                session_id: "cli-123".into(),
+                duration_ms: 5000,
+                cost_usd: Some(0.15),
+                subtype: "success".into(),
+                is_error: false,
+                num_turns: Some(3),
+                result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
+                error_code: None,
+                error_message: None,
+            },
+            ChatEvent::Result {
+                session_id: "cli-456".into(),
+                duration_ms: 1000,
+                cost_usd: None,
+                subtype: "error_max_turns".into(),
+                is_error: true,
+                num_turns: Some(15),
+                result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
+                error_code: None,
+                error_message: None,
+            },
+            ChatEvent::Result {
+                session_id: "cli-789".into(),
+                duration_ms: 2000,
+                cost_usd: Some(0.05),
+                subtype: "error_during_execution".into(),
+                is_error: true,
+                num_turns: Some(1),
+                result_text: Some("CLI crashed unexpectedly".into()),
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
+                error_code: None,
+                error_message: None,
+            },
+            ChatEvent::StreamDelta {
+                text: "Hello".into(),
+                parent_tool_use_id: None,
+            },
+            ChatEvent::Error {
+                message: "CLI not found".into(),
+                parent_tool_use_id: None,
+                code: None,
+                reason: None,
+                index: None,
+                request_id: None,
+            },
+            ChatEvent::PermissionDecision {
+                id: "pr_1".into(),
+                allow: true,
+                scope: Some(PermissionAnswerScope::Session),
+                rule: Some("Bash: git status".into()),
+            },
+            ChatEvent::PermissionDecision {
+                id: "pr_2".into(),
+                allow: false,
+                scope: None,
+                rule: None,
+            },
+            ChatEvent::ModelChanged {
+                model: "claude-opus-4-6".into(),
+                reason: None,
+            },
+            ChatEvent::CompactionStarted {
+                trigger: "auto".into(),
+            },
+            ChatEvent::CompactionStarted {
+                trigger: "manual".into(),
+            },
+            ChatEvent::CompactionRecovery {
+                hint_tokens: 450,
+                build_latency_ms: 120,
+                recovery_success: true,
+            },
+            ChatEvent::CompactionRecovery {
+                hint_tokens: 0,
+                build_latency_ms: 510,
+                recovery_success: false,
+            },
+            ChatEvent::CompactBoundary {
+                trigger: "auto".into(),
+                pre_tokens: Some(150000),
+            },
+            ChatEvent::CompactBoundary {
+                trigger: "manual".into(),
+                pre_tokens: None,
+            },
+            ChatEvent::SystemInit {
+                cli_session_id: "cli-init-123".into(),
+                model: Some("claude-sonnet-4-6".into()),
+                tools: vec!["Bash".into(), "Read".into(), "Write".into()],
+                mcp_servers: vec![serde_json::json!({"name": "po", "status": "connected"})],
+                permission_mode: Some("default".into()),
+                provider: None,
+                capabilities: None,
+                tool_policy: None,
+                policy_mode: None,
+                engine: None,
+                degraded_features: None,
+            },
+            ChatEvent::SystemInit {
+                cli_session_id: "cli-init-456".into(),
+                model: None,
+                tools: vec![],
+                mcp_servers: vec![],
+                permission_mode: None,
+                provider: None,
+                capabilities: None,
+                tool_policy: None,
+                policy_mode: None,
+                engine: None,
+                degraded_features: None,
+            },
+            ChatEvent::AutoContinue {
+                session_id: "sess-auto-1".into(),
+                delay_ms: 500,
+            },
+            ChatEvent::AutoContinueStateChanged {
+                session_id: "sess-auto-2".into(),
+                enabled: true,
+            },
+            ChatEvent::AutoContinueStateChanged {
+                session_id: "sess-auto-3".into(),
+                enabled: false,
+            },
+            ChatEvent::Retrying {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 1000,
+                error_message: "api_error: Internal server error".into(),
+            },
+            // T9 of plan 9a1684b2 — SessionError variant.
+            ChatEvent::SessionError {
+                reason: "subprocess_exited".into(),
+                message: "The CLI subprocess for this session has exited.".into(),
+                received_at: chrono::Utc::now(),
+            },
+            ChatEvent::SessionError {
+                reason: "transport_closed".into(),
+                message: "Lost connection to the CLI transport.".into(),
+                received_at: chrono::Utc::now(),
+            },
+        ];
+
+        for event in &events {
+            let json = serde_json::to_string(event).unwrap();
+            let deserialized: ChatEvent = serde_json::from_str(&json).unwrap();
+            // Verify the type tag roundtrips correctly
+            assert_eq!(event.event_type(), deserialized.event_type());
+        }
+    }
+
+    /// An in-place provider switch is stated on the SAME thread with a dedicated
+    /// event (`provider_switched`), not as a `conversation_relayed` to a new session.
+    /// The wire tag and every field round-trip unchanged.
+    #[test]
+    fn a_provider_switched_event_serializes_for_the_thread() {
+        let event = ChatEvent::ProviderSwitched {
+            session_id: "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b".into(),
+            from_provider: "claude-code".into(),
+            to_provider: "local".into(),
+            model: "example-model-large".into(),
+            relayed_entries: Some(12),
+            omitted_entries: Some(3),
+        };
+        assert_eq!(event.event_type(), "provider_switched");
+
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["type"], "provider_switched");
+        assert_eq!(wire["session_id"], "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b");
+        assert_eq!(wire["from_provider"], "claude-code");
+        assert_eq!(wire["to_provider"], "local");
+        assert_eq!(wire["model"], "example-model-large");
+        assert_eq!(wire["relayed_entries"], 12);
+        assert_eq!(wire["omitted_entries"], 3);
+
+        let back: ChatEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back.event_type(), "provider_switched");
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            wire,
+            "round-trips unchanged"
+        );
+
+        // With nothing to state the two optional counts stay off the wire.
+        let bare = ChatEvent::ProviderSwitched {
+            session_id: "s".into(),
+            from_provider: "a".into(),
+            to_provider: "b".into(),
+            model: "m".into(),
+            relayed_entries: None,
+            omitted_entries: None,
+        };
+        let bare_wire = serde_json::to_value(&bare).unwrap();
+        assert!(bare_wire.get("relayed_entries").is_none());
+        assert!(bare_wire.get("omitted_entries").is_none());
+    }
+
+    #[test]
+    fn test_auto_continue_event_types_and_fingerprints() {
+        let ac = ChatEvent::AutoContinue {
+            session_id: "sess-1".into(),
+            delay_ms: 500,
+        };
+        assert_eq!(ac.event_type(), "auto_continue");
+        assert_eq!(ac.fingerprint(), Some("auto_continue:sess-1".to_string()));
+
+        let acs_on = ChatEvent::AutoContinueStateChanged {
+            session_id: "sess-2".into(),
+            enabled: true,
+        };
+        assert_eq!(acs_on.event_type(), "auto_continue_state_changed");
+        assert_eq!(
+            acs_on.fingerprint(),
+            Some("auto_continue_state_changed:sess-2:true".to_string())
+        );
+
+        let acs_off = ChatEvent::AutoContinueStateChanged {
+            session_id: "sess-2".into(),
+            enabled: false,
+        };
+        assert_eq!(
+            acs_off.fingerprint(),
+            Some("auto_continue_state_changed:sess-2:false".to_string())
+        );
+    }
+
+    #[test]
+    fn test_auto_continue_event_deserialize_from_json() {
+        let json = r#"{"type":"auto_continue","session_id":"s1","delay_ms":500}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.event_type(), "auto_continue");
+
+        let json2 = r#"{"type":"auto_continue_state_changed","session_id":"s1","enabled":true}"#;
+        let event2: ChatEvent = serde_json::from_str(json2).unwrap();
+        assert_eq!(event2.event_type(), "auto_continue_state_changed");
+    }
+
+    #[test]
+    fn test_chat_event_deserialize_from_json() {
+        // Test deserializing from a known JSON structure
+        let json = r#"{"type":"tool_use","id":"t1","tool":"list_plans","input":{}}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, ChatEvent::ToolUse { ref tool, .. } if tool == "list_plans"));
+
+        let json = r#"{"type":"error","message":"fail"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, ChatEvent::Error { ref message, .. } if message == "fail"));
+
+        let json = r#"{"type":"permission_request","id":"p1","tool":"bash","input":{"cmd":"ls"}}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, ChatEvent::PermissionRequest { .. }));
+
+        // couac2: `input_request` was never emitted in production (only built in
+        // tests) and was removed; user questions go through AskUserQuestion.
+        let json = r#"{"type":"input_request","prompt":"Choose:","options":["A","B"]}"#;
+        assert!(serde_json::from_str::<ChatEvent>(json).is_err());
+
+        // CompactionStarted with auto trigger
+        let json = r#"{"type":"compaction_started","trigger":"auto"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, ChatEvent::CompactionStarted { ref trigger } if trigger == "auto"));
+        assert_eq!(event.event_type(), "compaction_started");
+        assert_eq!(
+            event.fingerprint(),
+            Some("compaction_started:auto".to_string())
+        );
+
+        // CompactionStarted with manual trigger
+        let json = r#"{"type":"compaction_started","trigger":"manual"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::CompactionStarted { ref trigger } if trigger == "manual")
+        );
+
+        // CompactionStarted round-trip serialization
+        let original = ChatEvent::CompactionStarted {
+            trigger: "auto".to_string(),
+        };
+        let serialized = serde_json::to_string(&original).unwrap();
+        let deserialized: ChatEvent = serde_json::from_str(&serialized).unwrap();
+        assert!(matches!(
+            deserialized,
+            ChatEvent::CompactionStarted { ref trigger } if trigger == "auto"
+        ));
+
+        // CompactionRecovery — success
+        let json = r#"{"type":"compaction_recovery","hint_tokens":450,"build_latency_ms":120,"recovery_success":true}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            event,
+            ChatEvent::CompactionRecovery {
+                hint_tokens: 450,
+                build_latency_ms: 120,
+                recovery_success: true
+            }
+        ));
+        assert_eq!(event.event_type(), "compaction_recovery");
+        assert_eq!(
+            event.fingerprint(),
+            Some("compaction_recovery:450:120:true".to_string())
+        );
+
+        // CompactionRecovery — failure
+        let json = r#"{"type":"compaction_recovery","hint_tokens":0,"build_latency_ms":510,"recovery_success":false}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            event,
+            ChatEvent::CompactionRecovery {
+                hint_tokens: 0,
+                build_latency_ms: 510,
+                recovery_success: false
+            }
+        ));
+
+        // CompactionRecovery round-trip
+        let original = ChatEvent::CompactionRecovery {
+            hint_tokens: 200,
+            build_latency_ms: 80,
+            recovery_success: true,
+        };
+        let serialized = serde_json::to_string(&original).unwrap();
+        let deserialized: ChatEvent = serde_json::from_str(&serialized).unwrap();
+        assert!(matches!(
+            deserialized,
+            ChatEvent::CompactionRecovery {
+                hint_tokens: 200,
+                build_latency_ms: 80,
+                recovery_success: true
+            }
+        ));
+
+        // CompactBoundary with pre_tokens
+        let json = r#"{"type":"compact_boundary","trigger":"auto","pre_tokens":150000}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::CompactBoundary { ref trigger, pre_tokens: Some(150000) } if trigger == "auto")
+        );
+
+        // CompactBoundary without pre_tokens (backward compat)
+        let json = r#"{"type":"compact_boundary","trigger":"manual"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::CompactBoundary { ref trigger, pre_tokens: None } if trigger == "manual")
+        );
+
+        // ModelChanged
+        let json = r#"{"type":"model_changed","model":"claude-opus-4-6"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::ModelChanged { ref model, .. } if model == "claude-opus-4-6")
+        );
+
+        // SystemInit with all fields
+        let json = r#"{"type":"system_init","cli_session_id":"sid-1","model":"claude-sonnet-4-6","tools":["Bash","Read"],"mcp_servers":[{"name":"po"}],"permission_mode":"default"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::SystemInit { ref cli_session_id, ref model, .. } if cli_session_id == "sid-1" && model.as_deref() == Some("claude-sonnet-4-6"))
+        );
+
+        // SystemInit minimal (backward compat — only required field)
+        let json = r#"{"type":"system_init","cli_session_id":"sid-2"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::SystemInit { ref cli_session_id, ref tools, ref mcp_servers, .. } if cli_session_id == "sid-2" && tools.is_empty() && mcp_servers.is_empty())
+        );
+    }
+
+    #[test]
+    fn test_chat_event_parent_tool_use_id_serde() {
+        // (1) parent_tool_use_id: None → JSON should NOT contain the field
+        let event = ChatEvent::ToolUse {
+            id: "t1".into(),
+            tool: "Bash".into(),
+            input: serde_json::json!({}),
+            parent_tool_use_id: None,
+            category: None,
+            canonical: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("parent_tool_use_id"));
+
+        // (2) parent_tool_use_id: Some → JSON SHOULD contain the field
+        let event = ChatEvent::ToolUse {
+            id: "t2".into(),
+            tool: "Read".into(),
+            input: serde_json::json!({"path": "/src/main.rs"}),
+            parent_tool_use_id: Some("toolu_abc123".into()),
+            category: None,
+            canonical: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"parent_tool_use_id\":\"toolu_abc123\""));
+
+        // (3) Backward compat: deserialize JSON WITHOUT parent_tool_use_id → None
+        let json = r#"{"type":"tool_use","id":"t3","tool":"Grep","input":{}}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        if let ChatEvent::ToolUse {
+            parent_tool_use_id, ..
+        } = event
+        {
+            assert!(parent_tool_use_id.is_none());
+        } else {
+            panic!("Expected ToolUse variant");
+        }
+
+        // (4) Deserialize JSON WITH parent_tool_use_id → Some
+        let json = r#"{"type":"stream_delta","text":"hello","parent_tool_use_id":"toolu_xyz789"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        if let ChatEvent::StreamDelta {
+            text,
+            parent_tool_use_id,
+        } = event
+        {
+            assert_eq!(text, "hello");
+            assert_eq!(parent_tool_use_id.as_deref(), Some("toolu_xyz789"));
+        } else {
+            panic!("Expected StreamDelta variant");
+        }
+
+        // (5) Roundtrip with parent — serialize then deserialize
+        let event = ChatEvent::ToolResult {
+            id: "tu_1".into(),
+            result: serde_json::json!({"ok": true}),
+            is_error: false,
+            parent_tool_use_id: Some("toolu_parent".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: ChatEvent = serde_json::from_str(&json).unwrap();
+        if let ChatEvent::ToolResult {
+            parent_tool_use_id, ..
+        } = deserialized
+        {
+            assert_eq!(parent_tool_use_id.as_deref(), Some("toolu_parent"));
+        } else {
+            panic!("Expected ToolResult variant");
+        }
+
+        // (6) All variant types that have parent_tool_use_id — roundtrip test
+        let events_with_parent: Vec<ChatEvent> = vec![
+            ChatEvent::AssistantText {
+                content: "hi".into(),
+                parent_tool_use_id: Some("p1".into()),
+            },
+            ChatEvent::Thinking {
+                content: "hmm".into(),
+                parent_tool_use_id: Some("p2".into()),
+            },
+            ChatEvent::StreamDelta {
+                text: "tok".into(),
+                parent_tool_use_id: Some("p3".into()),
+            },
+            ChatEvent::Error {
+                message: "err".into(),
+                parent_tool_use_id: Some("p4".into()),
+                code: None,
+                reason: None,
+                index: None,
+                request_id: None,
+            },
+            ChatEvent::PermissionRequest {
+                id: "pr1".into(),
+                tool: "bash".into(),
+                input: serde_json::json!({}),
+                parent_tool_use_id: Some("p5".into()),
+                category: None,
+                canonical: None,
+                tool_use_id: None,
+                always: None,
+                consent: None,
+            },
+            ChatEvent::ToolUseInputResolved {
+                id: "tu1".into(),
+                input: serde_json::json!({}),
+                parent_tool_use_id: Some("p7".into()),
+            },
+        ];
+        for event in &events_with_parent {
+            let json = serde_json::to_string(event).unwrap();
+            assert!(
+                json.contains("parent_tool_use_id"),
+                "Missing parent_tool_use_id in JSON for {:?}",
+                event.event_type()
+            );
+            let deserialized: ChatEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(event.event_type(), deserialized.event_type());
+        }
+    }
+
+    #[test]
+    fn test_client_message_serialize_roundtrip() {
+        let messages = vec![
+            ClientMessage::UserMessage {
+                content: "Hello".into(),
+            },
+            ClientMessage::PermissionResponse {
+                allow: true,
+                reason: Some("Trusted tool".into()),
+            },
+            ClientMessage::PermissionResponse {
+                allow: false,
+                reason: None,
+            },
+            ClientMessage::InputResponse {
+                content: "option A".into(),
+            },
+        ];
+
+        for msg in &messages {
+            let json = serde_json::to_string(msg).unwrap();
+            let deserialized: ClientMessage = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&deserialized).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn test_create_session_response_serde() {
+        let resp = CreateSessionResponse {
+            session_id: "abc-123".into(),
+            stream_url: "/api/chat/sessions/abc-123/stream".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: CreateSessionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.session_id, "abc-123");
+        assert_eq!(deserialized.stream_url, "/api/chat/sessions/abc-123/stream");
+    }
+
+    #[test]
+    fn test_chat_request_full_fields() {
+        let json = r#"{
+            "message": "Create a plan",
+            "session_id": "existing-session",
+            "cwd": "/home/dev/project",
+            "project_slug": "my-project",
+            "model": "claude-sonnet-4-6"
+        }"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.message, "Create a plan");
+        assert_eq!(req.session_id.as_deref(), Some("existing-session"));
+        assert_eq!(req.cwd, "/home/dev/project");
+        assert_eq!(req.project_slug.as_deref(), Some("my-project"));
+        assert_eq!(req.model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn test_chat_session_serde_roundtrip() {
+        let session = ChatSession {
+            mirror_of: None,
+            routing_mode: None,
+            routing_pool: None,
+            id: "test-id".into(),
+            cli_session_id: Some("cli-123".into()),
+            project_slug: Some("my-project".into()),
+            workspace_slug: None,
+            cwd: "/tmp".into(),
+            title: Some("Test session".into()),
+            model: "claude-opus-4-6".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            message_count: 5,
+            total_cost_usd: Some(0.15),
+            children_cost_usd: None,
+            aggregated_cost_usd: None,
+            conversation_id: Some("conv-abc-123".into()),
+            preview: Some("Hello, can you help me?".into()),
+            permission_mode: None,
+            add_dirs: None,
+            spawned_by: None,
+            linked_plans: Vec::new(),
+            linked_tasks: Vec::new(),
+            linked_rfcs: Vec::new(),
+            activity: None,
+            provider_id: None,
+            capabilities: None,
+            effective_capabilities: None,
+            routed_by: None,
+            execution_place: Default::default(),
+            access: Default::default(),
+        };
+
+        let json = serde_json::to_string(&session).unwrap();
+        let deserialized: ChatSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, "test-id");
+        assert_eq!(deserialized.cli_session_id.as_deref(), Some("cli-123"));
+        assert_eq!(deserialized.model, "claude-opus-4-6");
+        assert_eq!(deserialized.message_count, 5);
+    }
+
+    // ====================================================================
+    // truncate_snippet
+    // ====================================================================
+
+    #[test]
+    fn test_truncate_snippet_short_text() {
+        let text = "Hello, world!";
+        assert_eq!(truncate_snippet(text, 50), "Hello, world!");
+    }
+
+    #[test]
+    fn test_truncate_snippet_exact_length() {
+        let text = "abcde";
+        assert_eq!(truncate_snippet(text, 5), "abcde");
+    }
+
+    #[test]
+    fn test_truncate_snippet_long_text_breaks_at_space() {
+        let text = "Hello world this is a long text";
+        let result = truncate_snippet(text, 15);
+        // Should break at word boundary before char 15 and add "..."
+        assert!(result.ends_with("..."));
+        assert!(result.len() < text.len());
+    }
+
+    #[test]
+    fn test_truncate_snippet_no_space_to_break() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let result = truncate_snippet(text, 10);
+        // No spaces, so truncates at char boundary
+        assert!(result.ends_with("..."));
+        assert!(result.starts_with("abcdefghij"));
+    }
+
+    #[test]
+    fn test_truncate_snippet_utf8_multibyte() {
+        let text = "Héllo wörld café résumé";
+        let result = truncate_snippet(text, 10);
+        assert!(result.ends_with("..."));
+        // Should not panic on multi-byte chars
+    }
+
+    #[test]
+    fn test_truncate_snippet_emoji() {
+        let text = "🎉🎊🎈🎁🎀🎆🎇✨🧨🎃🎄";
+        let result = truncate_snippet(text, 5);
+        assert!(result.ends_with("..."));
+        // 5 emoji chars + "..."
+        assert_eq!(result.chars().filter(|c| *c != '.').count(), 5);
+    }
+
+    #[test]
+    fn test_truncate_snippet_empty() {
+        assert_eq!(truncate_snippet("", 10), "");
+    }
+
+    #[test]
+    fn test_truncate_snippet_single_char() {
+        assert_eq!(truncate_snippet("a", 10), "a");
+    }
+
+    // ====================================================================
+    // MessageSearchHit & MessageSearchResult serde
+    // ====================================================================
+
+    #[test]
+    fn test_message_search_hit_serde_roundtrip() {
+        let hit = MessageSearchHit {
+            message_id: "msg-123".into(),
+            role: "user".into(),
+            content_snippet: "Hello, help me with...".into(),
+            turn_index: 3,
+            created_at: 1700000000,
+            score: 0.95,
+        };
+        let json = serde_json::to_string(&hit).unwrap();
+        let deserialized: MessageSearchHit = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.message_id, "msg-123");
+        assert_eq!(deserialized.role, "user");
+        assert_eq!(deserialized.turn_index, 3);
+        assert!((deserialized.score - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_message_search_result_serde_roundtrip() {
+        let result = MessageSearchResult {
+            session_id: "sess-abc".into(),
+            session_title: Some("My session".into()),
+            session_preview: Some("First message preview".into()),
+            project_slug: Some("my-project".into()),
+            workspace_slug: None,
+            conversation_id: "conv-xyz".into(),
+            hits: vec![MessageSearchHit {
+                message_id: "msg-1".into(),
+                role: "assistant".into(),
+                content_snippet: "Here is the answer...".into(),
+                turn_index: 4,
+                created_at: 1700000100,
+                score: 0.88,
+            }],
+            best_score: 0.88,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: MessageSearchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.session_id, "sess-abc");
+        assert_eq!(deserialized.session_title.as_deref(), Some("My session"));
+        assert_eq!(
+            deserialized.session_preview.as_deref(),
+            Some("First message preview")
+        );
+        assert_eq!(deserialized.project_slug.as_deref(), Some("my-project"));
+        assert_eq!(deserialized.conversation_id, "conv-xyz");
+        assert_eq!(deserialized.hits.len(), 1);
+        assert!((deserialized.best_score - 0.88).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_message_search_result_minimal_fields() {
+        let result = MessageSearchResult {
+            session_id: "sess-1".into(),
+            session_title: None,
+            session_preview: None,
+            project_slug: None,
+            workspace_slug: None,
+            conversation_id: "conv-1".into(),
+            hits: vec![],
+            best_score: 0.0,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: MessageSearchResult = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.session_title.is_none());
+        assert!(deserialized.session_preview.is_none());
+        assert!(deserialized.project_slug.is_none());
+        assert!(deserialized.hits.is_empty());
+    }
+
+    #[test]
+    fn test_chat_session_with_preview_field() {
+        let json = r#"{
+            "id": "test-id",
+            "cwd": "/tmp",
+            "model": "claude-opus-4-6",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "preview": "Can you help me build a REST API?"
+        }"#;
+        let session: ChatSession = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            session.preview.as_deref(),
+            Some("Can you help me build a REST API?")
+        );
+        // Optional fields default correctly
+        assert!(session.title.is_none());
+        assert!(session.conversation_id.is_none());
+        assert_eq!(session.message_count, 0);
+    }
+
+    // ====================================================================
+    // workspace_slug & add_dirs fields
+    // ====================================================================
+
+    #[test]
+    fn test_chat_request_with_workspace_and_add_dirs() {
+        let json = r#"{
+            "message": "Hello",
+            "cwd": "/tmp",
+            "workspace_slug": "my-workspace",
+            "add_dirs": ["/extra/dir1", "/extra/dir2"]
+        }"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.workspace_slug.as_deref(), Some("my-workspace"));
+        assert_eq!(
+            req.add_dirs.as_deref(),
+            Some(vec!["/extra/dir1".to_string(), "/extra/dir2".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn test_chat_request_workspace_defaults_to_none() {
+        let json = r#"{"message": "Hi", "cwd": "/tmp"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert!(req.workspace_slug.is_none());
+        assert!(req.add_dirs.is_none());
+    }
+
+    #[test]
+    fn test_chat_session_with_workspace_and_add_dirs() {
+        let session = ChatSession {
+            mirror_of: None,
+            routing_mode: None,
+            routing_pool: None,
+            id: "s1".into(),
+            cli_session_id: None,
+            project_slug: Some("proj".into()),
+            workspace_slug: Some("my-ws".into()),
+            cwd: "/tmp".into(),
+            title: None,
+            model: "model".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            message_count: 0,
+            total_cost_usd: None,
+            children_cost_usd: None,
+            aggregated_cost_usd: None,
+            conversation_id: None,
+            preview: None,
+            permission_mode: None,
+            add_dirs: Some(vec!["/dir/a".into(), "/dir/b".into()]),
+            spawned_by: None,
+            linked_plans: Vec::new(),
+            linked_tasks: Vec::new(),
+            linked_rfcs: Vec::new(),
+            activity: None,
+            provider_id: None,
+            capabilities: None,
+            effective_capabilities: None,
+            routed_by: None,
+            execution_place: Default::default(),
+            access: Default::default(),
+        };
+
+        let json = serde_json::to_string(&session).unwrap();
+        let de: ChatSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.workspace_slug.as_deref(), Some("my-ws"));
+        assert_eq!(de.add_dirs.as_ref().unwrap().len(), 2);
+        assert_eq!(de.add_dirs.as_ref().unwrap()[0], "/dir/a");
+        assert_eq!(de.add_dirs.as_ref().unwrap()[1], "/dir/b");
+    }
+
+    #[test]
+    fn test_chat_session_workspace_fields_default() {
+        let json = r#"{
+            "id": "s2",
+            "cwd": "/tmp",
+            "model": "m",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let session: ChatSession = serde_json::from_str(json).unwrap();
+        assert!(session.workspace_slug.is_none());
+        assert!(session.add_dirs.is_none());
+    }
+
+    #[test]
+    fn test_message_search_result_with_workspace_slug() {
+        let result = MessageSearchResult {
+            session_id: "sess-1".into(),
+            session_title: None,
+            session_preview: None,
+            project_slug: Some("proj".into()),
+            workspace_slug: Some("ws-slug".into()),
+            conversation_id: "conv-1".into(),
+            hits: vec![],
+            best_score: 0.0,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let de: MessageSearchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.workspace_slug.as_deref(), Some("ws-slug"));
+    }
+
+    #[test]
+    fn test_message_search_result_workspace_slug_default() {
+        let json = r#"{
+            "session_id": "s",
+            "conversation_id": "c",
+            "hits": [],
+            "best_score": 0.0
+        }"#;
+        let result: MessageSearchResult = serde_json::from_str(json).unwrap();
+        assert!(result.workspace_slug.is_none());
+    }
+
+    // ====================================================================
+    // Retrying event
+    // ====================================================================
+
+    #[test]
+    fn test_retrying_event_serde_roundtrip() {
+        let event = ChatEvent::Retrying {
+            attempt: 2,
+            max_attempts: 3,
+            delay_ms: 2000,
+            error_message: "api_error: Internal server error".into(),
+        };
+        assert_eq!(event.event_type(), "retrying");
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"retrying\""));
+        assert!(json.contains("\"attempt\":2"));
+        assert!(json.contains("\"max_attempts\":3"));
+        assert!(json.contains("\"delay_ms\":2000"));
+
+        let deserialized: ChatEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.event_type(), "retrying");
+    }
+
+    #[test]
+    fn test_retrying_event_deserialize_from_json() {
+        let json = r#"{"type":"retrying","attempt":1,"max_attempts":3,"delay_ms":1000,"error_message":"api_error"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.event_type(), "retrying");
+        if let ChatEvent::Retrying {
+            attempt,
+            max_attempts,
+            delay_ms,
+            ..
+        } = event
+        {
+            assert_eq!(attempt, 1);
+            assert_eq!(max_attempts, 3);
+            assert_eq!(delay_ms, 1000);
+        } else {
+            panic!("Expected Retrying variant");
+        }
+    }
+
+    #[test]
+    fn test_retrying_event_fingerprint() {
+        let event = ChatEvent::Retrying {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 1000,
+            error_message: "err".into(),
+        };
+        assert_eq!(event.fingerprint(), Some("retrying:1:3".to_string()));
+    }
+
+    /// A locked vault is polled: the same advisory repeats and is shown once, but
+    /// a sentence that changed (a wait that grew) is a new notice.
+    #[test]
+    fn a_repeated_provider_notice_dedups_and_a_new_sentence_does_not() {
+        let notice = |message: &str| ChatEvent::ProviderNotice {
+            kind: "credentials_locked".into(),
+            code: Some("credentials_locked".into()),
+            message: message.into(),
+            severity: "action_required".into(),
+            data: None,
+        };
+        let first = notice("the vault is locked").fingerprint().unwrap();
+        assert!(first.starts_with("provider_notice:credentials_locked:action_required:"));
+        assert_eq!(notice("the vault is locked").fingerprint().unwrap(), first);
+        assert_ne!(
+            notice("the vault is locked (2 min)").fingerprint().unwrap(),
+            first
+        );
+    }
+
+    // ====================================================================
+    // classify_api_error
+    // ====================================================================
+
+    #[test]
+    fn test_classify_api_error_retryable_json() {
+        // Standard Anthropic 500 error format
+        let msg = r#"API Error: 500 {"type":"error","error":{"type":"api_error","message":"Internal server error"},"request_id":"req_abc"}"#;
+        let kind = classify_api_error(msg);
+        assert_eq!(kind, ApiErrorKind::Retryable("api_error".into()));
+        assert!(kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_overloaded() {
+        let msg = r#"API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let kind = classify_api_error(msg);
+        assert_eq!(kind, ApiErrorKind::Retryable("overloaded_error".into()));
+        assert!(kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_non_retryable_invalid_request() {
+        let msg = r#"API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Bad request"}}"#;
+        let kind = classify_api_error(msg);
+        assert_eq!(
+            kind,
+            ApiErrorKind::NonRetryable("invalid_request_error".into())
+        );
+        assert!(!kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_non_retryable_auth() {
+        let msg = r#"{"type":"error","error":{"type":"authentication_error","message":"Invalid API key"}}"#;
+        let kind = classify_api_error(msg);
+        assert_eq!(
+            kind,
+            ApiErrorKind::NonRetryable("authentication_error".into())
+        );
+        assert!(!kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_retryable_rate_limit() {
+        // A 429 is transient: retry (the retry loop backs off), not a final answer.
+        let msg = r#"API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}"#;
+        let kind = classify_api_error(msg);
+        assert_eq!(kind, ApiErrorKind::Retryable("rate_limit_error".into()));
+        assert!(kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_retryable_504_and_timeout() {
+        assert!(classify_api_error("API Error: 504 Gateway Timeout").is_retryable());
+        assert!(classify_api_error("Request timed out").is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_non_retryable_not_found() {
+        let msg = r#"{"type":"error","error":{"type":"not_found_error","message":"Not found"}}"#;
+        let kind = classify_api_error(msg);
+        assert_eq!(kind, ApiErrorKind::NonRetryable("not_found_error".into()));
+    }
+
+    #[test]
+    fn test_classify_api_error_fallback_keyword() {
+        // No JSON, but contains the keyword
+        let kind = classify_api_error("Something went wrong: api_error occurred");
+        assert_eq!(kind, ApiErrorKind::Retryable("api_error".into()));
+
+        let kind = classify_api_error("overloaded_error: try again");
+        assert_eq!(kind, ApiErrorKind::Retryable("overloaded_error".into()));
+    }
+
+    #[test]
+    fn test_classify_api_error_fallback_http_status() {
+        let kind = classify_api_error("HTTP 500 Internal Server Error");
+        assert_eq!(kind, ApiErrorKind::Retryable("http_5xx".into()));
+
+        let kind = classify_api_error("Error 503 Service Unavailable");
+        assert_eq!(kind, ApiErrorKind::Retryable("http_5xx".into()));
+
+        let kind = classify_api_error("Error 529 Overloaded");
+        assert_eq!(kind, ApiErrorKind::Retryable("http_5xx".into()));
+    }
+
+    #[test]
+    fn test_classify_api_error_unknown() {
+        let kind = classify_api_error("Something completely unknown happened");
+        assert_eq!(kind, ApiErrorKind::NonRetryable("unknown".into()));
+        assert!(!kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_empty_message() {
+        let kind = classify_api_error("");
+        assert_eq!(kind, ApiErrorKind::NonRetryable("unknown".into()));
+    }
+
+    // ====================================================================
+    // is_out_of_credit_message
+    // ====================================================================
+
+    #[test]
+    fn test_is_out_of_credit_message_402_api_error() {
+        // Legacy engine reports a 402 as plain text.
+        let msg = r#"API Error: 402 {"type":"error","error":{"type":"invalid_request_error","message":"Insufficient credits"}}"#;
+        assert!(is_out_of_credit_message(msg));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_insufficient_credits_json() {
+        let msg = r#"{"error":{"message":"Insufficient credits to complete this request.","type":"invalid_request_error"}}"#;
+        assert!(is_out_of_credit_message(msg));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_out_of_credit() {
+        // "out of credit" is matched on its own, without a status code.
+        assert!(is_out_of_credit_message(
+            "This account is out of credit. Please top up."
+        ));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_case_insensitive() {
+        assert!(is_out_of_credit_message(
+            "API ERROR: 402 INSUFFICIENT CREDITS"
+        ));
+        assert!(is_out_of_credit_message("Out Of Credit"));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_negative_invalid_request() {
+        // A 400 invalid request is NOT an out-of-credit refusal.
+        let msg = r#"API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Bad request"}}"#;
+        assert!(!is_out_of_credit_message(msg));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_bare_credits_in_a_400_is_not_matched() {
+        // A 400 that mentions "credits" in a non-out-of-credit sense must NOT
+        // be mistaken for an out-of-credit refusal.
+        let msg = r#"API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"credits field is required"}}"#;
+        assert!(!is_out_of_credit_message(msg));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_402_inside_unrelated_number() {
+        // "402" embedded in a larger number must NOT match.
+        assert!(!is_out_of_credit_message("request id 14025 failed"));
+        assert!(!is_out_of_credit_message("line 4025 has no credit issue"));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_singular_credit_not_matched() {
+        // "credit" alone (not part of the recognized phrases) is NOT a match.
+        assert!(!is_out_of_credit_message("credit card declined"));
+    }
+
+    // ====================================================================
+    // SessionWorkLog
+    // ====================================================================
+
+    #[test]
+    fn test_session_work_log_record_write_edit_read() {
+        let mut log = SessionWorkLog::default();
+
+        // Write tool
+        log.record_tool_use(
+            "Write",
+            &serde_json::json!({"file_path": "/src/main.rs", "content": "fn main() {}"}),
+        );
+        assert!(log.files_modified.contains("/src/main.rs"));
+        assert_eq!(log.tool_use_count, 1);
+        assert_eq!(log.last_tool_name.as_deref(), Some("Write"));
+
+        // Edit tool
+        log.record_tool_use(
+            "Edit",
+            &serde_json::json!({"file_path": "/src/lib.rs", "old_string": "a", "new_string": "b"}),
+        );
+        assert!(log.files_modified.contains("/src/lib.rs"));
+        assert_eq!(log.tool_use_count, 2);
+
+        // Read tool
+        log.record_tool_use("Read", &serde_json::json!({"file_path": "/src/types.rs"}));
+        assert!(log.files_read.contains("/src/types.rs"));
+        assert_eq!(log.tool_use_count, 3);
+    }
+
+    #[test]
+    fn test_session_work_log_dedup_files() {
+        let mut log = SessionWorkLog::default();
+
+        // Same file written twice → only one entry
+        log.record_tool_use(
+            "Write",
+            &serde_json::json!({"file_path": "/src/main.rs", "content": "v1"}),
+        );
+        log.record_tool_use(
+            "Write",
+            &serde_json::json!({"file_path": "/src/main.rs", "content": "v2"}),
+        );
+        assert_eq!(log.files_modified.len(), 1);
+        assert_eq!(log.tool_use_count, 2);
+    }
+
+    #[test]
+    fn test_session_work_log_step_tracking() {
+        let mut log = SessionWorkLog::default();
+        let step1 = Uuid::new_v4();
+        let step2 = Uuid::new_v4();
+
+        // Step in_progress
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": step1.to_string(), "status": "in_progress"}),
+        );
+        assert_eq!(log.step_in_progress, Some(step1));
+        assert!(log.steps_completed.is_empty());
+
+        // Step completed
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": step1.to_string(), "status": "completed"}),
+        );
+        assert_eq!(log.step_in_progress, None);
+        assert_eq!(log.steps_completed, vec![step1]);
+
+        // Second step in_progress
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": step2.to_string(), "status": "in_progress"}),
+        );
+        assert_eq!(log.step_in_progress, Some(step2));
+
+        // Complete step2
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": step2.to_string(), "status": "completed"}),
+        );
+        assert_eq!(log.steps_completed, vec![step1, step2]);
+    }
+
+    #[test]
+    fn test_session_work_log_to_summary_markdown() {
+        let mut log = SessionWorkLog::default();
+        let step1 = Uuid::new_v4();
+        let step2 = Uuid::new_v4();
+
+        // Add 3 files modified
+        log.record_tool_use("Write", &serde_json::json!({"file_path": "/a.rs"}));
+        log.record_tool_use("Edit", &serde_json::json!({"file_path": "/b.rs"}));
+        log.record_tool_use("Write", &serde_json::json!({"file_path": "/c.rs"}));
+
+        // Add 2 steps completed
+        log.steps_completed.push(step1);
+        log.steps_completed.push(step2);
+
+        let md = log.to_summary_markdown();
+        assert!(md.contains("## Session Work Log"));
+        assert!(md.contains("`/a.rs`"));
+        assert!(md.contains("`/b.rs`"));
+        assert!(md.contains("`/c.rs`"));
+        assert!(md.contains("Files modified (3)"));
+        assert!(md.contains(&step1.to_string()));
+        assert!(md.contains(&step2.to_string()));
+        assert!(md.contains("Steps completed (2)"));
+        assert!(md.contains("Last tool:"));
+    }
+
+    #[test]
+    fn test_session_work_log_empty_summary() {
+        let log = SessionWorkLog::default();
+        assert!(log.to_summary_markdown().is_empty());
+    }
+
+    #[test]
+    fn test_session_work_log_snapshot() {
+        let mut log = SessionWorkLog::default();
+        log.record_tool_use("Write", &serde_json::json!({"file_path": "/z.rs"}));
+        log.record_tool_use("Write", &serde_json::json!({"file_path": "/a.rs"}));
+        log.record_tool_use("Read", &serde_json::json!({"file_path": "/m.rs"}));
+
+        let snap = log.snapshot();
+        // Snapshot files are sorted
+        assert_eq!(snap.files_modified, vec!["/a.rs", "/z.rs"]);
+        assert_eq!(snap.files_read, vec!["/m.rs"]);
+        assert_eq!(snap.tool_use_count, 3);
+
+        // Snapshot is serializable
+        let json = serde_json::to_string(&snap).unwrap();
+        let deserialized: SessionWorkLogSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.files_modified, snap.files_modified);
+    }
+
+    #[test]
+    fn test_session_work_log_reset_for_new_stream() {
+        let mut log = SessionWorkLog::default();
+        log.record_tool_use("Write", &serde_json::json!({"file_path": "/a.rs"}));
+        log.record_tool_use("Read", &serde_json::json!({"file_path": "/b.rs"}));
+        assert_eq!(log.last_tool_name.as_deref(), Some("Read"));
+
+        log.reset_for_new_stream();
+
+        // Accumulated data persists
+        assert!(log.files_modified.contains("/a.rs"));
+        assert!(log.files_read.contains("/b.rs"));
+        assert_eq!(log.tool_use_count, 2);
+        // Per-stream transient is cleared
+        assert!(log.last_tool_name.is_none());
+    }
+
+    #[test]
+    fn test_session_work_log_bash_decisions_capped() {
+        let mut log = SessionWorkLog::default();
+        for i in 0..25 {
+            log.record_tool_use(
+                "Bash",
+                &serde_json::json!({"command": format!("echo {}", i)}),
+            );
+        }
+        // Decisions capped at 20
+        assert_eq!(log.decisions_summary.len(), 20);
+        // Most recent should be the last ones
+        assert!(log.decisions_summary.last().unwrap().contains("echo 24"));
+    }
+
+    #[test]
+    fn test_session_work_log_glob_grep_tracking() {
+        let mut log = SessionWorkLog::default();
+        log.record_tool_use(
+            "Glob",
+            &serde_json::json!({"path": "/src", "pattern": "*.rs"}),
+        );
+        log.record_tool_use(
+            "Grep",
+            &serde_json::json!({"path": "/src/lib.rs", "pattern": "fn main"}),
+        );
+        assert!(log.files_read.contains("/src"));
+        assert!(log.files_read.contains("/src/lib.rs"));
+    }
+
+    #[test]
+    fn test_session_work_log_notebook_edit_tracking() {
+        let mut log = SessionWorkLog::default();
+        log.record_tool_use(
+            "NotebookEdit",
+            &serde_json::json!({"file_path": "/notebooks/analysis.ipynb", "cell_index": 0}),
+        );
+        assert!(log.files_modified.contains("/notebooks/analysis.ipynb"));
+        assert_eq!(log.tool_use_count, 1);
+        assert_eq!(log.last_tool_name.as_deref(), Some("NotebookEdit"));
+    }
+
+    #[test]
+    fn test_session_work_log_step_update_non_update_action_ignored() {
+        let mut log = SessionWorkLog::default();
+        let step = Uuid::new_v4();
+        // action: "list" should be ignored by record_step_update
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "list", "task_id": step.to_string()}),
+        );
+        assert!(log.steps_completed.is_empty());
+        assert!(log.step_in_progress.is_none());
+    }
+
+    #[test]
+    fn test_session_work_log_step_update_invalid_uuid_ignored() {
+        let mut log = SessionWorkLog::default();
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": "not-a-uuid", "status": "completed"}),
+        );
+        assert!(log.steps_completed.is_empty());
+    }
+
+    #[test]
+    fn test_session_work_log_step_completed_dedup() {
+        let mut log = SessionWorkLog::default();
+        let step = Uuid::new_v4();
+        // Complete the same step twice
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": step.to_string(), "status": "completed"}),
+        );
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": step.to_string(), "status": "completed"}),
+        );
+        assert_eq!(log.steps_completed.len(), 1);
+    }
+
+    #[test]
+    fn test_session_work_log_summary_with_step_in_progress_and_decisions() {
+        let mut log = SessionWorkLog::default();
+        let step = Uuid::new_v4();
+        log.step_in_progress = Some(step);
+        log.decisions_summary
+            .push("Use trait-based approach".to_string());
+        log.last_tool_name = Some("Edit".to_string());
+        log.tool_use_count = 5;
+
+        let md = log.to_summary_markdown();
+        assert!(md.contains("## Session Work Log"));
+        assert!(md.contains("Step in progress:"));
+        assert!(md.contains(&step.to_string()));
+        assert!(md.contains("Decisions:"));
+        assert!(md.contains("Use trait-based approach"));
+        assert!(
+            md.contains("Last tool:") && md.contains("Edit") && md.contains("total: 5"),
+            "Missing last tool info in: {}",
+            md
+        );
+    }
+
+    #[test]
+    fn test_session_work_log_bash_truncation_at_80_chars() {
+        let mut log = SessionWorkLog::default();
+        let long_cmd = "a".repeat(120);
+        log.record_tool_use("Bash", &serde_json::json!({"command": long_cmd}));
+        assert_eq!(log.decisions_summary.len(), 1);
+        // "bash: " prefix (6 chars) + 80 chars of command = 86 total
+        assert!(
+            log.decisions_summary[0].len() <= 86,
+            "Decision should be truncated, got len {}",
+            log.decisions_summary[0].len()
+        );
+    }
+
+    #[test]
+    fn test_session_work_log_unknown_tool_ignored() {
+        let mut log = SessionWorkLog::default();
+        log.record_tool_use("SomeRandomTool", &serde_json::json!({"whatever": "value"}));
+        assert!(log.files_modified.is_empty());
+        assert!(log.files_read.is_empty());
+        assert!(log.decisions_summary.is_empty());
+        assert_eq!(log.tool_use_count, 1); // still counted
+        assert_eq!(log.last_tool_name.as_deref(), Some("SomeRandomTool"));
+    }
+
+    #[test]
+    fn test_session_work_log_tool_missing_file_path() {
+        let mut log = SessionWorkLog::default();
+        // Write without file_path key
+        log.record_tool_use("Write", &serde_json::json!({"content": "hello"}));
+        assert!(log.files_modified.is_empty());
+        assert_eq!(log.tool_use_count, 1);
+    }
+
+    #[test]
+    fn test_background_output_event_roundtrip() {
+        let received_at = chrono::DateTime::parse_from_rfc3339("2026-04-30T13:45:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let event = ChatEvent::BackgroundOutput {
+            source: "Monitor".into(),
+            content: "[epoch 50] cos=0.871".into(),
+            received_at,
+            correlation_id: Some("bg-abc123".into()),
+            tool: None,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"background_output\""));
+        assert!(json.contains("\"source\":\"Monitor\""));
+        assert!(json.contains("\"correlation_id\":\"bg-abc123\""));
+
+        let parsed: ChatEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ChatEvent::BackgroundOutput {
+                source,
+                content,
+                correlation_id,
+                ..
+            } => {
+                assert_eq!(source, "Monitor");
+                assert_eq!(content, "[epoch 50] cos=0.871");
+                assert_eq!(correlation_id.as_deref(), Some("bg-abc123"));
+            }
+            other => panic!("expected BackgroundOutput, got {:?}", other),
+        }
+
+        assert_eq!(event.event_type(), "background_output");
+        let fp = event
+            .fingerprint()
+            .expect("BackgroundOutput must have a fingerprint");
+        assert!(fp.starts_with("background_output:Monitor:"));
+        assert!(fp.ends_with(":bg-abc123"));
+    }
+
+    #[test]
+    fn test_background_output_omits_correlation_id_when_none() {
+        let event = ChatEvent::BackgroundOutput {
+            source: "BashOutput".into(),
+            content: "build complete".into(),
+            received_at: chrono::Utc::now(),
+            correlation_id: None,
+            tool: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // None correlation_id should be skipped, not serialized as null
+        assert!(!json.contains("correlation_id"));
+    }
+
+    #[test]
+    fn test_pending_message_background_output() {
+        let msg = PendingMessage::background_output("monitor: epoch 100".into());
+        assert_eq!(msg.kind, PendingMessageKind::BackgroundOutput);
+        assert_eq!(msg.content, "monitor: epoch 100");
+    }
+
+    // ========================================================================
+    // T1 of plan 754a1379 — BackgroundTaskInfo / BackgroundTaskKind serde
+    // round-trip + property tests.
+    // ========================================================================
+
+    #[test]
+    fn test_background_task_kind_serde_round_trip() {
+        for (kind, expected_json) in [
+            (BackgroundTaskKind::Monitor, "\"monitor\""),
+            (BackgroundTaskKind::BashBackground, "\"bash_background\""),
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(
+                json, expected_json,
+                "BackgroundTaskKind::{:?} must serialise as {}",
+                kind, expected_json
+            );
+            let back: BackgroundTaskKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, kind, "round-trip mismatch for {:?}", kind);
+        }
+    }
+
+    #[test]
+    fn test_background_task_info_serde_round_trip_full() {
+        let info = BackgroundTaskInfo {
+            id: "toolu_01ABC".to_string(),
+            kind: BackgroundTaskKind::Monitor,
+            description: "tail -F /tmp/build.log".to_string(),
+            started_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            last_seen_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            pid: Some(42_424),
+            parent_tool_use_id: Some("toolu_01ABC".to_string()),
+            pending_removal_at: None,
+            signalled: false,
+        };
+        let json = serde_json::to_string(&info).expect("serialise");
+        let back: BackgroundTaskInfo = serde_json::from_str(&json).expect("deserialise");
+
+        assert_eq!(back.id, info.id);
+        assert_eq!(back.kind, info.kind);
+        assert_eq!(back.description, info.description);
+        assert_eq!(back.started_at, info.started_at);
+        assert_eq!(back.pid, info.pid);
+        assert_eq!(back.parent_tool_use_id, info.parent_tool_use_id);
+    }
+
+    #[test]
+    fn test_background_task_info_pending_removal_at_skipped_on_wire() {
+        // pending_removal_at is `Instant`, not serialisable, and explicitly
+        // marked `#[serde(skip)]`. It must NOT appear in the JSON.
+        let info = BackgroundTaskInfo {
+            id: "toolu_01XYZ".into(),
+            kind: BackgroundTaskKind::BashBackground,
+            description: "npm install".into(),
+            started_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
+            pid: Some(12345),
+            parent_tool_use_id: Some("toolu_01XYZ".into()),
+            pending_removal_at: Some(std::time::Instant::now()),
+            signalled: true,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(
+            !json.contains("pending_removal_at"),
+            "pending_removal_at must be skipped from the wire format, got: {}",
+            json
+        );
+        // `signalled` is server-side bookkeeping too (review of #694, point 3).
+        assert!(
+            !json.contains("signalled"),
+            "signalled must be skipped from the wire format, got: {}",
+            json
+        );
+
+        // Round-trip drops both fields (None / false on deserialise).
+        let back: BackgroundTaskInfo = serde_json::from_str(&json).unwrap();
+        assert!(back.pending_removal_at.is_none());
+        assert!(!back.signalled);
+    }
+
+    #[test]
+    fn test_active_tasks_update_serde_round_trip() {
+        let event = ChatEvent::ActiveTasksUpdate {
+            tasks: vec![
+                BackgroundTaskInfo {
+                    id: "toolu_01ABC".into(),
+                    kind: BackgroundTaskKind::Monitor,
+                    description: "tail -F /tmp/build.log".into(),
+                    started_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                    last_seen_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                    pid: Some(42_424),
+                    parent_tool_use_id: Some("toolu_01ABC".into()),
+                    pending_removal_at: None,
+                    signalled: false,
+                },
+                BackgroundTaskInfo {
+                    id: "toolu_02XYZ".into(),
+                    kind: BackgroundTaskKind::BashBackground,
+                    description: "cargo build".into(),
+                    started_at: chrono::Utc.timestamp_opt(1_700_000_005, 0).unwrap(),
+                    last_seen_at: chrono::Utc.timestamp_opt(1_700_000_005, 0).unwrap(),
+                    pid: Some(42_425),
+                    parent_tool_use_id: Some("toolu_02XYZ".into()),
+                    pending_removal_at: None,
+                    signalled: false,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // Discriminator field should be present.
+        assert!(json.contains("\"type\":\"active_tasks_update\""));
+        // Both task ids should be present.
+        assert!(json.contains("toolu_01ABC"));
+        assert!(json.contains("toolu_02XYZ"));
+
+        let back: ChatEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            ChatEvent::ActiveTasksUpdate { tasks } => {
+                assert_eq!(tasks.len(), 2);
+                assert_eq!(tasks[0].id, "toolu_01ABC");
+                assert_eq!(tasks[0].kind, BackgroundTaskKind::Monitor);
+                assert_eq!(tasks[1].kind, BackgroundTaskKind::BashBackground);
+            }
+            _ => panic!("expected ActiveTasksUpdate, got {:?}", back),
+        }
+    }
+
+    #[test]
+    fn test_active_tasks_update_empty_snapshot_round_trip() {
+        // Empty snapshot is a legitimate value — meaning "no background
+        // tasks active". The frontend uses it to clear its toolbar pill.
+        let event = ChatEvent::ActiveTasksUpdate { tasks: vec![] };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"tasks\":[]"));
+
+        let back: ChatEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            ChatEvent::ActiveTasksUpdate { tasks } => assert!(tasks.is_empty()),
+            _ => panic!("round-trip lost the variant"),
+        }
+    }
+
+    #[test]
+    fn test_active_tasks_update_event_type_and_fingerprint() {
+        let event = ChatEvent::ActiveTasksUpdate { tasks: vec![] };
+        // event_type should be the snake_case variant name.
+        assert_eq!(event.event_type(), "active_tasks_update");
+        // fingerprint must be None — every emission is a fresh full
+        // snapshot, dedup would actively hide useful state changes
+        // (cf the doc-comment on the variant).
+        assert!(event.fingerprint().is_none());
+    }
+
+    #[test]
+    fn test_background_task_info_recovered_synthetic_id() {
+        // Recovered tasks (T13) have a synthetic id and no parent_tool_use_id.
+        let info = BackgroundTaskInfo {
+            id: "recovered-42424".into(),
+            kind: BackgroundTaskKind::Monitor,
+            description: "[recovered after restart] PID 42424".into(),
+            started_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
+            pid: Some(42_424),
+            parent_tool_use_id: None,
+            pending_removal_at: None,
+            signalled: false,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: BackgroundTaskInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "recovered-42424");
+        assert!(back.parent_tool_use_id.is_none());
+    }
+
+    #[test]
+    fn an_old_payload_with_a_cwd_still_deserializes_as_before() {
+        let req: ChatRequest =
+            serde_json::from_str(r#"{"message":"hi","cwd":"/home/dev/project"}"#).unwrap();
+        assert_eq!(req.cwd, "/home/dev/project");
+    }
+
+    #[test]
+    fn a_request_without_cwd_or_with_an_empty_one_is_accepted() {
+        let absent: ChatRequest = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
+        assert_eq!(absent.cwd, "");
+        let empty: ChatRequest = serde_json::from_str(r#"{"message":"hi","cwd":""}"#).unwrap();
+        assert_eq!(empty.cwd, "");
+    }
+
+    #[test]
+    fn execution_place_is_left_off_the_wire_for_a_project_and_read_back_as_project() {
+        let mut resp = CreateSessionResponse::default();
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("execution_place").is_none());
+        assert!(json.get("notices").is_none());
+        // A payload written before the field existed.
+        let old: CreateSessionResponse =
+            serde_json::from_str(r#"{"session_id":"a","stream_url":"/ws/chat/a"}"#).unwrap();
+        assert_eq!(old.execution_place, ExecutionPlace::Project);
+        resp.execution_place = ExecutionPlace::Neutral;
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["execution_place"], "neutral");
+        let back: CreateSessionResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back.execution_place, ExecutionPlace::Neutral);
+    }
+}
+
+#[cfg(test)]
+mod pool_spans_providers_tests {
+    use super::{pool_spans_providers, RoutingPoolEntry};
+    fn entry(provider: &str, model: &str) -> RoutingPoolEntry {
+        RoutingPoolEntry {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
+    #[test]
+    fn two_providers_span_one_does_not() {
+        assert!(!pool_spans_providers(None), "no pool");
+        assert!(!pool_spans_providers(Some(&[])), "an empty pool");
+        assert!(
+            !pool_spans_providers(Some(&[entry("a", "m")])),
+            "one tick is strict"
+        );
+        assert!(
+            !pool_spans_providers(Some(&[entry("a", "m"), entry("a", "big")])),
+            "two models of ONE provider never move the conversation"
+        );
+        assert!(pool_spans_providers(Some(&[
+            entry("a", "m"),
+            entry("b", "m")
+        ])));
+        assert!(
+            pool_spans_providers(Some(&[entry("a", "m"), entry("a", "big"), entry("b", "m")])),
+            "the count is of providers, not of entries"
+        );
+    }
+
+    /// Two switches in ONE message must not collapse: the reason is part of the
+    /// identity, so a limit and a safeguards refusal read as two different events.
+    #[test]
+    fn a_model_change_fingerprints_with_its_reason() {
+        let changed =
+            |model: &str, reason: Option<&str>| crate::chat::types::ChatEvent::ModelChanged {
+                model: model.to_string(),
+                reason: reason.map(str::to_string),
+            };
+        assert_eq!(
+            changed("m2", Some("limit_reached")).fingerprint(),
+            Some("model_changed:m2:limit_reached".to_string())
+        );
+        assert_ne!(
+            changed("m2", Some("limit_reached")).fingerprint(),
+            changed("m2", Some("request_refused")).fingerprint(),
+            "the reason tells the two switches apart"
+        );
+        assert_eq!(
+            changed("m2", None).fingerprint(),
+            Some("model_changed:m2:".to_string()),
+            "a switch without a reason keeps its plain key"
+        );
+    }
+}

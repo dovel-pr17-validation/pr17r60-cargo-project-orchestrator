@@ -1,0 +1,1799 @@
+//! FsmPromptComposer — modular, FSM-aware prompt assembly.
+//!
+//! Replaces the monolithic `build_system_prompt()` in manager.rs with a composable
+//! system that adapts the prompt based on:
+//! - Scaffolding level (0-4) — progressive complexity reduction
+//! - Active protocol runs — inject prompt_fragment, available_tools, forbidden_actions
+//! - Project context — plans, constraints, guidelines, topology
+//! - Session continuity — previous session resume data
+//! - User message — intent detection for tool group selection
+//! - Routing hints — future: DualTrackRouter provides section weights
+//!
+//! Architecture:
+//! ```text
+//! ┌─────────────────────────────────────────────────────────┐
+//! │                   FsmPromptComposer                     │
+//! │                                                         │
+//! │  Inputs:                                                │
+//! │  1. scaffolding_level: u8                               │
+//! │  2. protocol_runs: Vec<ProtocolRunStatus>               │
+//! │  3. project_context_markdown: String                    │
+//! │  4. continuity_markdown: String                         │
+//! │  5. user_message: &str                                  │
+//! │  6. routing_hints: Option<Vec<SectionHint>>             │
+//! │                                                         │
+//! │  Pipeline:                                              │
+//! │  ┌──────────┐  ┌───────────┐  ┌──────────────────────┐ │
+//! │  │ Select   │→ │ Inject    │→ │ Select tool groups   │ │
+//! │  │ sections │  │ FSM frags │  │ (intent+FSM+level)   │ │
+//! │  └──────────┘  └───────────┘  └──────────────────────┘ │
+//! │       ↓              ↓               ↓                  │
+//! │  ┌──────────────────────────────────────────────┐      │
+//! │  │ Assemble: base + FSM + dynamic + tool_ref    │      │
+//! │  └──────────────────────────────────────────────┘      │
+//! │       ↓                                                 │
+//! │  ┌──────────┐                                           │
+//! │  │ Truncate  │ → String                                 │
+//! │  └──────────┘                                           │
+//! └─────────────────────────────────────────────────────────┘
+//! ```
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use super::prompt::TOOL_REFERENCE;
+use super::prompt_sections::{
+    adapt_subagent_vocabulary, assemble_sections, assemble_sections_weighted, child_section,
+    extract_tool_reference, SECTION_ISO_SCENE,
+};
+use super::routing::{HeuristicRouter, RoutingContext, RoutingDecisionRecord, RoutingProvider};
+use super::stages::status_injection::ProtocolRunStatus;
+
+// Re-export SectionHint from routing for backward compatibility
+pub use super::prompt_sections::{ChildFrame, SubagentVocabulary};
+pub use super::routing::SectionHint;
+
+/// Who the prompt is for: the words its engine has for sub-agents, and, for the child
+/// of a conversation, how it was opened. The default (a root session on Claude Code)
+/// leaves the prompt unchanged byte for byte.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptAudience {
+    /// The engine's sub-agent vocabulary ([`SubagentVocabulary::of_provider`]).
+    pub vocabulary: SubagentVocabulary,
+    /// `Some` for the child of a conversation: it gets the child section.
+    pub child: Option<ChildFrame>,
+    /// The session has a `spawned_by` (a child, a delegation, a run...): something
+    /// other than a person opened it. `false` for a root conversation.
+    pub spawned: bool,
+    /// The content posture of the engine the prompt is for ([`super::content_policy`]):
+    /// a `Restricted` provider (Claude Code) does not get the project's provider-sensitive
+    /// notes in its prompt, so a safety classifier does not refuse the turn for context it
+    /// never needed. The default is `Restricted` (a root session on Claude Code).
+    pub content_policy: super::content_policy::ContentPolicy,
+}
+
+impl PromptAudience {
+    /// From a session's `spawned_by` JSON and the id of the provider it runs on.
+    ///
+    /// Only a `conversation` spawn is framed as a child: with a `tool_use_id` it answers
+    /// the parent's sub-agent call, without one it is a sub-conversation opened beside the
+    /// parent. The runner, pipeline, gate and trigger spawns have a prompt of their own
+    /// (`runner::prompt`), a delegation carries its task: none of them is framed here.
+    /// Malformed JSON frames nothing.
+    pub fn of(spawned_by: Option<&str>, provider_id: &str) -> Self {
+        let child = spawned_by
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("conversation"))
+            .and_then(|v| {
+                let parent_session_id = v.get("parent_session_id")?.as_str()?.to_owned();
+                let answers_a_call = v
+                    .get("tool_use_id")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| !t.is_empty());
+                Some(ChildFrame {
+                    parent_session_id,
+                    answers_a_call,
+                })
+            });
+        Self {
+            vocabulary: SubagentVocabulary::of_provider(provider_id),
+            child,
+            spawned: spawned_by.is_some_and(|s| !s.trim().is_empty()),
+            content_policy: super::content_policy::provider_content_policy(provider_id),
+        }
+    }
+
+    /// Whether a person reads this conversation's answers in the PO interface, which
+    /// draws an ```iso-scene block as a 3D scene: a root conversation only. The child
+    /// of a conversation (an `Agent` call, a sub-conversation an agent opened) answers a
+    /// model, which would only get the JSON; a runner, pipeline, gate, trigger or
+    /// delegation session has no display either (and normally gets `runner::prompt`,
+    /// not this one).
+    pub fn displays_scenes(&self) -> bool {
+        !self.spawned && self.child.is_none()
+    }
+}
+
+// ============================================================================
+// FsmPromptComposer — the central prompt assembly engine
+// ============================================================================
+
+/// Inputs for prompt composition, gathered before calling `compose()`.
+///
+/// All async data fetching happens outside the composer — it receives
+/// pre-rendered markdown strings for dynamic sections.
+#[derive(Debug, Clone, Default)]
+pub struct ComposerInput<'a> {
+    /// Scaffolding level (0=full guidance, 4=expert).
+    pub scaffolding_level: u8,
+    /// Active protocol runs with their FSM state data.
+    pub protocol_runs: &'a [ProtocolRunStatus],
+    /// Dynamic project context rendered as markdown (from `context_to_markdown`).
+    pub project_context_markdown: &'a str,
+    /// Session continuity rendered as markdown (from `load_session_context`).
+    pub continuity_markdown: &'a str,
+    /// Enrichment pipeline output rendered as markdown (from `to_system_prompt_markdown`).
+    /// Integrated into the system prompt instead of being prepended to the user message.
+    pub enrichment_markdown: &'a str,
+    /// The user's current message (for intent detection).
+    pub user_message: &'a str,
+    /// Optional routing hints (ignored by HeuristicRouter, used by DualTrackRouter).
+    pub routing_hints: Option<&'a [SectionHint]>,
+    /// Whether the project has sibling projects (multi-project workspace).
+    pub is_multi_project: bool,
+    /// Whether there are active plans.
+    pub has_active_plan: bool,
+    /// Number of tasks across active plans.
+    pub task_count: usize,
+    /// Model name (e.g., "claude-sonnet-4-20250514"). Informative only: the budget
+    /// reads [`Self::context_window`], never the name.
+    pub model: &'a str,
+    /// The model's context window in tokens, as the catalog knows it (`None`:
+    /// unknown). Sizes the dynamic context ([`compute_dynamic_budget`]). Resolved once
+    /// when the session opens, so every prompt of a session gets the same budget.
+    pub context_window: Option<u64>,
+    /// Pre-computed embedding of the user message (for DualTrackRouter).
+    /// `None` if embeddings are unavailable → routing falls back to heuristics.
+    pub message_embedding: Option<&'a Vec<f32>>,
+    /// Whether external MCP servers are connected (triggers External tool group).
+    pub external_tools_available: bool,
+    /// `refs_v1` is on: teach the agent to cite entities as `#kind:uuid`.
+    /// Off (the default) the prompt is unchanged byte for byte.
+    pub cite_refs: bool,
+    /// The interface draws ```iso-scene blocks for this conversation
+    /// ([`PromptAudience::displays_scenes`]): teach the agent to write one
+    /// ([`SECTION_ISO_SCENE`]). Off (the default) the prompt is unchanged byte for byte.
+    pub iso_scene: bool,
+    /// Who the prompt is for: the engine's sub-agent words, the frame of a child of a
+    /// conversation. The default (root session, Claude Code) changes nothing.
+    pub audience: PromptAudience,
+}
+
+// Default is derived — all numeric fields default to 0, bools to false,
+// &str to "", Option to None, &[] to empty slice.
+
+/// Fallback character budget when the model's context window is unknown (~2500 tokens
+/// at 4 chars/token). Only an UNKNOWN window gets it: a known window, whatever the
+/// model's family, is budgeted from its size ([`compute_dynamic_budget`]).
+pub(crate) const DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET: usize = 10_000;
+/// Share of the context window (after the base prompt) given to the dynamic context.
+const DYNAMIC_CONTEXT_WINDOW_PERCENT: usize = 15;
+/// Smallest dynamic budget for a known window.
+const MIN_DYNAMIC_CONTEXT_CHAR_BUDGET: usize = 5_000;
+/// Largest dynamic budget, whatever the window.
+const MAX_DYNAMIC_CONTEXT_CHAR_BUDGET: usize = 40_000;
+
+/// Compute the dynamic context character budget from the model's context window
+/// (`window_tokens`, `None` = unknown) and the current system prompt length.
+///
+/// Strategy: allocate 15% of the window's remaining room (after the base prompt) to
+/// the dynamic context, at about four characters a token, clamped between 5K and
+/// 40K chars. The window is the one the catalog knows (nexus capabilities, the
+/// Anthropic Models API for Claude Code: `ChatManager::known_context_window`), for
+/// every model: a 128K DeepSeek is budgeted like a 128K Claude. An unknown window
+/// gets [`DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET`]; nothing is guessed from the name.
+///
+/// Pure in its inputs: a session's prompt is built from the window resolved once at
+/// its opening, so the budget, hence the prefix, does not move between its turns.
+pub(crate) fn compute_dynamic_budget(
+    window_tokens: Option<u64>,
+    base_prompt_chars: usize,
+) -> usize {
+    let Some(window_tokens) = window_tokens else {
+        return DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET;
+    };
+    // Convert to chars (~4 chars per token); a window too large for usize is capped
+    // by the clamp below anyway.
+    let context_window_chars =
+        usize::try_from(window_tokens.saturating_mul(4)).unwrap_or(usize::MAX);
+    let remaining = context_window_chars.saturating_sub(base_prompt_chars);
+    let budget = remaining.saturating_mul(DYNAMIC_CONTEXT_WINDOW_PERCENT) / 100;
+    budget.clamp(
+        MIN_DYNAMIC_CONTEXT_CHAR_BUDGET,
+        MAX_DYNAMIC_CONTEXT_CHAR_BUDGET,
+    )
+}
+
+/// Global cap, in characters, of the enrichment block put in front of ONE turn (the
+/// knowledge notes, propagated notes, activated skills, file context... of
+/// `enrichment_for_turn`). Each stage caps itself (3 000 for the notes, 1 500 per
+/// skill, three skills...) but nothing capped their sum.
+///
+/// It is the window's dynamic budget with no base prompt subtracted, i.e. the same
+/// figure the system prompt's dynamic section gets: 10 000 when the window is
+/// unknown, 15% of a small window (5 000 at least), 40 000 at most (reached from a
+/// ~67K-token window). Why this figure:
+/// - one ceiling for "graph context a turn carries": the system prompt's dynamic
+///   section and the per-turn block together take at most 30% of any window above
+///   ~8K tokens, so a turn keeps ≥ 70% for the history, the tools and the answer,
+///   and alone they cannot push a fresh conversation past nexus' compaction
+///   threshold (80%);
+/// - this block stays in the history after its turn, so it must scale DOWN with a
+///   small window (a 16K-token window gets 9 600, not a fixed 15 000+);
+/// - with a known window of 67K tokens or more (the usual 128K to 1M windows of
+///   Claude, DeepSeek, GLM, Qwen) it is above what the stages produce together in practice
+///   (≈ 5 000 notes + 3 × 1 500 skills + a few small sections): it only bites when
+///   a stage misbehaves, which is what a global cap is for.
+pub(crate) fn turn_enrichment_cap(window_tokens: Option<u64>) -> usize {
+    compute_dynamic_budget(window_tokens, 0)
+}
+
+/// The FsmPromptComposer assembles the full system prompt from modular sections.
+///
+/// It is stateless — each call to `compose()` produces a fresh prompt string.
+/// All state (project context, protocol runs, etc.) is passed via `ComposerInput`.
+///
+/// # Prefix byte-stability (cache)
+///
+/// The system prompt is the FIRST message the provider sends, so it is the head of
+/// the prefix a KV/prompt cache reuses across turns (system message + tools +
+/// replayed history). For that cache to hit, the composed prefix must be
+/// byte-identical from one request to the next. The composer guarantees this
+/// structurally: it is a pure function of `ComposerInput` — it reads no global or
+/// mutable state, holds no counter, and takes no conversation history. A turn only
+/// appends to the provider's replayed history (which the composer never sees), so
+/// recomposing with the same session-frozen inputs yields the same bytes. Any
+/// change that must reach the model (re-summarisation, a new instruction) is done
+/// APPEND-ONLY by the provider as a trailing message, never by rewriting this head.
+pub struct FsmPromptComposer;
+
+impl FsmPromptComposer {
+    /// Compose the full system prompt using the default [`HeuristicRouter`].
+    ///
+    /// This is the standard entry point. For custom routing (e.g., DualTrackRouter),
+    /// use [`compose_with_router()`] instead.
+    pub fn compose(input: &ComposerInput<'_>) -> String {
+        Self::compose_with_router(input, &HeuristicRouter).0
+    }
+
+    /// Compose the full system prompt and return the routing decision record.
+    ///
+    /// Use this when you need to emit the routing decision to the
+    /// `TrajectoryCollector` for the neural feedback loop.
+    pub fn compose_with_record(
+        input: &ComposerInput<'_>,
+        router: &dyn RoutingProvider,
+    ) -> (String, RoutingDecisionRecord) {
+        Self::compose_with_router(input, router)
+    }
+
+    /// Compose the full system prompt using a custom [`RoutingProvider`].
+    ///
+    /// Assembly pipeline:
+    /// 1. Build [`RoutingContext`] from the input
+    /// 2. Call `router.route()` to get section + tool group decisions
+    /// 3. Assemble base sections into markdown
+    /// 4. Inject FSM prompt fragments (from active protocol runs)
+    /// 5. Render selected tool reference groups
+    /// 6. Append dynamic context (project + continuity + enrichment), truncated
+    /// 7. Join everything into the final prompt
+    ///
+    /// ## Integrating a custom router (e.g., DualTrackRouter)
+    ///
+    /// ```rust,ignore
+    /// use crate::chat::routing::{RoutingProvider, RoutingContext, RoutingDecision};
+    ///
+    /// let dual_track = DualTrackRouter::new(model_weights);
+    /// let prompt = FsmPromptComposer::compose_with_router(&input, &dual_track);
+    /// ```
+    pub fn compose_with_router(
+        input: &ComposerInput<'_>,
+        router: &dyn RoutingProvider,
+    ) -> (String, RoutingDecisionRecord) {
+        // ── Step 1: Build routing context ─────────────────────────────
+        let fsm_tools: Vec<String> = input
+            .protocol_runs
+            .iter()
+            .filter_map(|r| r.available_tools.as_ref())
+            .flatten()
+            .cloned()
+            .collect();
+
+        let routing_ctx = RoutingContext {
+            scaffolding_level: input.scaffolding_level,
+            has_active_plan: input.has_active_plan,
+            has_active_protocol: !input.protocol_runs.is_empty(),
+            task_count: input.task_count,
+            is_multi_project: input.is_multi_project,
+            external_tools_available: input.external_tools_available,
+            fsm_available_tools: fsm_tools,
+            user_message: input.user_message.to_string(),
+            detected_intent: None, // Future: from enrichment hints
+            message_embedding: input.message_embedding.cloned(),
+        };
+
+        // ── Step 2: Route — get section + tool group decisions ────────
+        let decision = router.route(&routing_ctx);
+
+        // ── Step 3: Assemble base sections ────────────────────────────
+        // Merge section_hints from the router decision with optional input hints
+        let merged_hints: Vec<(super::prompt_sections::PromptSectionId, f32)> = {
+            let mut hints: Vec<_> = decision
+                .section_hints
+                .iter()
+                .map(|h| (h.section_id, h.weight))
+                .collect();
+            // Input routing_hints override/extend router hints
+            if let Some(input_hints) = input.routing_hints {
+                for h in input_hints {
+                    // Remove existing hint for same section, then add the override
+                    hints.retain(|(id, _)| *id != h.section_id);
+                    hints.push((h.section_id, h.weight));
+                }
+            }
+            hints
+        };
+
+        let base_prompt = if !merged_hints.is_empty() {
+            // Weighted assembly: truncate low-weight base sections when over budget.
+            // Use 60% of the model's context window (in chars) as the base section budget.
+            let model_budget = compute_dynamic_budget(input.context_window, 0) * 6;
+            assemble_sections_weighted(&decision.sections, &merged_hints, model_budget)
+        } else {
+            assemble_sections(&decision.sections)
+        };
+        // The sections are written in Claude Code's words; another engine gets its own.
+        let base_prompt = adapt_subagent_vocabulary(base_prompt, input.audience.vocabulary);
+
+        // ── Step 4: Inject FSM prompt fragments ───────────────────────
+        let fsm_section = Self::build_fsm_section(input.protocol_runs);
+
+        // ── Step 5: Render selected tool reference groups ─────────────
+        let tool_ref = extract_tool_reference(TOOL_REFERENCE, &decision.tool_groups);
+
+        // ── Step 6: Build dynamic context (truncated) ─────────────────
+        // Compute adaptive budget based on model context window and current prompt size
+        let base_prompt_len = base_prompt.len() + fsm_section.len() + tool_ref.len();
+        let char_budget = compute_dynamic_budget(input.context_window, base_prompt_len);
+        let dynamic = Self::build_dynamic_section(
+            input.continuity_markdown,
+            input.project_context_markdown,
+            input.enrichment_markdown,
+            char_budget,
+        );
+
+        // ── Step 7: Build trajectory record ────────────────────────────
+        let routing_record = decision.to_trajectory_record(&routing_ctx);
+
+        // ── Step 8: Assemble final prompt ─────────────────────────────
+        let mut parts: Vec<&str> = Vec::with_capacity(5);
+        parts.push(&base_prompt);
+
+        // A child of a conversation: who opened it, where its answer goes. Right after
+        // the base sections, before anything that changes from one turn to the next.
+        let child_owned;
+        if let Some(frame) = &input.audience.child {
+            child_owned = child_section(frame);
+            parts.push(&child_owned);
+        }
+
+        let cite_owned;
+        if input.cite_refs {
+            cite_owned = crate::refs::cite::prompt_section();
+            parts.push(&cite_owned);
+        }
+
+        if input.iso_scene {
+            parts.push(SECTION_ISO_SCENE);
+        }
+
+        let fsm_owned;
+        if !fsm_section.is_empty() {
+            fsm_owned = fsm_section;
+            parts.push(&fsm_owned);
+        }
+
+        let dynamic_owned;
+        if !dynamic.is_empty() {
+            dynamic_owned = dynamic;
+            parts.push(&dynamic_owned);
+        }
+
+        parts.push(&tool_ref);
+
+        (parts.join("\n\n---\n\n"), routing_record)
+    }
+
+    /// Build the FSM context section from active protocol runs.
+    ///
+    /// Injects prompt_fragment, available_tools whitelist, and forbidden_actions
+    /// from each active run's current state.
+    fn build_fsm_section(runs: &[ProtocolRunStatus]) -> String {
+        if runs.is_empty() {
+            return String::new();
+        }
+
+        let mut lines = vec!["## Active Protocol Context".to_string()];
+
+        for run in runs {
+            lines.push(format!(
+                "\n### Protocol: {} (state: `{}`)",
+                run.protocol_name, run.current_state
+            ));
+
+            if !run.status_message.is_empty() {
+                lines.push(format!("Status: {}", run.status_message));
+            }
+
+            // Inject the prompt fragment (contextual instructions for this state)
+            if let Some(ref fragment) = run.prompt_fragment {
+                lines.push(String::new());
+                lines.push(fragment.clone());
+            }
+
+            // Render available tools whitelist
+            if let Some(ref tools) = run.available_tools {
+                if !tools.is_empty() {
+                    lines.push(String::new());
+                    lines.push(format!(
+                        "**Allowed tools in state `{}`**: {}",
+                        run.current_state,
+                        tools.join(", ")
+                    ));
+                }
+            }
+
+            // Render forbidden actions as warnings
+            if let Some(ref forbidden) = run.forbidden_actions {
+                if !forbidden.is_empty() {
+                    lines.push(String::new());
+                    lines.push(format!(
+                        "⚠️ **Forbidden in state `{}`**:",
+                        run.current_state
+                    ));
+                    for action in forbidden {
+                        lines.push(format!("- {}", action));
+                    }
+                }
+            }
+        }
+
+        lines.join("\n")
+    }
+
+    /// Build the dynamic context section (continuity + project context + enrichment)
+    /// with semantic truncation.
+    ///
+    /// Instead of blindly cutting at a character boundary, this function:
+    /// 1. Parses the markdown into sections (## headers) with their list items (- lines)
+    /// 2. Scores each item by importance markers ([Critical] > [High] > [Medium] > [Low])
+    /// 3. When over budget, keeps only the top-N items per section (never drops entire sections)
+    ///
+    /// `char_budget` is the maximum character count for the dynamic section, computed
+    /// by [`compute_dynamic_budget()`] based on the model's context window.
+    fn build_dynamic_section(
+        continuity: &str,
+        project_context: &str,
+        enrichment: &str,
+        char_budget: usize,
+    ) -> String {
+        let has_continuity = !continuity.is_empty();
+        let has_enrichment = !enrichment.is_empty();
+        let has_project = !project_context.is_empty();
+
+        if !has_continuity && !has_enrichment && !has_project {
+            return String::new();
+        }
+
+        // Quick path: everything fits without truncation
+        let total_len = continuity.len()
+            + enrichment.len()
+            + project_context.len()
+            + if has_continuity { 2 } else { 0 }
+            + if has_enrichment { 2 } else { 0 };
+
+        if total_len <= char_budget {
+            let mut parts = Vec::new();
+            if has_enrichment {
+                parts.push(enrichment);
+            }
+            if has_continuity {
+                parts.push(continuity);
+            }
+            if has_project {
+                parts.push(project_context);
+            }
+            return parts.join("\n\n");
+        }
+
+        // Over budget → sub-budget allocation: enrichment 40%, continuity 30%, project 30%
+        // Enrichment gets the largest share because it's the most contextually relevant
+        // (freshly searched knowledge, active skills, propagated notes).
+        let active_count = [has_enrichment, has_continuity, has_project]
+            .iter()
+            .filter(|&&b| b)
+            .count();
+
+        let (enrichment_budget, continuity_budget, project_budget) = if active_count == 1 {
+            // Single source gets the whole budget
+            (char_budget, char_budget, char_budget)
+        } else {
+            (
+                if has_enrichment {
+                    (char_budget * 40) / 100
+                } else {
+                    0
+                },
+                if has_continuity {
+                    (char_budget * 30) / 100
+                } else {
+                    0
+                },
+                if has_project {
+                    (char_budget * 30) / 100
+                } else {
+                    0
+                },
+            )
+        };
+
+        // Truncate each source within its own budget
+        let trunc_enrichment = if has_enrichment {
+            truncate_with_boost(enrichment, enrichment_budget, ENRICHMENT_SCORE_BONUS)
+        } else {
+            String::new()
+        };
+        let trunc_continuity = if has_continuity {
+            truncate_markdown_semantically(continuity, continuity_budget)
+        } else {
+            String::new()
+        };
+        let trunc_project = if has_project {
+            truncate_markdown_semantically(project_context, project_budget)
+        } else {
+            String::new()
+        };
+
+        // Redistribute surplus: if a source used less than its budget,
+        // give the remainder to the others (enrichment gets priority).
+        // Only compute surplus for ACTIVE sources to avoid phantom surplus.
+        let enrichment_surplus = if has_enrichment {
+            enrichment_budget.saturating_sub(trunc_enrichment.len())
+        } else {
+            0
+        };
+        let continuity_surplus = if has_continuity {
+            continuity_budget.saturating_sub(trunc_continuity.len())
+        } else {
+            0
+        };
+        let project_surplus = if has_project {
+            project_budget.saturating_sub(trunc_project.len())
+        } else {
+            0
+        };
+        let total_surplus = enrichment_surplus + continuity_surplus + project_surplus;
+
+        // Re-truncate with expanded budgets if there's meaningful surplus
+        let (final_enrichment, final_continuity, final_project) = if total_surplus > 500 {
+            let extra_for_enrichment = continuity_surplus + project_surplus;
+            let extra_for_continuity = enrichment_surplus + project_surplus;
+            let extra_for_project = enrichment_surplus + continuity_surplus;
+
+            let fe = if has_enrichment && extra_for_enrichment > 0 {
+                truncate_with_boost(
+                    enrichment,
+                    enrichment_budget + extra_for_enrichment,
+                    ENRICHMENT_SCORE_BONUS,
+                )
+            } else {
+                trunc_enrichment
+            };
+            let fc = if has_continuity && extra_for_continuity > 0 {
+                truncate_markdown_semantically(continuity, continuity_budget + extra_for_continuity)
+            } else {
+                trunc_continuity
+            };
+            let fp = if has_project && extra_for_project > 0 {
+                truncate_markdown_semantically(project_context, project_budget + extra_for_project)
+            } else {
+                trunc_project
+            };
+            (fe, fc, fp)
+        } else {
+            (trunc_enrichment, trunc_continuity, trunc_project)
+        };
+
+        // Assemble: enrichment first (most relevant), then continuity, then project
+        let mut parts = Vec::new();
+        if !final_enrichment.is_empty() {
+            parts.push(final_enrichment);
+        }
+        if !final_continuity.is_empty() {
+            parts.push(final_continuity);
+        }
+        if !final_project.is_empty() {
+            parts.push(final_project);
+        }
+        parts.join("\n\n")
+    }
+
+    /// Estimate token count (~4 chars per token).
+    #[allow(dead_code)]
+    fn estimate_tokens(text: &str) -> usize {
+        text.len().div_ceil(4)
+    }
+
+    /// Count total tool groups selected (for metrics/logging).
+    #[allow(dead_code)]
+    pub fn count_tool_groups(input: &ComposerInput<'_>) -> usize {
+        Self::count_tool_groups_with_router(input, &HeuristicRouter)
+    }
+
+    /// Count tool groups using a custom router.
+    #[allow(dead_code)]
+    pub fn count_tool_groups_with_router(
+        input: &ComposerInput<'_>,
+        router: &dyn RoutingProvider,
+    ) -> usize {
+        let fsm_tools: Vec<String> = input
+            .protocol_runs
+            .iter()
+            .filter_map(|r| r.available_tools.as_ref())
+            .flatten()
+            .cloned()
+            .collect();
+
+        let routing_ctx = RoutingContext {
+            scaffolding_level: input.scaffolding_level,
+            has_active_plan: input.has_active_plan,
+            has_active_protocol: !input.protocol_runs.is_empty(),
+            task_count: input.task_count,
+            is_multi_project: input.is_multi_project,
+            external_tools_available: input.external_tools_available,
+            fsm_available_tools: fsm_tools,
+            user_message: input.user_message.to_string(),
+            detected_intent: None,
+            message_embedding: input.message_embedding.cloned(),
+        };
+        router.route(&routing_ctx).tool_groups.len()
+    }
+}
+
+/// Find the largest char boundary <= the given byte index.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// A parsed markdown section with header and scored items.
+struct MdSection {
+    /// The header line (e.g., "## Guidelines\n")
+    header: String,
+    /// Non-item lines (description text between header and items)
+    preamble: Vec<String>,
+    /// List items with importance scores (higher = more important)
+    items: Vec<(u8, String)>,
+}
+
+/// Score bonus applied to enrichment items during truncation.
+/// Enrichment content is freshly searched and contextually relevant,
+/// so it should survive truncation over static project_context/continuity.
+const ENRICHMENT_SCORE_BONUS: u8 = 30;
+
+/// Score a markdown list item by importance markers.
+///
+/// Recognizes patterns like `[Critical]`, `[High]`, `[Medium]`, `[Low]`
+/// and also priority numbers (priority 90 > priority 10).
+fn score_item(line: &str) -> u8 {
+    let lower = line.to_lowercase();
+    if lower.contains("[critical]") || lower.contains("critical") {
+        return 100;
+    }
+    if lower.contains("[high]") {
+        return 80;
+    }
+    if lower.contains("[medium]") {
+        return 50;
+    }
+    if lower.contains("[low]") {
+        return 20;
+    }
+    // Check for priority numbers: "priority 90" → score 90
+    if let Some(pos) = lower.find("priority ") {
+        let rest = &lower[pos + 9..];
+        if let Some(num_str) = rest.split(|c: char| !c.is_ascii_digit()).next() {
+            if let Ok(n) = num_str.parse::<u8>() {
+                return n;
+            }
+        }
+    }
+    // Default: medium importance
+    40
+}
+
+/// Parse markdown into sections (## headers) with their list items.
+fn parse_markdown_sections(text: &str) -> Vec<MdSection> {
+    let mut sections: Vec<MdSection> = Vec::new();
+    let mut current: Option<MdSection> = None;
+    let mut in_items = false;
+
+    for line in text.lines() {
+        if line.starts_with("## ") {
+            // Save previous section
+            if let Some(sec) = current.take() {
+                sections.push(sec);
+            }
+            current = Some(MdSection {
+                header: line.to_string(),
+                preamble: Vec::new(),
+                items: Vec::new(),
+            });
+            in_items = false;
+        } else if let Some(ref mut sec) = current {
+            if line.starts_with("- ") || line.starts_with("* ") {
+                in_items = true;
+                let score = score_item(line);
+                sec.items.push((score, line.to_string()));
+            } else if in_items && (line.starts_with("  ") || line.is_empty()) {
+                // Continuation of previous item or blank between items
+                if let Some(last) = sec.items.last_mut() {
+                    last.1.push('\n');
+                    last.1.push_str(line);
+                }
+            } else {
+                sec.preamble.push(line.to_string());
+            }
+        } else {
+            // Lines before any section header — treat as preamble of a virtual section
+            if current.is_none() {
+                current = Some(MdSection {
+                    header: String::new(),
+                    preamble: vec![line.to_string()],
+                    items: Vec::new(),
+                });
+            }
+        }
+    }
+
+    if let Some(sec) = current {
+        sections.push(sec);
+    }
+
+    sections
+}
+
+/// Render sections back to markdown, keeping only top-N items per section.
+fn render_sections_budgeted(sections: &mut [MdSection], char_budget: usize) -> String {
+    // First pass: calculate total size with all items
+    let total: usize = sections
+        .iter()
+        .map(|s| {
+            s.header.len()
+                + s.preamble.iter().map(|l| l.len() + 1).sum::<usize>()
+                + s.items.iter().map(|(_, l)| l.len() + 1).sum::<usize>()
+                + 2 // newlines
+        })
+        .sum();
+
+    if total <= char_budget {
+        // Everything fits
+        return sections
+            .iter()
+            .map(|s| render_section(s, s.items.len()))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    // Over budget: progressively reduce items per section
+    // Sort items within each section by score (descending)
+    for sec in sections.iter_mut() {
+        sec.items.sort_by(|a, b| b.0.cmp(&a.0));
+    }
+
+    // Binary search for max items per section that fits
+    let max_items = sections.iter().map(|s| s.items.len()).max().unwrap_or(0);
+    let mut best_n = 1; // Keep at least 1 item per section
+
+    for n in (1..=max_items).rev() {
+        let size: usize = sections
+            .iter()
+            .map(|s| {
+                let kept = s.items.len().min(n);
+                s.header.len()
+                    + s.preamble.iter().map(|l| l.len() + 1).sum::<usize>()
+                    + s.items.iter().take(kept).map(|(_, l)| l.len() + 1).sum::<usize>()
+                    + if kept < s.items.len() { 40 } else { 0 } // "[N more items omitted]"
+                    + 2
+            })
+            .sum();
+
+        if size <= char_budget {
+            best_n = n;
+            break;
+        }
+    }
+
+    let mut result: Vec<String> = Vec::new();
+    for sec in sections.iter() {
+        result.push(render_section(sec, best_n));
+    }
+
+    let mut output = result.join("\n");
+    if output.len() > char_budget {
+        // Final safety: hard truncate if still over (shouldn't happen normally)
+        let boundary = floor_char_boundary(&output, char_budget);
+        output.truncate(boundary);
+        output.push_str("\n\n[... context truncated]");
+    }
+    output
+}
+
+/// Render a single section with at most `max_items` items (sorted by score descending).
+fn render_section(sec: &MdSection, max_items: usize) -> String {
+    let mut lines = Vec::new();
+    if !sec.header.is_empty() {
+        lines.push(sec.header.clone());
+    }
+    for p in &sec.preamble {
+        lines.push(p.clone());
+    }
+    let total_items = sec.items.len();
+    let kept = total_items.min(max_items);
+    for (_, item_line) in sec.items.iter().take(kept) {
+        lines.push(item_line.clone());
+    }
+    let omitted = total_items.saturating_sub(kept);
+    if omitted > 0 {
+        lines.push(format!("  [{} more items omitted]", omitted));
+    }
+    lines.join("\n")
+}
+
+/// Semantically truncate markdown with an additive score boost on all items.
+///
+/// Same as `truncate_markdown_semantically` but applies `score_boost` to every item's
+/// importance score before truncation. Used for enrichment content which should
+/// survive truncation over lower-value static content.
+fn truncate_with_boost(text: &str, char_budget: usize, score_boost: u8) -> String {
+    if text.len() <= char_budget {
+        return text.to_string();
+    }
+    let mut sections = parse_markdown_sections(text);
+    // Apply score boost to all items
+    for sec in &mut sections {
+        for item in &mut sec.items {
+            item.0 = item.0.saturating_add(score_boost);
+        }
+    }
+    render_sections_budgeted(&mut sections, char_budget)
+}
+
+/// Semantically truncate markdown by parsing sections and keeping top-N items by importance.
+///
+/// Unlike blind character truncation, this:
+/// - Never drops entire sections (headers are always kept)
+/// - Prioritizes items by importance markers ([Critical] > [High] > [Medium] > [Low])
+/// - Uniformly reduces items per section to fit the budget
+fn truncate_markdown_semantically(text: &str, char_budget: usize) -> String {
+    if text.len() <= char_budget {
+        return text.to_string();
+    }
+    let mut sections = parse_markdown_sections(text);
+    render_sections_budgeted(&mut sections, char_budget)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    const PARENT: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// The audience of a `conversation` child of [`PARENT`] on `provider` (P18-suite, point 7).
+    fn audience_of_child(provider: &str, tool_use_id: Option<&str>) -> PromptAudience {
+        let mut spawned = serde_json::json!({"type": "conversation", "parent_session_id": PARENT});
+        if let Some(id) = tool_use_id {
+            spawned["tool_use_id"] = serde_json::json!(id);
+        }
+        PromptAudience::of(Some(&spawned.to_string()), provider)
+    }
+
+    fn plan_input() -> ComposerInput<'static> {
+        ComposerInput {
+            scaffolding_level: 0,
+            has_active_plan: true,
+            task_count: 10,
+            user_message: "montre le plan",
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_audience_frames_only_a_conversation_child_and_reads_the_engine_from_the_provider() {
+        let agent_child = audience_of_child("deepseek", Some("toolu_1"));
+        assert_eq!(agent_child.vocabulary, SubagentVocabulary::Agent);
+        assert_eq!(
+            agent_child.child,
+            Some(ChildFrame {
+                parent_session_id: PARENT.to_owned(),
+                answers_a_call: true
+            })
+        );
+        let sub_conversation = audience_of_child("claude-code", None);
+        assert_eq!(sub_conversation.vocabulary, SubagentVocabulary::ClaudeCode);
+        assert!(
+            matches!(
+                sub_conversation.child,
+                Some(ChildFrame {
+                    answers_a_call: false,
+                    ..
+                })
+            ),
+            "{sub_conversation:?}"
+        );
+        // The stored sessions keep an empty provider id for Claude Code.
+        assert_eq!(
+            PromptAudience::of(None, ""),
+            PromptAudience::default(),
+            "a root session on Claude Code is the default audience"
+        );
+        // A delegation, a runner child, junk and a root session are not framed.
+        for spawned in [
+            Some(r#"{"type":"delegation","parent_session_id":"x","task_id":"y"}"#),
+            Some(r#"{"type":"runner","run_id":"a","task_id":"b"}"#),
+            Some(r#"{"type":"conversation"}"#),
+            Some("not json"),
+            None,
+        ] {
+            assert_eq!(
+                PromptAudience::of(spawned, "deepseek").child,
+                None,
+                "{spawned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_audience_carries_the_provider_content_policy() {
+        use super::super::content_policy::ContentPolicy;
+        // Claude Code (and the empty default) is restricted: Anthropic's safeguards.
+        assert_eq!(
+            PromptAudience::of(None, "claude-code").content_policy,
+            ContentPolicy::Restricted
+        );
+        assert_eq!(
+            PromptAudience::default().content_policy,
+            ContentPolicy::Restricted
+        );
+        // Another provider is permissive.
+        assert_eq!(
+            PromptAudience::of(None, "deepseek").content_policy,
+            ContentPolicy::Permissive
+        );
+    }
+
+    #[test]
+    fn a_native_child_prompt_speaks_agent_and_never_task_output_a_claude_code_one_keeps_task() {
+        let claude = FsmPromptComposer::compose(&ComposerInput {
+            audience: audience_of_child("claude-code", Some("toolu_1")),
+            ..plan_input()
+        });
+        let native = FsmPromptComposer::compose(&ComposerInput {
+            audience: audience_of_child("deepseek", Some("toolu_1")),
+            ..plan_input()
+        });
+        assert!(
+            claude.contains("Wave Dispatch"),
+            "the test needs the wave dispatch subsection in the prompt"
+        );
+        assert!(
+            claude.contains("TaskOutput(block: true)") && claude.contains("Task(subagent_type"),
+            "Claude Code keeps its own words"
+        );
+        assert!(
+            !native.contains("TaskOutput") && !native.contains("run_in_background"),
+            "no Claude Code sub-agent word reaches the native engine:\n{native}"
+        );
+        assert!(
+            native.contains("`Agent(description, prompt)`"),
+            "the native engine is told about Agent"
+        );
+        for prompt in [&claude, &native] {
+            assert!(
+                prompt.contains("## You are a sub-agent") && prompt.contains(PARENT),
+                "a child is told it is one, and by whom"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_session_prompt_is_unchanged_and_a_child_only_gains_its_section() {
+        let root = FsmPromptComposer::compose(&plan_input());
+        assert!(
+            !root.contains("You are a sub-agent") && !root.contains("You are a sub-conversation"),
+            "a root session is never framed as a child"
+        );
+        let child = FsmPromptComposer::compose(&ComposerInput {
+            audience: audience_of_child("claude-code", Some("toolu_1")),
+            ..plan_input()
+        });
+        let section = child_section(&ChildFrame {
+            parent_session_id: PARENT.to_owned(),
+            answers_a_call: true,
+        });
+        assert_eq!(
+            child.replacen(&format!("\n\n---\n\n{section}"), "", 1),
+            root,
+            "child = root + its section, nothing else moved"
+        );
+        let sub = FsmPromptComposer::compose(&ComposerInput {
+            audience: audience_of_child("claude-code", None),
+            ..plan_input()
+        });
+        assert!(
+            sub.contains("## You are a sub-conversation") && !sub.contains("nobody will answer"),
+            "a sub-conversation is framed as one, and not told that no one reads it"
+        );
+    }
+
+    #[test]
+    fn test_compose_no_project_no_fsm() {
+        let input = ComposerInput {
+            scaffolding_level: 0,
+            has_active_plan: true,
+            task_count: 10,
+            ..Default::default()
+        };
+        let prompt = FsmPromptComposer::compose(&input);
+
+        // Should contain the identity section
+        assert!(
+            prompt.contains("# Development Agent"),
+            "Should have identity"
+        );
+        assert!(
+            prompt.contains("MCP Mega-Tools Reference"),
+            "Should have tool reference"
+        );
+        assert!(
+            !prompt.contains("Active Protocol Context"),
+            "No FSM section"
+        );
+    }
+
+    #[test]
+    fn only_a_root_conversation_is_taught_the_iso_scene_block() {
+        // A person reads a root conversation in the PO interface, which draws the block.
+        assert!(PromptAudience::of(None, "").displays_scenes());
+        assert!(PromptAudience::of(Some(""), "deepseek").displays_scenes());
+        assert!(PromptAudience::default().displays_scenes());
+        // A child answers a model; a delegation, a run, a trigger has no display.
+        assert!(!audience_of_child("claude-code", Some("toolu_1")).displays_scenes());
+        assert!(!audience_of_child("deepseek", None).displays_scenes());
+        for spawned in [
+            r#"{"type":"delegation","plan_id":"x","task_id":"y"}"#,
+            r#"{"type":"runner","run_id":"a","task_id":"b"}"#,
+            r#"{"type":"pipeline","run_id":"a","task_id":"b","wave":1}"#,
+            r#"{"type":"gate","run_id":"a","task_id":"b","gate_name":"g","attempt":1}"#,
+            r#"{"type":"trigger","trigger_id":"t"}"#,
+            r#"{"type":"conversation"}"#,
+            "not json",
+        ] {
+            assert!(
+                !PromptAudience::of(Some(spawned), "").displays_scenes(),
+                "{spawned}"
+            );
+        }
+
+        // Off (the default): the prompt is unchanged; on: the section and nothing else.
+        let off = ComposerInput {
+            user_message: "explique l'architecture",
+            ..Default::default()
+        };
+        let on = ComposerInput {
+            iso_scene: true,
+            ..off.clone()
+        };
+        let (before, after) = (
+            FsmPromptComposer::compose(&off),
+            FsmPromptComposer::compose(&on),
+        );
+        assert!(!before.contains("```iso-scene"), "off: no scene section");
+        assert!(after.contains(SECTION_ISO_SCENE), "on: the section is in");
+        assert_eq!(
+            after.replacen(&format!("\n\n---\n\n{SECTION_ISO_SCENE}"), "", 1),
+            before,
+            "on = off + the section, nothing else moved"
+        );
+    }
+
+    #[test]
+    fn test_cite_refs_off_leaves_the_prompt_untouched_and_on_only_adds_the_section() {
+        let off = ComposerInput {
+            user_message: "montre le plan",
+            ..Default::default()
+        };
+        let on = ComposerInput {
+            cite_refs: true,
+            ..off.clone()
+        };
+        let (before, after) = (
+            FsmPromptComposer::compose(&off),
+            FsmPromptComposer::compose(&on),
+        );
+        let section = crate::refs::cite::prompt_section();
+        assert!(!section.is_empty());
+        assert!(!before.contains(&section), "flag off: no citation section");
+        assert!(
+            after.contains(&section),
+            "flag on: the section is in the prompt"
+        );
+        assert_eq!(
+            after.replacen(&format!("\n\n---\n\n{section}"), "", 1),
+            before,
+            "on = off + the section, nothing else moved"
+        );
+    }
+
+    #[test]
+    fn test_compose_with_fsm_fragment() {
+        let runs = vec![ProtocolRunStatus {
+            protocol_name: "code-review".to_string(),
+            current_state: "analyzing".to_string(),
+            progress: 25,
+            status_message: "Analyzing changes".to_string(),
+            prompt_fragment: Some("Focus on test coverage and error handling.".to_string()),
+            available_tools: Some(vec!["code".to_string(), "note".to_string()]),
+            forbidden_actions: Some(vec!["Do NOT commit without review approval".to_string()]),
+        }];
+        let input = ComposerInput {
+            protocol_runs: &runs,
+            ..Default::default()
+        };
+        let prompt = FsmPromptComposer::compose(&input);
+
+        assert!(
+            prompt.contains("Active Protocol Context"),
+            "Should have FSM section"
+        );
+        assert!(prompt.contains("code-review"), "Should name the protocol");
+        assert!(prompt.contains("analyzing"), "Should name the state");
+        assert!(
+            prompt.contains("Focus on test coverage"),
+            "Should inject prompt fragment"
+        );
+        assert!(
+            prompt.contains("Allowed tools"),
+            "Should list available tools"
+        );
+        assert!(
+            prompt.contains("Forbidden in state"),
+            "Should list forbidden actions"
+        );
+    }
+
+    #[test]
+    fn test_compose_with_dynamic_context() {
+        let input = ComposerInput {
+            project_context_markdown: "## Project: my-app\n- 3 active plans\n- Rust codebase",
+            continuity_markdown: "## Previous Session\n- Last worked on auth module",
+            ..Default::default()
+        };
+        let prompt = FsmPromptComposer::compose(&input);
+
+        assert!(
+            prompt.contains("Previous Session"),
+            "Should have continuity"
+        );
+        assert!(
+            prompt.contains("Project: my-app"),
+            "Should have project context"
+        );
+    }
+
+    #[test]
+    fn test_compose_l4_smaller_than_l0() {
+        let input_l0 = ComposerInput {
+            scaffolding_level: 0,
+            has_active_plan: true,
+            task_count: 10,
+            ..Default::default()
+        };
+        let input_l4 = ComposerInput {
+            scaffolding_level: 4,
+            has_active_plan: true,
+            task_count: 10,
+            ..Default::default()
+        };
+        let prompt_l0 = FsmPromptComposer::compose(&input_l0);
+        let prompt_l4 = FsmPromptComposer::compose(&input_l4);
+
+        assert!(
+            prompt_l4.len() < prompt_l0.len(),
+            "L4 ({} chars) should be smaller than L0 ({} chars)",
+            prompt_l4.len(),
+            prompt_l0.len()
+        );
+    }
+
+    #[test]
+    fn test_compose_dynamic_truncation() {
+        // Build a large structured markdown context
+        let mut big_context = String::from("## Items\n");
+        for i in 0..500 {
+            big_context.push_str(&format!(
+                "- [Low] Item {} with padding text to make it much longer\n",
+                i
+            ));
+        }
+        let input = ComposerInput {
+            project_context_markdown: &big_context,
+            ..Default::default()
+        };
+        let prompt = FsmPromptComposer::compose(&input);
+
+        // The dynamic section should be semantically truncated
+        assert!(
+            prompt.contains("more items omitted") || prompt.contains("context truncated"),
+            "Should indicate truncation"
+        );
+        // Total prompt should be reasonable (base + tool_ref + truncated dynamic)
+        assert!(
+            prompt.len() < 100_000,
+            "Total prompt should be bounded, got {}",
+            prompt.len()
+        );
+    }
+
+    #[test]
+    fn test_fsm_section_empty_when_no_runs() {
+        let section = FsmPromptComposer::build_fsm_section(&[]);
+        assert!(section.is_empty(), "No runs → empty FSM section");
+    }
+
+    #[test]
+    fn test_fsm_section_multiple_runs() {
+        let runs = vec![
+            ProtocolRunStatus {
+                protocol_name: "deploy".to_string(),
+                current_state: "staging".to_string(),
+                progress: 50,
+                status_message: "Deploying to staging".to_string(),
+                prompt_fragment: Some("Check staging logs.".to_string()),
+                available_tools: None,
+                forbidden_actions: None,
+            },
+            ProtocolRunStatus {
+                protocol_name: "review".to_string(),
+                current_state: "pending".to_string(),
+                progress: 0,
+                status_message: "".to_string(),
+                prompt_fragment: None,
+                available_tools: None,
+                forbidden_actions: None,
+            },
+        ];
+        let section = FsmPromptComposer::build_fsm_section(&runs);
+        assert!(section.contains("deploy"), "Should contain first protocol");
+        assert!(section.contains("review"), "Should contain second protocol");
+        assert!(
+            section.contains("Check staging logs"),
+            "Should contain fragment"
+        );
+    }
+
+    #[test]
+    fn test_tool_groups_fsm_filtering() {
+        let runs = vec![ProtocolRunStatus {
+            protocol_name: "test".to_string(),
+            current_state: "run".to_string(),
+            progress: 0,
+            status_message: "".to_string(),
+            prompt_fragment: None,
+            available_tools: Some(vec!["code".to_string(), "note".to_string()]),
+            forbidden_actions: None,
+        }];
+        let input = ComposerInput {
+            protocol_runs: &runs,
+            ..Default::default()
+        };
+        let groups = FsmPromptComposer::count_tool_groups(&input);
+        // Core + Knowledge always, + CodeExploration (has "code")
+        assert!(
+            (2..=4).contains(&groups),
+            "FSM whitelist should limit groups, got {}",
+            groups
+        );
+    }
+
+    // ── Semantic truncation tests ────────────────────────────────────
+
+    #[test]
+    fn test_score_item_importance_ordering() {
+        assert!(score_item("- [Critical] Never do X") > score_item("- [High] Avoid Y"));
+        assert!(score_item("- [High] Avoid Y") > score_item("- [Medium] Consider Z"));
+        assert!(score_item("- [Medium] Consider Z") > score_item("- [Low] Maybe W"));
+    }
+
+    #[test]
+    fn test_score_item_priority_number() {
+        let score = score_item("- **Plan A** (InProgress, priority 90)");
+        assert!(score == 90, "Should extract priority 90, got {}", score);
+    }
+
+    #[test]
+    fn test_parse_markdown_sections() {
+        let md =
+            "## Guidelines\n- [Critical] Rule 1\n- [Low] Rule 2\n\n## Gotchas\n- Watch out for X\n";
+        let sections = parse_markdown_sections(md);
+        assert_eq!(sections.len(), 2, "Should parse 2 sections");
+        assert_eq!(sections[0].items.len(), 2, "Guidelines should have 2 items");
+        assert_eq!(sections[1].items.len(), 1, "Gotchas should have 1 item");
+    }
+
+    #[test]
+    fn test_semantic_truncation_keeps_critical_drops_low() {
+        // Build a dynamic context with 8 guidelines of varying importance
+        let mut md = String::from("## Guidelines\n");
+        md.push_str("- [Critical] Never expose API keys\n");
+        md.push_str("- [Critical] Always validate input\n");
+        md.push_str("- [Critical] Use parameterized queries\n");
+        md.push_str("- [High] Log all errors\n");
+        md.push_str("- [High] Use structured logging\n");
+        md.push_str("- [Medium] Prefer composition over inheritance\n");
+        md.push_str("- [Low] Use snake_case for variables\n");
+        md.push_str("- [Low] Max line length 100\n");
+
+        // Set a very tight budget that can only fit ~3 items
+        let budget = md.len() / 2;
+        let result = truncate_markdown_semantically(&md, budget);
+
+        // Should keep the Critical items, drop Low items
+        assert!(
+            result.contains("Never expose API keys"),
+            "Should keep Critical item"
+        );
+        assert!(
+            result.contains("Always validate input"),
+            "Should keep Critical item"
+        );
+        assert!(
+            result.contains("## Guidelines"),
+            "Should keep section header"
+        );
+        // Should indicate omitted items
+        assert!(
+            result.contains("more items omitted"),
+            "Should show omission indicator"
+        );
+    }
+
+    #[test]
+    fn test_semantic_truncation_preserves_all_section_headers() {
+        let md = "## Guidelines\n- [Low] Rule 1\n- [Low] Rule 2\n- [Low] Rule 3\n- [Low] Rule 4\n\n\
+                   ## Gotchas\n- [Low] Gotcha 1\n- [Low] Gotcha 2\n- [Low] Gotcha 3\n- [Low] Gotcha 4\n\n\
+                   ## Plans\n- [Low] Plan 1\n- [Low] Plan 2\n- [Low] Plan 3\n- [Low] Plan 4\n";
+
+        // Budget that fits headers + 1 item each but not all items
+        let budget = md.len() * 2 / 3;
+        let result = truncate_markdown_semantically(md, budget);
+
+        // All section headers must be preserved
+        assert!(
+            result.contains("## Guidelines"),
+            "Must keep Guidelines header"
+        );
+        assert!(result.contains("## Gotchas"), "Must keep Gotchas header");
+        assert!(result.contains("## Plans"), "Must keep Plans header");
+        // Should have omitted some items
+        assert!(
+            result.contains("more items omitted"),
+            "Should indicate omitted items"
+        );
+    }
+
+    #[test]
+    fn test_semantic_truncation_under_budget_unchanged() {
+        let md = "## Small\n- Item 1\n- Item 2\n";
+        let result = truncate_markdown_semantically(md, 10_000);
+        // Should return as-is (no omission markers)
+        assert!(
+            !result.contains("omitted"),
+            "Under budget should not truncate"
+        );
+        assert!(result.contains("Item 1"));
+        assert!(result.contains("Item 2"));
+    }
+
+    #[test]
+    fn test_dynamic_section_uses_semantic_truncation() {
+        // Build a big project context that exceeds the default budget
+        let budget = DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET;
+        let mut big_context = String::new();
+        big_context.push_str("## Guidelines\n");
+        for i in 0..100 {
+            let importance = if i < 10 {
+                "Critical"
+            } else if i < 30 {
+                "High"
+            } else {
+                "Low"
+            };
+            big_context.push_str(&format!(
+                "- [{}] Guideline number {} with some padding text to make it longer and exceed the budget easily\n",
+                importance, i
+            ));
+        }
+        big_context.push_str("\n## Gotchas\n");
+        for i in 0..50 {
+            big_context.push_str(&format!("- [Medium] Gotcha number {} with extra text\n", i));
+        }
+
+        assert!(
+            big_context.len() > budget,
+            "Test context should exceed budget"
+        );
+
+        let result = FsmPromptComposer::build_dynamic_section("", &big_context, "", budget);
+
+        // Should be within budget (with some margin for omission markers)
+        assert!(
+            result.len() <= budget + 200,
+            "Result ({} chars) should be near budget ({})",
+            result.len(),
+            budget
+        );
+
+        // Should keep section headers
+        assert!(result.contains("## Guidelines"));
+        assert!(result.contains("## Gotchas"));
+
+        // Should indicate truncation
+        assert!(result.contains("more items omitted"));
+    }
+
+    // ── Sub-budgeting and enrichment priority tests ──────────────────
+
+    #[test]
+    fn test_enrichment_gets_priority_in_truncation() {
+        // Enrichment should survive truncation better than project_context
+        // thanks to the +30 score boost and 40% budget allocation.
+        let budget = 2000;
+
+        // Build enrichment with critical items
+        let mut enrichment = String::from("## Active Skills\n");
+        for i in 0..20 {
+            enrichment.push_str(&format!("- Skill {} with relevant context\n", i));
+        }
+
+        // Build project context with low items
+        let mut project = String::from("## Project Info\n");
+        for i in 0..20 {
+            project.push_str(&format!("- [Low] Generic info item {}\n", i));
+        }
+
+        let result = FsmPromptComposer::build_dynamic_section("", &project, &enrichment, budget);
+
+        // Enrichment should appear first (it's assembled first)
+        let enrichment_pos = result.find("Active Skills");
+        let project_pos = result.find("Project Info");
+        assert!(
+            enrichment_pos.is_some(),
+            "Enrichment should be present in output"
+        );
+        assert!(
+            project_pos.is_some(),
+            "Project context should be present in output"
+        );
+        assert!(
+            enrichment_pos.unwrap() < project_pos.unwrap(),
+            "Enrichment should come before project context"
+        );
+    }
+
+    #[test]
+    fn test_sub_budget_reserves_enrichment_space() {
+        // When both enrichment and project_context are large, enrichment
+        // should get 40% of the budget (more than the 30% for project).
+        let budget = 3000;
+
+        let mut enrichment = String::from("## Enrichment\n");
+        for i in 0..50 {
+            enrichment.push_str(&format!(
+                "- Enrichment item {} with important context data\n",
+                i
+            ));
+        }
+
+        let mut project = String::from("## Project\n");
+        for i in 0..50 {
+            project.push_str(&format!("- Project item {} with some padding text\n", i));
+        }
+
+        let result = FsmPromptComposer::build_dynamic_section("", &project, &enrichment, budget);
+
+        // Count how much enrichment content survived vs project content
+        let enrichment_lines = result
+            .lines()
+            .filter(|l| l.contains("Enrichment item"))
+            .count();
+        let project_lines = result
+            .lines()
+            .filter(|l| l.contains("Project item"))
+            .count();
+
+        assert!(
+            enrichment_lines >= project_lines,
+            "Enrichment ({} items) should get at least as many items as project ({} items) due to 40% vs 30% budget",
+            enrichment_lines,
+            project_lines
+        );
+    }
+
+    #[test]
+    fn test_enrichment_score_boost_preserves_items() {
+        // The ENRICHMENT_SCORE_BONUS (+30) should make enrichment items
+        // score higher than default (40) → they become 70, surviving over
+        // low-priority items at 20.
+        let boosted = truncate_with_boost(
+            "## Skills\n- Skill A\n- Skill B\n- Skill C\n",
+            200,
+            ENRICHMENT_SCORE_BONUS,
+        );
+        // All items should survive since the text is under budget
+        assert!(boosted.contains("Skill A"));
+        assert!(boosted.contains("Skill B"));
+        assert!(boosted.contains("Skill C"));
+    }
+
+    #[test]
+    fn test_surplus_redistribution() {
+        // If enrichment is small, its surplus should be given to project_context.
+        let budget = 3000;
+        let enrichment = "## Skills\n- One active skill\n";
+        let mut project = String::from("## Project\n");
+        for i in 0..60 {
+            project.push_str(&format!("- Project item {} with padding text\n", i));
+        }
+
+        let result = FsmPromptComposer::build_dynamic_section("", &project, enrichment, budget);
+
+        // Project should get more than its 30% base allocation thanks to
+        // surplus from enrichment's unused 40%.
+        assert!(
+            result.len() > budget * 30 / 100,
+            "Result ({} chars) should exceed the 30% base project allocation ({})",
+            result.len(),
+            budget * 30 / 100
+        );
+    }
+
+    // ── compute_dynamic_budget tests ─────────────────────────────────
+
+    #[test]
+    fn test_budget_200k_window() {
+        // 200K tokens × 4 chars = 800K chars; remaining = 750K; 15% = 112.5K → clamped to 40K
+        assert_eq!(compute_dynamic_budget(Some(200_000), 50_000), 40_000);
+    }
+
+    #[test]
+    fn test_budget_deepseek_128k_matches_claude_128k() {
+        // The budget reads the window, never the name: a 128K DeepSeek on the native
+        // harness gets what a 128K Claude gets (it used to fall to 10 000).
+        let deepseek = ComposerInput {
+            model: "deepseek-chat",
+            context_window: Some(128_000),
+            ..Default::default()
+        };
+        let claude = ComposerInput {
+            model: "claude-sonnet-4-6",
+            context_window: Some(128_000),
+            ..Default::default()
+        };
+        let budget =
+            |input: &ComposerInput<'_>| compute_dynamic_budget(input.context_window, 50_000);
+        assert_eq!(budget(&deepseek), budget(&claude));
+        // 128K × 4 = 512K; remaining 462K; 15% = 69.3K → clamped to 40K
+        assert_eq!(budget(&deepseek), 40_000);
+
+        // And the composed prompts are the same: same window, same dynamic context.
+        let long_context: String = (0..2_000)
+            .map(|i| format!("- [Medium] item {i} with some words to fill the line\n"))
+            .collect();
+        let long_context = format!("## Context\n{long_context}");
+        let with = |model: &'static str| ComposerInput {
+            model,
+            context_window: Some(128_000),
+            project_context_markdown: &long_context,
+            ..Default::default()
+        };
+        let deepseek_prompt = FsmPromptComposer::compose(&with("deepseek-chat"));
+        let claude_prompt = FsmPromptComposer::compose(&with("claude-sonnet-4-6"));
+        assert_eq!(deepseek_prompt, claude_prompt);
+        // Bigger than what the unknown-window fallback lets through.
+        let unknown_prompt = FsmPromptComposer::compose(&ComposerInput {
+            model: "deepseek-chat",
+            context_window: None,
+            project_context_markdown: &long_context,
+            ..Default::default()
+        });
+        assert!(deepseek_prompt.len() > unknown_prompt.len() + 20_000);
+    }
+
+    #[test]
+    fn test_budget_unknown_window_uses_default() {
+        assert_eq!(
+            compute_dynamic_budget(None, 50_000),
+            DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET
+        );
+        assert_eq!(compute_dynamic_budget(None, 0), 10_000);
+        // Whatever the name: a Claude model whose window is unknown is not guessed.
+        let input = ComposerInput {
+            model: "claude-opus-4-20250514",
+            ..Default::default()
+        };
+        assert_eq!(compute_dynamic_budget(input.context_window, 50_000), 10_000);
+    }
+
+    #[test]
+    fn test_budget_small_window_scales_down() {
+        // 16K tokens × 4 = 64K chars; 15% = 9 600
+        assert_eq!(compute_dynamic_budget(Some(16_000), 0), 9_600);
+        // A tiny window still gets the floor.
+        assert_eq!(compute_dynamic_budget(Some(4_000), 0), 5_000);
+        // An absurd window does not overflow.
+        assert_eq!(compute_dynamic_budget(Some(u64::MAX), 0), 40_000);
+    }
+
+    /// (B16-3) The runner's sessions get the same budget as a chat's: from the
+    /// window the catalog knows, never from the model's name. A 32K window is
+    /// budgeted at 15% of its room; a 1M window hits the 40K ceiling.
+    #[test]
+    fn test_budget_32k_and_1m_windows_follow_the_window_not_the_name() {
+        // 32K × 4 = 128K chars; 15% = 19 200 (no base prompt).
+        assert_eq!(compute_dynamic_budget(Some(32_000), 0), 19_200);
+        // With a 50K base prompt: (128K − 50K) × 15% = 11 700.
+        assert_eq!(compute_dynamic_budget(Some(32_000), 50_000), 11_700);
+        // 1M × 4 = 4M chars; 15% ≫ 40K → the ceiling, base prompt or not.
+        assert_eq!(compute_dynamic_budget(Some(1_000_000), 0), 40_000);
+        assert_eq!(compute_dynamic_budget(Some(1_000_000), 50_000), 40_000);
+        // Same window, any name: same budget.
+        for model in ["claude-opus-4-20250514", "deepseek-chat", "qwen3-coder"] {
+            let input = ComposerInput {
+                model,
+                context_window: Some(32_000),
+                ..Default::default()
+            };
+            assert_eq!(compute_dynamic_budget(input.context_window, 0), 19_200);
+        }
+    }
+
+    #[test]
+    fn test_budget_large_base_prompt_reduces_budget() {
+        // Base prompt nearly fills the context window
+        // 200K tokens × 4 = 800K chars; remaining = 800K - 780K = 20K; 15% = 3K → clamped to 5K
+        assert_eq!(compute_dynamic_budget(Some(200_000), 780_000), 5_000);
+    }
+
+    #[test]
+    fn test_budget_small_base_prompt_gets_max() {
+        // Tiny base prompt → 15% of ~800K = ~120K → clamped to 40K
+        assert_eq!(compute_dynamic_budget(Some(200_000), 1_000), 40_000);
+    }
+
+    #[test]
+    fn test_turn_enrichment_cap_follows_the_window_budget() {
+        assert_eq!(turn_enrichment_cap(None), 10_000);
+        assert_eq!(turn_enrichment_cap(Some(16_000)), 9_600);
+        assert_eq!(turn_enrichment_cap(Some(128_000)), 40_000);
+        assert_eq!(turn_enrichment_cap(Some(1_000_000)), 40_000);
+    }
+
+    #[test]
+    fn test_same_inputs_same_prompt() {
+        // The prompt of a session is a pure function of its inputs: the same session
+        // (same window, same context) composes the same prompt byte for byte.
+        let input = ComposerInput {
+            model: "deepseek-chat",
+            context_window: Some(128_000),
+            project_context_markdown: "## Context\n- item",
+            continuity_markdown: "## Previous\n- done",
+            ..Default::default()
+        };
+        assert_eq!(
+            FsmPromptComposer::compose(&input),
+            FsmPromptComposer::compose(&input)
+        );
+    }
+
+    // ── Prefix byte-stability (cache) ─────────────────────────────────
+
+    /// The system prompt is the head of the provider-facing prefix (system +
+    /// tools + replayed history), so it must be byte-identical across turns for
+    /// the KV/prefix cache to hit. This test proves the half the composer owns —
+    /// PURITY: recomposing the same session-frozen inputs yields the same bytes.
+    ///
+    /// It does NOT, by itself, prove byte-stability *across a turn*: the composer
+    /// produces only the head and has no input for the provider's replayed
+    /// history, so it cannot express "append a trailing turn" in isolation. That
+    /// append-only contract is proven at the boundary that owns the history —
+    /// `provider/transcripts.rs::a_turn_appends_to_the_replayed_history_without_touching_its_prefix`
+    /// (save → resume → append → save, the cached prefix stays byte-identical).
+    #[test]
+    fn the_system_prompt_is_a_pure_function_of_its_session_frozen_inputs() {
+        let runs = vec![ProtocolRunStatus {
+            protocol_name: "code-review".to_string(),
+            current_state: "analyzing".to_string(),
+            progress: 25,
+            status_message: "Analyzing changes".to_string(),
+            prompt_fragment: Some("Focus on test coverage.".to_string()),
+            available_tools: Some(vec!["code".to_string(), "note".to_string()]),
+            forbidden_actions: Some(vec!["Do NOT commit".to_string()]),
+        }];
+        let input = ComposerInput {
+            model: "deepseek-chat",
+            context_window: Some(128_000),
+            scaffolding_level: 1,
+            protocol_runs: &runs,
+            project_context_markdown: "## Project: my-app\n- [High] keep the auth flow\n- [Low] ui",
+            continuity_markdown: "## Previous Session\n- worked on the auth module",
+            enrichment_markdown: "## Notes\n- a propagated note",
+            is_multi_project: true,
+            has_active_plan: true,
+            task_count: 6,
+            ..Default::default()
+        };
+
+        let before = FsmPromptComposer::compose(&input);
+        // Nothing about a turn reaches the composer (it reads no history and
+        // holds no state), so recomposing the same frozen inputs yields the same
+        // bytes.
+        let after = FsmPromptComposer::compose(&input);
+
+        assert!(!before.is_empty());
+        assert_eq!(
+            before, after,
+            "the composer is pure: same inputs, same bytes"
+        );
+    }
+
+    /// The composer holds no state between calls: composing another prompt in
+    /// between must not disturb a later recomposition of the first. A session's
+    /// prefix is never influenced by the prompts of any other session.
+    #[test]
+    fn compose_holds_no_state_between_calls() {
+        let a = ComposerInput {
+            project_context_markdown: "## A\n- alpha",
+            ..Default::default()
+        };
+        let b = ComposerInput {
+            project_context_markdown: "## B\n- beta",
+            ..Default::default()
+        };
+        let a1 = FsmPromptComposer::compose(&a);
+        let _b = FsmPromptComposer::compose(&b);
+        let a2 = FsmPromptComposer::compose(&a);
+        assert_eq!(a1, a2, "composing `b` in between must not leak into `a`");
+    }
+}

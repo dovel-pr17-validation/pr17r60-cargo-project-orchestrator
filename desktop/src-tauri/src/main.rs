@@ -1,0 +1,749 @@
+// Prevents additional console window on Windows in release
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod docker;
+mod net;
+mod plugins;
+mod setup;
+mod tray;
+mod updater;
+
+use project_orchestrator::Config;
+use tauri::Manager;
+use tauri_plugin_opener::OpenerExt;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Actual backend port — written once at startup from the config, read by
+/// `get_server_port` Tauri command. Defaults to `DEFAULT_DESKTOP_PORT` (6600)
+/// until the config is loaded.
+static BACKEND_PORT: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(setup::DEFAULT_DESKTOP_PORT);
+
+/// Flag set by the splash screen's `proceed_to_main` Tauri command to signal
+/// that the splash has finished all its checks and is ready to transition.
+/// The backend thread polls this flag before calling `show_main_window()`.
+static SPLASH_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long the desktop thread waits for the backend's HTTP listener before moving on.
+const BACKEND_LISTEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Where the wait for the backend's HTTP listener stands.
+#[derive(Debug, PartialEq, Eq)]
+enum BackendWait {
+    /// Keep polling.
+    Keep,
+    /// The splash signalled `proceed_to_main` ("Continue anyway" or a finished check): stop now.
+    SplashProceeded,
+    /// The backend did not answer within `BACKEND_LISTEN_TIMEOUT`.
+    TimedOut,
+}
+
+/// The splash wins over the clock: once it has faded out, waiting on would leave an empty window.
+fn backend_wait_state(splash_ready: bool, elapsed: std::time::Duration) -> BackendWait {
+    if splash_ready {
+        BackendWait::SplashProceeded
+    } else if elapsed > BACKEND_LISTEN_TIMEOUT {
+        BackendWait::TimedOut
+    } else {
+        BackendWait::Keep
+    }
+}
+
+/// Tauri command: get the server port for the frontend to connect to.
+/// Returns the real port from config.yaml (not necessarily 6600).
+#[tauri::command]
+fn get_server_port() -> u16 {
+    BACKEND_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tauri command: called by the splash screen when all checks are done
+/// and it's ready to transition to the main window.
+///
+/// This removes the need for the Rust thread to duplicate Docker/CLI checks —
+/// the splash screen drives the transition by calling this when ready.
+#[tauri::command]
+fn proceed_to_main() {
+    tracing::info!("Splash screen signaled ready — will transition to main window");
+    SPLASH_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Tauri command: check backend health and return the full `/health` response.
+///
+/// Returns the JSON body from the `/health` endpoint, which includes:
+/// - `status`: "ok" | "degraded" | "unhealthy"
+/// - `version`: semver string
+/// - `services.neo4j`: "connected" | "disconnected"
+/// - `services.meilisearch`: "connected" | "disconnected"
+///
+/// Returns `null` if the server is not reachable yet.
+#[tauri::command]
+async fn check_health(port: u16) -> Result<Option<serde_json::Value>, String> {
+    let url = format!("http://localhost:{}/health", port);
+    match reqwest::get(&url).await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(body) => Ok(Some(body)),
+            Err(_) => Ok(Some(serde_json::json!({"status": "ok"}))),
+        },
+        Err(e) => {
+            // The splash polls every 200 ms: say why once, not 600 times.
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!("check_health {} failed: {}", url, e);
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Tauri command: open a URL in the system's default browser.
+///
+/// This is the most reliable way to open external links from the webview.
+/// Called by ExternalLink onClick in Tauri mode.
+#[tauri::command]
+fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// Tauri command: open a native directory picker dialog.
+///
+/// Returns the selected directory path, or `None` if the user cancelled.
+/// This uses `tauri_plugin_dialog` under the hood but is exposed as a
+/// custom command so the frontend can call it via `invoke()` — which is
+/// more reliable than the JS plugin bindings (no build-time IPC glue needed).
+#[tauri::command]
+async fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog()
+        .file()
+        .set_title("Select project folder")
+        .pick_folder(move |path| {
+            let _ = tx.send(path.map(|p| p.to_string()));
+        });
+    rx.recv()
+        .map_err(|e| format!("Dialog channel error: {}", e))
+}
+
+/// Tauri command: restart the entire application.
+///
+/// Called by the setup wizard after generating config.yaml so the backend
+/// restarts with the new configuration. This is the simplest and safest
+/// approach — the backend thread has no graceful shutdown handle, so we
+/// relaunch the whole process.
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    tracing::info!("Restarting application (requested by setup wizard)...");
+    app.restart();
+}
+
+/// Tauri command: receive a webview console.log/error/warn and forward it to
+/// the tracing backend so it's visible in the terminal (release builds strip
+/// the webview inspector on macOS).
+#[tauri::command]
+fn webview_log(level: String, message: String) {
+    match level.as_str() {
+        "error" => tracing::error!(target: "webview", "{}", message),
+        "warn" => tracing::warn!(target: "webview", "{}", message),
+        _ => tracing::info!(target: "webview", "{}", message),
+    }
+}
+
+fn main() {
+    // Linux launch fix (2026-06-02) — webkitgtk ≥ 2.42 ships a DMABUF renderer
+    // that crashes or shows a blank window at startup on many Linux setups
+    // (Wayland, NVIDIA proprietary, several recent Intel/Mesa stacks). This is
+    // the most common cause of "the Linux desktop app doesn't launch". Disable
+    // it BEFORE the webview initializes. No-op on macOS/Windows; respects an
+    // explicit user override if already set in the environment.
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
+
+    // Initialize tracing
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,project_orchestrator=debug".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    tracing::info!("Starting Project Orchestrator Desktop...");
+
+    // Initialize Docker manager (shared state for Tauri commands)
+    let docker_manager = docker::create_docker_manager();
+
+    // Clone docker manager for the exit handler and for the splash→main transition
+    let docker_for_exit = docker_manager.clone();
+    let docker_for_setup = docker_manager.clone();
+
+    // Launch Tauri application (splash screen shows immediately)
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_websocket::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(docker_manager)
+        .invoke_handler(tauri::generate_handler![
+            get_server_port,
+            proceed_to_main,
+            check_health,
+            net::probe_services,
+            net::test_connection_detailed,
+            open_url,
+            pick_directory,
+            restart_app,
+            webview_log,
+            // Splash screen dependency checks
+            setup::check_dependencies,
+            // Setup wizard commands
+            setup::check_config_exists,
+            setup::get_config_path,
+            setup::generate_config,
+            setup::read_config,
+            setup::detect_claude_code,
+            setup::detect_shell_path,
+            setup::check_cli_status,
+            setup::check_codex_status,
+            setup::install_cli,
+            setup::setup_claude_code,
+            setup::verify_oidc_discovery,
+            // Embedding model commands (setup wizard blocking validation)
+            setup::check_embedding_model,
+            setup::download_embedding_model,
+            setup::test_embedding_endpoint,
+            // Docker management commands
+            docker::check_docker,
+            docker::open_docker_desktop,
+            docker::start_docker_services,
+            docker::check_services_health,
+            docker::stop_docker_services,
+            docker::get_service_logs,
+            docker::test_connection,
+            // Auto-update commands
+            updater::check_update,
+            updater::install_update,
+            // macOS native rounded corners
+            plugins::mac_rounded_corners::enable_rounded_corners,
+            plugins::mac_rounded_corners::enable_modern_window_style,
+            plugins::mac_rounded_corners::reposition_traffic_lights,
+        ])
+        .setup(move |app| {
+            style_splash_window(app.handle());
+            // Create system tray
+            if let Err(e) = tray::create_tray(app.handle()) {
+                tracing::warn!("Failed to create system tray: {}", e);
+            }
+            // Set up minimize-to-tray behavior
+            tray::setup_minimize_to_tray(app.handle());
+            // Check for updates at startup and every few hours (unless disabled in
+            // config.yaml; the setting is re-read on each check).
+            updater::start_periodic_checks(app.handle().clone());
+
+            // Resolve absolute paths to bundled resources so the backend can find them.
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                // Frontend dist/ for HTTP serving.
+                // Force SERVE_FRONTEND=true so the backend also serves the SPA via HTTP.
+                // This is required for OIDC callback: after OAuth redirect to
+                // http://localhost:6600/auth/callback, the backend must serve
+                // index.html as SPA fallback (not just the Tauri protocol).
+                let dist_path = resource_dir.join("dist");
+                if dist_path.exists() {
+                    tracing::info!("Frontend dist path: {}", dist_path.display());
+                    std::env::set_var("FRONTEND_PATH", dist_path.to_str().unwrap_or("./dist"));
+                    std::env::set_var("SERVE_FRONTEND", "true");
+                } else {
+                    tracing::warn!("Bundled dist/ not found at: {}", dist_path.display());
+                }
+
+                // MCP server binary for chat sessions (InteractiveClient / Claude Code CLI)
+                let mcp_name = format!("mcp_server{}", std::env::consts::EXE_SUFFIX);
+                let mcp_path = resource_dir.join(&mcp_name);
+                if mcp_path.exists() {
+                    tracing::info!("MCP server path: {}", mcp_path.display());
+                    std::env::set_var("MCP_SERVER_PATH", mcp_path.to_str().unwrap_or("mcp_server"));
+                } else {
+                    tracing::warn!("Bundled mcp_server not found at: {}", mcp_path.display());
+                }
+
+                // nexus-tools: the files, shell and web tools of a native session. The release
+                // bundles it as a resource; the server looks next to ITS executable, which here
+                // is the app's, so it is named explicitly. An operator's NEXUS_TOOLS_PATH wins.
+                let tools_name = format!("nexus-tools{}", std::env::consts::EXE_SUFFIX);
+                let tools_path = resource_dir.join(&tools_name);
+                if std::env::var_os("NEXUS_TOOLS_PATH").is_none() && tools_path.exists() {
+                    tracing::info!("nexus-tools path: {}", tools_path.display());
+                    std::env::set_var("NEXUS_TOOLS_PATH", &tools_path);
+                }
+            }
+
+            // Create the main window PROGRAMMATICALLY (not from tauri.conf.json)
+            // so we can attach an on_new_window handler that intercepts
+            // target="_blank" links and opens them in the system browser.
+            //
+            // NOTE: We intentionally do NOT use on_navigation here because
+            // the OIDC/SSO flow navigates the webview to the OAuth provider
+            // (e.g. accounts.google.com) and back to localhost:6600/auth/callback.
+            // Blocking external navigations would break SSO.
+            let new_win_handle = app.handle().clone();
+            let _main_window = tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::App("index.html".into()),
+            )
+            .title("Project Orchestrator")
+            .inner_size(1280.0, 800.0)
+            .min_inner_size(900.0, 600.0)
+            .resizable(true)
+            .center()
+            .visible(false)
+            .decorations(false)
+            // Inject console → tracing bridge as an initialization script.
+            // This runs after __TAURI_INTERNALS__ is created but before HTML
+            // is parsed, guaranteeing the bridge is in place before any
+            // application JS (React, eventBus, wsAdapter) executes.
+            .initialization_script(r#"
+                (function() {
+                    // 0. macOS Tauri 2 click fix — block touch events that interfere
+                    //    with mouse clicks in webviews with decorations: false.
+                    //    See: https://github.com/tauri-apps/tauri/discussions/11957
+                    if (/Mac|Macintosh/i.test(navigator.userAgent)) {
+                        var origAEL = EventTarget.prototype.addEventListener;
+                        EventTarget.prototype.addEventListener = function(type, listener, options) {
+                            if (/^touch/.test(type)) return;
+                            return origAEL.call(this, type, listener, options);
+                        };
+                    }
+
+                    // 1. Block Cmd/Ctrl +/-/0 zoom shortcuts
+                    document.addEventListener('keydown', function(e) {
+                        if ((e.metaKey || e.ctrlKey) && (e.key === '+' || e.key === '-' || e.key === '=' || e.key === '0')) {
+                            e.preventDefault();
+                        }
+                    }, true);
+
+                    // 2. Bridge console → Tauri tracing
+                    var ti = window.__TAURI_INTERNALS__;
+                    if (ti && ti.invoke) {
+                        var origLog = console.log;
+                        var origError = console.error;
+                        var origWarn = console.warn;
+                        function fwd(level, args) {
+                            try {
+                                var parts = [];
+                                for (var i = 0; i < args.length; i++) {
+                                    var a = args[i];
+                                    parts.push(typeof a === 'string' ? a : JSON.stringify(a));
+                                }
+                                ti.invoke('webview_log', { level: level, message: parts.join(' ') });
+                            } catch(e) {}
+                        }
+                        console.log = function() { origLog.apply(console, arguments); fwd('info', arguments); };
+                        console.error = function() { origError.apply(console, arguments); fwd('error', arguments); };
+                        console.warn = function() { origWarn.apply(console, arguments); fwd('warn', arguments); };
+                        origLog.call(console, '[webview-bridge] Console bridge installed via initialization_script');
+                    } else {
+                        console.warn('[webview-bridge] __TAURI_INTERNALS__ not available in initialization_script');
+                    }
+                })();
+            "#)
+            // Intercept target="_blank" / window.open() — open in system browser
+            // instead of creating a new Tauri window. This handles all <a target="_blank">
+            // links in the chat UI (PR links, web search results, etc.).
+            .on_new_window(move |url, _features| {
+                tracing::info!("on_new_window: opening external URL in browser: {}", url);
+                let _ = new_win_handle.opener().open_url(url.as_str(), None::<&str>);
+                tauri::webview::NewWindowResponse::Deny
+            })
+            .build()
+            .expect("Failed to create main window");
+
+            // Start backend server and manage splash → main window transition
+            let handle = app.handle().clone();
+            let _docker_for_transition = docker_for_setup.clone();
+            std::thread::spawn(move || {
+                // Ensure a config.yaml exists — generate a default one if missing
+                let config_path = setup::config_path();
+                if !config_path.exists() {
+                    tracing::info!("No config.yaml found — generating default (unconfigured) config");
+                    if let Err(e) = setup::generate_default_config() {
+                        tracing::error!("Failed to generate default config: {}", e);
+                        show_main_window(&handle);
+                        return;
+                    }
+                }
+
+                // Load config from the desktop config path
+                let config = match Config::from_yaml_and_env(Some(&config_path)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("Failed to load config: {}", e);
+                        show_main_window(&handle);
+                        return;
+                    }
+                };
+
+                let port = config.server_port;
+                BACKEND_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+                let is_configured = config.setup_completed;
+
+                // Read infra_mode from the YAML config (defaults to "docker")
+                let infra_mode = std::fs::read_to_string(&config_path)
+                    .ok()
+                    .and_then(|contents| project_orchestrator::yaml::value_from_str(&contents).ok())
+                    .and_then(|v| v.get("infra_mode").and_then(|m| m.as_str().map(String::from)))
+                    .unwrap_or_else(|| "docker".to_string());
+
+                // Always start the backend server (even in unconfigured mode)
+                // In unconfigured mode it runs no-auth so the setup wizard can load
+                use std::sync::Arc;
+                use std::sync::atomic::{AtomicBool, Ordering};
+
+                let server_started = Arc::new(AtomicBool::new(false));
+                let server_started_clone = server_started.clone();
+
+                // The server's own runtime and stack (`runtime::RUNTIME_STACK_BYTES`): a bare
+                // `Runtime::new()` gives 2 MiB workers, and `block_on` polls the server on
+                // this thread, which needs the same stack (a chat turn overflowed 2 MiB).
+                project_orchestrator::runtime::spawn_with_runtime_stack("po-server", move || {
+                    let rt = project_orchestrator::runtime::build_runtime()
+                        .expect("Failed to create tokio runtime");
+                    rt.block_on(async {
+                        // Signal that the runtime is up and server is about to start
+                        server_started_clone.store(true, Ordering::SeqCst);
+                        if let Err(e) = project_orchestrator::start_server(config).await {
+                            tracing::error!("Server error: {}", e);
+                        }
+                    });
+                })
+                .expect("Failed to start the server thread");
+
+                // Wait for the tokio runtime to start
+                while !server_started.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+
+                // Poll /health until the server is listening.
+                tracing::info!(
+                    "Waiting for backend on port {} (configured: {}, infra: {})...",
+                    port,
+                    is_configured,
+                    infra_mode
+                );
+                let health_url = format!("http://localhost:{}/health", port);
+                let start = std::time::Instant::now();
+
+                loop {
+                    match backend_wait_state(
+                        SPLASH_READY.load(std::sync::atomic::Ordering::SeqCst),
+                        start.elapsed(),
+                    ) {
+                        BackendWait::SplashProceeded => {
+                            // "Continue anyway" was pressed: the splash already faded out, so do
+                            // not keep the user on an empty window for the rest of the wait.
+                            tracing::warn!(
+                                "Splash asked to proceed after {:?} — not waiting for the backend any longer",
+                                start.elapsed()
+                            );
+                            break;
+                        }
+                        BackendWait::TimedOut => {
+                            tracing::error!("Backend HTTP listener did not start within 30 seconds");
+                            break;
+                        }
+                        BackendWait::Keep => {}
+                    }
+                    // We only check that the HTTP listener is up (any response),
+                    // NOT that services are connected. /health may return 503 when
+                    // Neo4j is still starting — that's fine, the Docker health loop
+                    // below handles service readiness.
+                    if reqwest::blocking::get(&health_url).is_ok() {
+                        tracing::info!(
+                            "Backend HTTP ready in {:?}",
+                            start.elapsed()
+                        );
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                // ─────────────────────────────────────────────────────────────
+                // Wait for the splash screen to signal readiness.
+                //
+                // The splash screen drives the transition: it checks Docker,
+                // Claude CLI, starts services, and polls backend health.
+                // When everything is ready, the splash JS calls
+                // invoke('proceed_to_main') which sets SPLASH_READY = true.
+                //
+                // This removes the duplicate Docker health + CLI detection
+                // loops that were in the Rust thread — single source of truth.
+                // ─────────────────────────────────────────────────────────────
+                let splash_timeout = std::time::Duration::from_secs(600); // 10 min max
+                let splash_start = std::time::Instant::now();
+
+                tracing::info!("Waiting for splash screen to signal readiness...");
+                while !SPLASH_READY.load(std::sync::atomic::Ordering::SeqCst) {
+                    if splash_start.elapsed() > splash_timeout {
+                        tracing::warn!(
+                            "Splash screen did not signal readiness after {:?} — proceeding anyway",
+                            splash_timeout
+                        );
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+
+                // Transition: close splash → show main window
+                // The frontend will check /api/setup-status and redirect to /setup if needed
+                show_main_window(&handle);
+            });
+
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .expect("Error while building Tauri application");
+
+    app.run(move |_app, event| {
+        // macOS: clicking the dock icon when the window is hidden should reshow it
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen {
+            has_visible_windows,
+            ..
+        } = &event
+        {
+            if !has_visible_windows {
+                tray::show_main_window(_app);
+            }
+        }
+
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            // Only stop Docker containers if infra_mode is "docker" (managed mode).
+            // In "external" mode the user manages their own services — we must NOT
+            // stop containers that the app didn't start.
+            let infra_mode = std::fs::read_to_string(setup::config_path())
+                .ok()
+                .and_then(|c| project_orchestrator::yaml::value_from_str(&c).ok())
+                .and_then(|v| {
+                    v.get("infra_mode")
+                        .and_then(|m| m.as_str().map(String::from))
+                })
+                .unwrap_or_else(|| "docker".to_string());
+
+            if infra_mode == "external" {
+                tracing::info!(
+                    "Application exiting — infra_mode is external, skipping Docker stop"
+                );
+            } else {
+                tracing::info!("Application exiting — stopping Docker services...");
+                let dm = docker_for_exit.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        let mgr = dm.read().await;
+                        if let Err(e) = mgr.stop_services().await {
+                            tracing::warn!("Failed to stop Docker services on exit: {}", e);
+                        }
+                    });
+                })
+                .join()
+                .ok();
+            }
+        }
+    });
+}
+
+/// Give the borderless splash window native rounded corners and the app's dark
+/// background, so no square edge or white flash shows before the HTML paints.
+/// Same technique as the main window (corner radius on the content view layer);
+/// it avoids a transparent window, which would need macOS private APIs.
+fn style_splash_window(handle: &tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    if let Some(splash) = handle.get_webview_window("splashscreen") {
+        let _ = splash.with_webview(|webview| {
+            use objc2_app_kit::NSColor;
+            use plugins::mac_rounded_corners as mac;
+
+            let Some(ns_window) = mac::ns_window(&webview) else {
+                return;
+            };
+            let bg = NSColor::colorWithSRGBRed_green_blue_alpha(
+                11.0 / 255.0,
+                13.0 / 255.0,
+                19.0 / 255.0,
+                1.0,
+            );
+            // The window itself is clear and has no shadow: the rounded content view is the only
+            // thing drawn, so there is no frame, outline or square corner around it.
+            ns_window.setOpaque(false);
+            ns_window.setBackgroundColor(Some(&NSColor::clearColor()));
+            ns_window.setHasShadow(false);
+            mac::set_under_page_background(&webview, &bg);
+            mac::round_content_view(&ns_window, Some(18.0));
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = handle;
+}
+
+/// Close the splash screen and show the main application window.
+///
+/// The main window was initially created with `WebviewUrl::App("index.html")` to
+/// get an instant load while the backend starts. Now that the backend is confirmed
+/// healthy, we navigate the webview to `http://localhost:{port}/` so that all
+/// subsequent requests (REST, WS tickets, OIDC) are **same-origin**.
+///
+/// This is critical for auth: HttpOnly cookies set by `/auth/callback` are scoped
+/// to `localhost` — they are only sent on same-origin requests. From `tauri://`,
+/// `fetch(http://localhost:…)` is cross-origin and `SameSite=Lax` cookies are NOT
+/// sent, which breaks `/auth/refresh` (no cookie → no JWT → no WS ticket → 401).
+///
+/// The `capabilities/remote.json` grants full Tauri IPC permissions (invoke,
+/// event:listen, plugins) on `http://localhost:*` so everything keeps working.
+fn show_main_window(handle: &tauri::AppHandle) {
+    // Close splash screen
+    if let Some(splash) = handle.get_webview_window("splashscreen") {
+        if let Err(e) = splash.close() {
+            tracing::warn!("Failed to close splash screen: {}", e);
+        }
+    }
+
+    // Show main window
+    if let Some(main_window) = handle.get_webview_window("main") {
+        // Navigate to the backend HTTP origin so all requests are same-origin.
+        // The backend serves the SPA (SERVE_FRONTEND=true), so this loads the
+        // exact same React app but from http://localhost:{port}/ instead of
+        // tauri://localhost/index.html.
+        //
+        // Cache-buster: append ?v=<version> so WKWebView treats each app version
+        // as a distinct URL. Without this, the WebKit cache (stored in
+        // ~/Library/WebKit/, NOT inside the .app bundle) can serve stale
+        // index.html from a previous version even after reinstalling the app.
+        let port = BACKEND_PORT.load(std::sync::atomic::Ordering::Relaxed);
+        let version = env!("CARGO_PKG_VERSION");
+        let http_url = format!("http://localhost:{}/?v={}", port, version);
+        tracing::info!(
+            "Navigating main window to {} (same-origin for cookies)",
+            http_url
+        );
+        if let Ok(url) = http_url.parse() {
+            if let Err(e) = main_window.navigate(url) {
+                tracing::error!("Failed to navigate main window to {}: {}", http_url, e);
+            }
+        }
+        // On macOS, apply native rounded corners + dark background BEFORE showing
+        // the window to avoid any flash of white/square corners.
+        // This does the same work as the JS `enableModernWindowStyle()` plugin,
+        // but earlier — before the webview JS has a chance to run.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = main_window.with_webview(|webview| {
+                use objc2_app_kit::{
+                    NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSColor,
+                    NSWindowTitleVisibility,
+                };
+                use plugins::mac_rounded_corners as mac;
+
+                let Some(ns_window) = mac::ns_window(&webview) else {
+                    return;
+                };
+
+                // 1. Force dark appearance on the window.
+                //    This makes the webview report prefers-color-scheme: dark,
+                //    so external pages (Google SSO, etc.) render in dark mode.
+                //    It also prevents white flashes during page transitions.
+                // SAFETY: reading an AppKit `extern` constant (an immutable NSString exported by
+                // AppKit since macOS 10.14; the app's minimum is above that).
+                let dark_aqua = unsafe { NSAppearanceNameDarkAqua };
+                if let Some(dark_appearance) = NSAppearance::appearanceNamed(dark_aqua) {
+                    ns_window.setAppearance(Some(&dark_appearance));
+                }
+
+                // 2. Set dark background color matching --surface-base (#0f1117)
+                let bg_color = NSColor::colorWithSRGBRed_green_blue_alpha(
+                    15.0 / 255.0, // 0x0f
+                    17.0 / 255.0, // 0x11
+                    23.0 / 255.0, // 0x17
+                    1.0,
+                );
+                ns_window.setBackgroundColor(Some(&bg_color));
+
+                // 3. Apply modern window style with rounded corners
+                mac::add_modern_style_mask(&ns_window);
+
+                // 4. Transparent titlebar that blends with content
+                ns_window.setTitlebarAppearsTransparent(true);
+                ns_window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+                ns_window.setHasShadow(true);
+
+                // 5. Set dark underPageBackgroundColor on the WKWebView.
+                //    This is the color shown behind page content — visible
+                //    during overscroll, navigation transitions, and before a
+                //    page paints. Setting it to dark prevents white flashes
+                //    when navigating to external SSO pages.
+                mac::set_under_page_background(&webview, &bg_color);
+
+                // 6. Set corner radius on the content view layer
+                mac::round_content_view(&ns_window, Some(10.0));
+            });
+        }
+
+        // Console bridge + keyboard shortcuts are now injected via
+        // initialization_script() on the WebviewWindowBuilder (runs before
+        // page HTML is parsed, guaranteeing __TAURI_INTERNALS__ is available).
+
+        if let Err(e) = main_window.show() {
+            tracing::warn!("Failed to show main window: {}", e);
+        }
+        if let Err(e) = main_window.set_focus() {
+            tracing::warn!("Failed to focus main window: {}", e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// The splash's "Continue anyway" button sets `SPLASH_READY` through `proceed_to_main`.
+    /// The wait for the backend reads that flag, otherwise the faded-out splash stays on an
+    /// empty window until the whole backend timeout has run out.
+    #[test]
+    fn proceed_to_main_sets_the_flag_the_backend_wait_reads() {
+        SPLASH_READY.store(false, Ordering::SeqCst);
+        proceed_to_main();
+        assert!(SPLASH_READY.load(Ordering::SeqCst));
+        SPLASH_READY.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn the_backend_wait_is_bounded_and_the_splash_wins_over_the_clock() {
+        use std::time::Duration;
+        assert_eq!(BACKEND_LISTEN_TIMEOUT.as_secs(), 30);
+        assert_eq!(
+            backend_wait_state(false, Duration::from_secs(5)),
+            BackendWait::Keep
+        );
+        assert_eq!(
+            backend_wait_state(false, Duration::from_secs(31)),
+            BackendWait::TimedOut
+        );
+        // "Continue anyway" at once: no waiting at all.
+        assert_eq!(
+            backend_wait_state(true, Duration::ZERO),
+            BackendWait::SplashProceeded
+        );
+        // Pressed after the timeout already ran out: still reported as the splash's decision.
+        assert_eq!(
+            backend_wait_state(true, Duration::from_secs(31)),
+            BackendWait::SplashProceeded
+        );
+    }
+}

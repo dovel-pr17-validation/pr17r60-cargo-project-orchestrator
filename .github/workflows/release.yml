@@ -1,0 +1,2028 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.0.1) — must already exist"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run: build, sign and check everything, publish NOTHING (no release, no Docker image, no Homebrew formula). The release files are attached to the run as an artifact."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: orchestrator
+  FRONTEND_REPO: this-rs/project-orchestrator-frontend
+  # Resolve the release tag: use the workflow_dispatch input if provided, otherwise GITHUB_REF_NAME (from tag push)
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  # The native library versions are NOT here: scripts/native-libs.env is their single source
+  # (scripts/prebuilt-lib.sh reads it, .github/workflows/prebuilt-libs.yml builds and publishes
+  # them). Raising one there is the whole operation.
+
+jobs:
+  # ==========================================================================
+  # Build frontend - Compile React SPA once, share as artifact
+  # ==========================================================================
+  build-frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone frontend (latest main)
+        run: |
+          git clone --depth=1 https://github.com/${{ env.FRONTEND_REPO }}.git .
+          echo "=== Frontend checkout verification ==="
+          echo "Commit: $(git rev-parse HEAD)"
+          echo "Date:   $(git log -1 --format='%ci')"
+          echo "Msg:    $(git log -1 --format='%s')"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Inject version from git tag
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          npm pkg set version="${VERSION}"
+          echo "Injected frontend version: $(node -p "require('./package.json').version")"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify build output
+        run: |
+          echo "=== Build output verification ==="
+          echo "index.html hash: $(sha256sum dist/index.html | cut -c1-16)"
+          echo "Asset files:"
+          ls -la dist/assets/ | head -20
+          echo "Version in bundle:"
+          grep -o '"0\.[0-9]\.[0-9]"' dist/assets/*.js | head -5 || true
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-dist
+          path: dist/
+          retention-days: 1
+
+  # ==========================================================================
+  # Third-party licenses - THIRD-PARTY-LICENSES.txt, the license texts and notices
+  # of the third-party code inside the binaries (MIT/BSD/Apache-2.0 require them in
+  # a binary distribution). Generated once, then shipped with LICENSE, LICENSE-MIT
+  # and LICENSE-EE in EVERY artifact: archives (and from them Homebrew, .deb, .rpm,
+  # the desktop app) and the Docker image. scripts/third-party-licenses.sh says what
+  # goes in; cargo-about is pinned there and here.
+  # ==========================================================================
+  third-party-licenses:
+    name: Third-party licenses
+    runs-on: ubuntu-22.04
+    needs: [build-frontend]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the repository toolchain
+        run: rustup show
+
+      # Prebuilt, at the version scripts/third-party-licenses.sh requires (ABOUT_VERSION).
+      - name: Install cargo-about
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-about@0.9.2
+
+      # The web interface embedded in the full variant and the desktop app carries the
+      # notices of its npm packages (dist/third-party-licenses.txt, built by the frontend).
+      - name: Download frontend dist
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontend-dist/
+
+      # Network only here (crates of Cargo.lock, nexus-tools resolution); the generation
+      # itself reads local files only (cargo-about does not query any web service).
+      - name: Fetch crates
+        run: cargo fetch --locked
+
+      # Another binary shipped next to the server adds its own section here: --cargo NAME=MANIFEST[:FEATURES]
+      # for a Rust binary (the LICENSE/NOTICE files at the root of its workspace are copied verbatim, then
+      # its crates and their NOTICE files), --notices NAME=PATH for what is not a crate (e.g. V8's notices).
+      - name: Generate THIRD-PARTY-LICENSES.txt
+        run: |
+          extra=()
+          if [ -f frontend-dist/third-party-licenses.txt ]; then
+            extra+=(--notices "Web interface (npm packages bundled in the full variant and the desktop app)=frontend-dist/third-party-licenses.txt")
+          else
+            echo "::error::frontend dist has no third-party-licenses.txt (the frontend build generates it)"
+            exit 1
+          fi
+          # nexus-tools embeds Obscura (Apache-2.0: its LICENSE and NOTICE verbatim) and links V8 (the
+          # license texts of the prebuilt library, vendored in the nexus repository at the pinned revision).
+          nexus_ws="$(cargo metadata --locked --format-version 1 \
+            | jq -r '.packages[] | select(.name == "nexus-tools" and (.source // "" | startswith("git+"))) | .manifest_path' \
+            | head -1 | xargs dirname | xargs dirname)"
+          test -f "$nexus_ws/obscura/NOTICE"
+          test -f "$nexus_ws/obscura/licenses/v8/NOTICE"
+          extra+=(--notices "Obscura (vendored in nexus-tools, Apache-2.0)=$nexus_ws/obscura")
+          extra+=(--notices "V8 and its third-party code (linked into nexus-tools)=$nexus_ws/obscura/licenses/v8")
+          scripts/third-party-licenses.sh "${extra[@]}" licenses-out/THIRD-PARTY-LICENSES.txt
+          head -20 licenses-out/THIRD-PARTY-LICENSES.txt
+
+      - name: Upload third-party licenses
+        uses: actions/upload-artifact@v7
+        with:
+          name: third-party-licenses
+          path: licenses-out/THIRD-PARTY-LICENSES.txt
+          retention-days: 1
+
+  # ==========================================================================
+  # Build backend - Compile light + full variants in a single job per target
+  # (shares compiled dependencies between the two variants for ~50% faster CI)
+  # ==========================================================================
+  build-backend:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    needs: [build-frontend, third-party-licenses]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Apple Silicon (native — ort-sys has prebuilt static ONNX Runtime)
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            os: macos
+            arch: arm64
+            use_cross: false
+
+          # macOS Intel — built NATIVELY on an Intel runner (`macos-15-intel`, the standard Intel
+          # label that replaced the retired `macos-13`), NOT cross-compiled on the Apple Silicon
+          # one. Reason (REL-1): nexus-tools embeds Obscura, and Obscura links V8 whose
+          # startup snapshot is ARCHITECTURE-SPECIFIC. Cross-compiling arm64 -> x64 makes
+          # obscura-js/build.rs (its `is_cross` branch) fall back to a HOST snapshot, because the
+          # cross-mksnapshot it looks for (gn_out/clang_arm64_v8_x64/mksnapshot) is never built;
+          # the x86_64 binary then carries an arm64 blob and the embedded browser crashes at
+          # runtime. Building ON x86_64 makes host == target, so the snapshot is right.
+          # ort-sys has NO prebuilt ONNX Runtime for this target, and Microsoft stopped
+          # publishing osx-x86_64 at 1.23 (ort needs API 24, i.e. 1.24+). We BUILD it
+          # (scripts/build-onnxruntime-macos.sh, cached) and link it dynamically via
+          # ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK (see steps below).
+          # The resulting binaries need libonnxruntime.dylib at runtime.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            os: macos
+            arch: x86_64
+            use_cross: false
+
+          # macOS Intel "legacy" (macOS 10.15 to 13.3): the standard Intel build links libonnxruntime, which is
+          # built for macOS 13.4 and needs a libc++ symbol Catalina..Ventura- do not have (0.0.17 crashed at launch
+          # on 10.15.7: "Symbol not found: basic_stringbuf::str() const"). This one is built WITHOUT the
+          # `local-embeddings` feature: no ONNX Runtime at all, deployment target 10.15. Semantic search then needs an
+          # HTTP embedding provider (Ollama, OpenAI...). Archive: orchestrator-<v>-macos-x86_64-legacy.tar.gz.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            os: macos
+            arch: x86_64-legacy
+            use_cross: false
+            legacy: true
+
+          # Linux runners are PINNED to Ubuntu 22.04 (glibc 2.35), not ubuntu-latest: a binary needs the glibc of the machine that
+          # built it, so building on 24.04 (what ubuntu-latest became) produced files that need glibc 2.39 and refuse to start on
+          # Ubuntu 22.04 / Debian 12. The promise is in scripts/check-os-floor.sh; the release fails if a build exceeds it.
+          # Linux x86_64 (native build — no need for cross since host == target)
+          # ONNX Runtime is linked DYNAMICALLY from Microsoft's official build (step "Download ONNX Runtime
+          # for Linux"), as on ARM64. ort-sys's own prebuilt (pyke.io), linked statically, references glibc
+          # 2.38 symbols (__isoc23_strtol...): it does not link on 22.04 (measured, run 38916923260).
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            os: linux
+            arch: x86_64
+            use_cross: false
+
+          # Linux ARM64: built NATIVELY on an ARM runner (as the desktop job already does). The cross-rs container produced
+          # glibc 2.39 binaries (measured on 0.0.17); a native 22.04 build gives 2.35.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            os: linux
+            arch: arm64
+            use_cross: false
+
+          # Windows x86_64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            os: windows
+            arch: x86_64
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Inject version from git tag
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i.bak "0,/^version = \".*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "Injected version ${VERSION}:"
+          grep '^version' Cargo.toml | head -1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Belt-and-braces: when the runner image's preinstalled stable lags the
+      # channel, `rustup toolchain install stable --target <t>` takes the
+      # UPDATE path and silently drops the extra target — rust-std for <t> is
+      # never installed and cross-target builds die with E0463 "can't find
+      # crate for core". Deterministic, not a flake (observed on v0.0.15:
+      # macos-14 image had 1.96.0, channel had 1.96.1 → x86_64-apple-darwin
+      # std lost). `rustup target add` is idempotent and guarantees the std.
+      - name: Ensure ${{ matrix.target }} stdlib is installed
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-${{ matrix.target }}${{ matrix.legacy && '-legacy' || '' }}"
+
+      - name: Install cross-rs
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      # Install build dependencies for native Linux builds.
+      # ort-sys build script needs openssl-sys (via ureq → native-tls) to compile.
+      - name: Install build dependencies (Linux native)
+        if: matrix.os == 'linux' && !matrix.use_cross
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      # -----------------------------------------------------------------------
+      # ONNX Runtime pre-download for targets where ort-sys cannot self-serve:
+      #
+      # - macOS x86_64: pyke.io has NO prebuilt for this target
+      # - Linux (x86_64 and aarch64): the pyke.io prebuilt is linked statically and
+      #   needs glibc 2.38 (__isoc23_* symbols); the Linux builds run on Ubuntu 22.04
+      #   (glibc 2.35, the promise of scripts/check-os-floor.sh), where it does not
+      #   link. Microsoft's official build needs glibc 2.27 (measured on 1.23.2 and 1.24.2 x64).
+      #
+      # We download the official Microsoft ONNX Runtime release and set
+      # ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK so ort-sys links dynamically
+      # instead of trying to download from pyke.io.
+      # The .so/.dylib files are bundled alongside binaries in packaging steps.
+      # -----------------------------------------------------------------------
+
+      # macOS legacy: lower the floor BEFORE anything compiles (rustc and every C dependency read it).
+      - name: macOS legacy settings (deployment target 10.15, no ONNX Runtime)
+        if: matrix.legacy
+        run: echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
+
+      # ONNX Runtime, from the versioned prebuilt channel (scripts/prebuilt-lib.sh), in this order:
+      #   1. the library release `lib/ort-<version>` of this repository — durable and versioned, and
+      #      visible to a TAG-triggered run, which actions/cache is not;
+      #   2. Microsoft's own archive;
+      #   3. a local build, only for macOS Intel (upstream stopped osx-x86_64 at 1.23) and only
+      #      where the host IS the Intel target — a cross-built library is the wrong architecture.
+      # scripts/check-ort-api.sh runs on whatever we ended up with: a runtime that does not serve
+      # the API `ort` was compiled for panics at start.
+      - name: ONNX Runtime (prebuilt channel)
+        if: (matrix.target == 'x86_64-apple-darwin' && !matrix.legacy) || matrix.os == 'linux'
+        run: scripts/prebuilt-lib.sh use ort ${{ matrix.target }}
+
+      - name: Install patchelf (for Linux dynamic ORT bundling)
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y patchelf
+
+      # nexus-tools: the files, shell and web tools of a NATIVE session (Read, Bash, WebFetch...).
+      # Without it a native session has none of them and reports `nexus_tools` in its
+      # degraded_features. It ships NEXT TO the orchestrator executable in every archive (light and
+      # full), and from there in Homebrew, .deb, .rpm and the desktop app; the server finds it there
+      # (src/chat/config.rs, detect_nexus_tools_path; NEXUS_TOOLS_PATH overrides). Built at the
+      # nexus revision Cargo.toml pins, with https and Obscura embedded (`--features tls,obscura`: the
+      # keyless search and the browser, nothing to install next to it; V8 checksum-verified):
+      # scripts/build-nexus-tools.sh, the same script the CI runs (.github/actions/nexus-fakes).
+      # The macOS 10.15 "legacy" build keeps `tls` only: V8's prebuilt library does not promise
+      # to run that far back.
+      - name: Build nexus-tools (pinned nexus revision, tls + obscura)
+        shell: bash
+        env:
+          NEXUS_TOOLS_FEATURES: ${{ matrix.legacy && 'tls' || 'tls,obscura' }}
+        run: scripts/build-nexus-tools.sh "$RUNNER_TEMP/nexus-tools" --target ${{ matrix.target }} --target-dir target/nexus-tools
+
+      # The license files of every archive: ours (LICENSE, LICENSE-MIT, LICENSE-EE) and the third-party
+      # notices (job third-party-licenses). From the archives they reach Homebrew, .deb, .rpm and the app.
+      - name: Download third-party licenses
+        uses: actions/download-artifact@v8
+        with:
+          name: third-party-licenses
+          path: ${{ runner.temp }}/licenses/
+
+      - name: Gather license files
+        shell: bash
+        run: |
+          cp LICENSE LICENSE-MIT LICENSE-EE "$RUNNER_TEMP/licenses/"
+          ls -la "$RUNNER_TEMP/licenses/"
+
+      # --- Light variant (no embedded frontend) ---
+
+      - name: Build light variant (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.legacy && '--no-default-features' || '' }}
+
+      - name: Build light variant (cross)
+        if: matrix.use_cross
+        run: cross build --release --features vendored-openssl --target ${{ matrix.target }}
+
+      - name: Package light (Unix)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "staging/${ARCHIVE_NAME}"
+          for bin in orchestrator orch mcp_server; do
+            cp "target/${{ matrix.target }}/release/${bin}" "staging/${ARCHIVE_NAME}/"
+          done
+          cp "$RUNNER_TEMP/nexus-tools/bin/nexus-tools" "staging/${ARCHIVE_NAME}/"
+          cp "$RUNNER_TEMP"/licenses/* "staging/${ARCHIVE_NAME}/"
+          if [ -d "queries" ]; then
+            cp -r queries "staging/${ARCHIVE_NAME}/"
+          fi
+          # Bundle ONNX Runtime dylib for targets using dynamic linking
+          # (macOS x86_64, Linux x86_64 and aarch64).
+          if [ -n "${ORT_LIB_LOCATION:-}" ]; then
+            echo "Bundling ONNX Runtime dylib from $ORT_LIB_LOCATION"
+            cp -a "${ORT_LIB_LOCATION}"/libonnxruntime* "staging/${ARCHIVE_NAME}/"
+            for bin in orchestrator orch mcp_server; do
+              # macOS: @executable_path rpath (dylib next to binary + Homebrew layout)
+              install_name_tool -add_rpath @executable_path "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
+              install_name_tool -add_rpath @executable_path/../lib "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
+              # Linux: $ORIGIN rpath so binary finds .so in same directory
+              patchelf --set-rpath '$ORIGIN' "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
+            done
+          fi
+          cd staging
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          echo "ARCHIVE_LIGHT=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package light (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $archiveName = "${env:BINARY_NAME}-${version}-windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path "staging/${archiveName}"
+          foreach ($bin in @("orchestrator", "orch", "mcp_server")) {
+            Copy-Item "target/${{ matrix.target }}/release/${bin}.exe" "staging/${archiveName}/"
+          }
+          Copy-Item "$env:RUNNER_TEMP/nexus-tools/bin/nexus-tools.exe" "staging/${archiveName}/"
+          Copy-Item "$env:RUNNER_TEMP/licenses/*" "staging/${archiveName}/"
+          if (Test-Path "queries") {
+            Copy-Item -Recurse "queries" "staging/${archiveName}/"
+          }
+          Compress-Archive -Path "staging/${archiveName}" -DestinationPath "staging/${archiveName}.zip"
+          echo "ARCHIVE_LIGHT=${archiveName}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload light artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARCHIVE_LIGHT }}
+          path: staging/${{ env.ARCHIVE_LIGHT }}
+          retention-days: 1
+
+      # --- Full variant (with embedded frontend) ---
+      # Incremental build: only crates affected by the `embedded-frontend` feature
+      # are recompiled (~2 min instead of full ~10 min).
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: dist/
+
+      - name: Build full variant (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release --features embedded-frontend --target ${{ matrix.target }} ${{ matrix.legacy && '--no-default-features' || '' }}
+
+      - name: Build full variant (cross)
+        if: matrix.use_cross
+        run: cross build --release --features embedded-frontend,vendored-openssl --target ${{ matrix.target }}
+
+      - name: Package full (Unix)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-full-${{ steps.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "staging/${ARCHIVE_NAME}"
+          for bin in orchestrator orch mcp_server; do
+            cp "target/${{ matrix.target }}/release/${bin}" "staging/${ARCHIVE_NAME}/"
+          done
+          cp "$RUNNER_TEMP/nexus-tools/bin/nexus-tools" "staging/${ARCHIVE_NAME}/"
+          cp "$RUNNER_TEMP"/licenses/* "staging/${ARCHIVE_NAME}/"
+          if [ -d "queries" ]; then
+            cp -r queries "staging/${ARCHIVE_NAME}/"
+          fi
+          # Bundle ONNX Runtime dylib for targets using dynamic linking
+          if [ -n "${ORT_LIB_LOCATION:-}" ]; then
+            echo "Bundling ONNX Runtime dylib from $ORT_LIB_LOCATION"
+            cp -a "${ORT_LIB_LOCATION}"/libonnxruntime* "staging/${ARCHIVE_NAME}/"
+            for bin in orchestrator orch mcp_server; do
+              # macOS: @executable_path rpath
+              install_name_tool -add_rpath @executable_path "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
+              install_name_tool -add_rpath @executable_path/../lib "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
+              # Linux: $ORIGIN rpath
+              patchelf --set-rpath '$ORIGIN' "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
+            done
+          fi
+          cd staging
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          echo "ARCHIVE_FULL=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
+
+      # Compare what the archives REQUIRE (macOS minimum version, glibc) with what we promise (scripts/check-os-floor.sh).
+      # Runs on every non-Windows target, light and full: a runner upgrade or a new native dependency that raises the floor
+      # fails here instead of at a user's launch. Windows is not measured (no equivalent check yet).
+      - name: Check OS floor (archives)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: scripts/check-os-floor.sh "${{ matrix.os }}-${{ matrix.arch }}" staging
+
+      - name: Package full (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $archiveName = "${env:BINARY_NAME}-full-${version}-windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path "staging/${archiveName}"
+          foreach ($bin in @("orchestrator", "orch", "mcp_server")) {
+            Copy-Item "target/${{ matrix.target }}/release/${bin}.exe" "staging/${archiveName}/"
+          }
+          Copy-Item "$env:RUNNER_TEMP/nexus-tools/bin/nexus-tools.exe" "staging/${archiveName}/"
+          Copy-Item "$env:RUNNER_TEMP/licenses/*" "staging/${archiveName}/"
+          if (Test-Path "queries") {
+            Copy-Item -Recurse "queries" "staging/${archiveName}/"
+          }
+          Compress-Archive -Path "staging/${archiveName}" -DestinationPath "staging/${archiveName}.zip"
+          echo "ARCHIVE_FULL=${archiveName}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload full artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARCHIVE_FULL }}
+          path: staging/${{ env.ARCHIVE_FULL }}
+          retention-days: 1
+
+  # ==========================================================================
+  # Package Debian - Build .deb packages for Linux targets
+  # ==========================================================================
+  package-deb:
+    name: Package .deb (${{ matrix.arch }})
+    # Pinned to 22.04 (NOT ubuntu-latest), matching build-backend: `cargo deb
+    # --no-build` runs dpkg-shlibdeps on the packaging host to resolve
+    # `depends = "$auto"`. On ubuntu-latest (now 24.04) it resolves the shared
+    # libraries of the 22.04-built binaries against 24.04's package database —
+    # notably libssl.so.3 → libssl3t64 (the 24.04 time_t-transition name) — and
+    # emits a .deb whose Depends cannot be satisfied on Ubuntu 22.04/20.04
+    # (DGX OS 6/5), so `dpkg -i`/`apt install` fails before the binary ever runs.
+    runs-on: ubuntu-22.04
+    needs: [build-backend]
+    if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            artifact_os: linux
+            artifact_arch: x86_64
+
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            artifact_os: linux
+            artifact_arch: arm64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Belt-and-braces: when the runner image's preinstalled stable lags the
+      # channel, `rustup toolchain install stable --target <t>` takes the
+      # UPDATE path and silently drops the extra target — rust-std for <t> is
+      # never installed and cross-target builds die with E0463 "can't find
+      # crate for core". Deterministic, not a flake (observed on v0.0.15:
+      # macos-14 image had 1.96.0, channel had 1.96.1 → x86_64-apple-darwin
+      # std lost). `rustup target add` is idempotent and guarantees the std.
+      - name: Ensure ${{ matrix.target }} stdlib is installed
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Inject version from git tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "0,/^version = \".*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          echo "Injected version ${VERSION}:"
+          grep '^version' Cargo.toml | head -1
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}.tar.gz
+          path: artifact/
+
+      - name: Extract binaries to target dir
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
+          tar xzf "artifact/${ARCHIVE_NAME}.tar.gz" -C artifact/
+          # cargo-deb --target expects binaries in target/<triple>/release/
+          mkdir -p "target/${{ matrix.target }}/release"
+          for bin in orchestrator orch mcp_server nexus-tools; do
+            cp "artifact/${ARCHIVE_NAME}/${bin}" "target/${{ matrix.target }}/release/${bin}"
+          done
+          chmod +x target/${{ matrix.target }}/release/*
+          # The third-party notices, from the archive (Cargo.toml packages them from target/release/).
+          cp "artifact/${ARCHIVE_NAME}/THIRD-PARTY-LICENSES.txt" "target/${{ matrix.target }}/release/THIRD-PARTY-LICENSES.txt"
+          # Linux links ONNX Runtime dynamically (both arches): the archive ships libonnxruntime*.so
+          # next to the binaries, but cargo-deb only picks up the four binaries above.
+          # Dereference the versioned symlink into stable real files so the bundled-ort
+          # variant's merge-assets.append can package them next to the binary ($ORIGIN).
+          cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime.so.1" "target/${{ matrix.target }}/release/libonnxruntime.so.1"
+          cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime_providers_shared.so" "target/${{ matrix.target }}/release/libonnxruntime_providers_shared.so"
+
+      # The bundled-ort variant declares its Depends by hand (dpkg-shlibdeps, behind `$auto`, fails on a
+      # library shipped inside the package itself, and cannot read ARM64 libraries on this x86_64 runner).
+      # A hand-written list can go stale: fail if a binary needs a library the list does not cover.
+      - name: Check the declared Depends cover every needed library
+        run: |
+          # soname → what covers it: Depends of the bundled-ort variant (Cargo.toml), or the package itself.
+          allowed='^(libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|ld-linux-(x86-64|aarch64)\.so\.[12]|libgcc_s\.so\.1|libstdc\+\+\.so\.6|libssl\.so\.3|libcrypto\.so\.3|libonnxruntime\.so\.1)$'
+          bad=0
+          for f in target/${{ matrix.target }}/release/*; do
+            if [ ! -f "$f" ] || ! head -c4 "$f" | grep -q 'ELF'; then continue; fi
+            for lib in $(readelf -d "$f" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p'); do
+              if ! echo "$lib" | grep -Eq "$allowed"; then
+                echo "::error::$(basename "$f") needs $lib, which the bundled-ort Depends (Cargo.toml) do not cover"
+                bad=1
+              fi
+            done
+          done
+          exit $bad
+
+      - name: Build .deb package
+        run: |
+          # bundled-ort variant: explicit Depends + ONNX Runtime next to the binaries (see Cargo.toml).
+          # --no-strip: this x86_64 runner's strip cannot read ARM64 binaries.
+          cargo deb --no-build ${{ matrix.arch == 'arm64' && '--no-strip' || '' }} --variant=bundled-ort --target ${{ matrix.target }}
+
+      - name: Find and upload .deb
+        run: |
+          DEB_FILE=$(find target/ -name "*.deb" | head -1)
+          DEB_NAME=$(basename "$DEB_FILE")
+          cp "$DEB_FILE" "$DEB_NAME"
+          echo "DEB_NAME=${DEB_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.DEB_NAME }}
+          path: ${{ env.DEB_NAME }}
+          retention-days: 1
+
+  # ==========================================================================
+  # Package RPM - Build .rpm packages for Linux targets
+  # ==========================================================================
+  package-rpm:
+    name: Package .rpm (${{ matrix.arch }})
+    # Pinned to 22.04 (NOT ubuntu-latest), matching build-backend: the binaries
+    # are compiled on 22.04, so cargo-generate-rpm's dependency auto-detection
+    # must run against 22.04's package database too, not 24.04's (the time_t-
+    # transition names like libssl3t64 do not exist on Ubuntu 22.04/20.04).
+    runs-on: ubuntu-22.04
+    needs: [build-backend]
+    if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            artifact_os: linux
+            artifact_arch: x86_64
+
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            artifact_os: linux
+            artifact_arch: arm64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Belt-and-braces: when the runner image's preinstalled stable lags the
+      # channel, `rustup toolchain install stable --target <t>` takes the
+      # UPDATE path and silently drops the extra target — rust-std for <t> is
+      # never installed and cross-target builds die with E0463 "can't find
+      # crate for core". Deterministic, not a flake (observed on v0.0.15:
+      # macos-14 image had 1.96.0, channel had 1.96.1 → x86_64-apple-darwin
+      # std lost). `rustup target add` is idempotent and guarantees the std.
+      - name: Ensure ${{ matrix.target }} stdlib is installed
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Inject version from git tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "0,/^version = \".*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          echo "Injected version ${VERSION}:"
+          grep '^version' Cargo.toml | head -1
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}.tar.gz
+          path: artifact/
+
+      - name: Extract binaries to target dir
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
+          tar xzf "artifact/${ARCHIVE_NAME}.tar.gz" -C artifact/
+          # cargo-generate-rpm --target expects binaries in target/<triple>/release/
+          mkdir -p "target/${{ matrix.target }}/release"
+          for bin in orchestrator orch mcp_server nexus-tools; do
+            cp "artifact/${ARCHIVE_NAME}/${bin}" "target/${{ matrix.target }}/release/${bin}"
+          done
+          chmod +x target/${{ matrix.target }}/release/*
+          # The third-party notices, from the archive (Cargo.toml packages them from target/release/).
+          cp "artifact/${ARCHIVE_NAME}/THIRD-PARTY-LICENSES.txt" "target/${{ matrix.target }}/release/THIRD-PARTY-LICENSES.txt"
+          # Linux links ONNX Runtime dynamically (both arches): the archive ships libonnxruntime*.so
+          # next to the binaries. Dereference the versioned symlink into stable real
+          # files so the generate-rpm assets can package them next to the binary ($ORIGIN).
+          cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime.so.1" "target/${{ matrix.target }}/release/libonnxruntime.so.1"
+          cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime_providers_shared.so" "target/${{ matrix.target }}/release/libonnxruntime_providers_shared.so"
+
+      - name: Build .rpm package
+        run: cargo generate-rpm --target ${{ matrix.target }}
+
+      # The automatic Requires name the bundled ONNX Runtime; nothing on the target system provides
+      # it but the package itself (Cargo.toml, generate-rpm.provides). A Requires it does not provide
+      # makes `dnf install` refuse the package, so fail here rather than on the user's machine.
+      - name: Check the package provides its bundled ONNX Runtime
+        run: |
+          sudo apt-get install -y rpm >/dev/null
+          RPM_FILE=$(find target/ -name "*.rpm" | head -1)
+          rpm -qp --requires "$RPM_FILE" | sed 's/ *$//' | sort -u > /tmp/requires.txt
+          rpm -qp --provides "$RPM_FILE" | sed 's/ *$//' | sort -u > /tmp/provides.txt
+          echo "=== Requires ==="; cat /tmp/requires.txt
+          missing=$(grep '^libonnxruntime' /tmp/requires.txt | grep -vxFf /tmp/provides.txt || true)
+          if [ -n "$missing" ]; then
+            echo "::error::the .rpm requires what it does not provide (Cargo.toml generate-rpm.provides): $missing"
+            exit 1
+          fi
+
+      - name: Find and upload .rpm
+        run: |
+          RPM_FILE=$(find target/ -name "*.rpm" | head -1)
+          RPM_NAME=$(basename "$RPM_FILE")
+          cp "$RPM_FILE" "$RPM_NAME"
+          echo "RPM_NAME=${RPM_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload .rpm artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.RPM_NAME }}
+          path: ${{ env.RPM_NAME }}
+          retention-days: 1
+
+  # ==========================================================================
+  # Build Tauri Desktop - Compile signed desktop bundles for all platforms
+  # ==========================================================================
+  build-tauri:
+    name: Tauri ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    needs: [build-frontend, build-backend]
+    env:
+      # Expose secrets as job-level env so step `if:` conditions can check them
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            tauri_target: aarch64-apple-darwin
+            artifact_os: macos
+            artifact_arch: arm64
+
+          # Native Intel runner (`macos-15-intel`), like build-backend: the desktop bundle rides
+          # nexus-tools (with Obscura/V8) along as a resource, so the V8 snapshot must be the
+          # target's (REL-1).
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            tauri_target: x86_64-apple-darwin
+            artifact_os: macos
+            artifact_arch: x86_64
+
+          # macOS Intel "legacy" (10.15 to 13.3): see build-backend. Own updater feed (latest-legacy.json) so a Catalina
+          # install is never offered the standard build; its .dmg and .app.tar.gz carry a "-legacy" suffix.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            tauri_target: x86_64-apple-darwin
+            artifact_os: macos
+            artifact_arch: x86_64-legacy
+            legacy: true
+
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            tauri_target: x86_64-unknown-linux-gnu
+            artifact_os: linux
+            artifact_arch: x86_64
+
+          # Linux arm64 desktop bundle (.deb + .rpm). Built natively on a
+          # GitHub-hosted ARM runner so ARM Linux machines (e.g. DGX Spark /
+          # aarch64) get a runnable desktop app instead of the x86_64 AppImage
+          # they can't execute (GNOME falls back to "mount as disk image" →
+          # nothing happens).
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            tauri_target: aarch64-unknown-linux-gnu
+            artifact_os: linux
+            artifact_arch: arm64
+            # deb + rpm only: no AppImage on arm64.
+            #
+            # History, so this is not "fixed" a third time on the same belief:
+            # - 2026-06-02 (#329): AppImage disabled, linuxdeploy would not run
+            #   on this runner even with APPIMAGE_EXTRACT_AND_RUN (#328).
+            # - 2026-09-24 (#428): re-enabled after checking, on a DGX Spark,
+            #   that the UPSTREAM linuxdeploy-aarch64 build 368 runs.
+            # - 2026-10-04, v0.0.16 release (run 37205006144): the job failed
+            #   with "failed to bundle project: `failed to run linuxdeploy`",
+            #   after the .deb and .rpm had been bundled fine.
+            #
+            # The check of #428 did not test what this job runs. The Tauri CLI
+            # does not use upstream's current build: it downloads its own
+            # pinned copy,
+            #   tauri-apps/binary-releases/.../linuxdeploy-07333c6/linuxdeploy-aarch64.AppImage
+            # and that one still fails here. Re-enable only with a release run
+            # (or a dry run of this job) that shows the AppImage bundled.
+            bundles: deb,rpm
+
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            tauri_target: x86_64-pc-windows-msvc
+            artifact_os: windows
+            artifact_arch: x86_64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # Inject the git tag version into all version files so the built
+      # artifacts (app name, About dialog, --version flag) match the release.
+      - name: Inject version from git tag
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "Injecting version ${VERSION} into project files..."
+
+          # Root Cargo.toml (workspace)
+          sed -i.bak "0,/^version = \".*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+
+          # Desktop Tauri Cargo.toml
+          sed -i.bak "0,/^version = \".*\"/s//version = \"${VERSION}\"/" desktop/src-tauri/Cargo.toml
+          rm -f desktop/src-tauri/Cargo.toml.bak
+
+          # Tauri config JSON
+          sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" desktop/src-tauri/tauri.conf.json
+          rm -f desktop/src-tauri/tauri.conf.json.bak
+
+          echo "Verification:"
+          grep '^version' Cargo.toml | head -1
+          grep '^version' desktop/src-tauri/Cargo.toml | head -1
+          grep '"version"' desktop/src-tauri/tauri.conf.json
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontend-dist/
+
+      # Replicate scripts/build-desktop.sh logic:
+      # 1. Copy dist → desktop/dist/  2. Copy splash.html into dist  3. Build mcp_server  4. cargo tauri build
+      - name: Prepare desktop/dist (copy frontend + splash.html)
+        shell: bash
+        run: |
+          rm -rf desktop/dist
+          cp -r frontend-dist desktop/dist
+          # splash.html must be in desktop/dist/ alongside the frontend assets
+          if [ -f "desktop/src-tauri/splash.html" ]; then
+            cp desktop/src-tauri/splash.html desktop/dist/splash.html
+          fi
+          echo "desktop/dist contents:"
+          ls -la desktop/dist/
+
+      # Verify the frontend artifact is fresh — catches stale artifacts or
+      # checkout issues that would silently bundle an old frontend.
+      - name: Verify frontend dist (pre-build)
+        shell: bash
+        run: |
+          echo "=== Frontend dist verification (pre-build) ==="
+          echo "index.html hash: $(sha256sum desktop/dist/index.html | cut -c1-16)"
+          echo "Asset count: $(ls desktop/dist/assets/ | wc -l)"
+          echo "Version in JS bundle:"
+          grep -oP '"[0-9]+\.[0-9]+\.[0-9]+"' desktop/dist/assets/*.js 2>/dev/null | head -5 || true
+          echo "JS files:"
+          ls desktop/dist/assets/*.js 2>/dev/null || echo "(none)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Belt-and-braces: when the runner image's preinstalled stable lags the
+      # channel, `rustup toolchain install stable --target <t>` takes the
+      # UPDATE path and silently drops the extra target — rust-std for <t> is
+      # never installed and cross-target builds die with E0463 "can't find
+      # crate for core". Deterministic, not a flake (observed on v0.0.15:
+      # macos-14 image had 1.96.0, channel had 1.96.1 → x86_64-apple-darwin
+      # std lost). `rustup target add` is idempotent and guarantees the std.
+      - name: Ensure ${{ matrix.target }} stdlib is installed
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "tauri-${{ matrix.target }}${{ matrix.legacy && '-legacy' || '' }}"
+          workspaces: ". -> target"
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # xdg-utils (provides /usr/bin/xdg-open) + desktop-file-utils are preinstalled on
+          # the x86_64 ubuntu-latest image but NOT on ubuntu-24.04-arm — the Tauri AppImage
+          # bundler hard-fails without xdg-open ("xdg-open binary not found"). Install explicitly.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev xdg-utils desktop-file-utils
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2"
+
+      # x86_64-apple-darwin: provide ONNX Runtime for dynamic linking
+      # (same rationale as build-backend — ort-sys has no prebuilt for macOS Intel)
+      - name: macOS legacy settings (deployment target 10.15, own updater feed)
+        if: matrix.legacy
+        run: |
+          echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
+          # Merged over tauri.conf.json by `--config` in "Build Tauri bundle" (arrays are replaced):
+          # the legacy app reads latest-legacy.json.
+          # NOT through the TAURI_CONFIG env var: the CLI OVERWRITES it with its own --config
+          # (tauri.nexus-tools.json), so an override put there is silently dropped (run 39244961960).
+          echo '{"plugins":{"updater":{"endpoints":["https://github.com/this-rs/project-orchestrator/releases/latest/download/latest-legacy.json"]}}}' > "$RUNNER_TEMP/tauri-variant.json"
+          echo "TAURI_VARIANT_CONFIG=$RUNNER_TEMP/tauri-variant.json" >> "$GITHUB_ENV"
+
+      # The standard Intel app links libonnxruntime (macOS 13.4+). Declare it, so an older Mac gets macOS's own
+      # "requires macOS 13.4" message instead of a crash at launch. Same file mechanism as above.
+      - name: macOS Intel standard settings (declare the real minimum, 13.4)
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
+        run: |
+          echo '{"bundle":{"macOS":{"minimumSystemVersion":"13.4"}}}' > "$RUNNER_TEMP/tauri-variant.json"
+          echo "TAURI_VARIANT_CONFIG=$RUNNER_TEMP/tauri-variant.json" >> "$GITHUB_ENV"
+
+      # ONNX Runtime, from the SAME versioned channel as build-backend (scripts/prebuilt-lib.sh):
+      # the download takes seconds, so this job no longer waits for an artifact another job uploaded.
+      # The app needs the library at runtime, next to mcp_server, whose rpath is $ORIGIN: on Linux
+      # the libraries ride along as resources (/usr/lib/Project Orchestrator/) and the app's own
+      # rpath points there from /usr/bin (deb, rpm, AppImage's usr/).
+      - name: ONNX Runtime (prebuilt channel)
+        if: (matrix.target == 'x86_64-apple-darwin' && !matrix.legacy) || runner.os == 'Linux'
+        run: |
+          scripts/prebuilt-lib.sh use ort ${{ matrix.target }}
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # The path contains a space, which RUSTFLAGS would split: CARGO_ENCODED_RUSTFLAGS.
+            # shellcheck disable=SC2016  # $ORIGIN must reach the linker literally
+            echo 'CARGO_ENCODED_RUSTFLAGS=-Clink-arg=-Wl,-rpath,$ORIGIN/../lib/Project Orchestrator' >> "$GITHUB_ENV"
+          fi
+
+      # Reuse the mcp_server binary already compiled by build-backend
+      # (same code, same target, same release profile — no need to compile again)
+      - name: Download pre-built mcp_server
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}${{ matrix.artifact_os == 'windows' && '.zip' || '.tar.gz' }}
+          path: mcp-artifact/
+
+      - name: Extract mcp_server to target/release (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
+          tar xzf "mcp-artifact/${ARCHIVE_NAME}.tar.gz" -C mcp-artifact/
+          mkdir -p target/release
+          cp "mcp-artifact/${ARCHIVE_NAME}/mcp_server" target/release/mcp_server
+          chmod +x target/release/mcp_server
+          echo "✅ mcp_server extracted to target/release/"
+          ls -la target/release/mcp_server
+          # nexus-tools rides along as a resource of the app (the overlay is passed to `cargo tauri build`);
+          # the app points NEXUS_TOOLS_PATH at it (desktop/src-tauri/src/main.rs).
+          cp "mcp-artifact/${ARCHIVE_NAME}/nexus-tools" target/release/nexus-tools
+          chmod +x target/release/nexus-tools
+          # The third-party notices ride along too (our LICENSE files are in tauri.conf.json): licenses/ in the app.
+          cp "mcp-artifact/${ARCHIVE_NAME}/THIRD-PARTY-LICENSES.txt" target/release/THIRD-PARTY-LICENSES.txt
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # ONNX Runtime next to mcp_server (its rpath is $ORIGIN) and where the app's rpath looks.
+            # Real files, not the versioned symlinks (a resource is copied as a file).
+            cp -L "$ORT_LIB_LOCATION/libonnxruntime.so.1" target/release/libonnxruntime.so.1
+            cp -L "$ORT_LIB_LOCATION/libonnxruntime_providers_shared.so" target/release/libonnxruntime_providers_shared.so
+            echo '{"bundle":{"resources":{"../../target/release/nexus-tools":"nexus-tools","../../target/release/THIRD-PARTY-LICENSES.txt":"licenses/THIRD-PARTY-LICENSES.txt","../../target/release/libonnxruntime.so.1":"libonnxruntime.so.1","../../target/release/libonnxruntime_providers_shared.so":"libonnxruntime_providers_shared.so"}}}' > desktop/src-tauri/tauri.nexus-tools.json
+          else
+            echo '{"bundle":{"resources":{"../../target/release/nexus-tools":"nexus-tools","../../target/release/THIRD-PARTY-LICENSES.txt":"licenses/THIRD-PARTY-LICENSES.txt"}}}' > desktop/src-tauri/tauri.nexus-tools.json
+          fi
+
+      - name: Extract mcp_server to target/release (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $archiveName = "${env:BINARY_NAME}-${version}-windows-${{ matrix.artifact_arch }}"
+          Expand-Archive -Path "mcp-artifact/${archiveName}.zip" -DestinationPath "mcp-artifact/"
+          New-Item -ItemType Directory -Force -Path "target/release"
+          Copy-Item "mcp-artifact/${archiveName}/mcp_server.exe" "target/release/mcp_server.exe"
+          # Tauri resource path expects "mcp_server" without .exe extension
+          Copy-Item "target/release/mcp_server.exe" "target/release/mcp_server"
+          Write-Host "✅ mcp_server extracted to target/release/"
+          # nexus-tools rides along as a resource of the app, under its .exe name (see the Unix step).
+          Copy-Item "mcp-artifact/${archiveName}/nexus-tools.exe" "target/release/nexus-tools.exe"
+          # The third-party notices ride along too (see the Unix step).
+          Copy-Item "mcp-artifact/${archiveName}/THIRD-PARTY-LICENSES.txt" "target/release/THIRD-PARTY-LICENSES.txt"
+          Set-Content -Path "desktop/src-tauri/tauri.nexus-tools.json" -Value '{"bundle":{"resources":{"../../target/release/nexus-tools.exe":"nexus-tools.exe","../../target/release/THIRD-PARTY-LICENSES.txt":"licenses/THIRD-PARTY-LICENSES.txt"}}}'
+
+      # --- Windows: Bundle ALL MSVC Runtime DLLs + VC++ Redistributable ---
+      # ort-sys (ONNX Runtime) is compiled with dynamic CRT (/MD).
+      # Rather than guessing which DLLs are needed, we bundle ALL DLLs from the
+      # VC++ CRT directory (~12 files, ~4MB total). This covers direct deps
+      # (msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll) AND transitive deps
+      # (msvcp140_1.dll, msvcp140_2.dll, concrt140.dll, etc.).
+      #
+      # Strategy (belt-and-suspenders):
+      # 1. Bundle ALL CRT DLLs — the NSIS hook copies them next to the exe
+      #    as a guaranteed fallback (no admin needed, no external installer)
+      # 2. Also bundle vc_redist.x64.exe — the NSIS hook ALWAYS runs it
+      #    (idempotent, cleaner long-term, benefits other apps too)
+      #
+      # See: https://github.com/tauri-apps/tauri/discussions/2662
+      - name: Bundle MSVC Runtime DLLs and VC++ Redistributable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $resourcesDir = "desktop/src-tauri/resources"
+          New-Item -ItemType Directory -Force -Path $resourcesDir
+
+          # --- 1. Copy ALL MSVC runtime DLLs from the Visual Studio installation ---
+          # GitHub Actions Windows runners have VS 2022 Enterprise with MSVC tools.
+          # We find the latest VC redist directory and copy ALL .dll files.
+          $vcRedistDirs = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory -ErrorAction SilentlyContinue
+          if ($vcRedistDirs) {
+            $crtDir = ($vcRedistDirs | Sort-Object Name | Select-Object -Last 1).FullName
+            Write-Host "Found MSVC CRT directory: $crtDir"
+            $dllFiles = Get-ChildItem "$crtDir\*.dll"
+            Write-Host "Found $($dllFiles.Count) DLLs to bundle:"
+            foreach ($dll in $dllFiles) {
+              Copy-Item $dll.FullName "$resourcesDir/$($dll.Name)"
+              $size = [math]::Round($dll.Length / 1KB, 1)
+              Write-Host "  $($dll.Name) (${size} KB)"
+            }
+          } else {
+            Write-Host "WARNING: Could not find MSVC CRT directory — DLL fallback will not be available"
+          }
+
+          # --- 2. Download vc_redist.x64.exe (system-wide installer) ---
+          $vcRedistUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+          Invoke-WebRequest -Uri $vcRedistUrl -OutFile "$resourcesDir/vc_redist.x64.exe" -UseBasicParsing
+          $size = [math]::Round((Get-Item "$resourcesDir/vc_redist.x64.exe").Length / 1MB, 1)
+          Write-Host "Downloaded vc_redist.x64.exe (${size} MB)"
+
+          # --- 3. Dynamically inject all resources into tauri.conf.json ---
+          $configPath = "desktop/src-tauri/tauri.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          # vc_redist goes to $INSTDIR/resources/ in the NSIS bundle
+          $config.bundle.resources | Add-Member -NotePropertyName "resources/vc_redist.x64.exe" -NotePropertyValue "vc_redist.x64.exe"
+          # Add ALL DLLs found in the resources directory
+          $resourceDlls = Get-ChildItem "$resourcesDir\*.dll"
+          foreach ($dll in $resourceDlls) {
+            $config.bundle.resources | Add-Member -NotePropertyName "resources/$($dll.Name)" -NotePropertyValue "$($dll.Name)"
+          }
+          $config | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
+          Write-Host "✅ $($resourceDlls.Count) MSVC DLLs + vc_redist.x64.exe added to Tauri resources"
+          Write-Host "Resources dir contents:"
+          Get-ChildItem $resourcesDir | Format-Table Name, Length
+
+      # --- macOS Code Signing: import certificate into a persistent keychain ---
+      # We manage our own keychain so the certificate stays available for BOTH
+      # the Tauri build step AND the post-build re-sign step (which adds --timestamp).
+      # We do NOT pass APPLE_CERTIFICATE to Tauri — that would make Tauri create
+      # its own temporary keychain, which gets cleaned up before re-sign runs.
+      - name: Import Apple Developer certificate
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          # Create and configure keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add to keychain search list (prepend so it's found first)
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychain -d user | tr -d '"')
+
+          # Verify
+          security find-identity -v "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+      # Remove any cached bundle output from Swatinem/rust-cache.
+      # cargo tauri build does NOT clean old bundles — if a previous release
+      # cached the target/ dir, stale .app/.dmg/.AppImage could persist.
+      - name: Clean stale Tauri bundle cache
+        shell: bash
+        run: |
+          echo "Cleaning stale bundle output..."
+          rm -rf target/*/release/bundle
+          echo "✅ Bundle cache cleaned"
+
+      # IMPORTANT: TAURI_SIGNING_PRIVATE_KEY must be set in GitHub Secrets for
+      # auto-update to work. Without it, Tauri won't generate the updater bundles
+      # (.app.tar.gz, .AppImage.tar.gz, .nsis.zip) nor their .sig files, and
+      # latest.json will have empty URLs — causing "relative URL without a base"
+      # errors on the client.
+      #
+      # Generate a keypair with: cargo tauri signer generate -w ~/.tauri/myapp.key
+      # Then set TAURI_SIGNING_PRIVATE_KEY to the contents of the private key file,
+      # and update the pubkey in desktop/src-tauri/tauri.conf.json → plugins.updater.pubkey
+      #
+      # macOS: We pass APPLE_SIGNING_IDENTITY only (NOT APPLE_CERTIFICATE) so Tauri
+      # uses our pre-imported keychain instead of creating its own temporary one.
+      # This keeps the certificate available for the re-sign step that follows.
+      - name: Build Tauri bundle
+        working-directory: desktop/src-tauri
+        env:
+          # linuxdeploy + appimagetool are themselves AppImages and need FUSE to
+          # self-mount. Minimal CI runners (notably ubuntu-24.04-arm) ship no
+          # FUSE → "failed to run linuxdeploy". Extract-and-run avoids FUSE
+          # entirely. No-op on macOS/Windows.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS — identity only, certificate is in our persistent keychain
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # Windows signing
+          TAURI_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        # Legacy: arguments after `--` go to cargo. `custom-protocol` is what makes the app load its embedded frontend.
+        # TAURI_VARIANT_CONFIG: the per-variant overlay file written by the macOS settings steps (absent elsewhere).
+        run: cargo tauri build --target ${{ matrix.tauri_target }} --config tauri.nexus-tools.json ${{ env.TAURI_VARIANT_CONFIG && format('--config {0}', env.TAURI_VARIANT_CONFIG) || '' }} ${{ matrix.bundles && format('--bundles {0}', matrix.bundles) || '' }} ${{ matrix.legacy && '-- --no-default-features --features custom-protocol' || '' }}
+
+      # Free disk space after Tauri build completes.
+      # The cargo build output (deps/, build/, .fingerprint/, incremental/) can
+      # consume 5-10 GB on macOS runners. We only need the bundle/ directory
+      # for the remaining steps (re-sign, DMG, notarize, upload).
+      # Without this cleanup, macOS runners (14 GB disk) run out of space
+      # during hdiutil create (DMG recreation).
+      - name: Free disk space (remove build intermediates)
+        shell: bash
+        run: |
+          TARGET_DIR="target/${{ matrix.tauri_target }}/release"
+          if [ -d "$TARGET_DIR" ]; then
+            echo "=== Disk usage before cleanup ==="
+            df -h . | tail -1
+            echo "Target dir size: $(du -sh "$TARGET_DIR" | cut -f1)"
+            echo "Bundle dir size: $(du -sh "$TARGET_DIR/bundle" 2>/dev/null | cut -f1 || echo 'N/A')"
+
+            # Remove everything in release/ except the bundle/ directory
+            find "$TARGET_DIR" -maxdepth 1 -not -name bundle -not -path "$TARGET_DIR" -exec rm -rf {} +
+
+            echo "=== Disk usage after cleanup ==="
+            df -h . | tail -1
+            echo "Target dir size: $(du -sh "$TARGET_DIR" | cut -f1)"
+          fi
+
+      # x86_64-apple-darwin: bundle ONNX Runtime dylib inside the .app so the
+      # main binary and mcp_server can find libonnxruntime at runtime.
+      # We place it in Contents/Frameworks/ (standard macOS location) and add
+      # the matching rpath. The re-sign step below will codesign the dylib.
+      - name: Bundle ONNX Runtime in Tauri app (macOS x86_64)
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
+        run: |
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
+          APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::warning::No .app bundle found — skipping ONNX Runtime bundling"
+            exit 0
+          fi
+
+          # Copy ONNX Runtime dylib to Frameworks/
+          FRAMEWORKS_DIR="$APP_PATH/Contents/Frameworks"
+          mkdir -p "$FRAMEWORKS_DIR"
+          cp -a "${ORT_LIB_LOCATION}"/libonnxruntime* "$FRAMEWORKS_DIR/"
+          chmod +x "$FRAMEWORKS_DIR"/libonnxruntime*.dylib
+
+          # Add rpath so all executables find the dylib in ../Frameworks/
+          # NOTE: The .app folder uses productName ("Project Orchestrator") but the
+          # binary inside Contents/MacOS/ uses the Cargo package name
+          # ("project-orchestrator-desktop"). We must iterate over actual files.
+          echo "Adding @executable_path/../Frameworks rpath to all executables..."
+          for binary in "$APP_PATH/Contents/MacOS/"*; do
+            if [ -f "$binary" ] && [ -x "$binary" ]; then
+              echo "  rpath → $(basename "$binary")"
+              install_name_tool -add_rpath @executable_path/../Frameworks "$binary"
+            fi
+          done
+
+          # Bundled mcp_server (resource binary, also dynamically linked). It already carries
+          # `@executable_path` from the archive step (Package light/full, l.373): that rpath is
+          # Contents/Resources itself, so the dylib goes next to it and no load command is added.
+          # Adding one here fails on Intel ("larger updated load commands do not fit", run 39137156378).
+          MCP_SERVER="$APP_PATH/Contents/Resources/mcp_server"
+          if [ -f "$MCP_SERVER" ]; then
+            if otool -l "$MCP_SERVER" | grep -q 'path @executable_path (offset'; then
+              echo "  mcp_server: symlinks to the signed dylib in Frameworks (rpath @executable_path)"
+              # A symlink, not a copy: the Frameworks copy is the one codesign signs; a second
+              # unsigned Mach-O in Resources would break signing and notarization.
+              for dylib in "$FRAMEWORKS_DIR"/libonnxruntime*; do
+                ln -sfn "../Frameworks/$(basename "$dylib")" "$APP_PATH/Contents/Resources/$(basename "$dylib")"
+              done
+            else
+              echo "  rpath → mcp_server (resource)"
+              install_name_tool -add_rpath @executable_path/../Frameworks "$MCP_SERVER"
+            fi
+          fi
+
+          echo "✅ ONNX Runtime dylib bundled in Frameworks/"
+          ls -la "$FRAMEWORKS_DIR/"
+          echo "Executables with rpath:"
+          for binary in "$APP_PATH/Contents/MacOS/"*; do
+            [ -f "$binary" ] && otool -l "$binary" | grep -A2 LC_RPATH || true
+          done
+
+      # What the app REQUIRES vs what we PROMISE (scripts/check-os-floor.sh), after ONNX Runtime is bundled and before signing.
+      # macOS: every Mach-O's minimum, and the .app's LSMinimumSystemVersion must not be lower than that (the 0.0.17 lie).
+      - name: Check OS floor (macOS app)
+        if: runner.os == 'macOS'
+        run: scripts/check-os-floor.sh "macos-${{ matrix.artifact_arch }}" "target/${{ matrix.target }}/release/bundle/macos"
+
+      # Linux: the binaries inside the .deb (the AppImage and .rpm are built from the same ones).
+      - name: Check OS floor (Linux app)
+        if: runner.os == 'Linux'
+        run: |
+          rm -rf "$RUNNER_TEMP/debx" && mkdir -p "$RUNNER_TEMP/debx"
+          dpkg-deb -x target/${{ matrix.target }}/release/bundle/deb/*.deb "$RUNNER_TEMP/debx"
+          scripts/check-os-floor.sh "linux-${{ matrix.artifact_arch }}" "$RUNNER_TEMP/debx"
+
+      # ONNX Runtime is linked dynamically and shipped as a resource: prove, on the files as they will be
+      # installed, that the app and mcp_server find it (a missing rpath only shows at launch otherwise).
+      - name: Check the Linux app finds ONNX Runtime
+        if: runner.os == 'Linux'
+        run: |
+          bad=0
+          for f in "$RUNNER_TEMP"/debx/usr/bin/* "$RUNNER_TEMP/debx/usr/lib/Project Orchestrator/mcp_server"; do
+            if [ ! -f "$f" ] || ! head -c4 "$f" | grep -q 'ELF'; then continue; fi
+            echo "=== $f"; ldd "$f" | grep -E 'onnxruntime|not found' || true
+            if ldd "$f" | grep -q 'not found'; then
+              echo "::error::$(basename "$f") does not find a library it needs (see above)"; bad=1
+            fi
+          done
+          exit $bad
+
+      # Verify the built bundle contains the correct frontend.
+      # This catches any issue where Tauri silently bundles stale frontend files.
+      - name: Verify bundle frontend (post-build)
+        shell: bash
+        run: |
+          echo "=== Bundle frontend verification (post-build) ==="
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
+
+          # macOS: check inside .app/Contents/Resources/dist/
+          if [ -d "$BUNDLE_DIR/macos" ]; then
+            APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
+            if [ -n "$APP_PATH" ]; then
+              DIST_DIR="$APP_PATH/Contents/Resources/dist"
+              if [ -f "$DIST_DIR/index.html" ]; then
+                echo "macOS .app dist/index.html hash: $(sha256sum "$DIST_DIR/index.html" | cut -c1-16)"
+                echo "macOS .app JS assets:"
+                ls "$DIST_DIR/assets/"*.js 2>/dev/null || echo "(no JS files)"
+                echo "Version in macOS bundle:"
+                grep -oP '"[0-9]+\.[0-9]+\.[0-9]+"' "$DIST_DIR/assets/"*.js 2>/dev/null | head -3 || true
+              else
+                echo "⚠️ WARNING: No index.html found in $DIST_DIR"
+              fi
+            fi
+          fi
+
+          # Linux: check AppImage (if available, just list it)
+          if [ -d "$BUNDLE_DIR/appimage" ]; then
+            echo "Linux AppImage:"
+            ls -la "$BUNDLE_DIR/appimage/"*.AppImage 2>/dev/null || echo "(none)"
+          fi
+
+          # Compare with source dist
+          echo "Source desktop/dist/index.html hash: $(sha256sum desktop/dist/index.html | cut -c1-16)"
+
+      # --- macOS: Re-sign with --timestamp for notarization ---
+      # Tauri's built-in codesign does NOT pass --timestamp to codesign (bug in
+      # tauri-macos-sign). Apple requires a secure timestamp for notarization.
+      # We re-sign everything after the Tauri build with --timestamp added.
+      #
+      # IMPORTANT: The main executable and .app bundle MUST be re-signed with
+      # --entitlements to preserve the entitlements from tauri.conf.json.
+      # Without this, --force strips the original entitlements, and with
+      # hardened runtime (--options runtime), the app loses network permissions.
+      - name: Re-sign macOS bundle with timestamp
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
+          APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
+          ENTITLEMENTS="desktop/src-tauri/entitlements.plist"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "::warning::No .app bundle found — skipping re-sign"
+            exit 0
+          fi
+
+          echo "Re-signing $APP_PATH with --timestamp..."
+          echo "  Entitlements: $ENTITLEMENTS"
+
+          # Sign deepest binaries first (inside-out order required by codesign)
+          # 1. Sign all nested frameworks and dylibs (no entitlements needed)
+          find "$APP_PATH/Contents/Frameworks" -type f -perm +111 2>/dev/null | while read binary; do
+            echo "  Signing framework: $(basename "$binary")"
+            codesign --force --timestamp --options runtime \
+              --sign "$APPLE_SIGNING_IDENTITY" "$binary" || true
+          done
+
+          # 2. Sign resource binaries (e.g. mcp_server bundled as Tauri resource)
+          #    These are helper binaries — they inherit the app's sandbox but
+          #    need their own hardened runtime signature.
+          find "$APP_PATH/Contents/Resources" -type f -perm +111 2>/dev/null | while read binary; do
+            echo "  Signing resource: $(basename "$binary")"
+            codesign --force --timestamp --options runtime \
+              --entitlements "$ENTITLEMENTS" \
+              --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+          done
+
+          # 3. Sign all nested executables (helpers, etc.)
+          find "$APP_PATH/Contents/MacOS" -type f -perm +111 | while read binary; do
+            echo "  Signing executable: $(basename "$binary")"
+            codesign --force --timestamp --options runtime \
+              --entitlements "$ENTITLEMENTS" \
+              --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+          done
+
+          # 4. Sign the .app bundle itself (must be last)
+          codesign --force --timestamp --options runtime \
+            --entitlements "$ENTITLEMENTS" \
+            --sign "$APPLE_SIGNING_IDENTITY" "$APP_PATH"
+
+          # 5. Verify the signature and entitlements
+          echo "Verifying signature..."
+          codesign --verify --deep --strict "$APP_PATH"
+          echo "Verifying entitlements..."
+          codesign -d --entitlements - "$APP_PATH" 2>&1 | head -20
+          echo "✅ Re-sign with timestamp + entitlements successful"
+
+      # --- macOS: Recreate DMG with re-signed .app ---
+      # The DMG created by Tauri contains a snapshot of the .app BEFORE re-sign.
+      # We must recreate the DMG so it contains the re-signed .app (with timestamps).
+      # Then sign the DMG itself with a timestamp.
+      #
+      # IMPORTANT: Tauri's original DMG (via bundle_dmg.sh) includes:
+      #   - The .app bundle
+      #   - An "Applications" symlink → /Applications (drag-to-install UX)
+      #   - A .VolumeIcon.icns (custom DMG icon in Finder)
+      #   - A .DS_Store (icon positions in the Finder window)
+      # A bare `hdiutil create -srcfolder <app>` loses all of these.
+      # We stage a directory that replicates the Tauri DMG structure.
+      - name: Recreate and sign macOS DMG
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
+          APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
+          DMG_PATH=$(find "$BUNDLE_DIR/dmg" -name "*.dmg" | head -1)
+
+          if [ -z "$APP_PATH" ] || [ -z "$DMG_PATH" ]; then
+            echo "::warning::No .app or .dmg found — skipping DMG recreation"
+            exit 0
+          fi
+
+          APP_NAME=$(basename "$APP_PATH")
+          DMG_NAME=$(basename "$DMG_PATH")
+          DMG_DIR=$(dirname "$DMG_PATH")
+          VOLUME_NAME="${APP_NAME%.app}"
+
+          echo "Recreating DMG with re-signed app..."
+          echo "  App: $APP_PATH"
+          echo "  DMG: $DMG_PATH"
+
+          # --- Stage the DMG contents (replicate Tauri's bundle_dmg.sh layout) ---
+          STAGING="$RUNNER_TEMP/dmg-staging"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING"
+
+          # 1. Copy the re-signed .app
+          cp -R "$APP_PATH" "$STAGING/"
+
+          # 2. Add "Applications" symlink (drag-to-install shortcut)
+          ln -s /Applications "$STAGING/Applications"
+
+          # 3. Add volume icon from the .app's icon.icns
+          ICNS_FILE="$APP_PATH/Contents/Resources/icon.icns"
+          if [ -f "$ICNS_FILE" ]; then
+            cp "$ICNS_FILE" "$STAGING/.VolumeIcon.icns"
+          fi
+
+          echo "  Staging contents:"
+          ls -la "$STAGING/"
+
+          # --- Create the DMG via explicit-size writable image ---
+          # hdiutil create -srcfolder -format UDZO auto-calculates the intermediate
+          # image size, but DOESN'T account for code signature extended attributes
+          # (xattr from codesign --timestamp). This causes "No space left on device"
+          # on the MOUNTED IMAGE (not the real disk) for aarch64 builds.
+          # Fix: create a writable image with 2x headroom, copy, then convert.
+          rm -f "$DMG_PATH"
+
+          # Calculate staging size and add generous padding
+          STAGING_SIZE_MB=$(du -sm "$STAGING" | cut -f1)
+          IMAGE_SIZE_MB=$((STAGING_SIZE_MB * 2 + 100))
+          echo "  Staging: ${STAGING_SIZE_MB}MB → Image: ${IMAGE_SIZE_MB}MB"
+
+          # Detach any stale volume from previous failed attempts
+          hdiutil detach "/Volumes/$VOLUME_NAME" 2>/dev/null || true
+
+          # Step 1: Create writable HFS+ image with explicit size
+          TEMP_DMG="$RUNNER_TEMP/temp-writable.dmg"
+          hdiutil create -size "${IMAGE_SIZE_MB}m" -fs HFS+ -volname "$VOLUME_NAME" "$TEMP_DMG"
+
+          # Step 2: Mount, copy contents, unmount
+          MOUNT_POINT="$RUNNER_TEMP/dmg-mount"
+          mkdir -p "$MOUNT_POINT"
+          hdiutil attach "$TEMP_DMG" -mountpoint "$MOUNT_POINT" -nobrowse
+          cp -R "$STAGING/"* "$MOUNT_POINT/"
+          # Set volume icon flag (makes Finder show .VolumeIcon.icns)
+          SetFile -a C "$MOUNT_POINT" 2>/dev/null || true
+          hdiutil detach "$MOUNT_POINT"
+
+          # Cleanup staging before conversion (free disk space)
+          rm -rf "$STAGING"
+
+          # Step 3: Convert to compressed read-only UDZO
+          hdiutil convert "$TEMP_DMG" -format UDZO -imagekey zlib-level=9 -o "$DMG_PATH"
+          rm -f "$TEMP_DMG"
+
+          # Sign the DMG itself
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG_PATH"
+          codesign --verify --deep --strict "$DMG_PATH"
+          echo "✅ DMG recreated and signed with re-signed app (includes Applications shortcut)"
+
+      # --- macOS: Rebuild updater bundles (.app.tar.gz + .sig) ---
+      # The .app.tar.gz and .sig generated by Tauri are stale after re-sign.
+      # We recreate them with the re-signed .app and sign with the Tauri updater key.
+      # The key MUST have been generated with -p <password> to work in CI
+      # (see tauri-apps/tauri#14829 — keys without password fail in non-interactive mode).
+      - name: Rebuild updater bundles after re-sign
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
+          APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
+          APP_NAME=$(basename "$APP_PATH")
+
+          if [ -z "$APP_PATH" ]; then
+            echo "::warning::No .app bundle found — skipping updater rebuild"
+            exit 0
+          fi
+
+          # Recreate .app.tar.gz with re-signed app
+          TAR_PATH="$BUNDLE_DIR/macos/${APP_NAME}.tar.gz"
+          echo "Recreating $TAR_PATH..."
+          cd "$BUNDLE_DIR/macos"
+          rm -f "$(basename "$TAR_PATH")" "$(basename "$TAR_PATH").sig"
+          tar czf "$(basename "$TAR_PATH")" "$APP_NAME"
+          cd -
+
+          # Re-sign with Tauri updater key (env vars auto-read by cargo tauri signer)
+          echo "Signing updater bundle with Tauri key..."
+          cargo tauri signer sign "$TAR_PATH"
+          echo "✅ Updater bundle recreated and signed"
+
+      # --- macOS Notarization: submit to Apple and staple ---
+      - name: Notarize macOS .dmg
+        if: runner.os == 'macOS' && env.APPLE_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # A signed-but-unnotarized app is rejected by Gatekeeper on every Mac
+          # ("damaged" / "cannot be opened"). Shipping it silently is worse than
+          # failing the release, so ANY outcome other than "Accepted" is fatal.
+          DMG_PATH=$(find target/${{ matrix.target }}/release/bundle/dmg -name "*.dmg" | head -1)
+          if [ -z "$DMG_PATH" ]; then
+            echo "::error::No .dmg found to notarize"
+            exit 1
+          fi
+          echo "Notarizing $DMG_PATH..."
+          SUBMIT_OUTPUT=$(xcrun notarytool submit "$DMG_PATH" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait 2>&1) || true
+          echo "$SUBMIT_OUTPUT"
+
+          SUBMISSION_ID=$(echo "$SUBMIT_OUTPUT" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+          if echo "$SUBMIT_OUTPUT" | grep -qE "status: Accepted"; then
+            echo "✅ Notarization accepted!"
+            # Stapling fetches the ticket from Apple's CloudKit. That fetch can
+            # drop (NSURLErrorDomain -1005, "Error 68") AFTER an accepted
+            # notarization — measured on run 39244961960. The ticket exists,
+            # so retrying is safe; a real failure still fails after 5 tries.
+            for cmd in staple validate; do
+              for attempt in 1 2 3 4 5; do
+                if xcrun stapler "$cmd" "$DMG_PATH"; then
+                  break
+                fi
+                if [ "$attempt" = 5 ]; then
+                  echo "::error::xcrun stapler $cmd failed 5 times"
+                  exit 1
+                fi
+                echo "::warning::xcrun stapler $cmd failed (attempt $attempt/5), retrying in $((attempt * 15))s"
+                sleep $((attempt * 15))
+              done
+            done
+            spctl --assess --type open --context context:primary-signature -v "$DMG_PATH"
+          else
+            if [ -n "$SUBMISSION_ID" ]; then
+              echo "::group::Apple notarization log"
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" || true
+              echo "::endgroup::"
+            fi
+            if echo "$SUBMIT_OUTPUT" | grep -q "HTTP status code: 403"; then
+              echo "::error::Apple returned 403 (agreement missing/expired). Accept the latest agreements at https://developer.apple.com/account then re-run this job."
+            fi
+            echo "::error::Notarization did not return Accepted — refusing to publish an unnotarized macOS app"
+            exit 1
+          fi
+
+      # Rename macOS updater bundles to include architecture.
+      # Tauri produces "Product Name.app.tar.gz" (no arch) for both aarch64 and x86_64.
+      # Without renaming, the flatten step in the release job overwrites one with the other,
+      # causing both darwin platforms in latest.json to point to the same binary.
+      - name: Rename macOS updater bundles with arch suffix
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle/macos"
+          ARCH="${{ matrix.artifact_arch }}"
+
+          for f in "$BUNDLE_DIR"/*.app.tar.gz; do
+            [ -f "$f" ] || continue
+            [[ "$f" == *.sig ]] && continue
+            BASE=$(basename "$f" .app.tar.gz)
+            DIR=$(dirname "$f")
+            NEW="${DIR}/${BASE}_${ARCH}.app.tar.gz"
+            mv "$f" "$NEW"
+            echo "Renamed: $(basename "$f") → $(basename "$NEW")"
+            if [ -f "${f}.sig" ]; then
+              mv "${f}.sig" "${NEW}.sig"
+              echo "Renamed: $(basename "${f}.sig") → $(basename "${NEW}.sig")"
+            fi
+          done
+          echo "Updater bundles after rename:"
+          ls -la "$BUNDLE_DIR"/*.app.tar.gz* 2>/dev/null || echo "  (none)"
+
+      # The legacy .dmg is named like the standard Intel one (both are "..._x64.dmg"): without a suffix the release job
+      # would flatten one over the other. The site finds it by "_x64-legacy.dmg".
+      - name: Rename the legacy .dmg
+        if: matrix.legacy
+        shell: bash
+        run: |
+          for f in target/${{ matrix.target }}/release/bundle/dmg/*_x64.dmg; do
+            [ -f "$f" ] || { echo "::error::no _x64.dmg to rename"; exit 1; }
+            mv "$f" "${f%_x64.dmg}_x64-legacy.dmg"
+            echo "Renamed: $(basename "$f") → $(basename "${f%_x64.dmg}_x64-legacy.dmg")"
+          done
+
+      - name: Upload Tauri artifacts (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tauri-${{ matrix.target }}${{ matrix.legacy && '-legacy' || '' }}
+          path: |
+            target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+            target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
+          retention-days: 1
+
+      - name: Upload Tauri artifacts (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tauri-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/bundle/deb/*.deb
+            target/${{ matrix.target }}/release/bundle/rpm/*.rpm
+            target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+            target/${{ matrix.target }}/release/bundle/appimage/*.AppImage.tar.gz
+            target/${{ matrix.target }}/release/bundle/appimage/*.AppImage.tar.gz.sig
+          retention-days: 1
+
+      - name: Upload Tauri artifacts (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tauri-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            target/${{ matrix.target }}/release/bundle/nsis/*.nsis.zip
+            target/${{ matrix.target }}/release/bundle/nsis/*.nsis.zip.sig
+            target/${{ matrix.target }}/release/bundle/msi/*.msi
+            target/${{ matrix.target }}/release/bundle/msi/*.msi.zip
+            target/${{ matrix.target }}/release/bundle/msi/*.msi.zip.sig
+          retention-days: 1
+
+      # --- macOS Cleanup: remove temp keychain ---
+      - name: Cleanup macOS keychain
+        if: runner.os == 'macOS' && always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+
+  # ==========================================================================
+  # Release - Collect all artifacts and publish GitHub Release
+  # ==========================================================================
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [build-backend, build-tauri, package-deb, package-rpm]
+    # Always run: collect whatever artifacts succeeded.
+    # Individual matrix entries may fail/cancel (e.g. macos-13 runner unavailable)
+    # but we still want to publish everything that built successfully.
+    if: always()
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download release artifacts (native builds)
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+          pattern: orchestrator-*
+
+      - name: Download release artifacts (deb/rpm)
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          path: artifacts/
+          pattern: project-orchestrator*
+
+      - name: Download release artifacts (tauri)
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          path: artifacts/
+          pattern: tauri-*
+
+      - name: Collect release files
+        run: |
+          mkdir -p release-files
+          find artifacts/ -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.deb" -o -name "*.rpm" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.exe" -o -name "*.msi" -o -name "*.sig" \) -exec cp {} release-files/ \;
+          echo "=== Release artifacts ==="
+          ls -la release-files/ || echo "No release files found"
+
+      - name: Generate checksums
+        working-directory: release-files
+        run: |
+          sha256sum * > checksums-sha256.txt
+          echo "=== Checksums ==="
+          cat checksums-sha256.txt
+
+      - name: Debug — list release-files before latest.json generation
+        run: |
+          echo "=== All files in release-files/ ==="
+          ls -la release-files/ || echo "No release files found"
+          echo ""
+          echo "=== Updater-relevant files ==="
+          echo "macOS arm64:"
+          ls release-files/*_arm64.app.tar.gz release-files/*_arm64.app.tar.gz.sig 2>/dev/null || echo "  (none)"
+          echo "macOS x86_64:"
+          ls release-files/*_x86_64.app.tar.gz release-files/*_x86_64.app.tar.gz.sig 2>/dev/null || echo "  (none)"
+          echo "Linux:"
+          ls release-files/*.AppImage.tar.gz release-files/*.AppImage.tar.gz.sig 2>/dev/null || echo "  (none)"
+          echo "Windows:"
+          ls release-files/*.nsis.zip release-files/*.nsis.zip.sig 2>/dev/null || echo "  (none)"
+
+      - name: Generate Tauri updater latest.json
+        shell: bash
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          REPO="${{ github.repository }}"
+          BASE_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}"
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # Shown by the in-app update banner. The generated changelog does not exist yet
+          # (the release is created after this step), so point at the release page itself.
+          NOTES="Release notes: https://github.com/${REPO}/releases/tag/${RELEASE_TAG}"
+
+          # Helper: GitHub Releases replaces spaces with dots in asset names.
+          # e.g. "Project Orchestrator_arm64.app.tar.gz" → "Project.Orchestrator_arm64.app.tar.gz"
+          gh_asset_name() { basename "$1" | tr ' ' '.'; }
+
+          # --- macOS ---
+          # Updater bundles are renamed to include arch suffix in the build-tauri job:
+          #   "Product Name_arm64.app.tar.gz" and "Product Name_x86_64.app.tar.gz"
+          # This prevents collision when both builds produce identically named files.
+          MACOS_ARM64_URL=""
+          MACOS_ARM64_SIG=""
+          MACOS_X86_64_URL=""
+          MACOS_X86_64_SIG=""
+
+          for f in release-files/*_arm64.app.tar.gz; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && MACOS_ARM64_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
+          done
+          for f in release-files/*_arm64.app.tar.gz.sig; do
+            [ -f "$f" ] && MACOS_ARM64_SIG=$(cat "$f") && break
+          done
+          for f in release-files/*_x86_64.app.tar.gz; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && MACOS_X86_64_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
+          done
+          for f in release-files/*_x86_64.app.tar.gz.sig; do
+            [ -f "$f" ] && MACOS_X86_64_SIG=$(cat "$f") && break
+          done
+
+          # Fallback: if only one macOS arch built, use it for both
+          if [ -z "$MACOS_ARM64_URL" ] && [ -n "$MACOS_X86_64_URL" ]; then
+            echo "::warning::macOS arm64 updater bundle missing — using x86_64 for both darwin platforms"
+            MACOS_ARM64_URL="$MACOS_X86_64_URL"
+            MACOS_ARM64_SIG="$MACOS_X86_64_SIG"
+          fi
+          if [ -z "$MACOS_X86_64_URL" ] && [ -n "$MACOS_ARM64_URL" ]; then
+            echo "::warning::macOS x86_64 updater bundle missing — using arm64 for both darwin platforms"
+            MACOS_X86_64_URL="$MACOS_ARM64_URL"
+            MACOS_X86_64_SIG="$MACOS_ARM64_SIG"
+          fi
+
+          # --- Linux ---
+          # Tauri produces "Product.Name_version_amd64.AppImage.tar.gz"
+          LINUX_X86_64_URL=""
+          LINUX_X86_64_SIG=""
+          for f in release-files/*.AppImage.tar.gz; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && LINUX_X86_64_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
+          done
+          for f in release-files/*.AppImage.tar.gz.sig; do
+            [ -f "$f" ] && LINUX_X86_64_SIG=$(cat "$f") && break
+          done
+
+          # --- Windows ---
+          # Tauri produces "Product.Name_version_x64-setup.nsis.zip"
+          WINDOWS_X86_64_URL=""
+          WINDOWS_X86_64_SIG=""
+          for f in release-files/*.nsis.zip; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && WINDOWS_X86_64_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
+          done
+          for f in release-files/*.nsis.zip.sig; do
+            [ -f "$f" ] && WINDOWS_X86_64_SIG=$(cat "$f") && break
+          done
+
+          # --- Validation ---
+          [ -z "$MACOS_ARM64_URL" ] && echo "::warning::darwin-aarch64 updater URL is empty"
+          [ -z "$MACOS_X86_64_URL" ] && echo "::warning::darwin-x86_64 updater URL is empty"
+          [ -z "$LINUX_X86_64_URL" ] && echo "::warning::linux-x86_64 updater URL is empty"
+          [ -z "$WINDOWS_X86_64_URL" ] && echo "::warning::windows-x86_64 updater URL is empty"
+
+          if [ -z "$MACOS_ARM64_URL" ] && [ -z "$MACOS_X86_64_URL" ] && [ -z "$LINUX_X86_64_URL" ] && [ -z "$WINDOWS_X86_64_URL" ]; then
+            echo "::warning::All updater URLs are empty — latest.json will not enable auto-updates. Check that TAURI_SIGNING_PRIVATE_KEY is set and updater bundles were generated."
+          fi
+
+          # Build JSON using jq
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "$NOTES" \
+            --arg pub_date "$PUB_DATE" \
+            --arg macos_arm64_url "$MACOS_ARM64_URL" \
+            --arg macos_arm64_sig "$MACOS_ARM64_SIG" \
+            --arg macos_x86_64_url "$MACOS_X86_64_URL" \
+            --arg macos_x86_64_sig "$MACOS_X86_64_SIG" \
+            --arg linux_x86_64_url "$LINUX_X86_64_URL" \
+            --arg linux_x86_64_sig "$LINUX_X86_64_SIG" \
+            --arg windows_x86_64_url "$WINDOWS_X86_64_URL" \
+            --arg windows_x86_64_sig "$WINDOWS_X86_64_SIG" \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "darwin-aarch64": { url: $macos_arm64_url, signature: $macos_arm64_sig },
+                "darwin-x86_64": { url: $macos_x86_64_url, signature: $macos_x86_64_sig },
+                "linux-x86_64": { url: $linux_x86_64_url, signature: $linux_x86_64_sig },
+                "windows-x86_64": { url: $windows_x86_64_url, signature: $windows_x86_64_sig }
+              }
+            }' > release-files/latest.json
+
+          echo "=== Tauri updater latest.json ==="
+          cat release-files/latest.json
+
+          # --- macOS Intel legacy: its own feed. The legacy app polls latest-legacy.json (see build-tauri), so a Mac on
+          # 10.15 to 13.3 is only ever offered the build that runs there. Not written when the legacy build is missing:
+          # the endpoint then 404s and that app simply sees no update, instead of being offered a file that cannot run.
+          LEGACY_URL=""
+          LEGACY_SIG=""
+          for f in release-files/*_x86_64-legacy.app.tar.gz; do
+            [ -f "$f" ] && LEGACY_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
+          done
+          for f in release-files/*_x86_64-legacy.app.tar.gz.sig; do
+            [ -f "$f" ] && LEGACY_SIG=$(cat "$f") && break
+          done
+          if [ -n "$LEGACY_URL" ] && [ -n "$LEGACY_SIG" ]; then
+            jq -n \
+              --arg version "$VERSION" --arg notes "$NOTES" --arg pub_date "$PUB_DATE" \
+              --arg url "$LEGACY_URL" --arg sig "$LEGACY_SIG" \
+              '{ version: $version, notes: $notes, pub_date: $pub_date, platforms: { "darwin-x86_64": { url: $url, signature: $sig } } }' \
+              > release-files/latest-legacy.json
+            echo "=== macOS legacy updater latest-legacy.json ==="
+            cat release-files/latest-legacy.json
+          else
+            echo "::warning::macOS legacy updater bundle missing — latest-legacy.json not generated"
+          fi
+
+      # Delete any existing release for this tag before creating a fresh one.
+      # softprops/action-gh-release with generate_release_notes APPENDS notes
+      # when updating an existing release — causing duplicate changelogs on re-runs.
+      # Dry run: keep the files (latest.json, latest-legacy.json, installers) for inspection instead of publishing them.
+      - name: Upload release files (dry run only)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: dry-run-release-files
+          path: release-files/
+          retention-days: 3
+
+      - name: Delete existing release (if any)
+        if: ${{ !inputs.dry_run }}
+        run: gh release delete "${{ env.RELEASE_TAG }}" --yes --cleanup-tag=false 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          files: |
+            release-files/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # Docker - Build and push multi-arch images to ghcr.io
+  # ==========================================================================
+  docker-publish:
+    name: Docker (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    needs: [build-frontend, third-party-licenses]
+    if: ${{ !inputs.dry_run }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: full
+            include_frontend: "true"
+            suffix: ""
+
+          - variant: api-only
+            include_frontend: "false"
+            suffix: "-api"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download frontend dist
+        if: matrix.include_frontend == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+      - name: Create empty frontend dir
+        if: matrix.include_frontend == 'false'
+        run: mkdir -p frontend/dist
+
+      # Into the build context, where the Dockerfile copies it to /app/licenses/ with our LICENSE files.
+      - name: Download third-party licenses
+        uses: actions/download-artifact@v8
+        with:
+          name: third-party-licenses
+          path: .
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Set up QEMU (for multi-arch)
+        uses: docker/setup-qemu-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # The action derives image.licenses from the repository's detected license, which GitHub reports
+          # as NOASSERTION (dual license): state ours, as the Dockerfile does.
+          labels: |
+            org.opencontainers.image.licenses=MIT AND BUSL-1.1
+            org.opencontainers.image.vendor=FFS SASU
+          flavor: |
+            suffix=${{ matrix.suffix }}
+          tags: |
+            type=raw,value=${{ env.RELEASE_TAG }}
+            type=raw,value=latest,enable=${{ matrix.variant == 'full' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            FRONTEND_SRC=./frontend
+            INCLUDE_FRONTEND=${{ matrix.include_frontend }}
+            APP_VERSION=${{ env.RELEASE_TAG }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Two caches, both keyed by variant (the two variants shared one scope and evicted each
+          # other's layers, under a 10 GB cap):
+          #   - gha: the fast path within a branch;
+          #   - a cache IMAGE in GHCR: durable and versioned, with no 10 GB cap and no 7-day
+          #     eviction. This is what makes a release start warm even months later — the Docker
+          #     jobs were the slowest of v0.0.17 (214 min for api-only, 122 min for full).
+          cache-from: |
+            type=gha,scope=release-docker-${{ matrix.variant }}
+            type=registry,ref=ghcr.io/${{ github.repository }}-cache:docker-${{ matrix.variant }}
+          cache-to: |
+            type=gha,mode=max,scope=release-docker-${{ matrix.variant }}
+            type=registry,ref=ghcr.io/${{ github.repository }}-cache:docker-${{ matrix.variant }},mode=max,ignore-error=true
+
+      # GHCR packages default to private, even when the repo is public.
+      # Make the package public after the first push so `docker pull` works
+      # without authentication. This is idempotent — subsequent runs are no-ops.
+      - name: Make GHCR package public
+        if: matrix.variant == 'full'
+        run: |
+          gh api --method PUT \
+            /orgs/${{ github.repository_owner }}/packages/container/project-orchestrator/visibility \
+            -f visibility=public 2>/dev/null \
+          || echo "::warning::Could not set package visibility to public — may need to be done manually in org settings"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # Update Homebrew tap - Push new formula after release is published
+  # ==========================================================================
+  update-homebrew:
+    name: Update Homebrew Formula
+    runs-on: ubuntu-latest
+    needs: [release]
+    # Skip pre-releases (e.g. v0.0.1-beta). Works for both tag push and workflow_dispatch.
+    if: ${{ !inputs.dry_run && !contains(inputs.tag || github.ref_name, '-') }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download checksums
+        run: |
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/checksums-sha256.txt" \
+            -o checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - name: Extract SHA256 values
+        id: sha
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          cat checksums-sha256.txt
+
+          macos_arm64=$(grep "orchestrator-full-${VERSION}-macos-arm64.tar.gz" checksums-sha256.txt | awk '{print $1}' || true)
+          macos_x86_64=$(grep "orchestrator-full-${VERSION}-macos-x86_64.tar.gz" checksums-sha256.txt | awk '{print $1}' || true)
+          linux_arm64=$(grep "orchestrator-full-${VERSION}-linux-arm64.tar.gz" checksums-sha256.txt | awk '{print $1}' || true)
+          linux_x86_64=$(grep "orchestrator-full-${VERSION}-linux-x86_64.tar.gz" checksums-sha256.txt | awk '{print $1}' || true)
+
+          # Validate required checksums (at minimum: macOS ARM64 + Linux x86_64)
+          if [ -z "$macos_arm64" ] || [ -z "$linux_x86_64" ]; then
+            echo "::error::Missing required checksums (macos_arm64 or linux_x86_64)"
+            exit 1
+          fi
+
+          # For missing optional platforms, reuse the same-OS alternative
+          [ -z "$macos_x86_64" ] && macos_x86_64="$macos_arm64" && echo "::warning::macOS x86_64 not available, using ARM64 universal"
+          [ -z "$linux_arm64" ] && linux_arm64="$linux_x86_64" && echo "::warning::Linux ARM64 not available, using x86_64"
+
+          echo "macos_arm64=${macos_arm64}" >> "$GITHUB_OUTPUT"
+          echo "macos_x86_64=${macos_x86_64}" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=${linux_arm64}" >> "$GITHUB_OUTPUT"
+          echo "linux_x86_64=${linux_x86_64}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate updated formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -e "s/VERSION_PLACEHOLDER/${VERSION}/g" \
+              -e "s/SHA256_MACOS_ARM64_PLACEHOLDER/${{ steps.sha.outputs.macos_arm64 }}/g" \
+              -e "s/SHA256_MACOS_X86_64_PLACEHOLDER/${{ steps.sha.outputs.macos_x86_64 }}/g" \
+              -e "s/SHA256_LINUX_ARM64_PLACEHOLDER/${{ steps.sha.outputs.linux_arm64 }}/g" \
+              -e "s/SHA256_LINUX_X86_64_PLACEHOLDER/${{ steps.sha.outputs.linux_x86_64 }}/g" \
+              packaging/homebrew/project-orchestrator.rb > project-orchestrator.rb
+          cat project-orchestrator.rb
+
+      - name: Push to Homebrew tap
+        uses: dmnemec/copy_file_to_another_repo_action@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        with:
+          source_file: project-orchestrator.rb
+          destination_repo: this-rs/homebrew-tap
+          destination_folder: Formula
+          destination_branch: main
+          destination_file: project-orchestrator.rb
+          user_email: "t@ffs.holdings"
+          user_name: "Théotime Rivière"
+          commit_message: "Update project-orchestrator to v${{ steps.version.outputs.version }}"

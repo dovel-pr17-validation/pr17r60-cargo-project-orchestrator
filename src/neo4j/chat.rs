@@ -1,0 +1,4080 @@
+//! Neo4j Chat Session and Event operations
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use super::client::Neo4jClient;
+use super::models::*;
+use anyhow::Result;
+use neo4rs::query;
+use std::collections::HashMap;
+use uuid::Uuid;
+
+/// The `(:DataMigration)` key of the move of agent edges from model facets to the self.
+pub const AGENT_SELF_MIGRATION_KEY: &str = "agent_identity_self";
+
+/// Agent attribution edges (`AUTHORED`, `LIVED`) counted by where they hang: a model
+/// facet (before the migration), or the durable self (after).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentEdgeCount {
+    pub facet_authored: usize,
+    pub facet_lived: usize,
+    pub self_authored: usize,
+    pub self_lived: usize,
+}
+
+impl AgentEdgeCount {
+    /// Edges still hanging on a model facet.
+    pub fn facet_total(&self) -> usize {
+        self.facet_authored + self.facet_lived
+    }
+
+    /// Edges on the durable self.
+    pub fn self_total(&self) -> usize {
+        self.self_authored + self.self_lived
+    }
+}
+
+/// What the agent-edge migration found and moved, before and after.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentEdgeMigration {
+    pub before: AgentEdgeCount,
+    pub after: AgentEdgeCount,
+    pub moved_authored: usize,
+    pub moved_lived: usize,
+    /// Statements executed, both edge types together. Reported so a run that moved
+    /// nothing is told apart from a run that never started.
+    pub batches: u64,
+    /// The `(:DataMigration)` marker said `done` before this run (the run is still safe).
+    pub already_done: bool,
+}
+
+/// SET clauses of `update_chat_session`. Free-text fields are bound as
+/// `$cli_session_id`, `$title`, `$conversation_id`, `$preview` by the caller
+/// (the former inline escaping missed backslashes, so a trailing `\\` in a
+/// title broke out of the string literal).
+pub(crate) fn chat_session_update_clauses(
+    has_cli_session_id: bool,
+    has_title: bool,
+    message_count: Option<i64>,
+    total_cost_usd: Option<f64>,
+    has_conversation_id: bool,
+    has_preview: bool,
+) -> Vec<String> {
+    let mut c = vec!["s.updated_at = datetime()".to_string()];
+    if has_cli_session_id {
+        c.push("s.cli_session_id = $cli_session_id".to_string());
+    }
+    if has_title {
+        c.push("s.title = $title".to_string());
+    }
+    if let Some(v) = message_count {
+        c.push(format!("s.message_count = {}", v));
+    }
+    if let Some(v) = total_cost_usd.filter(|v| v.is_finite()) {
+        c.push(format!("s.total_cost_usd = {}", v));
+    }
+    if has_conversation_id {
+        c.push("s.conversation_id = $conversation_id".to_string());
+    }
+    if has_preview {
+        c.push("s.preview = $preview".to_string());
+    }
+    c
+}
+
+impl Neo4jClient {
+    // ========================================================================
+    // Chat Session operations
+    // ========================================================================
+
+    /// Create a new chat session, optionally linking to a project via slug
+    pub async fn create_chat_session(&self, session: &ChatSessionNode) -> Result<()> {
+        let q = if session.project_slug.is_some() {
+            query(
+                r#"
+                CREATE (s:ChatSession {
+                    id: $id,
+                    cli_session_id: $cli_session_id,
+                    project_slug: $project_slug,
+                    workspace_slug: $workspace_slug,
+                    cwd: $cwd,
+                    title: $title,
+                    model: $model,
+                    created_at: datetime($created_at),
+                    updated_at: datetime($updated_at),
+                    message_count: $message_count,
+                    total_cost_usd: $total_cost_usd,
+                    conversation_id: $conversation_id,
+                    preview: $preview,
+                    permission_mode: $permission_mode,
+                    add_dirs: $add_dirs,
+                    spawned_by: $spawned_by,
+                    provider_id: $provider_id,
+                    routed_by: $routed_by,
+                    routing_mode: $routing_mode,
+                    routing_pool: $routing_pool,
+                    capabilities: $capabilities,
+                    engine: $engine,
+                    resume_token: $resume_token,
+                    execution_place: $execution_place,
+                    project_inferred: $project_inferred,
+                    access: $access,
+                    owner: $owner,
+                    file_scope_lifted: $file_scope_lifted,
+                    mirror_of: $mirror_of,
+                    shell_moved: false
+                })
+                WITH s
+                OPTIONAL MATCH (p:Project {slug: $project_slug})
+                FOREACH (_ IN CASE WHEN p IS NOT NULL THEN [1] ELSE [] END |
+                    CREATE (p)-[:HAS_CHAT_SESSION]->(s)
+                )
+                "#,
+            )
+        } else {
+            query(
+                r#"
+                CREATE (s:ChatSession {
+                    id: $id,
+                    cli_session_id: $cli_session_id,
+                    project_slug: $project_slug,
+                    workspace_slug: $workspace_slug,
+                    cwd: $cwd,
+                    title: $title,
+                    model: $model,
+                    created_at: datetime($created_at),
+                    updated_at: datetime($updated_at),
+                    message_count: $message_count,
+                    total_cost_usd: $total_cost_usd,
+                    conversation_id: $conversation_id,
+                    preview: $preview,
+                    permission_mode: $permission_mode,
+                    add_dirs: $add_dirs,
+                    spawned_by: $spawned_by,
+                    provider_id: $provider_id,
+                    routed_by: $routed_by,
+                    routing_mode: $routing_mode,
+                    routing_pool: $routing_pool,
+                    capabilities: $capabilities,
+                    engine: $engine,
+                    resume_token: $resume_token,
+                    execution_place: $execution_place,
+                    project_inferred: $project_inferred,
+                    access: $access,
+                    owner: $owner,
+                    file_scope_lifted: $file_scope_lifted,
+                    mirror_of: $mirror_of,
+                    shell_moved: false
+                })
+                "#,
+            )
+        };
+
+        self.graph
+            .run(
+                q.param("id", session.id.to_string())
+                    .param(
+                        "cli_session_id",
+                        session.cli_session_id.clone().unwrap_or_default(),
+                    )
+                    .param(
+                        "project_slug",
+                        session.project_slug.clone().unwrap_or_default(),
+                    )
+                    .param(
+                        "workspace_slug",
+                        session.workspace_slug.clone().unwrap_or_default(),
+                    )
+                    .param("cwd", session.cwd.clone())
+                    .param("title", session.title.clone().unwrap_or_default())
+                    .param("model", session.model.clone())
+                    .param("created_at", session.created_at.to_rfc3339())
+                    .param("updated_at", session.updated_at.to_rfc3339())
+                    .param("message_count", session.message_count)
+                    .param("total_cost_usd", session.total_cost_usd.unwrap_or(0.0))
+                    .param(
+                        "conversation_id",
+                        session.conversation_id.clone().unwrap_or_default(),
+                    )
+                    .param("preview", session.preview.clone().unwrap_or_default())
+                    .param(
+                        "permission_mode",
+                        session.permission_mode.clone().unwrap_or_default(),
+                    )
+                    .param(
+                        "add_dirs",
+                        serde_json::to_string(&session.add_dirs.clone().unwrap_or_default())
+                            .unwrap_or_else(|_| "[]".to_string()),
+                    )
+                    .param("spawned_by", session.spawned_by.clone().unwrap_or_default())
+                    .param(
+                        "provider_id",
+                        session.provider_id.clone().unwrap_or_default(),
+                    )
+                    .param("routed_by", session.routed_by.clone().unwrap_or_default())
+                    .param(
+                        "routing_mode",
+                        session.routing_mode.clone().unwrap_or_default(),
+                    )
+                    .param(
+                        "routing_pool",
+                        session.routing_pool.clone().unwrap_or_default(),
+                    )
+                    .param(
+                        "capabilities",
+                        session.capabilities.clone().unwrap_or_default(),
+                    )
+                    .param("engine", session.engine.clone().unwrap_or_default())
+                    .param(
+                        "resume_token",
+                        session.resume_token.clone().unwrap_or_default(),
+                    )
+                    .param("execution_place", session.execution_place.as_str())
+                    .param("project_inferred", session.project_inferred)
+                    .param("access", session.access.as_str())
+                    .param("owner", session.owner.clone().unwrap_or_default())
+                    .param("file_scope_lifted", session.file_scope_lifted)
+                    .param("mirror_of", session.mirror_of.clone().unwrap_or_default()),
+            )
+            .await?;
+
+        // Lineage as a real edge, written IN ADDITION to the `spawned_by` JSON
+        // property (reads still use the JSON). MERGE on the bare relationship so
+        // an edge already written by `create_spawned_by_relation` is reused.
+        if let Some(parent) = session
+            .spawned_by
+            .as_deref()
+            .and_then(crate::chat::types::SpawnedBy::from_json_str)
+            .and_then(|sb| sb.parent_session_id())
+        {
+            self.graph
+                .run(
+                    query(
+                        "MATCH (c:ChatSession {id: $child_id}) \
+                         MATCH (p:ChatSession {id: $parent_id}) \
+                         MERGE (c)-[r:SPAWNED_BY]->(p) \
+                         ON CREATE SET r.created_at = datetime()",
+                    )
+                    .param("child_id", session.id.to_string())
+                    .param("parent_id", parent.to_string()),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Get a chat session by ID
+    pub async fn get_chat_session(&self, id: Uuid) -> Result<Option<ChatSessionNode>> {
+        let q = query("MATCH (s:ChatSession {id: $id}) RETURN s").param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            Ok(Some(Self::parse_chat_session_node(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List chat sessions with optional project_slug filter.
+    /// When `include_detached` is false (default), sessions with a non-empty `spawned_by`
+    /// field are excluded (e.g. PlanRunner sub-sessions).
+    pub async fn list_chat_sessions(
+        &self,
+        project_slug: Option<&str>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+        include_detached: bool,
+    ) -> Result<(Vec<ChatSessionNode>, usize)> {
+        // Filter clause to exclude detached (spawned) sessions unless explicitly requested
+        let detached_filter = if include_detached {
+            ""
+        } else {
+            " AND (s.spawned_by IS NULL OR s.spawned_by = '') \
+             AND NOT EXISTS { (s)-[:SPAWNED_BY]->(:ChatSession) }"
+        };
+
+        let (data_query, count_query) = if let Some(slug) = project_slug {
+            (
+                query(&format!(
+                    r#"
+                    MATCH (s:ChatSession {{project_slug: $slug}})
+                    WHERE true{detached_filter}
+                    RETURN s ORDER BY s.updated_at DESC
+                    SKIP $offset LIMIT $limit
+                    "#,
+                ))
+                .param("slug", slug.to_string())
+                .param("offset", offset as i64)
+                .param("limit", limit as i64),
+                query(&format!(
+                    "MATCH (s:ChatSession {{project_slug: $slug}}) WHERE true{detached_filter} RETURN count(s) AS total",
+                ))
+                    .param("slug", slug.to_string()),
+            )
+        } else if let Some(ws) = workspace_slug {
+            // Match sessions directly tagged with workspace_slug
+            // OR sessions whose project_slug belongs to a project in this workspace
+            (
+                query(&format!(
+                    r#"
+                    OPTIONAL MATCH (w:Workspace {{slug: $ws}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)
+                    WITH collect(proj.slug) AS ws_project_slugs
+                    MATCH (s:ChatSession)
+                    WHERE (s.workspace_slug = $ws
+                       OR (s.project_slug IS NOT NULL AND s.project_slug IN ws_project_slugs)){detached_filter}
+                    RETURN s ORDER BY s.updated_at DESC
+                    SKIP $offset LIMIT $limit
+                    "#,
+                ))
+                .param("ws", ws.to_string())
+                .param("offset", offset as i64)
+                .param("limit", limit as i64),
+                query(&format!(
+                    r#"
+                    OPTIONAL MATCH (w:Workspace {{slug: $ws}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)
+                    WITH collect(proj.slug) AS ws_project_slugs
+                    MATCH (s:ChatSession)
+                    WHERE (s.workspace_slug = $ws
+                       OR (s.project_slug IS NOT NULL AND s.project_slug IN ws_project_slugs)){detached_filter}
+                    RETURN count(s) AS total
+                    "#,
+                ))
+                .param("ws", ws.to_string()),
+            )
+        } else {
+            (
+                query(&format!(
+                    r#"
+                    MATCH (s:ChatSession)
+                    WHERE true{detached_filter}
+                    RETURN s ORDER BY s.updated_at DESC
+                    SKIP $offset LIMIT $limit
+                    "#,
+                ))
+                .param("offset", offset as i64)
+                .param("limit", limit as i64),
+                query(&format!(
+                    "MATCH (s:ChatSession) WHERE true{detached_filter} RETURN count(s) AS total",
+                )),
+            )
+        };
+
+        let mut sessions = Vec::new();
+        let mut result = self.graph.execute(data_query).await?;
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            sessions.push(Self::parse_chat_session_node(&node)?);
+        }
+
+        let mut count_result = self.graph.execute(count_query).await?;
+        let total = if let Some(row) = count_result.next().await? {
+            row.get::<i64>("total")? as usize
+        } else {
+            0
+        };
+
+        Ok((sessions, total))
+    }
+
+    /// Update a chat session (partial, None fields are skipped)
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_chat_session(
+        &self,
+        id: Uuid,
+        cli_session_id: Option<String>,
+        title: Option<String>,
+        message_count: Option<i64>,
+        total_cost_usd: Option<f64>,
+        conversation_id: Option<String>,
+        preview: Option<String>,
+    ) -> Result<Option<ChatSessionNode>> {
+        let set_clauses = chat_session_update_clauses(
+            cli_session_id.is_some(),
+            title.is_some(),
+            message_count,
+            total_cost_usd,
+            conversation_id.is_some(),
+            preview.is_some(),
+        );
+
+        let cypher = format!(
+            "MATCH (s:ChatSession {{id: $id}}) SET {} RETURN s",
+            set_clauses.join(", ")
+        );
+
+        let mut q = query(&cypher).param("id", id.to_string());
+        if let Some(v) = cli_session_id {
+            q = q.param("cli_session_id", v);
+        }
+        if let Some(v) = title {
+            q = q.param("title", v);
+        }
+        if let Some(v) = conversation_id {
+            q = q.param("conversation_id", v);
+        }
+        if let Some(v) = preview {
+            q = q.param("preview", v);
+        }
+        let mut result = self.graph.execute(q).await?;
+
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            Ok(Some(Self::parse_chat_session_node(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Binds the project a session actually works on, when the node carries none.
+    ///
+    /// A session opened without a `project_slug` resolves its project from its working
+    /// directory on every turn, but the node kept `project_slug = null` for ever: the
+    /// enrichment knew the project while `/api/agents/live` reported an agent without
+    /// one, and the dashboard could not place it in its project. Idempotent by
+    /// construction: the WHERE clause refuses any session that already has a slug, so
+    /// an explicit (or already bound) project is never overwritten.
+    pub async fn bind_chat_session_project(&self, id: Uuid, project_slug: &str) -> Result<bool> {
+        let cypher = "MATCH (s:ChatSession {id: $id}) \
+                      WHERE s.project_slug IS NULL OR trim(s.project_slug) = '' \
+                      SET s.project_slug = $slug, s.updated_at = datetime() \
+                      RETURN s";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("slug", project_slug.to_string());
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// Update the permission_mode field on a chat session node
+    pub async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()> {
+        let cypher = "MATCH (s:ChatSession {id: $id}) SET s.permission_mode = $mode, s.updated_at = datetime()";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("mode", mode.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Adds `delta_usd` to the children spend of a session (PYSR-3); returns the new total.
+    /// Atomic in the database (one `SET x = coalesce(x, 0) + $delta`).
+    pub async fn add_chat_session_children_cost(&self, id: Uuid, delta_usd: f64) -> Result<f64> {
+        let delta = if delta_usd.is_finite() && delta_usd > 0.0 {
+            delta_usd
+        } else {
+            0.0
+        };
+        let cypher = "MATCH (s:ChatSession {id: $id}) \
+             SET s.children_cost_usd = coalesce(s.children_cost_usd, 0.0) + $delta \
+             RETURN s.children_cost_usd AS total";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("delta", delta);
+        let mut rows = self.graph.execute(q).await?;
+        Ok(match rows.next().await? {
+            Some(row) => row.get::<f64>("total").unwrap_or(0.0),
+            None => 0.0,
+        })
+    }
+
+    /// The children spend of a session (`0.0` when none).
+    pub async fn get_chat_session_children_cost(&self, id: Uuid) -> Result<f64> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $id}) RETURN coalesce(s.children_cost_usd, 0.0) AS total",
+        )
+        .param("id", id.to_string());
+        let mut rows = self.graph.execute(q).await?;
+        Ok(match rows.next().await? {
+            Some(row) => row.get::<f64>("total").unwrap_or(0.0),
+            None => 0.0,
+        })
+    }
+
+    /// Records whether a person lifted the file scope of a chat session (decision fce98b8a).
+    pub async fn update_chat_session_file_scope_lifted(
+        &self,
+        id: Uuid,
+        lifted: bool,
+    ) -> Result<()> {
+        let cypher = "MATCH (s:ChatSession {id: $id}) SET s.file_scope_lifted = $lifted, s.updated_at = datetime()";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("lifted", lifted);
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Update the model field on a chat session node.
+    ///
+    /// The model is otherwise written only at create time, so a mid-session model
+    /// switch would be lost the moment the session went dormant and was resumed
+    /// (resume reads `s.model` back from Neo4j). Persisting here makes the chosen
+    /// model survive idle-cleanup and respawn.
+    pub async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()> {
+        let cypher =
+            "MATCH (s:ChatSession {id: $id}) SET s.model = $model, s.updated_at = datetime()";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("model", model.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Replace the routing of one conversation; an absent value is stored empty (read back
+    /// as `None`, like every optional session property). `false`: no such session.
+    pub async fn update_chat_session_routing(
+        &self,
+        id: Uuid,
+        routing_mode: Option<&str>,
+        routing_pool: Option<&str>,
+        routed_by: Option<&str>,
+    ) -> Result<bool> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $id}) \
+             SET s.routing_mode = $routing_mode, s.routing_pool = $routing_pool, \
+                 s.routed_by = $routed_by, s.updated_at = datetime() \
+             RETURN s.id AS id",
+        )
+        .param("id", id.to_string())
+        .param("routing_mode", routing_mode.unwrap_or_default().to_string())
+        .param("routing_pool", routing_pool.unwrap_or_default().to_string())
+        .param("routed_by", routed_by.unwrap_or_default().to_string());
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// Re-target a chat session IN PLACE to another provider (B-SW phase 1). Providers do
+    /// not share a session format and a resume token is refused across families, so the
+    /// provider-specific fields are cleared (read back as `None`, like every optional
+    /// session property), and `engine` is written to the engine the target runs on.
+    /// `false`: no such session.
+    pub async fn update_chat_session_provider(
+        &self,
+        id: Uuid,
+        provider_id: &str,
+        model: &str,
+        routed_by: &str,
+        engine: &str,
+    ) -> Result<bool> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $id}) \
+             SET s.provider_id = $provider_id, s.model = $model, s.routed_by = $routed_by, \
+                 s.resume_token = '', s.capabilities = '', s.cli_session_id = '', \
+                 s.engine = $engine, s.updated_at = datetime() \
+             RETURN s.id AS id",
+        )
+        .param("id", id.to_string())
+        .param("provider_id", provider_id.to_string())
+        .param("model", model.to_string())
+        .param("routed_by", routed_by.to_string())
+        .param("engine", engine.to_string());
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// Restore the provider fields of a chat session after a failed in-place re-target:
+    /// `provider_id` is `provider_id` (the resolved id it was on), while the rest comes back
+    /// from `node` (the session as it was before the re-target). An absent optional field is
+    /// written empty and reads back `None`, like every optional session property.
+    pub async fn restore_chat_session_provider(
+        &self,
+        node: &ChatSessionNode,
+        provider_id: &str,
+    ) -> Result<bool> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $id}) \
+             SET s.provider_id = $provider_id, s.model = $model, s.routed_by = $routed_by, \
+                 s.resume_token = $resume_token, s.capabilities = $capabilities, \
+                 s.cli_session_id = $cli_session_id, s.engine = $engine, \
+                 s.updated_at = datetime() \
+             RETURN s.id AS id",
+        )
+        .param("id", node.id.to_string())
+        .param("provider_id", provider_id.to_string())
+        .param("model", node.model.clone())
+        .param("routed_by", node.routed_by.clone().unwrap_or_default())
+        .param(
+            "resume_token",
+            node.resume_token.clone().unwrap_or_default(),
+        )
+        .param(
+            "capabilities",
+            node.capabilities.clone().unwrap_or_default(),
+        )
+        .param(
+            "cli_session_id",
+            node.cli_session_id.clone().unwrap_or_default(),
+        )
+        .param("engine", node.engine.clone().unwrap_or_default());
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// One setting document of the provider harness.
+    pub async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        let q = query("MATCH (s:LlmSetting {scope: $scope, key: $key}) RETURN s.value AS value")
+            .param("scope", scope.to_string())
+            .param("key", key.to_string());
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(Some(row.get::<String>("value")?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Creates or replaces a setting document.
+    pub async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()> {
+        let q = query(
+            "MERGE (s:LlmSetting {scope: $scope, key: $key}) \
+             SET s.value = $value, s.updated_at = datetime()",
+        )
+        .param("scope", scope.to_string())
+        .param("key", key.to_string())
+        .param("value", value.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Deletes a setting document; `true` when it existed.
+    pub async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool> {
+        let q = query(
+            "MATCH (s:LlmSetting {scope: $scope, key: $key}) \
+             WITH s, count(s) AS n DELETE s RETURN n",
+        )
+        .param("scope", scope.to_string())
+        .param("key", key.to_string());
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// All documents of a scope whose key starts with `prefix`.
+    pub async fn list_llm_settings(
+        &self,
+        scope: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let q = query(
+            "MATCH (s:LlmSetting {scope: $scope}) WHERE s.key STARTS WITH $prefix \
+             RETURN s.key AS key, s.value AS value ORDER BY s.key",
+        )
+        .param("scope", scope.to_string())
+        .param("prefix", prefix.to_string());
+        let mut result = self.graph.execute(q).await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            out.push((row.get::<String>("key")?, row.get::<String>("value")?));
+        }
+        Ok(out)
+    }
+
+    /// Record the capability snapshot and the resume token of a harness session.
+    /// A `None` argument leaves the stored value untouched.
+    pub async fn update_chat_session_harness(
+        &self,
+        id: Uuid,
+        capabilities: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> Result<()> {
+        let cypher = "MATCH (s:ChatSession {id: $id}) \
+            SET s.capabilities = coalesce($capabilities, s.capabilities), \
+                s.resume_token = coalesce($resume_token, s.resume_token), \
+                s.updated_at = datetime()";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("capabilities", capabilities.map(str::to_string))
+            .param("resume_token", resume_token.map(str::to_string));
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// See [`crate::neo4j::traits::GraphStore::set_chat_session_fingerprint`].
+    pub async fn set_chat_session_fingerprint(&self, id: Uuid, fingerprint: &str) -> Result<()> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $id}) SET s.resume_fingerprint = $fp, s.updated_at = datetime()",
+        )
+        .param("id", id.to_string())
+        .param("fp", fingerprint.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// See [`crate::neo4j::traits::GraphStore::get_chat_session_fingerprint`].
+    pub async fn get_chat_session_fingerprint(&self, id: Uuid) -> Result<Option<String>> {
+        let q = query("MATCH (s:ChatSession {id: $id}) RETURN s.resume_fingerprint AS fp")
+            .param("id", id.to_string());
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let fp: Option<String> = row.get("fp").unwrap_or(None);
+            return Ok(fp.filter(|f| !f.is_empty()));
+        }
+        Ok(None)
+    }
+
+    /// See [`crate::neo4j::traits::GraphStore::set_chat_session_shell_moved`].
+    pub async fn set_chat_session_shell_moved(&self, id: Uuid) -> Result<()> {
+        let q = query("MATCH (s:ChatSession {id: $id}) SET s.shell_moved = true")
+            .param("id", id.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// See [`crate::neo4j::traits::GraphStore::get_chat_session_shell_moved`].
+    pub async fn get_chat_session_shell_moved(&self, id: Uuid) -> Result<Option<bool>> {
+        let q = query("MATCH (s:ChatSession {id: $id}) RETURN s.shell_moved AS moved")
+            .param("id", id.to_string());
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            // A value of another type reads as `None` on purpose: the caller takes the
+            // shell as moved (fail safe).
+            Some(row) => Ok(row.get::<Option<bool>>("moved").unwrap_or(None)),
+            None => Ok(None),
+        }
+    }
+
+    /// Backfill title and preview for sessions that don't have them yet.
+    /// Uses the first user_message event stored in Neo4j.
+    /// Returns the number of sessions updated.
+    pub async fn backfill_chat_session_previews(&self) -> Result<usize> {
+        // Find sessions without preview, get their first user_message event
+        let q = query(
+            r#"
+            MATCH (s:ChatSession)
+            WHERE s.preview IS NULL OR s.preview = ''
+            OPTIONAL MATCH (s)-[:HAS_EVENT]->(e:ChatEvent {event_type: 'user_message'})
+            WITH s, e ORDER BY e.seq ASC
+            WITH s, collect(e)[0] AS first_event
+            WHERE first_event IS NOT NULL
+            RETURN s.id AS session_id, first_event.data AS event_data
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        let mut updates = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let session_id: String = row.get("session_id")?;
+            let event_data: String = row.get("event_data").unwrap_or_default();
+
+            // Parse the event data JSON to extract content
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&event_data) {
+                // The title rule of every session (`chat::session_record`).
+                if let Some((title, preview)) = data
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::chat::session_record::title_and_preview)
+                {
+                    updates.push((session_id, title, preview));
+                }
+            }
+        }
+
+        let count = updates.len();
+        for (session_id, title, preview) in updates {
+            let update_q = query(
+                r#"
+                MATCH (s:ChatSession {id: $id})
+                WHERE s.preview IS NULL OR s.preview = ''
+                SET s.title = $title, s.preview = $preview, s.updated_at = datetime()
+                "#,
+            )
+            .param("id", session_id)
+            .param("title", title)
+            .param("preview", preview);
+
+            let _ = self.graph.run(update_q).await;
+        }
+
+        Ok(count)
+    }
+
+    /// Delete a chat session
+    pub async fn delete_chat_session(&self, id: Uuid) -> Result<bool> {
+        // First check existence, then delete
+        let check =
+            query("MATCH (s:ChatSession {id: $id}) RETURN s.id AS sid").param("id", id.to_string());
+        let mut check_result = self.graph.execute(check).await?;
+        let exists = check_result.next().await?.is_some();
+
+        if exists {
+            // Anchors and their journal belong to the session; their targets do not.
+            for cypher in [
+                "MATCH (a:Anchor {session_id: $id}) DELETE a",
+                "MATCH (e:AnchorEvent {session_id: $id}) DELETE e",
+            ] {
+                self.graph
+                    .run(query(cypher).param("id", id.to_string()))
+                    .await?;
+            }
+            // The episode its close left goes with it IN THE SAME STATEMENT. A close episode
+            // written concurrently commits after (its MATCH finds no session: nothing written)
+            // or before (deleted here, or by the sweep just below).
+            let q = query(
+                "MATCH (s:ChatSession {id: $id}) \
+                 OPTIONAL MATCH (e:SessionEpisode {session_id: $id}) \
+                 DETACH DELETE e, s",
+            )
+            .param("id", id.to_string());
+            self.graph.run(q).await?;
+            // A close episode whose write held the session's lock while the delete above
+            // waited lost its link to it (DETACH): it was committed BEFORE the delete, so
+            // it is here now, unlinked — and no write can make another one (no session).
+            self.graph
+                .run(
+                    query(
+                        "MATCH (e:SessionEpisode {session_id: $id}) \
+                         WHERE NOT (e)-[:EPISODE_OF]->() DETACH DELETE e",
+                    )
+                    .param("id", id.to_string()),
+                )
+                .await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// See [`crate::neo4j::GraphStore::save_session_episode`]. The episode is kept whole
+    /// as JSON (`payload`); `session_id`, `project_id` and `collected_at` are copied out
+    /// for the uniqueness constraint and the listing.
+    pub async fn save_session_episode(
+        &self,
+        episode: &crate::episodes::models::Episode,
+    ) -> Result<bool> {
+        let Some(session) = episode.session.as_ref() else {
+            return Ok(false);
+        };
+        // The vector lives in its own property (the `session_episode_embeddings` index
+        // reads it), not in the JSON: a 768-float payload would be read on every listing.
+        let mut without_vector = episode.clone();
+        let embedding = without_vector.embedding.take();
+        let payload = serde_json::to_string(&without_vector)?;
+        // MATCH first: no session, no row, nothing written — in the same statement.
+        let set_vector = if embedding.is_some() {
+            ", e.embedding = $embedding"
+        } else {
+            ""
+        };
+        let mut q = query(&format!(
+            "MATCH (s:ChatSession {{id: $sid}}) \
+             MERGE (e:SessionEpisode {{session_id: $sid}}) \
+             SET e.id = $id, e.project_id = $pid, e.collected_at = $at, e.payload = $payload{set_vector} \
+             MERGE (e)-[:EPISODE_OF]->(s) \
+             RETURN e.id AS id"
+        ))
+        .param("sid", session.session_id.to_string())
+        .param("id", episode.id.to_string())
+        .param("pid", episode.project_id.to_string())
+        .param("at", episode.collected_at.to_rfc3339())
+        .param("payload", payload);
+        if let Some(vector) = embedding {
+            q = q.param("embedding", vector);
+        }
+        let mut result = self.graph.execute(q).await?;
+        if result.next().await?.is_none() {
+            return Ok(false);
+        }
+
+        // The agent that lived this episode becomes a node and owns the edge, at the
+        // write. Best effort: an episode is more valuable than the edge that names it.
+        if let Some(agent) = session.agent_id {
+            if let Err(e) = self.ensure_agent(agent, None).await {
+                tracing::warn!(error = %e, "the node of the agent of an episode could not be made");
+            }
+            if let Err(e) = self.link_agent_lived(agent, episode.id).await {
+                tracing::warn!(error = %e, "the episode could not be given to its agent");
+            }
+        }
+        Ok(true)
+    }
+
+    /// See [`crate::neo4j::GraphStore::search_episodes_by_embedding`]: the session
+    /// episodes of `project_id` closest to `embedding`, through the HNSW index
+    /// `session_episode_embeddings`. The index returns its `k` nearest over EVERY
+    /// project, so `k` is wider than `limit` and the project is filtered after. An
+    /// episode whose session is gone (no `EPISODE_OF`) is never a hit. A Neo4j
+    /// without vector indexes errs here, and the reflex that calls this logs and
+    /// recalls nothing.
+    pub async fn search_episodes_by_embedding(
+        &self,
+        project_id: Uuid,
+        embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
+        if embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let k = (limit * 8).clamp(limit, 64) as i64;
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "CALL db.index.vector.queryNodes('session_episode_embeddings', $k, $embedding) \
+                     YIELD node AS e, score \
+                     WHERE e.project_id = $pid AND (e)-[:EPISODE_OF]->(:ChatSession) \
+                     RETURN e.payload AS payload, score \
+                     ORDER BY score DESC LIMIT $limit",
+                )
+                .param("k", k)
+                .param("embedding", embedding.to_vec())
+                .param("pid", project_id.to_string())
+                .param("limit", limit as i64),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let payload: String = row.get("payload")?;
+            let score: f64 = row.get("score")?;
+            match serde_json::from_str(&payload) {
+                Ok(episode) => out.push((episode, score)),
+                Err(e) => tracing::warn!(error = %e, "unreadable SessionEpisode payload, skipped"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::agent_identity_namespace`]. One MERGE on a key
+    /// the `agent_identity_root_key` constraint makes unique: a concurrent first call
+    /// matches the node the other created, and reads its namespace.
+    pub async fn agent_identity_namespace(&self) -> Result<Uuid> {
+        // Cached once read: the root never changes after it is made.
+        self.agent_identity_root
+            .get_or_try_init(|| self.merge_agent_identity_root())
+            .await
+            .copied()
+    }
+
+    async fn merge_agent_identity_root(&self) -> Result<Uuid> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MERGE (r:AgentIdentityRoot {key: 'root'}) \
+                     ON CREATE SET r.namespace = $ns, r.created_at = datetime() \
+                     RETURN r.namespace AS ns",
+                )
+                .param("ns", Uuid::new_v4().to_string()),
+            )
+            .await?;
+        let row = result
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("MERGE of the agent identity root returned no row"))?;
+        let ns: String = row.get("ns")?;
+        Ok(Uuid::parse_str(&ns)?)
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::ensure_agent`]. The only agent of this store is its
+    /// durable self (the root): any other id is refused, never made a node. The model, when
+    /// known, is a dated facet beside the self (`FACET_OF`), one per model name; it never
+    /// becomes the identity. One statement, so a concurrent first call matches what the
+    /// other made (ids are under a uniqueness constraint). Returns `true` when the self was
+    /// created by this call.
+    pub async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool> {
+        let root = self.agent_identity_namespace().await?;
+        if agent_id != root {
+            anyhow::bail!("{agent_id} is not the durable self of this store");
+        }
+        let facet = model.and_then(|m| crate::notes::provenance::model_facet_id(root, m));
+        let model_name = model
+            .and_then(crate::notes::provenance::normalized_model)
+            .unwrap_or_default();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MERGE (s:Agent {id: $root}) ON CREATE SET s.kind = 'self', s.created_at = $now \
+                     WITH s, s.created_at = $now AS created \
+                     FOREACH (_ IN CASE WHEN $facet = '' THEN [] ELSE [1] END | \
+                         MERGE (f:Agent {id: $facet}) \
+                         ON CREATE SET f.kind = 'model', f.created_at = $now \
+                         SET f.model = $model, f.last_seen = $now \
+                         MERGE (f)-[:FACET_OF]->(s)) \
+                     RETURN created",
+                )
+                .param("root", root.to_string())
+                .param("facet", facet.map(|f| f.to_string()).unwrap_or_default())
+                .param("now", now)
+                .param("model", model_name),
+            )
+            .await?;
+        let row = result
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("MERGE of an agent returned no row"))?;
+        Ok(row.get::<bool>("created").unwrap_or(false))
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::backfill_agents`].
+    pub async fn backfill_agents(&self) -> Result<AgentBackfill> {
+        let before = self.count_model_agents().await?;
+        let root = self.agent_identity_namespace().await?;
+
+        let mut from_notes = std::collections::HashSet::new();
+        let mut note_edges: Vec<(Uuid, Uuid)> = Vec::new();
+        let mut rows = self
+            .graph
+            .execute(query(
+                "MATCH (n:Note) WHERE n.created_by STARTS WITH 'agent:' \
+                 RETURN n.id AS note, n.created_by AS by",
+            ))
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let by: String = row.get("by")?;
+            if let Some(agent) = crate::notes::provenance::parse_actor(&by) {
+                from_notes.insert(agent);
+                if let Some(note) = row
+                    .get::<String>("note")
+                    .ok()
+                    .and_then(|s| Uuid::parse_str(&s).ok())
+                {
+                    note_edges.push((agent, note));
+                }
+            }
+        }
+
+        let mut from_episodes = std::collections::HashSet::new();
+        let mut episode_edges: Vec<(Uuid, Uuid)> = Vec::new();
+        let mut rows = self
+            .graph
+            .execute(query(
+                "MATCH (e:SessionEpisode) RETURN e.id AS episode, e.payload AS payload",
+            ))
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let payload: String = row.get("payload")?;
+            match serde_json::from_str::<crate::episodes::models::Episode>(&payload) {
+                Ok(episode) => {
+                    if let Some(id) = episode.session.and_then(|s| s.agent_id) {
+                        from_episodes.insert(id);
+                        episode_edges.push((id, episode.id));
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "unreadable SessionEpisode payload, skipped"),
+            }
+        }
+
+        // Actors written before the durable self named the MODEL facet: each one resolves to
+        // the self through its `FACET_OF`. An id this store does not know resolves to nothing
+        // and draws nothing, never to another agent.
+        let mut resolved: std::collections::HashMap<Uuid, Uuid> = Default::default();
+        for raw in from_notes.union(&from_episodes) {
+            if let Some(s) = self.durable_of(*raw, root).await? {
+                resolved.insert(*raw, s);
+            }
+        }
+        if !resolved.is_empty() {
+            self.ensure_agent(root, None).await?;
+        }
+        let note_edges: Vec<(Uuid, Uuid)> = note_edges
+            .into_iter()
+            .filter_map(|(a, n)| resolved.get(&a).map(|s| (*s, n)))
+            .collect();
+        let episode_edges: Vec<(Uuid, Uuid)> = episode_edges
+            .into_iter()
+            .filter_map(|(a, e)| resolved.get(&a).map(|s| (*s, e)))
+            .collect();
+
+        // The same edges the write path draws, rebuilt from what is already written: one
+        // path, not two that could diverge.
+        let mut authored = 0;
+        for (agent, note) in &note_edges {
+            if self.link_agent_authored(*agent, *note).await? {
+                authored += 1;
+            }
+        }
+        let mut lived = 0;
+        for (agent, episode) in &episode_edges {
+            if self.link_agent_lived(*agent, *episode).await? {
+                lived += 1;
+            }
+        }
+
+        let after = self.count_model_agents().await?;
+        Ok(AgentBackfill {
+            before,
+            after,
+            from_notes: from_notes.len(),
+            from_episodes: from_episodes.len(),
+            authored,
+            lived,
+        })
+    }
+
+    /// Moves the `AUTHORED` and `LIVED` edges drawn from a MODEL facet onto the durable self
+    /// of this store, so the attribution is read on the identity that writes.
+    ///
+    /// Replayable and idempotent: a second run finds no facet edge and moves nothing; an
+    /// edge already present on the self is merged, never duplicated. Work is bounded by
+    /// `batch` edges per statement, looping until none is left. The facet nodes stay (they
+    /// hold the dated model facts). The run is recorded on a `(:DataMigration)` node keyed
+    /// [`AGENT_SELF_MIGRATION_KEY`], and the edge counts are reported before and after.
+    pub async fn migrate_agent_edges_to_self(&self, batch: usize) -> Result<AgentEdgeMigration> {
+        let batch = i64::try_from(batch.max(1)).unwrap_or(i64::MAX);
+        let root = self.agent_identity_namespace().await?;
+        let before = self.count_agent_edges(root).await?;
+        let already_done =
+            self.migration_status(AGENT_SELF_MIGRATION_KEY).await? == Some("done".into());
+
+        let (moved_authored, batches_authored) = self
+            .move_facet_edges("AUTHORED", "Note", root, batch)
+            .await?;
+        let (moved_lived, batches_lived) = self
+            .move_facet_edges("LIVED", "SessionEpisode", root, batch)
+            .await?;
+
+        let after = self.count_agent_edges(root).await?;
+        self.record_agent_migration(
+            AGENT_SELF_MIGRATION_KEY,
+            moved_authored + moved_lived,
+            after.facet_total(),
+        )
+        .await?;
+        let report = AgentEdgeMigration {
+            before,
+            after,
+            moved_authored,
+            moved_lived,
+            batches: batches_authored + batches_lived,
+            already_done,
+        };
+        tracing::info!(
+            moved_authored,
+            moved_lived,
+            facet_edges_before = report.before.facet_total(),
+            facet_edges_after = report.after.facet_total(),
+            self_edges_before = report.before.self_total(),
+            self_edges_after = report.after.self_total(),
+            already_done,
+            "agent edges migrated to the durable self"
+        );
+        Ok(report)
+    }
+
+    /// Edge counts of the agent attribution of this store: from the model facets, and on
+    /// the durable self.
+    async fn count_agent_edges(&self, root: Uuid) -> Result<AgentEdgeCount> {
+        let mut count = AgentEdgeCount::default();
+        for (edge, target) in [("AUTHORED", "Note"), ("LIVED", "SessionEpisode")] {
+            let facet = self
+                .count_one(
+                    &format!(
+                        "MATCH (f:Agent {{kind: 'model'}})-[:FACET_OF]->(:Agent {{id: $root}}) \
+                     MATCH (f)-[r:{edge}]->(:{target}) RETURN count(r) AS n"
+                    ),
+                    root,
+                )
+                .await?;
+            let own = self
+                .count_one(
+                    &format!(
+                        "MATCH (:Agent {{id: $root}})-[r:{edge}]->(:{target}) RETURN count(r) AS n"
+                    ),
+                    root,
+                )
+                .await?;
+            if edge == "AUTHORED" {
+                count.facet_authored = facet;
+                count.self_authored = own;
+            } else {
+                count.facet_lived = facet;
+                count.self_lived = own;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn count_one(&self, statement: &str, root: Uuid) -> Result<usize> {
+        let mut rows = self
+            .graph
+            .execute(query(statement).param("root", root.to_string()))
+            .await?;
+        let n: i64 = match rows.next().await? {
+            Some(row) => row.get("n")?,
+            None => 0,
+        };
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// Moves one edge type, in batches, until none is left on a facet. Returns the number
+    /// of edges moved and the number of statements it took.
+    ///
+    /// Each statement deletes what it moved, so the loop converges — but a `MERGE` that
+    /// kept matching without removing the facet edge would make it spin forever. The
+    /// batch count is therefore capped by [`MAX_BATCHES`], shared with the registered
+    /// migrations: hitting the cap is an ERROR, not a quiet stop, because a silent stop
+    /// would leave attribution on the facets while reporting success.
+    async fn move_facet_edges(
+        &self,
+        edge: &str,
+        target: &str,
+        root: Uuid,
+        batch: i64,
+    ) -> Result<(usize, u64)> {
+        // The labels and the edge come from this file's own call sites, never from input.
+        let statement = format!(
+            "MATCH (s:Agent {{id: $root}}) \
+             MATCH (f:Agent {{kind: 'model'}})-[:FACET_OF]->(s) \
+             MATCH (f)-[r:{edge}]->(t:{target}) \
+             WITH s, f, r, t LIMIT $batch \
+             MERGE (s)-[m:{edge}]->(t) \
+             ON CREATE SET m.created_at = coalesce(r.created_at, $now), m.migrated_from = f.id \
+             WITH r \
+             DELETE r \
+             RETURN count(*) AS moved"
+        );
+        let mut total = 0usize;
+        let mut batches = 0u64;
+        loop {
+            check_agent_edge_cap(edge, total, batches)?;
+            let mut rows = self
+                .graph
+                .execute(
+                    query(&statement)
+                        .param("root", root.to_string())
+                        .param("batch", batch)
+                        .param("now", chrono::Utc::now().to_rfc3339()),
+                )
+                .await?;
+            let moved: i64 = match rows.next().await? {
+                Some(row) => row.get("moved")?,
+                None => 0,
+            };
+            batches += 1;
+            if moved == 0 {
+                return Ok((total, batches));
+            }
+            total += usize::try_from(moved).unwrap_or(0);
+        }
+    }
+
+    async fn migration_status(&self, key: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .graph
+            .execute(
+                query("MATCH (m:DataMigration {key: $key}) RETURN m.status AS status")
+                    .param("key", key),
+            )
+            .await?;
+        Ok(match rows.next().await? {
+            Some(row) => row.get::<String>("status").ok(),
+            None => None,
+        })
+    }
+
+    /// Records the run on the marker node.
+    ///
+    /// `status` is `done` only when NO attribution edge is left on a facet: writing
+    /// `done` while `last_facet_edges_left > 0` would make the marker claim a migration
+    /// that has not finished, and [`Self::migrate_agent_edges_to_self`] would then treat
+    /// the next run as already complete. `partial` keeps it replayable.
+    async fn record_agent_migration(
+        &self,
+        key: &str,
+        moved: usize,
+        facet_left: usize,
+    ) -> Result<()> {
+        self.graph
+            .run(
+                query(
+                    "MERGE (m:DataMigration {key: $key}) \
+                     ON CREATE SET m.created_at = $now, m.runs = 0 \
+                     SET m.status = CASE WHEN $left = 0 THEN 'done' ELSE 'partial' END, \
+                         m.runs = m.runs + 1, m.last_run_at = $now, \
+                         m.last_moved = $moved, m.last_facet_edges_left = $left",
+                )
+                .param("key", key)
+                .param("now", chrono::Utc::now().to_rfc3339())
+                .param("moved", i64::try_from(moved).unwrap_or(i64::MAX))
+                .param("left", i64::try_from(facet_left).unwrap_or(i64::MAX)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The durable self an agent id stands for in this store: the root itself, or the self
+    /// a model facet of this store hangs under (`FACET_OF`, the actors written before the
+    /// self was the identity). `None` for any other id: a foreign agent is never resolved.
+    async fn durable_of(&self, id: Uuid, root: Uuid) -> Result<Option<Uuid>> {
+        if id == root {
+            return Ok(Some(root));
+        }
+        let mut rows = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (f:Agent {id: $id, kind: 'model'})-[:FACET_OF]->(s:Agent {id: $root}) \
+                     RETURN count(f) AS n",
+                )
+                .param("id", id.to_string())
+                .param("root", root.to_string()),
+            )
+            .await?;
+        let n: i64 = match rows.next().await? {
+            Some(row) => row.get("n")?,
+            None => 0,
+        };
+        Ok((n > 0).then_some(root))
+    }
+
+    async fn count_model_agents(&self) -> Result<usize> {
+        let mut rows = self
+            .graph
+            .execute(query(
+                "MATCH (a:Agent {kind: 'model'}) RETURN count(a) AS n",
+            ))
+            .await?;
+        let n: i64 = match rows.next().await? {
+            Some(row) => row.get("n")?,
+            None => 0,
+        };
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::link_agent_authored`].
+    pub async fn link_agent_authored(&self, agent_id: Uuid, note_id: Uuid) -> Result<bool> {
+        self.link_agent_to("AUTHORED", agent_id, "Note", note_id)
+            .await
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::link_agent_lived`].
+    pub async fn link_agent_lived(&self, agent_id: Uuid, episode_id: Uuid) -> Result<bool> {
+        self.link_agent_to("LIVED", agent_id, "SessionEpisode", episode_id)
+            .await
+    }
+
+    /// One MERGE for the plain attribution edges (`AUTHORED`, `LIVED`): they carry no
+    /// measure, only the fact, so `created_at` is all they record. A missing endpoint
+    /// draws nothing — a note or an episode deleted between the read and the write is a
+    /// skip, not a failure of the caller.
+    async fn link_agent_to(
+        &self,
+        edge: &str,
+        agent_id: Uuid,
+        target_label: &str,
+        target_id: Uuid,
+    ) -> Result<bool> {
+        // Both labels come from this file's own call sites, never from input.
+        // « Created » must mean « created by THIS call », not « recent ». A window would
+        // call a two-second-old edge new, which is precisely what a backfill re-run does.
+        // The stamp is ours, so equality is the proof.
+        let now = chrono::Utc::now().to_rfc3339();
+        let statement = format!(
+            "MATCH (a:Agent {{id: $agent}}), (t:{target_label} {{id: $target}}) \
+             MERGE (a)-[r:{edge}]->(t) \
+             ON CREATE SET r.created_at = $now \
+             RETURN r.created_at = $now AS created"
+        );
+        let mut result = self
+            .graph
+            .execute(
+                query(&statement)
+                    .param("agent", agent_id.to_string())
+                    .param("target", target_id.to_string())
+                    .param("now", now),
+            )
+            .await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<bool>("created").unwrap_or(false)),
+            None => Ok(false),
+        }
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::link_agent_knows`].
+    pub async fn link_agent_knows(
+        &self,
+        agent_id: Uuid,
+        note_id: Uuid,
+        scope: crate::graph::rules::KnowledgeScope,
+        project: Option<Uuid>,
+        provenance: &crate::graph::rules::AccountableProvenance,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (a:Agent {id: $agent}), (n:Note {id: $note}) \
+                     MERGE (a)-[r:KNOWS]->(n) \
+                     ON CREATE SET r.created_at = $now \
+                     SET r.rule = $rule, r.measure = $measure, r.at = $at, \
+                         r.scope = $scope, r.project_id = $project, r.score = $score \
+                     RETURN r.created_at = $now AS created",
+                )
+                .param("agent", agent_id.to_string())
+                .param("note", note_id.to_string())
+                .param("now", now)
+                .param("rule", provenance.rule.clone())
+                .param("measure", provenance.measure.clone())
+                .param("at", provenance.at.clone())
+                .param("scope", scope.as_str())
+                .param("project", project.map(|p| p.to_string()))
+                .param("score", provenance.score),
+            )
+            .await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<bool>("created").unwrap_or(false)),
+            None => Ok(false),
+        }
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::link_agent_uses`].
+    pub async fn link_agent_uses(
+        &self,
+        agent_id: Uuid,
+        label: &str,
+        target_id: Uuid,
+        provenance: &crate::graph::rules::AccountableProvenance,
+    ) -> Result<bool> {
+        if !crate::graph::rules::USABLE_LABELS.contains(&label) {
+            anyhow::bail!(
+                "{label} is not a usable label: {}",
+                crate::graph::rules::USABLE_LABELS.join(", ")
+            );
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let statement = format!(
+            "MATCH (a:Agent {{id: $agent}}), (t:{label} {{id: $target}}) \
+             MERGE (a)-[r:USES]->(t) \
+             ON CREATE SET r.created_at = $now \
+             SET r.rule = $rule, r.measure = $measure, r.at = $at \
+             RETURN r.created_at = $now AS created"
+        );
+        let mut result = self
+            .graph
+            .execute(
+                query(&statement)
+                    .param("agent", agent_id.to_string())
+                    .param("target", target_id.to_string())
+                    .param("now", now)
+                    .param("rule", provenance.rule.clone())
+                    .param("measure", provenance.measure.clone())
+                    .param("at", provenance.at.clone()),
+            )
+            .await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<bool>("created").unwrap_or(false)),
+            None => Ok(false),
+        }
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::llm_settings_by_key`].
+    pub async fn llm_settings_by_key(&self, key: &str) -> Result<Vec<(String, String)>> {
+        let mut rows = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (s:LlmSetting {key: $key}) \
+                     RETURN s.scope AS scope, s.value AS value",
+                )
+                .param("key", key.to_string()),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let scope: String = row.get("scope").unwrap_or_default();
+            let value: String = row.get("value").unwrap_or_default();
+            out.push((scope, value));
+        }
+        Ok(out)
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::release_agent_knows`].
+    pub async fn release_agent_knows(
+        &self,
+        agent_id: Uuid,
+        rule: &str,
+        keep: &[Uuid],
+    ) -> Result<usize> {
+        let keep: Vec<String> = keep.iter().map(|i| i.to_string()).collect();
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (a:Agent {id: $agent})-[r:KNOWS]->(n:Note) \
+                     WHERE r.rule = $rule AND NOT (n.id IN $keep) \
+                     DELETE r \
+                     RETURN count(*) AS released",
+                )
+                .param("agent", agent_id.to_string())
+                .param("rule", rule.to_string())
+                .param("keep", keep),
+            )
+            .await?;
+        let n: i64 = match result.next().await? {
+            Some(row) => row.get("released").unwrap_or(0),
+            None => 0,
+        };
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::agent_knows`]. Two reads, not one: the bounded
+    /// list and the total. A single query that returned only the list could not say how
+    /// much it had left out.
+    pub async fn agent_knows(
+        &self,
+        agent_id: Uuid,
+        project: Option<Uuid>,
+        limit: usize,
+    ) -> Result<crate::graph::rules::AgentKnowledge> {
+        // One row per edge, ordered in Rust: `collect()` promises no order, so asking the
+        // graph to sort it would promise something it does not deliver. A subject knows
+        // tens of notes, not millions — reading them all is the honest read.
+        let mut rows = self
+            .graph
+            .execute(
+                query(
+                    // Deux échelles : ce qui vaut pour TOUS les projets, et ce qui vaut pour
+                    // celui-ci. Sans projet, seule l'échelle globale est servie — jamais le
+                    // socle d'un autre projet.
+                    "MATCH (a:Agent {id: $agent})-[r:KNOWS]->(n:Note) \
+                     WHERE r.scope = 'global' OR ($project IS NOT NULL AND r.project_id = $project) \
+                     RETURN n.id AS id, coalesce(r.score, 0.0) AS score, r.at AS at",
+                )
+                .param("agent", agent_id.to_string())
+                .param("project", project.map(|p| p.to_string())),
+            )
+            .await?;
+        let mut all: Vec<(Uuid, f64, String)> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get("id")?;
+            let score: f64 = row.get("score").unwrap_or(0.0);
+            let at: String = row.get("at").unwrap_or_default();
+            if let Ok(id) = Uuid::parse_str(&id) {
+                all.push((id, score, at));
+            }
+        }
+        // Strongest first: recency is not relevance. The stamp only breaks ties, then the id
+        // so two equal scores stay deterministic.
+        all.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(crate::graph::rules::AgentKnowledge {
+            available: all.len(),
+            notes: all.into_iter().take(limit).map(|(id, _, _)| id).collect(),
+        })
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::ranked_foundation`].
+    pub async fn ranked_foundation(
+        &self,
+        project: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::graph::rules::FoundationCandidate>> {
+        // Le même filtre aux deux échelles ; ce qui change est le périmètre, et le fait que
+        // l'échelle globale exige une ESCALADE mesurée (des ancres dans plusieurs projets)
+        // ou une naissance globale.
+        let cypher = match project {
+            Some(_) => {
+                r#"
+                MATCH (n:Note {project_id: $project})
+                WHERE n.status = 'active'
+                  AND n.importance IN ['critical', 'high']
+                  AND coalesce(n.energy, 0.0) >= 0.8
+                OPTIONAL MATCH (n)-[:LINKED_TO]->(f:File)
+                WITH n, count(DISTINCT f) AS anchors
+                WHERE anchors > 0
+                OPTIONAL MATCH (n)-[s:SYNAPSE]-()
+                WITH n, anchors, count(DISTINCT s) AS synapses
+                RETURN n.id AS id, anchors, synapses, coalesce(n.energy, 0.0) AS energy
+                ORDER BY synapses DESC, energy DESC, n.id
+                LIMIT $limit
+                "#
+            }
+            None => {
+                r#"
+                MATCH (n:Note)
+                WHERE n.status = 'active'
+                  AND n.importance IN ['critical', 'high']
+                  AND coalesce(n.energy, 0.0) >= 0.8
+                OPTIONAL MATCH (n)-[:LINKED_TO]->(f:File)
+                WITH n, collect(DISTINCT f.project_id) AS projs, count(DISTINCT f) AS anchors
+                WITH n, anchors, [p IN projs WHERE p IS NOT NULL] AS ps
+                WHERE (size(ps) >= 2) OR (n.project_id IS NULL AND anchors > 0)
+                OPTIONAL MATCH (n)-[s:SYNAPSE]-()
+                WITH n, anchors, count(DISTINCT s) AS synapses
+                RETURN n.id AS id, anchors, synapses, coalesce(n.energy, 0.0) AS energy
+                ORDER BY synapses DESC, energy DESC, n.id
+                LIMIT $limit
+                "#
+            }
+        };
+
+        let mut rows = self
+            .graph
+            .execute(
+                query(cypher)
+                    .param("project", project.map(|p| p.to_string()))
+                    .param("limit", limit as i64),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get("id")?;
+            let Ok(note) = Uuid::parse_str(&id) else {
+                continue;
+            };
+            let anchors: i64 = row.get("anchors").unwrap_or(0);
+            let synapses: i64 = row.get("synapses").unwrap_or(0);
+            let energy: f64 = row.get("energy").unwrap_or(0.0);
+            out.push(crate::graph::rules::FoundationCandidate {
+                note,
+                score: crate::graph::rules::rank_score(synapses, anchors, energy),
+                anchors,
+                synapses,
+                energy,
+            });
+        }
+        // Re-rank in Rust: the score is the single definition of « what comes first », and
+        // it must be the same one the tests exercise.
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.note.cmp(&b.note))
+        });
+        Ok(out)
+    }
+
+    /// See [`crate::neo4j::GraphStore::list_session_episodes`]. A payload that no longer
+    /// parses is skipped with a warning, not an error: one bad node must not hide the rest.
+    pub async fn list_session_episodes(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::episodes::models::Episode>> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (e:SessionEpisode {project_id: $pid})-[:EPISODE_OF]->(:ChatSession) \
+                     RETURN e.payload AS payload ORDER BY e.collected_at DESC LIMIT $limit",
+                )
+                .param("pid", project_id.to_string())
+                .param("limit", limit as i64),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let payload: String = row.get("payload")?;
+            match serde_json::from_str(&payload) {
+                Ok(episode) => out.push(episode),
+                Err(e) => tracing::warn!(error = %e, "unreadable SessionEpisode payload, skipped"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Get child sessions spawned by a parent session (identified by the SPAWNED_BY edge, else by parent_id in the spawned_by JSON).
+    ///
+    /// A parent that no longer exists has no children (P18-suite, point 9): its DETACH DELETE
+    /// took the edges of its children with it, and the JSON fallback would otherwise hand
+    /// them back as the children of a deleted session.
+    pub async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>> {
+        let q = query(
+            r#"
+            // The SPAWNED_BY edge is the lineage; the `spawned_by` JSON is only the
+            // fallback for sessions that have no edge at all (written before it).
+            MATCH (p:ChatSession {id: $parent_id})
+            MATCH (s:ChatSession)
+            WHERE EXISTS { (s)-[:SPAWNED_BY]->(p) }
+               OR (NOT EXISTS { (s)-[:SPAWNED_BY]->(:ChatSession) }
+                   AND s.spawned_by IS NOT NULL
+                   AND s.spawned_by <> ''
+                   AND s.spawned_by CONTAINS $parent_id)
+            RETURN s ORDER BY s.created_at ASC
+            "#,
+        )
+        .param("parent_id", parent_id.to_string());
+
+        let mut sessions = Vec::new();
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            sessions.push(Self::parse_chat_session_node(&node)?);
+        }
+        Ok(sessions)
+    }
+
+    // ========================================================================
+    // Discussion Graph — SPAWNED_BY relations & tree traversal
+    // ========================================================================
+
+    /// Create a SPAWNED_BY relation between two chat sessions.
+    /// `(:ChatSession {id: child})-[:SPAWNED_BY {type, run_id, task_id, created_at}]->(:ChatSession {id: parent})`
+    pub async fn create_spawned_by_relation(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        spawn_type: &str,
+        run_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (child:ChatSession {id: $child_id})
+            MATCH (parent:ChatSession {id: $parent_id})
+            // MERGE: `create_chat_session` already writes the bare edge for a
+            // session that carries a parent; this fills in the run metadata
+            // instead of adding a second edge. A call that carries a run is
+            // authoritative; one that does not (the conversation path) only fills
+            // what is missing, so it never erases the metadata of a run.
+            MERGE (child)-[r:SPAWNED_BY]->(parent)
+            ON CREATE SET r.created_at = datetime()
+            SET r.type = CASE WHEN $run_id <> '' THEN $spawn_type ELSE coalesce(r.type, $spawn_type) END,
+                r.run_id = CASE WHEN $run_id <> '' THEN $run_id ELSE coalesce(r.run_id, $run_id) END,
+                r.task_id = CASE WHEN $task_id <> '' THEN $task_id ELSE coalesce(r.task_id, $task_id) END
+            "#,
+        )
+        .param("child_id", child_session_id.to_string())
+        .param("parent_id", parent_session_id.to_string())
+        .param("spawn_type", spawn_type.to_string())
+        .param("run_id", run_id.map(|u| u.to_string()).unwrap_or_default())
+        .param(
+            "task_id",
+            task_id.map(|u| u.to_string()).unwrap_or_default(),
+        );
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Link a runner session to its PlanRun (see `GraphStore::link_session_to_run`).
+    pub async fn link_session_to_run(
+        &self,
+        session_id: &str,
+        run_id: Uuid,
+        plan_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<bool> {
+        let q = query(
+            r#"
+            MATCH (s:ChatSession {id: $session_id})
+            MATCH (r:PlanRun {run_id: $run_id})
+            MERGE (s)-[l:SPAWNED_BY_RUN {run_id: $run_id}]->(r)
+            ON CREATE SET l.created_at = datetime()
+            SET l.plan_id = $plan_id, l.task_id = $task_id
+            RETURN count(l) AS n
+            "#,
+        )
+        .param("session_id", session_id.to_string())
+        .param("run_id", run_id.to_string())
+        .param(
+            "plan_id",
+            plan_id.map(|u| u.to_string()).unwrap_or_default(),
+        )
+        .param(
+            "task_id",
+            task_id.map(|u| u.to_string()).unwrap_or_default(),
+        );
+        let mut result = self.graph.execute(q).await?;
+        let n: i64 = match result.next().await? {
+            Some(row) => row.get("n").unwrap_or(0),
+            None => 0,
+        };
+        Ok(n > 0)
+    }
+
+    /// Stored links of many sessions in ONE query (4 branches, `UNION ALL`).
+    pub async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<String> = session_ids.iter().map(|u| u.to_string()).collect();
+        let q = query(
+            r#"
+            UNWIND $ids AS sid
+            MATCH (s:ChatSession {id: sid})-[l:SPAWNED_BY_RUN]->(r:PlanRun)
+            RETURN s.id AS session_id, 'run' AS kind, l.run_id AS run_id,
+                   l.task_id AS task_id,
+                   COALESCE(NULLIF(l.plan_id, ''), r.plan_id) AS plan_id,
+                   COALESCE(NULLIF(l.plan_id, ''), r.plan_id) AS thread_plan_id
+            UNION ALL
+            UNWIND $ids AS sid
+            MATCH (s:ChatSession {id: sid})-[:ASSOCIATED_WITH]->(t:Task)
+            OPTIONAL MATCH (p:Plan)-[:HAS_TASK]->(t)
+            RETURN s.id AS session_id, 'task' AS kind, null AS run_id,
+                   t.id AS task_id, null AS plan_id, p.id AS thread_plan_id
+            UNION ALL
+            UNWIND $ids AS sid
+            MATCH (s:ChatSession {id: sid})-[:ASSOCIATED_WITH]->(p:Plan)
+            RETURN s.id AS session_id, 'plan' AS kind, null AS run_id,
+                   null AS task_id, p.id AS plan_id, p.id AS thread_plan_id
+            UNION ALL
+            UNWIND $ids AS sid
+            MATCH (s:ChatSession {id: sid})-[sb:SPAWNED_BY]->(parent:ChatSession)
+            OPTIONAL MATCH (rr:PlanRun {run_id: sb.run_id})
+            OPTIONAL MATCH (parent)-[:SPAWNED_BY_RUN]->(pr:PlanRun)
+            OPTIONAL MATCH (parent)-[:ASSOCIATED_WITH]->(pp:Plan)
+            WITH s, sb, COALESCE(rr.plan_id, pr.plan_id, pp.id) AS plan
+            RETURN DISTINCT s.id AS session_id, 'spawned' AS kind,
+                   NULLIF(sb.run_id, '') AS run_id, NULLIF(sb.task_id, '') AS task_id,
+                   plan AS plan_id, plan AS thread_plan_id
+            "#,
+        )
+        .param("ids", ids);
+        let mut result = self.graph.execute(q).await?;
+        let uuid = |row: &neo4rs::Row, key: &str| -> Option<Uuid> {
+            row.get::<String>(key).ok().and_then(|s| s.parse().ok())
+        };
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let Some(session_id) = uuid(&row, "session_id") else {
+                continue;
+            };
+            let kind = match row.get::<String>("kind").unwrap_or_default().as_str() {
+                "run" => SessionLinkKind::RunRelation,
+                "task" => SessionLinkKind::TaskAssociation,
+                "plan" => SessionLinkKind::PlanAssociation,
+                "spawned" => SessionLinkKind::SpawnedByRelation,
+                _ => continue,
+            };
+            out.push(SessionLinkRow {
+                session_id,
+                kind,
+                run_id: uuid(&row, "run_id"),
+                task_id: uuid(&row, "task_id"),
+                plan_id: uuid(&row, "plan_id"),
+                thread_plan_id: uuid(&row, "thread_plan_id"),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Get the full session tree rooted at `session_id` (recursive traversal via SPAWNED_BY).
+    /// Bounded to 10 levels max for performance.
+    pub async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>> {
+        let q = query(
+            r#"
+            MATCH path = (root:ChatSession {id: $id})<-[:SPAWNED_BY*0..10]-(child:ChatSession)
+            WITH child, length(path) AS depth, relationships(path) AS rels
+            RETURN child.id AS session_id,
+                   CASE WHEN size(rels) > 0 THEN startNode(rels[size(rels)-1]).id ELSE null END AS self_id,
+                   CASE WHEN size(rels) > 0 THEN endNode(rels[size(rels)-1]).id ELSE null END AS parent_session_id,
+                   CASE WHEN size(rels) > 0 THEN rels[size(rels)-1].type ELSE null END AS spawn_type,
+                   CASE WHEN size(rels) > 0 THEN rels[size(rels)-1].run_id ELSE null END AS run_id,
+                   CASE WHEN size(rels) > 0 THEN rels[size(rels)-1].task_id ELSE null END AS task_id,
+                   depth,
+                   child.created_at AS created_at
+            ORDER BY depth ASC, child.created_at ASC
+            "#,
+        )
+        .param("id", session_id.to_string());
+
+        let mut nodes = Vec::new();
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            let session_id: String = row.get("session_id")?;
+            let parent_session_id: Option<String> = row
+                .get("parent_session_id")
+                .ok()
+                .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let spawn_type: Option<String> =
+                row.get("spawn_type")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let run_id_str: Option<String> =
+                row.get("run_id")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let task_id_str: Option<String> =
+                row.get("task_id")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let depth: i64 = row.get("depth").unwrap_or(0);
+            let created_at_str: Option<String> = row.get("created_at").ok();
+
+            nodes.push(SessionTreeNode {
+                session_id,
+                parent_session_id,
+                spawn_type,
+                run_id: run_id_str.and_then(|s| s.parse().ok()),
+                task_id: task_id_str.and_then(|s| s.parse().ok()),
+                depth: depth as u32,
+                created_at: created_at_str.and_then(|s| s.parse().ok()),
+                provider_id: None,
+                model: None,
+                cost_usd: None,
+                subtree_cost_usd: None,
+                max_depth: None,
+                max_children: None,
+                status: "closed".to_string(),
+                routed_by: None,
+            });
+        }
+        Ok(nodes)
+    }
+
+    /// Follow SPAWNED_BY upward to find the root session (the one with no parent).
+    pub async fn get_session_root(&self, session_id: &str) -> Result<Option<String>> {
+        let q = query(
+            r#"
+            MATCH path = (s:ChatSession {id: $id})-[:SPAWNED_BY*0..10]->(root:ChatSession)
+            WHERE NOT (root)-[:SPAWNED_BY]->()
+            RETURN root.id AS root_id
+            ORDER BY length(path) DESC
+            LIMIT 1
+            "#,
+        )
+        .param("id", session_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let root_id: String = row.get("root_id")?;
+            Ok(Some(root_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get all sessions for a PlanRun.
+    ///
+    /// Strategy: first try SPAWNED_BY relation metadata (used by pipeline/wave executor),
+    /// then fall back to searching the `spawned_by` JSON property on ChatSession nodes
+    /// (used by the classic PlanRunner which doesn't create SPAWNED_BY relations).
+    pub async fn get_run_sessions(&self, run_id: Uuid) -> Result<Vec<SessionInfo>> {
+        // Strategy 1: via SPAWNED_BY relation (pipeline/wave executor)
+        let q = query(
+            r#"
+            MATCH (child:ChatSession)-[r:SPAWNED_BY]->(parent:ChatSession)
+            WHERE r.run_id = $run_id
+            RETURN child.id AS session_id,
+                   child.title AS title,
+                   child.model AS model,
+                   r.type AS spawn_type,
+                   r.task_id AS task_id,
+                   child.created_at AS created_at
+            ORDER BY child.created_at ASC
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        let mut sessions = Vec::new();
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            let session_id: String = row.get("session_id")?;
+            let title: Option<String> =
+                row.get("title")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let model: String = row.get("model").unwrap_or_default();
+            let spawn_type: Option<String> =
+                row.get("spawn_type")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let task_id_str: Option<String> =
+                row.get("task_id")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let created_at_str: String = row.get("created_at").unwrap_or_default();
+            sessions.push(SessionInfo {
+                session_id,
+                title,
+                model,
+                spawn_type,
+                task_id: task_id_str.and_then(|s| s.parse().ok()),
+                created_at: created_at_str
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            });
+        }
+
+        if !sessions.is_empty() {
+            return Ok(sessions);
+        }
+
+        // Strategy 2: via spawned_by JSON property on ChatSession node
+        // The classic PlanRunner stores {"type":"runner","run_id":"...","task_id":"..."}
+        // as a JSON string in the spawned_by property, without creating SPAWNED_BY relations.
+        let q2 = query(
+            r#"
+            MATCH (s:ChatSession)
+            WHERE s.spawned_by IS NOT NULL
+              AND s.spawned_by <> ''
+              AND s.spawned_by CONTAINS $run_id
+            RETURN s.id AS session_id,
+                   s.title AS title,
+                   s.model AS model,
+                   s.spawned_by AS spawned_by_json,
+                   s.created_at AS created_at
+            ORDER BY s.created_at ASC
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        let mut result2 = self.graph.execute(q2).await?;
+        while let Some(row) = result2.next().await? {
+            let session_id: String = row.get("session_id")?;
+            let title: Option<String> =
+                row.get("title")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let model: String = row.get("model").unwrap_or_default();
+            let created_at_str: String = row.get("created_at").unwrap_or_default();
+            let spawned_by_json: String = row.get("spawned_by_json").unwrap_or_default();
+
+            // Parse task_id from the spawned_by JSON property
+            let task_id: Option<Uuid> = serde_json::from_str::<serde_json::Value>(&spawned_by_json)
+                .ok()
+                .and_then(|v| {
+                    v.get("task_id")
+                        .and_then(|t| t.as_str())
+                        .and_then(|s| s.parse::<Uuid>().ok())
+                });
+
+            sessions.push(SessionInfo {
+                session_id,
+                title,
+                model,
+                spawn_type: Some("runner".to_string()),
+                task_id,
+                created_at: created_at_str
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            });
+        }
+        Ok(sessions)
+    }
+
+    /// Parse a Neo4j Node into a ChatSessionNode
+    fn parse_chat_session_node(node: &neo4rs::Node) -> Result<ChatSessionNode> {
+        let cli_session_id: String = node.get("cli_session_id").unwrap_or_default();
+        let project_slug: String = node.get("project_slug").unwrap_or_default();
+        let workspace_slug: String = node.get("workspace_slug").unwrap_or_default();
+        let title: String = node.get("title").unwrap_or_default();
+        let conversation_id: String = node.get("conversation_id").unwrap_or_default();
+        let preview: String = node.get("preview").unwrap_or_default();
+        let permission_mode: String = node.get("permission_mode").unwrap_or_default();
+        let add_dirs_json: String = node.get("add_dirs").unwrap_or_default();
+        let spawned_by: String = node.get("spawned_by").unwrap_or_default();
+        // Harness fields: absent on every session written before the harness.
+        let non_empty = |key: &str| -> Option<String> {
+            node.get::<String>(key).ok().filter(|v| !v.is_empty())
+        };
+
+        // Deserialize add_dirs from JSON string (backward compat: empty string → None)
+        let add_dirs: Option<Vec<String>> = if add_dirs_json.is_empty() {
+            None
+        } else {
+            serde_json::from_str(&add_dirs_json)
+                .ok()
+                .and_then(|v: Vec<String>| if v.is_empty() { None } else { Some(v) })
+        };
+
+        Ok(ChatSessionNode {
+            file_scope_lifted: node.get::<bool>("file_scope_lifted").unwrap_or(false),
+            id: node.get::<String>("id")?.parse()?,
+            cli_session_id: if cli_session_id.is_empty() {
+                None
+            } else {
+                Some(cli_session_id)
+            },
+            project_slug: if project_slug.is_empty() {
+                None
+            } else {
+                Some(project_slug)
+            },
+            workspace_slug: if workspace_slug.is_empty() {
+                None
+            } else {
+                Some(workspace_slug)
+            },
+            cwd: node.get("cwd")?,
+            title: if title.is_empty() { None } else { Some(title) },
+            model: node.get("model")?,
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: node
+                .get::<String>("updated_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            message_count: node.get("message_count").unwrap_or(0),
+            total_cost_usd: {
+                let v: f64 = node.get("total_cost_usd").unwrap_or(0.0);
+                if v == 0.0 {
+                    None
+                } else {
+                    Some(v)
+                }
+            },
+            conversation_id: if conversation_id.is_empty() {
+                None
+            } else {
+                Some(conversation_id)
+            },
+            preview: if preview.is_empty() {
+                None
+            } else {
+                Some(preview)
+            },
+            permission_mode: if permission_mode.is_empty() {
+                None
+            } else {
+                Some(permission_mode)
+            },
+            add_dirs,
+            spawned_by: if spawned_by.is_empty() {
+                None
+            } else {
+                Some(spawned_by)
+            },
+            provider_id: non_empty("provider_id"),
+            routed_by: non_empty("routed_by"),
+            routing_mode: non_empty("routing_mode"),
+            routing_pool: non_empty("routing_pool"),
+            capabilities: non_empty("capabilities"),
+            engine: non_empty("engine"),
+            resume_token: non_empty("resume_token"),
+            execution_place: ExecutionPlace::parse_stored(
+                &node.get::<String>("execution_place").unwrap_or_default(),
+            ),
+            project_inferred: node.get::<bool>("project_inferred").unwrap_or(false),
+            access: crate::chat::provider::policy::SessionAccess::parse_stored(
+                &node.get::<String>("access").unwrap_or_default(),
+            ),
+            owner: non_empty("owner"),
+            mirror_of: non_empty("mirror_of"),
+        })
+    }
+
+    // ========================================================================
+    // Chat Event operations (WebSocket replay & persistence)
+    // ========================================================================
+
+    /// Store a batch of chat events for a session
+    pub async fn store_chat_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<ChatEventRecord>,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        for event in &events {
+            let q = query(
+                "MATCH (s:ChatSession {id: $session_id})
+                 CREATE (s)-[:HAS_EVENT]->(e:ChatEvent {
+                     id: $id,
+                     session_id: $session_id,
+                     seq: $seq,
+                     event_type: $event_type,
+                     data: $data,
+                     created_at: $created_at
+                 })",
+            )
+            .param("session_id", session_id.to_string())
+            .param("id", event.id.to_string())
+            .param("seq", event.seq)
+            .param("event_type", event.event_type.clone())
+            .param("data", event.data.clone())
+            .param("created_at", event.created_at.to_rfc3339());
+
+            self.graph.run(q).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Get chat events for a session after a given sequence number (for replay)
+    pub async fn get_chat_events(
+        &self,
+        session_id: Uuid,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $session_id})-[:HAS_EVENT]->(e:ChatEvent)
+             WHERE e.seq > $after_seq
+             RETURN e
+             ORDER BY e.seq ASC
+             LIMIT $limit",
+        )
+        .param("session_id", session_id.to_string())
+        .param("after_seq", after_seq)
+        .param("limit", limit);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut events = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("e")?;
+            events.push(Self::parse_chat_event_node(&node)?);
+        }
+
+        Ok(events)
+    }
+
+    /// Grouped read for the attention derivation (see the trait doc).
+    /// One query for every session: `session_id IN $ids` rides the composite
+    /// `(session_id, seq)` index. The payload of `user_message` is blanked
+    /// server-side — only its `seq` is needed and those rows are the bulk.
+    pub async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<String> = session_ids.iter().map(|id| id.to_string()).collect();
+        let q = query(
+            "MATCH (e:ChatEvent)
+             WHERE e.session_id IN $ids
+               AND e.event_type IN ['permission_request', 'permission_decision',
+                                    'ask_user_question', 'user_message', 'session_error']
+             RETURN e.id AS id, e.session_id AS session_id, e.seq AS seq,
+                    e.event_type AS event_type, e.created_at AS created_at,
+                    CASE WHEN e.event_type = 'user_message' THEN '' ELSE e.data END AS data
+             ORDER BY e.session_id ASC, e.seq ASC",
+        )
+        .param("ids", ids);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut events = Vec::new();
+        while let Some(row) = result.next().await? {
+            events.push(ChatEventRecord {
+                id: row.get::<String>("id")?.parse()?,
+                session_id: row.get::<String>("session_id")?.parse()?,
+                seq: row.get("seq")?,
+                event_type: row.get("event_type")?,
+                data: row.get("data")?,
+                created_at: row
+                    .get::<String>("created_at")?
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            });
+        }
+        Ok(events)
+    }
+
+    /// Get chat events with offset-based pagination (for REST/MCP).
+    pub async fn get_chat_events_paginated(
+        &self,
+        session_id: Uuid,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>> {
+        // Match events by the session_id property (backed by the composite
+        // (session_id, seq) index) rather than expanding the HAS_EVENT
+        // relationship. With the composite index the planner seeks to the
+        // session and walks seq in order, returning after LIMIT — instead of
+        // gathering every event of the conversation and sorting in memory.
+        // Equivalent result: every ChatEvent is created with session_id set to
+        // its owning session (see store_chat_events).
+        let q = query(
+            "MATCH (e:ChatEvent {session_id: $session_id})
+             RETURN e
+             ORDER BY e.seq ASC
+             SKIP $offset
+             LIMIT $limit",
+        )
+        .param("session_id", session_id.to_string())
+        .param("offset", offset)
+        .param("limit", limit);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut events = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("e")?;
+            events.push(Self::parse_chat_event_node(&node)?);
+        }
+
+        Ok(events)
+    }
+
+    /// Count total chat events for a session.
+    pub async fn count_chat_events(&self, session_id: Uuid) -> Result<i64> {
+        // Count via the session_id property (index-backed) instead of expanding
+        // the HAS_EVENT relationship — same result, no relationship walk.
+        let q = query(
+            "MATCH (e:ChatEvent {session_id: $session_id})
+             RETURN count(e) AS cnt",
+        )
+        .param("session_id", session_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+
+        if let Some(row) = result.next().await? {
+            let cnt: i64 = row.get("cnt").unwrap_or(0);
+            Ok(cnt)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get the latest sequence number for a session (0 if no events)
+    pub async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $session_id})-[:HAS_EVENT]->(e:ChatEvent)
+             RETURN MAX(e.seq) AS max_seq",
+        )
+        .param("session_id", session_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+
+        if let Some(row) = result.next().await? {
+            // MAX returns null if no rows, so unwrap_or(0)
+            let max_seq: i64 = row.get("max_seq").unwrap_or(0);
+            Ok(max_seq)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Delete all chat events for a session
+    pub async fn delete_chat_events(&self, session_id: Uuid) -> Result<()> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $session_id})-[:HAS_EVENT]->(e:ChatEvent)
+             DETACH DELETE e",
+        )
+        .param("session_id", session_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Parse a Neo4j Node into a ChatEventRecord
+    fn parse_chat_event_node(node: &neo4rs::Node) -> Result<ChatEventRecord> {
+        Ok(ChatEventRecord {
+            id: node.get::<String>("id")?.parse()?,
+            session_id: node.get::<String>("session_id")?.parse()?,
+            seq: node.get("seq")?,
+            event_type: node.get("event_type")?,
+            data: node.get("data")?,
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+        })
+    }
+
+    // ========================================================================
+    // DISCUSSED relations (ChatSession → Entity)
+    // ========================================================================
+
+    /// Add DISCUSSED relations between a chat session and entities.
+    ///
+    /// Uses MERGE for idempotence: if the relation already exists, increments
+    /// `mention_count` and updates `last_mentioned_at`.
+    /// Uses per-type UNWIND batching (one query per entity type).
+    ///
+    /// Each entity is identified by `(entity_type, entity_id)` where:
+    /// - entity_type: "File", "Function", "Struct", "Trait", "Enum"
+    /// - entity_id: the path (for File) or name (for symbols)
+    pub async fn add_discussed(
+        &self,
+        session_id: Uuid,
+        entities: &[(String, String)], // Vec<(entity_type, entity_id)>
+    ) -> Result<usize> {
+        if entities.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total = 0usize;
+
+        // Group entities by type for efficient per-type UNWIND queries
+        let mut files: Vec<String> = Vec::new();
+        let mut functions: Vec<String> = Vec::new();
+        let mut structs: Vec<String> = Vec::new();
+        let mut traits: Vec<String> = Vec::new();
+        let mut enums: Vec<String> = Vec::new();
+        // Work entities a session CITES (`#kind:uuid`): matched on their `id`.
+        let mut plans: Vec<String> = Vec::new();
+        let mut tasks: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        let mut decisions: Vec<String> = Vec::new();
+
+        for (etype, eid) in entities {
+            match etype.as_str() {
+                "File" => files.push(eid.clone()),
+                "Function" => functions.push(eid.clone()),
+                "Struct" => structs.push(eid.clone()),
+                "Trait" => traits.push(eid.clone()),
+                "Enum" => enums.push(eid.clone()),
+                "Plan" => plans.push(eid.clone()),
+                "Task" => tasks.push(eid.clone()),
+                "Note" => notes.push(eid.clone()),
+                "Decision" => decisions.push(eid.clone()),
+                _ => {} // skip unknown types
+            }
+        }
+
+        // Helper macro: run UNWIND MERGE for a given label and match property
+        // File nodes match on `path`, all others match on `name`
+        let sid = session_id.to_string();
+
+        if !files.is_empty() {
+            let q = query(
+                r#"
+                MATCH (s:ChatSession {id: $session_id})
+                UNWIND $ids AS file_path
+                MATCH (e:File {path: file_path})
+                MERGE (s)-[r:DISCUSSED]->(e)
+                ON CREATE SET r.mention_count = 1,
+                             r.first_mentioned_at = datetime(),
+                             r.last_mentioned_at = datetime()
+                ON MATCH SET r.mention_count = r.mention_count + 1,
+                            r.last_mentioned_at = datetime()
+                RETURN count(r) AS cnt
+                "#,
+            )
+            .param("session_id", sid.clone())
+            .param("ids", files);
+
+            let mut result = self.graph.execute(q).await?;
+            if let Some(row) = result.next().await? {
+                total += row.get::<i64>("cnt").unwrap_or(0) as usize;
+            }
+        }
+
+        // For symbol types (Function, Struct, Trait, Enum): match on name
+        let symbol_types: &[(&str, &str, Vec<String>)] = &[
+            ("Function", "name", functions),
+            ("Struct", "name", structs),
+            ("Trait", "name", traits),
+            ("Enum", "name", enums),
+        ];
+
+        for (label, _prop, ids) in symbol_types {
+            if ids.is_empty() {
+                continue;
+            }
+
+            // Dynamic label in Cypher via string formatting (label is a static &str, safe)
+            let cypher = format!(
+                r#"
+                MATCH (s:ChatSession {{id: $session_id}})
+                UNWIND $ids AS sym_name
+                MATCH (e:{} {{name: sym_name}})
+                WITH s, e
+                LIMIT 1
+                MERGE (s)-[r:DISCUSSED]->(e)
+                ON CREATE SET r.mention_count = 1,
+                             r.first_mentioned_at = datetime(),
+                             r.last_mentioned_at = datetime()
+                ON MATCH SET r.mention_count = r.mention_count + 1,
+                            r.last_mentioned_at = datetime()
+                RETURN count(r) AS cnt
+                "#,
+                label
+            );
+
+            let q = query(&cypher)
+                .param("session_id", sid.clone())
+                .param("ids", ids.clone());
+
+            let mut result = self.graph.execute(q).await?;
+            if let Some(row) = result.next().await? {
+                total += row.get::<i64>("cnt").unwrap_or(0) as usize;
+            }
+        }
+
+        // Entities a session CITES (`#kind:uuid`): each is matched on the node's
+        // `id` (a uuid string). A citation of something the graph does not hold
+        // links nothing — never a phantom node.
+        let cited_types: &[(&str, &[String])] = &[
+            ("Plan", &plans),
+            ("Task", &tasks),
+            ("Note", &notes),
+            ("Decision", &decisions),
+        ];
+        for (label, ids) in cited_types {
+            if ids.is_empty() {
+                continue;
+            }
+            let cypher = format!(
+                r#"
+                MATCH (s:ChatSession {{id: $session_id}})
+                UNWIND $ids AS cited_id
+                MATCH (e:{label} {{id: cited_id}})
+                MERGE (s)-[r:DISCUSSED]->(e)
+                ON CREATE SET r.mention_count = 1,
+                             r.first_mentioned_at = datetime(),
+                             r.last_mentioned_at = datetime()
+                ON MATCH SET r.mention_count = r.mention_count + 1,
+                            r.last_mentioned_at = datetime()
+                RETURN count(r) AS cnt
+                "#
+            );
+            let q = query(&cypher)
+                .param("session_id", sid.clone())
+                .param("ids", ids.to_vec());
+            let mut result = self.graph.execute(q).await?;
+            if let Some(row) = result.next().await? {
+                total += row.get::<i64>("cnt").unwrap_or(0) as usize;
+            }
+        }
+
+        Ok(total)
+    }
+
+    /// Get all entities discussed in a chat session.
+    ///
+    /// Returns a list of `(entity_type, entity_id, mention_count, last_mentioned_at)`.
+    /// Scoped by project_id if provided (security: no cross-project leaks).
+    pub async fn get_session_entities(
+        &self,
+        session_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<DiscussedEntity>> {
+        let cypher = if project_id.is_some() {
+            r#"
+            MATCH (s:ChatSession {id: $session_id})-[r:DISCUSSED]->(e)
+            WHERE (e:File AND EXISTS { MATCH (e)<-[:CONTAINS]-(p:Project {id: $project_id}) })
+               OR (e:Function AND e.project_id = $project_id)
+               OR (e:Struct AND e.project_id = $project_id)
+               OR (e:Trait AND e.project_id = $project_id)
+               OR (e:Enum AND e.project_id = $project_id)
+            RETURN
+              CASE
+                WHEN e:File THEN 'File'
+                WHEN e:Function THEN 'Function'
+                WHEN e:Struct THEN 'Struct'
+                WHEN e:Trait THEN 'Trait'
+                WHEN e:Enum THEN 'Enum'
+                ELSE 'Unknown'
+              END AS entity_type,
+              CASE
+                WHEN e:File THEN e.path
+                ELSE e.name
+              END AS entity_id,
+              r.mention_count AS mention_count,
+              toString(r.last_mentioned_at) AS last_mentioned_at,
+              CASE WHEN e:Function THEN e.file_path
+                   WHEN e:Struct THEN e.file_path
+                   WHEN e:Trait THEN e.file_path
+                   WHEN e:Enum THEN e.file_path
+                   ELSE null
+              END AS file_path
+            ORDER BY r.mention_count DESC
+            "#
+        } else {
+            r#"
+            MATCH (s:ChatSession {id: $session_id})-[r:DISCUSSED]->(e)
+            RETURN
+              CASE
+                WHEN e:File THEN 'File'
+                WHEN e:Function THEN 'Function'
+                WHEN e:Struct THEN 'Struct'
+                WHEN e:Trait THEN 'Trait'
+                WHEN e:Enum THEN 'Enum'
+                ELSE 'Unknown'
+              END AS entity_type,
+              CASE
+                WHEN e:File THEN e.path
+                ELSE e.name
+              END AS entity_id,
+              r.mention_count AS mention_count,
+              toString(r.last_mentioned_at) AS last_mentioned_at,
+              CASE WHEN e:Function THEN e.file_path
+                   WHEN e:Struct THEN e.file_path
+                   WHEN e:Trait THEN e.file_path
+                   WHEN e:Enum THEN e.file_path
+                   ELSE null
+              END AS file_path
+            ORDER BY r.mention_count DESC
+            "#
+        };
+
+        let mut q = query(cypher).param("session_id", session_id.to_string());
+        if let Some(pid) = project_id {
+            q = q.param("project_id", pid.to_string());
+        }
+
+        let mut result = self.graph.execute(q).await?;
+        let mut entities = Vec::new();
+        while let Some(row) = result.next().await? {
+            entities.push(DiscussedEntity {
+                entity_type: row.get("entity_type").unwrap_or_default(),
+                entity_id: row.get("entity_id").unwrap_or_default(),
+                mention_count: row.get("mention_count").unwrap_or(1),
+                last_mentioned_at: row.get::<String>("last_mentioned_at").ok(),
+                file_path: row.get::<String>("file_path").ok(),
+            });
+        }
+        Ok(entities)
+    }
+
+    /// WorldModel predictive context (biomimicry T7):
+    /// Get co-changers of files discussed in the last N sessions for a project.
+    /// Returns predicted files the agent may need, based on recent discussion patterns.
+    pub async fn get_discussed_co_changers(
+        &self,
+        project_id: Uuid,
+        max_sessions: i64,
+        max_results: i64,
+    ) -> Result<Vec<super::models::CoChanger>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:HAS_CHAT_SESSION]->(s:ChatSession)
+            WITH s ORDER BY s.created_at DESC LIMIT $max_sessions
+            MATCH (s)-[:DISCUSSED]->(f:File)
+            WITH DISTINCT f
+            MATCH (f)-[cc:CO_CHANGED]->(f2:File)
+            WHERE cc.count >= 2
+            AND NOT f2 = f
+            WITH f2.path AS path, max(cc.count) AS count, max(toString(cc.last_at)) AS last_at
+            ORDER BY count DESC
+            LIMIT $max_results
+            RETURN path, count, last_at
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("max_sessions", max_sessions)
+        .param("max_results", max_results);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut changers = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            changers.push(super::models::CoChanger {
+                path: row.get("path")?,
+                count: row.get("count")?,
+                last_at: row.get::<String>("last_at").ok(),
+            });
+        }
+
+        Ok(changers)
+    }
+
+    /// Backfill DISCUSSED relations on all existing chat sessions.
+    ///
+    /// Iterates all sessions in batches, extracts entities from user_message events
+    /// using the entity_extractor, and creates DISCUSSED relations via MERGE.
+    /// Idempotent — safe to run multiple times (MERGE prevents duplicates).
+    ///
+    /// Returns `(sessions_processed, entities_found, relations_created)`.
+    pub async fn backfill_discussed(&self) -> Result<(usize, usize, usize)> {
+        use crate::chat::entity_extractor;
+        use tracing::{debug, info};
+
+        const BATCH_SIZE: usize = 100;
+        let mut total_sessions = 0usize;
+        let mut total_entities = 0usize;
+        let mut total_relations = 0usize;
+        let mut offset = 0;
+
+        loop {
+            // Fetch a batch of sessions that have user_message events
+            let q = query(
+                r#"
+                MATCH (s:ChatSession)-[:HAS_EVENT]->(e:ChatEvent)
+                WHERE e.event_type IN ['user_message', 'assistant_text']
+                WITH s, collect(e.data) AS messages
+                RETURN s.id AS session_id, messages
+                ORDER BY s.created_at ASC
+                SKIP $offset
+                LIMIT $limit
+                "#,
+            )
+            .param("offset", offset as i64)
+            .param("limit", BATCH_SIZE as i64);
+
+            let mut result = self.graph.execute(q).await?;
+            let mut batch_count = 0;
+
+            while let Some(row) = result.next().await? {
+                let session_id_str: String = row.get("session_id")?;
+                let session_uuid: Uuid = match session_id_str.parse() {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+
+                let messages: Vec<String> = row.get("messages").unwrap_or_default();
+
+                // Extract entities from all messages in this session
+                let mut all_entities: Vec<(String, String)> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+
+                for msg_data in &messages {
+                    // Parse message JSON to get content
+                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(msg_data) {
+                        let content = data
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+
+                        if content.len() < 5 {
+                            continue;
+                        }
+
+                        let entities = entity_extractor::extract_entities(content);
+                        for e in entities {
+                            let label = match e.entity_type {
+                                entity_extractor::EntityType::File => "File",
+                                entity_extractor::EntityType::Function => "Function",
+                                entity_extractor::EntityType::Struct => "Struct",
+                                entity_extractor::EntityType::Trait => "Trait",
+                                entity_extractor::EntityType::Enum => "Enum",
+                                entity_extractor::EntityType::Symbol => "Function",
+                            };
+                            let key = (label.to_string(), e.identifier.clone());
+                            if seen.insert(key.clone()) {
+                                all_entities.push(key);
+                            }
+                        }
+                    }
+                }
+
+                total_entities += all_entities.len();
+
+                if !all_entities.is_empty() {
+                    match self.add_discussed(session_uuid, &all_entities).await {
+                        Ok(created) => {
+                            total_relations += created;
+                        }
+                        Err(e) => {
+                            debug!(
+                                session_id = %session_uuid,
+                                error = %e,
+                                "Backfill: failed to create DISCUSSED for session"
+                            );
+                        }
+                    }
+                }
+
+                batch_count += 1;
+                total_sessions += 1;
+            }
+
+            info!(
+                batch = offset / BATCH_SIZE + 1,
+                sessions = total_sessions,
+                entities = total_entities,
+                relations = total_relations,
+                "Backfill DISCUSSED: batch processed"
+            );
+
+            if batch_count < BATCH_SIZE {
+                break; // Last batch
+            }
+            offset += BATCH_SIZE;
+        }
+
+        info!(
+            sessions = total_sessions,
+            entities = total_entities,
+            relations = total_relations,
+            "Backfill DISCUSSED: complete"
+        );
+
+        Ok((total_sessions, total_entities, total_relations))
+    }
+
+    // ========================================================================
+    // Graph visualization — Chat layer
+    // ========================================================================
+
+    /// Get chat sessions with DISCUSSED relations for the graph visualization.
+    /// Only returns sessions that have at least 1 DISCUSSED relation.
+    /// Ordered by most recent, limited to `limit` sessions.
+    /// For each session, returns top 10 discussed entities by mention_count.
+    pub async fn get_chat_graph_data(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)> {
+        let pid = project_id.to_string();
+        let lim = limit as i64;
+
+        // Query 1: Sessions that have DISCUSSED relations, scoped by project
+        let sessions_query = query(
+            "MATCH (proj:Project {id: $pid})-[:HAS_CHAT_SESSION]->(cs:ChatSession)-[d:DISCUSSED]->()
+             WITH cs, count(d) AS disc_count
+             WHERE disc_count > 0
+             RETURN cs.id AS id,
+                    cs.title AS title,
+                    cs.model AS model,
+                    cs.message_count AS message_count,
+                    cs.total_cost_usd AS total_cost_usd,
+                    toString(cs.created_at) AS created_at,
+                    [(cs)-[:SPAWNED_BY]->(p:ChatSession) | p.id][0] AS parent_id
+             ORDER BY cs.updated_at DESC
+             LIMIT $lim",
+        )
+        .param("pid", pid.clone())
+        .param("lim", lim);
+
+        let mut result = self.graph.execute(sessions_query).await?;
+        let mut sessions = Vec::new();
+        let mut session_ids = Vec::new();
+        while let Some(row) = result.next().await? {
+            let id: String = row.get("id")?;
+            session_ids.push(id.clone());
+            sessions.push(ChatGraphSession {
+                id,
+                title: row
+                    .get::<String>("title")
+                    .unwrap_or_else(|_| "Untitled".to_string()),
+                model: row.get::<Option<String>>("model").ok().flatten(),
+                message_count: row.get::<i64>("message_count").unwrap_or(0),
+                total_cost_usd: row.get::<f64>("total_cost_usd").unwrap_or(0.0),
+                created_at: row.get::<String>("created_at").unwrap_or_default(),
+                parent_session_id: row.get::<Option<String>>("parent_id").ok().flatten(),
+            });
+        }
+
+        if sessions.is_empty() {
+            return Ok((sessions, vec![]));
+        }
+
+        // Query 1b: close the family. A sub-conversation belongs to the conversation even
+        // when it discussed nothing itself (a delegated agent that only ran commands), and
+        // a parent may have been scrolled out of the LIMIT. Without this the SPAWNED_BY link
+        // had no second end to attach to, so sub-conversations never showed on the graph.
+        let lineage_query = query(
+            "UNWIND $ids AS sid
+             MATCH (cs:ChatSession {id: sid})
+             OPTIONAL MATCH (cs)-[:SPAWNED_BY*1..8]->(up:ChatSession)
+             OPTIONAL MATCH (down:ChatSession)-[:SPAWNED_BY*1..8]->(cs)
+             WITH collect(DISTINCT cs) + collect(DISTINCT up) + collect(DISTINCT down) AS family
+             UNWIND family AS s
+             WITH DISTINCT s
+             RETURN s.id AS id,
+                    coalesce(s.title, 'Sans titre') AS title,
+                    s.model AS model,
+                    coalesce(s.message_count, 0) AS message_count,
+                    coalesce(s.total_cost_usd, 0.0) AS total_cost_usd,
+                    toString(s.created_at) AS created_at,
+                    [(s)-[:SPAWNED_BY]->(p:ChatSession) | p.id][0] AS parent_id
+             LIMIT $cap",
+        )
+        .param("ids", session_ids.clone())
+        // The family of a seed is small (a session and its children); the cap only guards
+        // against a pathological chain.
+        .param("cap", (limit.saturating_mul(3)).max(limit) as i64);
+
+        let mut result = self.graph.execute(lineage_query).await?;
+        let mut seen: std::collections::HashSet<String> =
+            sessions.iter().map(|s| s.id.clone()).collect();
+        while let Some(row) = result.next().await? {
+            let id: String = row.get("id")?;
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            sessions.push(ChatGraphSession {
+                id,
+                title: row
+                    .get::<String>("title")
+                    .unwrap_or_else(|_| "Untitled".to_string()),
+                model: row.get::<Option<String>>("model").ok().flatten(),
+                message_count: row.get::<i64>("message_count").unwrap_or(0),
+                total_cost_usd: row.get::<f64>("total_cost_usd").unwrap_or(0.0),
+                created_at: row.get::<String>("created_at").unwrap_or_default(),
+                parent_session_id: row.get::<Option<String>>("parent_id").ok().flatten(),
+            });
+        }
+        // Their own DISCUSSED edges are wanted too: a sub-conversation reads files.
+        session_ids = sessions.iter().map(|s| s.id.clone()).collect();
+
+        // Query 2: DISCUSSED edges for those sessions, top 10 per session by mention_count
+        let discussed_query = query(
+            "MATCH (cs:ChatSession)-[d:DISCUSSED]->(target)
+             WHERE cs.id IN $session_ids
+             WITH cs, d, target,
+                  labels(target) AS target_labels
+             ORDER BY d.mention_count DESC
+             WITH cs,
+                  collect({
+                    entity_type: target_labels[0],
+                    entity_id: COALESCE(target.path, target.name, target.id),
+                    mention_count: d.mention_count
+                  })[..10] AS top_discussed
+             UNWIND top_discussed AS disc
+             RETURN cs.id AS session_id,
+                    disc.entity_type AS entity_type,
+                    disc.entity_id AS entity_id,
+                    disc.mention_count AS mention_count",
+        )
+        .param("session_ids", session_ids);
+
+        let mut result = self.graph.execute(discussed_query).await?;
+        let mut discussed = Vec::new();
+        while let Some(row) = result.next().await? {
+            discussed.push(ChatGraphDiscussed {
+                session_id: row.get("session_id")?,
+                entity_type: row
+                    .get::<String>("entity_type")
+                    .unwrap_or_else(|_| "File".to_string()),
+                entity_id: row.get::<String>("entity_id").unwrap_or_default(),
+                mention_count: row.get::<i64>("mention_count").unwrap_or(1),
+            });
+        }
+
+        Ok((sessions, discussed))
+    }
+
+    // ========================================================================
+    // Chat ↔ Plan/Task/RFC linking
+    // ========================================================================
+
+    /// Create or merge an ASSOCIATED_WITH relation between a ChatSession and a Plan or Task.
+    pub async fn create_associated_with(
+        &self,
+        session_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+        source: &str,
+    ) -> Result<bool> {
+        let label = match entity_type {
+            "Plan" => "Plan",
+            "Task" => "Task",
+            _ => anyhow::bail!("Invalid entity_type for ASSOCIATED_WITH: {}", entity_type),
+        };
+        let cypher = format!(
+            r#"
+            MATCH (s:ChatSession {{id: $session_id}})
+            MATCH (e:{label} {{id: $entity_id}})
+            MERGE (s)-[r:ASSOCIATED_WITH]->(e)
+            ON CREATE SET r.source = $source, r.created_at = datetime()
+            RETURN true AS created
+            "#,
+        );
+        let q = query(&cypher)
+            .param("session_id", session_id.to_string())
+            .param("entity_id", entity_id.to_string())
+            .param("source", source);
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// Get all plans, tasks, and RFCs linked to a session (via both AgentExecution and ASSOCIATED_WITH).
+    pub async fn get_session_links(&self, session_id: Uuid) -> Result<LinkedSessionInfo> {
+        let q = query(
+            r#"
+            MATCH (s:ChatSession {id: $session_id})
+
+            // Path A: runner tasks via AgentExecution
+            OPTIONAL MATCH (ae:AgentExecution {session_id: $session_id})-[:EXECUTES]->(t_runner:Task)
+            OPTIONAL MATCH (p_runner:Plan)-[:HAS_TASK]->(t_runner)
+
+            // Path B: ASSOCIATED_WITH tasks
+            OPTIONAL MATCH (s)-[aw_t:ASSOCIATED_WITH]->(t_assoc:Task)
+            OPTIONAL MATCH (p_assoc:Plan)-[:HAS_TASK]->(t_assoc)
+
+            // Path C: ASSOCIATED_WITH plans
+            OPTIONAL MATCH (s)-[aw_p:ASSOCIATED_WITH]->(p_direct:Plan)
+
+            WITH collect(DISTINCT {id: t_runner.id, title: t_runner.title, source: 'runner'}) +
+                 collect(DISTINCT {id: t_assoc.id, title: t_assoc.title, source: COALESCE(aw_t.source, 'manual')}) AS raw_tasks,
+                 collect(DISTINCT {id: p_runner.id, title: p_runner.title, source: 'runner'}) +
+                 collect(DISTINCT {id: p_assoc.id, title: p_assoc.title, source: 'runner'}) +
+                 collect(DISTINCT {id: p_direct.id, title: p_direct.title, source: COALESCE(aw_p.source, 'manual')}) AS raw_plans
+
+            WITH [t IN raw_tasks WHERE t.id IS NOT NULL | t] AS tasks,
+                 [p IN raw_plans WHERE p.id IS NOT NULL | p] AS plans
+
+            // Get RFCs for these plans
+            UNWIND CASE WHEN size(plans) = 0 THEN [null] ELSE plans END AS plan_item
+            OPTIONAL MATCH (rfc:Note {note_type: 'rfc'})-[:LINKED_TO]->(pn:Plan)
+            WHERE plan_item IS NOT NULL AND pn.id = plan_item.id
+
+            WITH tasks, plans,
+                 collect(DISTINCT {id: rfc.id, content: rfc.content}) AS raw_rfcs
+
+            RETURN tasks,
+                   plans,
+                   [r IN raw_rfcs WHERE r.id IS NOT NULL | r] AS rfcs
+            "#,
+        )
+        .param("session_id", session_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut info = LinkedSessionInfo::default();
+
+        if let Some(row) = result.next().await? {
+            // Parse tasks
+            if let Ok(tasks_val) = row.get::<serde_json::Value>("tasks") {
+                if let Some(arr) = tasks_val.as_array() {
+                    for t in arr {
+                        if let (Some(id_str), Some(title)) = (
+                            t.get("id").and_then(|v| v.as_str()),
+                            t.get("title").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(id) = id_str.parse::<Uuid>() {
+                                let source = t
+                                    .get("source")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("manual")
+                                    .to_string();
+                                info.linked_tasks.push(LinkedTaskInfo {
+                                    id,
+                                    title: title.to_string(),
+                                    source,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Parse plans
+            if let Ok(plans_val) = row.get::<serde_json::Value>("plans") {
+                if let Some(arr) = plans_val.as_array() {
+                    for p in arr {
+                        if let (Some(id_str), Some(title)) = (
+                            p.get("id").and_then(|v| v.as_str()),
+                            p.get("title").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(id) = id_str.parse::<Uuid>() {
+                                let source = p
+                                    .get("source")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("manual")
+                                    .to_string();
+                                info.linked_plans.push(LinkedPlanInfo {
+                                    id,
+                                    title: title.to_string(),
+                                    source,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Parse RFCs
+            if let Ok(rfcs_val) = row.get::<serde_json::Value>("rfcs") {
+                if let Some(arr) = rfcs_val.as_array() {
+                    for r in arr {
+                        if let (Some(id_str), Some(content)) = (
+                            r.get("id").and_then(|v| v.as_str()),
+                            r.get("content").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(id) = id_str.parse::<Uuid>() {
+                                let title = content
+                                    .lines()
+                                    .find(|l| !l.trim().is_empty())
+                                    .unwrap_or("RFC")
+                                    .trim_start_matches('#')
+                                    .trim()
+                                    .chars()
+                                    .take(100)
+                                    .collect::<String>();
+                                info.linked_rfcs.push(LinkedRfcInfo { id, title });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(info)
+    }
+
+    /// Get all sessions linked to a plan (via runner execution, direct ASSOCIATED_WITH, or task association).
+    pub async fn get_sessions_for_plan(&self, plan_id: Uuid) -> Result<Vec<SessionWithLinks>> {
+        let q = query(
+            r#"
+            // Path 1: AgentExecution sessions
+            OPTIONAL MATCH (ae:AgentExecution)-[:EXECUTES]->(t:Task)<-[:HAS_TASK]-(p:Plan {id: $plan_id})
+            WHERE ae.session_id IS NOT NULL
+            WITH collect(DISTINCT {sid: ae.session_id, source: 'runner'}) AS runner_sids
+
+            // Path 2: ASSOCIATED_WITH → Plan
+            OPTIONAL MATCH (s2:ChatSession)-[r2:ASSOCIATED_WITH]->(p2:Plan {id: $plan_id})
+            WITH runner_sids, collect(DISTINCT {sid: s2.id, source: COALESCE(r2.source, 'manual')}) AS direct_sids
+
+            // Path 3: ASSOCIATED_WITH → Task → Plan
+            OPTIONAL MATCH (s3:ChatSession)-[r3:ASSOCIATED_WITH]->(t3:Task)<-[:HAS_TASK]-(p3:Plan {id: $plan_id})
+            WITH runner_sids, direct_sids, collect(DISTINCT {sid: s3.id, source: COALESCE(r3.source, 'manual')}) AS task_sids
+            WITH runner_sids + direct_sids + task_sids AS all_sids
+
+            UNWIND all_sids AS entry
+            WITH DISTINCT entry.sid AS sid, entry.source AS source
+            WHERE sid IS NOT NULL
+
+            MATCH (s:ChatSession {id: sid})
+            RETURN s, source
+            ORDER BY s.created_at DESC
+            "#,
+        )
+        .param("plan_id", plan_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut sessions = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(node) = row.get::<neo4rs::Node>("s") {
+                if let Ok(session) = Self::parse_chat_session_node(&node) {
+                    let source = row
+                        .get::<String>("source")
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    sessions.push(SessionWithLinks {
+                        session,
+                        links: LinkedSessionInfo::default(),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// Get all sessions linked to a task.
+    pub async fn get_sessions_for_task(&self, task_id: Uuid) -> Result<Vec<SessionWithLinks>> {
+        let q = query(
+            r#"
+            // Path 1: AgentExecution
+            OPTIONAL MATCH (ae:AgentExecution)-[:EXECUTES]->(t:Task {id: $task_id})
+            WHERE ae.session_id IS NOT NULL
+            WITH collect(DISTINCT {sid: ae.session_id, source: 'runner'}) AS runner_sids
+
+            // Path 2: ASSOCIATED_WITH
+            OPTIONAL MATCH (s2:ChatSession)-[r2:ASSOCIATED_WITH]->(t2:Task {id: $task_id})
+            WITH runner_sids, collect(DISTINCT {sid: s2.id, source: COALESCE(r2.source, 'manual')}) AS assoc_sids
+            WITH runner_sids + assoc_sids AS all_sids
+
+            UNWIND all_sids AS entry
+            WITH DISTINCT entry.sid AS sid, entry.source AS source
+            WHERE sid IS NOT NULL
+
+            MATCH (s:ChatSession {id: sid})
+            RETURN s, source
+            ORDER BY s.created_at DESC
+            "#,
+        )
+        .param("task_id", task_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut sessions = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(node) = row.get::<neo4rs::Node>("s") {
+                if let Ok(session) = Self::parse_chat_session_node(&node) {
+                    let source = row
+                        .get::<String>("source")
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    sessions.push(SessionWithLinks {
+                        session,
+                        links: LinkedSessionInfo::default(),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// Batch version of get_session_links for multiple sessions.
+    pub async fn get_session_links_batch(
+        &self,
+        session_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, LinkedSessionInfo>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let sid_strings: Vec<String> = session_ids.iter().map(|id| id.to_string()).collect();
+
+        let q = query(
+            r#"
+            UNWIND $session_ids AS sid
+            MATCH (s:ChatSession {id: sid})
+
+            // Path A: runner tasks via AgentExecution
+            OPTIONAL MATCH (ae:AgentExecution {session_id: sid})-[:EXECUTES]->(t_runner:Task)
+            OPTIONAL MATCH (p_runner:Plan)-[:HAS_TASK]->(t_runner)
+
+            // Path B: ASSOCIATED_WITH tasks
+            OPTIONAL MATCH (s)-[aw_t:ASSOCIATED_WITH]->(t_assoc:Task)
+            OPTIONAL MATCH (p_assoc:Plan)-[:HAS_TASK]->(t_assoc)
+
+            // Path C: ASSOCIATED_WITH plans
+            OPTIONAL MATCH (s)-[aw_p:ASSOCIATED_WITH]->(p_direct:Plan)
+
+            WITH sid,
+                 collect(DISTINCT {id: t_runner.id, title: t_runner.title, source: 'runner'}) +
+                 collect(DISTINCT {id: t_assoc.id, title: t_assoc.title, source: COALESCE(aw_t.source, 'manual')}) AS raw_tasks,
+                 collect(DISTINCT {id: p_runner.id, title: p_runner.title, source: 'runner'}) +
+                 collect(DISTINCT {id: p_assoc.id, title: p_assoc.title, source: 'runner'}) +
+                 collect(DISTINCT {id: p_direct.id, title: p_direct.title, source: COALESCE(aw_p.source, 'manual')}) AS raw_plans
+
+            WITH sid,
+                 [t IN raw_tasks WHERE t.id IS NOT NULL | t] AS tasks,
+                 [p IN raw_plans WHERE p.id IS NOT NULL | p] AS plans
+
+            // Get RFCs for these plans
+            UNWIND CASE WHEN size(plans) = 0 THEN [null] ELSE plans END AS plan_item
+            OPTIONAL MATCH (rfc:Note {note_type: 'rfc'})-[:LINKED_TO]->(pn:Plan)
+            WHERE plan_item IS NOT NULL AND pn.id = plan_item.id
+
+            WITH sid, tasks, plans,
+                 collect(DISTINCT {id: rfc.id, content: rfc.content}) AS raw_rfcs
+
+            RETURN sid,
+                   tasks,
+                   plans,
+                   [r IN raw_rfcs WHERE r.id IS NOT NULL | r] AS rfcs
+            "#,
+        )
+        .param("session_ids", sid_strings);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut map = HashMap::new();
+
+        while let Some(row) = result.next().await? {
+            let sid_str: String = row.get("sid")?;
+            let sid: Uuid = match sid_str.parse() {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            let mut info = LinkedSessionInfo::default();
+
+            // Parse tasks
+            if let Ok(tasks_val) = row.get::<serde_json::Value>("tasks") {
+                if let Some(arr) = tasks_val.as_array() {
+                    for t in arr {
+                        if let (Some(id_str), Some(title)) = (
+                            t.get("id").and_then(|v| v.as_str()),
+                            t.get("title").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(id) = id_str.parse::<Uuid>() {
+                                let source = t
+                                    .get("source")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("manual")
+                                    .to_string();
+                                info.linked_tasks.push(LinkedTaskInfo {
+                                    id,
+                                    title: title.to_string(),
+                                    source,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Parse plans
+            if let Ok(plans_val) = row.get::<serde_json::Value>("plans") {
+                if let Some(arr) = plans_val.as_array() {
+                    for p in arr {
+                        if let (Some(id_str), Some(title)) = (
+                            p.get("id").and_then(|v| v.as_str()),
+                            p.get("title").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(id) = id_str.parse::<Uuid>() {
+                                let source = p
+                                    .get("source")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("manual")
+                                    .to_string();
+                                info.linked_plans.push(LinkedPlanInfo {
+                                    id,
+                                    title: title.to_string(),
+                                    source,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Parse RFCs
+            if let Ok(rfcs_val) = row.get::<serde_json::Value>("rfcs") {
+                if let Some(arr) = rfcs_val.as_array() {
+                    for r in arr {
+                        if let (Some(id_str), Some(content)) = (
+                            r.get("id").and_then(|v| v.as_str()),
+                            r.get("content").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(id) = id_str.parse::<Uuid>() {
+                                let title = content
+                                    .lines()
+                                    .find(|l| !l.trim().is_empty())
+                                    .unwrap_or("RFC")
+                                    .trim_start_matches('#')
+                                    .trim()
+                                    .chars()
+                                    .take(100)
+                                    .collect::<String>();
+                                info.linked_rfcs.push(LinkedRfcInfo { id, title });
+                            }
+                        }
+                    }
+                }
+            }
+
+            map.insert(sid, info);
+        }
+        Ok(map)
+    }
+
+    /// Get the plan_id for a task (via HAS_TASK relation).
+    pub async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>> {
+        let q = query(
+            r#"
+            MATCH (p:Plan)-[:HAS_TASK]->(t:Task {id: $task_id})
+            RETURN p.id AS plan_id
+            LIMIT 1
+            "#,
+        )
+        .param("task_id", task_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let pid_str: String = row.get("plan_id")?;
+            Ok(pid_str.parse::<Uuid>().ok())
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+// ============================================================================
+// Chat anchors (see `crate::chat::anchor`)
+// ============================================================================
+
+fn anchor_opt(s: String) -> Option<String> {
+    (!s.is_empty()).then_some(s)
+}
+
+fn parse_ts(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    Ok(chrono::DateTime::parse_from_rfc3339(s)?.with_timezone(&chrono::Utc))
+}
+
+fn anchor_from_node(node: &neo4rs::Node) -> Result<crate::chat::anchor::Anchor> {
+    use crate::chat::anchor::*;
+    let bad = |what: &str| anyhow::anyhow!("corrupt Anchor node: {what}");
+    let s = |k: &str| node.get::<String>(k).unwrap_or_default();
+    let roles: Vec<String> = node.get("roles").unwrap_or_default();
+    Ok(Anchor {
+        id: s("id").parse()?,
+        session_id: s("session_id").parse()?,
+        target_type: AnchorTargetType::parse(&s("target_type"))
+            .ok_or_else(|| bad("target_type"))?,
+        target_id: s("target_id"),
+        roles: roles
+            .iter()
+            .map(|r| AnchorRole::parse(r).ok_or_else(|| bad("role")))
+            .collect::<Result<_>>()?,
+        state: AnchorState::parse(&s("state")).ok_or_else(|| bad("state"))?,
+        by: AnchorActor::parse(&s("by")).ok_or_else(|| bad("by"))?,
+        inferred: node.get::<bool>("inferred").unwrap_or(false),
+        confidence: node.get::<f64>("confidence").unwrap_or(1.0),
+        snapshot_name: anchor_opt(s("snapshot_name")),
+        snapshot_path: anchor_opt(s("snapshot_path")),
+        snapshot_type: anchor_opt(s("snapshot_type")),
+        rev: anchor_opt(s("rev")),
+        version: node.get::<i64>("version").unwrap_or(1).max(1) as u64,
+        created_at: parse_ts(&s("created_at"))?,
+        updated_at: parse_ts(&s("updated_at"))?,
+    })
+}
+
+fn anchor_event_from_node(node: &neo4rs::Node) -> Result<crate::chat::anchor::AnchorEvent> {
+    use crate::chat::anchor::*;
+    let bad = |what: &str| anyhow::anyhow!("corrupt AnchorEvent node: {what}");
+    let s = |k: &str| node.get::<String>(k).unwrap_or_default();
+    let json = |k: &str| anchor_opt(s(k)).and_then(|j| serde_json::from_str(&j).ok());
+    Ok(AnchorEvent {
+        id: s("id").parse()?,
+        seq: node.get::<i64>("seq").unwrap_or(0).max(0) as u64,
+        session_id: s("session_id").parse()?,
+        anchor_id: s("anchor_id").parse()?,
+        kind: AnchorEventKind::parse(&s("kind")).ok_or_else(|| bad("kind"))?,
+        by: AnchorActor::parse(&s("by")).ok_or_else(|| bad("by"))?,
+        actor: s("actor"),
+        at: parse_ts(&s("at"))?,
+        before: json("before"),
+        after: json("after"),
+    })
+}
+
+/// Run a statement inside a transaction and collect its rows.
+async fn txn_rows(txn: &mut neo4rs::Txn, q: neo4rs::Query) -> Result<Vec<neo4rs::Row>> {
+    let mut stream = txn.execute(q).await?;
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next(txn.handle()).await? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+impl Neo4jClient {
+    /// Rules of `chat::anchor::apply_op`, persisted in one transaction.
+    ///
+    /// The transaction first writes `anchor_lock` on the `ChatSession` node:
+    /// that takes the node's write lock, so two concurrent operations on the
+    /// same session run one after the other and each reads the anchors the
+    /// previous one committed. The caps and the `version` check are therefore
+    /// evaluated on a consistent view. The unique constraint on
+    /// `(session_id, target_type, target_id)` is the backstop.
+    pub async fn apply_anchor_op(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+    ) -> Result<crate::chat::anchor::AnchorChange> {
+        Ok(self.apply_anchor_op_if(session_id, op, None).await?.change)
+    }
+
+    /// [`Self::apply_anchor_op`] with the set-version check of `If-Match`. The
+    /// version of the set is `ChatSession.anchor_seq` (the number of the last
+    /// committed change), read under the same lock as the write: a stale
+    /// `if_match` is refused before anything is written.
+    pub async fn apply_anchor_op_if(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+        if_match: Option<u64>,
+    ) -> Result<crate::chat::anchor::AnchorSetChange> {
+        use crate::chat::anchor::*;
+        let sid = session_id.to_string();
+        let mut txn = self.graph.start_txn().await?;
+        let outcome: Result<(AnchorChange, u64)> = async {
+            let locked = txn_rows(
+                &mut txn,
+                query(
+                    "MATCH (s:ChatSession {id: $sid}) \
+                     SET s.anchor_lock = coalesce(s.anchor_lock, 0) + 1, \
+                         s.anchor_seq = coalesce(s.anchor_seq, 0) + 1 \
+                     RETURN s.anchor_seq AS seq",
+                )
+                .param("sid", sid.clone()),
+            )
+            .await?;
+            let Some(locked) = locked.first() else {
+                return Err(AnchorError::SessionNotFound(session_id).into());
+            };
+            // The number this operation takes IF it writes an event (otherwise the
+            // transaction is rolled back below, so the number is not consumed:
+            // no gap). The lock above serializes writers, hence no duplicate.
+            let seq = locked.get::<i64>("seq")?.max(0) as u64;
+            // The version the set had before this operation.
+            let current = seq.saturating_sub(1);
+            if let Some(expected) = if_match.filter(|v| *v != current) {
+                return Err(AnchorError::SetVersionConflict {
+                    expected,
+                    actual: current,
+                }
+                .into());
+            }
+            let rows = txn_rows(
+                &mut txn,
+                query("MATCH (a:Anchor {session_id: $sid}) RETURN a ORDER BY a.created_at, a.id")
+                    .param("sid", sid.clone()),
+            )
+            .await?;
+            let mut existing = Vec::with_capacity(rows.len());
+            for row in rows {
+                let node: neo4rs::Node = row.get("a")?;
+                existing.push(anchor_from_node(&node)?);
+            }
+            let mut change = apply_op(session_id, &existing, op, chrono::Utc::now())?;
+            if let Some(ev) = change.event.as_mut() {
+                ev.seq = seq;
+            }
+            let a = &change.anchor;
+            if change.deleted {
+                txn.run(
+                    query("MATCH (a:Anchor {id: $id, session_id: $sid}) DELETE a")
+                        .param("id", a.id.to_string())
+                        .param("sid", sid.clone()),
+                )
+                .await?;
+            } else if change.event.is_some() {
+                let roles: Vec<String> = a.roles.iter().map(|r| r.to_string()).collect();
+                txn.run(
+                    query(
+                        "MERGE (a:Anchor {session_id: $sid, target_type: $tt, target_id: $tid}) \
+                         SET a.id = $id, a.roles = $roles, a.state = $state, a.by = $by, \
+                             a.inferred = $inferred, a.confidence = $confidence, \
+                             a.snapshot_name = $snapshot_name, a.snapshot_path = $snapshot_path, \
+                             a.snapshot_type = $snapshot_type, a.rev = $rev, \
+                             a.version = $version, \
+                             a.created_at = coalesce(a.created_at, $created_at), \
+                             a.updated_at = $updated_at",
+                    )
+                    .param("sid", sid.clone())
+                    .param("tt", a.target_type.as_str())
+                    .param("tid", a.target_id.clone())
+                    .param("id", a.id.to_string())
+                    .param("roles", roles)
+                    .param("state", a.state.as_str())
+                    .param("by", a.by.as_str())
+                    .param("inferred", a.inferred)
+                    .param("confidence", a.confidence)
+                    .param("snapshot_name", a.snapshot_name.clone().unwrap_or_default())
+                    .param("snapshot_path", a.snapshot_path.clone().unwrap_or_default())
+                    .param("snapshot_type", a.snapshot_type.clone().unwrap_or_default())
+                    .param("rev", a.rev.clone().unwrap_or_default())
+                    .param("version", a.version as i64)
+                    .param("created_at", format_ts(a.created_at))
+                    .param("updated_at", format_ts(a.updated_at)),
+                )
+                .await?;
+            }
+            if let Some(ev) = &change.event {
+                let json = |v: &Option<serde_json::Value>| {
+                    v.as_ref().map(|v| v.to_string()).unwrap_or_default()
+                };
+                txn.run(
+                    query(
+                        "CREATE (:AnchorEvent {id: $id, session_id: $sid, anchor_id: $aid, \
+                         seq: $seq, kind: $kind, by: $by, actor: $actor, at: $at, \
+                         before: $before, after: $after})",
+                    )
+                    .param("id", ev.id.to_string())
+                    .param("sid", sid.clone())
+                    .param("aid", ev.anchor_id.to_string())
+                    .param("seq", ev.seq as i64)
+                    .param("kind", ev.kind.as_str())
+                    .param("by", ev.by.as_str())
+                    .param("actor", ev.actor.clone())
+                    .param("at", format_ts(ev.at))
+                    .param("before", json(&ev.before))
+                    .param("after", json(&ev.after)),
+                )
+                .await?;
+            }
+            Ok((change, seq))
+        }
+        .await;
+        match outcome {
+            Ok((change, seq)) => {
+                let version = if change.event.is_some() {
+                    txn.commit().await?;
+                    seq
+                } else {
+                    // nothing written: give back the lock and the number
+                    txn.rollback().await?;
+                    seq.saturating_sub(1)
+                };
+                Ok(AnchorSetChange { change, version })
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// All anchors of a session, oldest first.
+    pub async fn list_session_anchors(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::Anchor>> {
+        let mut result = self
+            .graph
+            .execute(
+                query("MATCH (a:Anchor {session_id: $sid}) RETURN a ORDER BY a.created_at, a.id")
+                    .param("sid", session_id.to_string()),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("a")?;
+            out.push(anchor_from_node(&node)?);
+        }
+        Ok(out)
+    }
+
+    /// The anchors of a session and the version of the set, in ONE read: a
+    /// client never gets anchors newer than the version it will send back in
+    /// `If-Match`. `None` when the session does not exist.
+    pub async fn get_anchor_set(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<crate::chat::anchor::AnchorSet>> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (s:ChatSession {id: $sid}) \
+                     OPTIONAL MATCH (a:Anchor {session_id: $sid}) \
+                     WITH s, a ORDER BY a.created_at, a.id \
+                     RETURN coalesce(s.anchor_seq, 0) AS version, collect(a) AS anchors",
+                )
+                .param("sid", session_id.to_string()),
+            )
+            .await?;
+        let Some(row) = result.next().await? else {
+            return Ok(None);
+        };
+        let version = row.get::<i64>("version")?.max(0) as u64;
+        let nodes: Vec<neo4rs::Node> = row.get("anchors")?;
+        let anchors = nodes
+            .iter()
+            .map(anchor_from_node)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(crate::chat::anchor::AnchorSet { version, anchors }))
+    }
+
+    /// Reverse query, keyset-paginated on the anchor id.
+    pub async fn list_sessions_for_target(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+        state: Option<crate::chat::anchor::AnchorState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<crate::chat::anchor::AnchorPage> {
+        let limit = limit.clamp(1, 200);
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (a:Anchor {target_type: $tt, target_id: $tid}) \
+                     WHERE ($state = '' OR a.state = $state) AND ($after = '' OR a.id > $after) \
+                     RETURN a ORDER BY a.id LIMIT $limit",
+                )
+                .param("tt", target_type.as_str())
+                .param("tid", target_id.to_string())
+                .param("state", state.map(|s| s.as_str()).unwrap_or(""))
+                .param("after", cursor.unwrap_or("").to_string())
+                .param("limit", (limit + 1) as i64),
+            )
+            .await?;
+        let mut items = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("a")?;
+            items.push(anchor_from_node(&node)?);
+        }
+        let next_cursor = if items.len() > limit {
+            items.truncate(limit);
+            items.last().map(|a| a.id.to_string())
+        } else {
+            None
+        };
+        Ok(crate::chat::anchor::AnchorPage { items, next_cursor })
+    }
+
+    /// The journal of a session, oldest first: by `seq`. Events written before
+    /// numbering existed (no `seq`) come first, by `at` then id.
+    pub async fn list_anchor_events(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::AnchorEvent>> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (e:AnchorEvent {session_id: $sid}) RETURN e \
+                     ORDER BY coalesce(e.seq, 0), e.at, e.id",
+                )
+                .param("sid", session_id.to_string()),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("e")?;
+            out.push(anchor_event_from_node(&node)?);
+        }
+        Ok(out)
+    }
+
+    /// Mark the anchors on a target `dangling` (one transaction per anchor).
+    pub async fn mark_anchors_dangling(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+    ) -> Result<usize> {
+        use crate::chat::anchor::*;
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (a:Anchor {target_type: $tt, target_id: $tid}) \
+                     WHERE a.state <> 'dangling' RETURN a.session_id AS sid, a.id AS id",
+                )
+                .param("tt", target_type.as_str())
+                .param("tid", target_id.to_string()),
+            )
+            .await?;
+        let mut todo = Vec::new();
+        while let Some(row) = result.next().await? {
+            let sid: String = row.get("sid")?;
+            let id: String = row.get("id")?;
+            todo.push((sid.parse::<Uuid>()?, id.parse::<Uuid>()?));
+        }
+        let mut changed = 0;
+        for (session_id, anchor_id) in todo {
+            let op = AnchorOp::SetState {
+                anchor_id,
+                state: AnchorState::Dangling,
+                expected_version: None,
+                by: AnchorActor::System,
+                actor: DANGLING_ACTOR.to_string(),
+            };
+            match self.apply_anchor_op(session_id, op).await {
+                Ok(c) if c.event.is_some() => changed += 1,
+                Ok(_) => {}
+                Err(e) => match e.downcast_ref::<AnchorError>() {
+                    // deleted between the scan and the write: nothing left to mark
+                    Some(AnchorError::NotFound(_) | AnchorError::SessionNotFound(_)) => {}
+                    _ => return Err(e),
+                },
+            }
+        }
+        Ok(changed)
+    }
+
+    /// See `AnalyticsStore::backfill_project_anchors`.
+    pub async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport> {
+        use crate::chat::anchor::*;
+        let mut result = self
+            .graph
+            .execute(query(
+                "MATCH (s:ChatSession) WHERE s.project_slug IS NOT NULL AND s.project_slug <> '' \
+                 RETURN s.id AS id, s.project_slug AS slug ORDER BY s.id",
+            ))
+            .await?;
+        let mut sessions = Vec::new();
+        while let Some(row) = result.next().await? {
+            sessions.push((row.get::<String>("id")?, row.get::<String>("slug")?));
+        }
+        let mut report = BackfillReport::default();
+        let mut resolved: HashMap<String, Option<crate::neo4j::models::ProjectNode>> =
+            HashMap::new();
+        for (id, slug) in sessions {
+            let Ok(session_id) = id.parse::<Uuid>() else {
+                report.skipped_unresolved += 1;
+                continue;
+            };
+            if !resolved.contains_key(&slug) {
+                let mut r = self
+                    .graph
+                    .execute(
+                        query("MATCH (p:Project {slug: $slug}) RETURN count(p) AS n")
+                            .param("slug", slug.clone()),
+                    )
+                    .await?;
+                let n: i64 = match r.next().await? {
+                    Some(row) => row.get("n")?,
+                    None => 0,
+                };
+                let project = if n == 1 {
+                    self.get_project_by_slug(&slug).await?
+                } else {
+                    None
+                };
+                resolved.insert(slug.clone(), project);
+            }
+            let Some(Some(project)) = resolved.get(&slug) else {
+                report.skipped_unresolved += 1;
+                continue;
+            };
+            match self
+                .apply_anchor_op(session_id, AnchorOp::Add(backfill_new_anchor(project)))
+                .await
+            {
+                Ok(c) if c.created => report.created += 1,
+                Ok(_) => report.already_present += 1,
+                Err(e) => match e.downcast_ref::<AnchorError>() {
+                    Some(AnchorError::AlreadyAnchored { .. }) => report.already_present += 1,
+                    Some(AnchorError::SessionNotFound(_)) => report.skipped_unresolved += 1,
+                    Some(_) => report.skipped_by_rule += 1,
+                    None => return Err(e),
+                },
+            }
+        }
+        Ok(report)
+    }
+
+    /// See `AnalyticsStore::backfill_spawned_by_edges`.
+    pub async fn backfill_spawned_by_edges(&self) -> Result<usize> {
+        let mut result = self
+            .graph
+            .execute(query(
+                "MATCH (c:ChatSession) \
+                 WHERE c.spawned_by IS NOT NULL AND c.spawned_by <> '' \
+                   AND NOT EXISTS { (c)-[:SPAWNED_BY]->(:ChatSession) } \
+                 RETURN c.id AS id, c.spawned_by AS sb ORDER BY c.id",
+            ))
+            .await?;
+        let mut todo = Vec::new();
+        while let Some(row) = result.next().await? {
+            let sb: String = row.get("sb")?;
+            let parent = crate::chat::types::SpawnedBy::from_json_str(&sb)
+                .and_then(|sb| sb.parent_session_id());
+            if let Some(parent) = parent {
+                todo.push((row.get::<String>("id")?, parent.to_string()));
+            }
+        }
+        let mut created = 0;
+        for (child, parent) in todo {
+            // MERGE + the absence test above: a second run finds nothing to do,
+            // and an edge that appeared meanwhile is reused, never doubled.
+            let mut r = self
+                .graph
+                .execute(
+                    query(
+                        "MATCH (c:ChatSession {id: $c}) \
+                         MATCH (p:ChatSession {id: $p}) \
+                         MERGE (c)-[r:SPAWNED_BY]->(p) \
+                         ON CREATE SET r.created_at = datetime() \
+                         RETURN count(r) AS n",
+                    )
+                    .param("c", child)
+                    .param("p", parent),
+                )
+                .await?;
+            if let Some(row) = r.next().await? {
+                created += row.get::<i64>("n")?.max(0) as usize;
+            }
+        }
+        Ok(created)
+    }
+
+    /// See `GraphStore::revert_inferred_anchors`. One statement, hence atomic.
+    pub async fn revert_inferred_anchors(&self) -> Result<usize> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (a:Anchor) \
+                     WHERE a.inferred = true AND a.by = 'system' AND a.version = 1 \
+                       AND EXISTS { MATCH (x:AnchorEvent {anchor_id: a.id, kind: 'added', actor: $actor}) } \
+                     OPTIONAL MATCH (e:AnchorEvent {anchor_id: a.id}) \
+                     WITH a, collect(e) AS evs \
+                     FOREACH (e IN evs | DELETE e) \
+                     WITH a, a.id AS aid \
+                     DELETE a \
+                     RETURN count(aid) AS n",
+                )
+                .param("actor", crate::chat::anchor::BACKFILL_ACTOR),
+            )
+            .await?;
+        Ok(match result.next().await? {
+            Some(row) => row.get::<i64>("n")? as usize,
+            None => 0,
+        })
+    }
+}
+
+/// Refuse une migration d'arêtes d'agent qui n'a pas convergé.
+///
+/// Détachée de la boucle exprès : la branche d'erreur d'une boucle de migration est
+/// justement celle qu'un test d'exécution ne peut pas atteindre (il faudrait un statement
+/// qui n'efface jamais ce qu'il déplace). Pure, elle se mesure.
+fn check_agent_edge_cap(edge: &str, moved: usize, batches: u64) -> Result<()> {
+    let cap = crate::neo4j::data_migrations::MAX_BATCHES;
+    if batches >= u64::from(cap) {
+        anyhow::bail!(
+            "moving {edge} edges onto the durable self did not converge within {cap} batches \
+             ({moved} moved so far): the statement keeps matching edges it does not delete"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::chat_session_update_clauses;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    #[test]
+    fn chat_session_update_binds_free_text() {
+        let c = chat_session_update_clauses(true, true, Some(3), Some(0.25), true, true).join(", ");
+        for p in ["$cli_session_id", "$title", "$conversation_id", "$preview"] {
+            assert!(c.contains(p), "{c}");
+        }
+        assert!(!c.contains('\''), "no string literal expected: {c}");
+        let nan = chat_session_update_clauses(false, false, None, Some(f64::NAN), false, false);
+        assert_eq!(nan, vec!["s.updated_at = datetime()".to_string()]);
+    }
+
+    /// Une migration qui n'a pas convergé ÉCHOUE en le disant. L'arrêt silencieux serait
+    /// pire que la panne : il laisserait l'attribution sur les facets en annonçant le
+    /// succès, et le démarrage suivant croirait le travail fait.
+    #[test]
+    fn a_migration_that_does_not_converge_fails_and_says_it() {
+        let cap = crate::neo4j::data_migrations::MAX_BATCHES;
+        assert!(
+            super::check_agent_edge_cap("AUTHORED", 0, 0).is_ok(),
+            "un premier lot est toujours permis"
+        );
+        assert!(super::check_agent_edge_cap("AUTHORED", 999, u64::from(cap) - 1).is_ok());
+        let error = super::check_agent_edge_cap("AUTHORED", 500, u64::from(cap))
+            .expect_err("le plafond atteint doit échouer");
+        let said = error.to_string();
+        assert!(said.contains("did not converge"), "{said}");
+        assert!(said.contains("AUTHORED"), "elle nomme l'arête : {said}");
+        assert!(said.contains(&cap.to_string()), "et le plafond : {said}");
+    }
+}
+
+/// The agent identity against a real Neo4j: the write path refuses a foreign id, and the
+/// migration of the edges of model facets onto the self is replayable without duplicates.
+/// Skipped unless `AGENT_IDENTITY_NEO4J_URI` is set (`HARNESS_NEO4J_REQUIRED=1` turns the
+/// skip into a failure). Run against a throwaway instance only:
+///   docker run -d --rm --name po-mig -p 17687:7687 -e NEO4J_AUTH=neo4j/testpassword neo4j:5
+///   AGENT_IDENTITY_NEO4J_URI=bolt://localhost:17687 NEO4J_PASSWORD=testpassword cargo test --lib agent_identity_neo4j
+#[cfg(test)]
+mod agent_identity_neo4j {
+    use super::*;
+
+    /// Not `NEO4J_URI`: the config tests of `lib.rs` clear and rewrite it while this suite
+    /// runs in parallel (the same reason as the parity test in `neo4j::mock`). Without this
+    /// variable the suite skips, unless `HARNESS_NEO4J_REQUIRED` is set.
+    async fn client() -> Option<Neo4jClient> {
+        let Ok(uri) = std::env::var("AGENT_IDENTITY_NEO4J_URI") else {
+            assert!(
+                std::env::var("HARNESS_NEO4J_REQUIRED").is_err(),
+                "HARNESS_NEO4J_REQUIRED is set but AGENT_IDENTITY_NEO4J_URI is not"
+            );
+            eprintln!("Skipping agent identity Neo4j tests: AGENT_IDENTITY_NEO4J_URI is not set");
+            return None;
+        };
+        let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
+        let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+        match Neo4jClient::new(&uri, &user, &password).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                assert!(
+                    std::env::var("HARNESS_NEO4J_REQUIRED").is_err(),
+                    "HARNESS_NEO4J_REQUIRED is set but no Neo4j answers at {uri}: {e}"
+                );
+                eprintln!("Skipping agent identity Neo4j tests: no Neo4j at {uri}");
+                None
+            }
+        }
+    }
+
+    async fn run(c: &Neo4jClient, q: &str, params: Vec<(&str, String)>) {
+        let mut query_ = query(q);
+        for (k, v) in params {
+            query_ = query_.param(k, v);
+        }
+        c.graph.run(query_).await.unwrap();
+    }
+
+    /// A note or an episode node, and a facet-or-self edge from `agent` to it.
+    async fn link(c: &Neo4jClient, agent: Uuid, edge: &str, target: &str, target_id: Uuid) {
+        run(
+            c,
+            &format!(
+                "MERGE (t:{target} {{id: $t}}) \
+                 WITH t MATCH (a:Agent {{id: $a}}) MERGE (a)-[:{edge}]->(t)"
+            ),
+            vec![("t", target_id.to_string()), ("a", agent.to_string())],
+        )
+        .await;
+    }
+
+    async fn ids_of(c: &Neo4jClient, agent: Uuid, edge: &str) -> Vec<String> {
+        let mut rows = c
+            .graph
+            .execute(
+                query(&format!(
+                    "MATCH (:Agent {{id: $a}})-[:{edge}]->(t) RETURN t.id AS id ORDER BY id"
+                ))
+                .param("a", agent.to_string()),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push(row.get::<String>("id").unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_foreign_id_is_never_made_an_agent() {
+        let Some(c) = client().await else { return };
+        assert!(c.ensure_agent(Uuid::new_v4(), None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_self_is_made_once_and_the_model_is_a_dated_facet_beside_it() {
+        let Some(c) = client().await else { return };
+        let root = c.agent_identity_namespace().await.unwrap();
+        c.ensure_agent(root, Some("claude-opus-5-5")).await.unwrap();
+        c.ensure_agent(root, Some("deepseek-v4")).await.unwrap();
+        c.ensure_agent(root, Some("deepseek-v4")).await.unwrap();
+
+        let facet = crate::notes::provenance::model_facet_id(root, "deepseek-v4").unwrap();
+        let mut rows = c
+            .graph
+            .execute(
+                query(
+                    "MATCH (f:Agent {id: $f, kind: 'model'})-[:FACET_OF]->(s:Agent {id: $root, kind: 'self'}) \
+                     RETURN f.model AS model, f.last_seen AS seen",
+                )
+                .param("f", facet.to_string())
+                .param("root", root.to_string()),
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("the facet hangs under the self");
+        assert_eq!(row.get::<String>("model").unwrap(), "deepseek-v4");
+        assert!(row.get::<String>("seen").is_ok(), "the fact is dated");
+    }
+
+    #[tokio::test]
+    async fn the_migration_moves_facet_edges_to_the_self_and_replays_without_duplicates() {
+        let Some(c) = client().await else { return };
+        let root = c.agent_identity_namespace().await.unwrap();
+        c.ensure_agent(root, Some("claude-opus-5-5")).await.unwrap();
+        let facet = crate::notes::provenance::model_facet_id(root, "claude-opus-5-5").unwrap();
+        c.ensure_agent(root, Some("claude-opus-5-5")).await.unwrap();
+
+        // Drain what an earlier run left on the shared instance, so the counts below are ours.
+        c.migrate_agent_edges_to_self(50).await.unwrap();
+
+        let (n1, n2, n3, e1) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for n in [n1, n2, n3] {
+            link(&c, facet, "AUTHORED", "Note", n).await;
+        }
+        // An edge the self already holds for n1: the move must merge it, not duplicate it.
+        link(&c, root, "AUTHORED", "Note", n1).await;
+        link(&c, facet, "LIVED", "SessionEpisode", e1).await;
+
+        // Batches of 2 for 4 edges: the loop must take more than one statement.
+        let first = c.migrate_agent_edges_to_self(2).await.unwrap();
+        assert_eq!(first.before.facet_authored, 3);
+        assert_eq!(first.before.facet_lived, 1);
+        assert_eq!(first.moved_authored, 3);
+        assert_eq!(first.moved_lived, 1);
+        assert_eq!(first.after.facet_total(), 0, "nothing left on a facet");
+
+        // The shared instance keeps other runs' edges: only this test's nodes are read.
+        let mine = |ids: Vec<String>, among: &[Uuid]| -> Vec<String> {
+            let among: Vec<String> = among.iter().map(Uuid::to_string).collect();
+            ids.into_iter().filter(|id| among.contains(id)).collect()
+        };
+        let notes = [n1, n2, n3];
+        let mut expected: Vec<String> = notes.iter().map(Uuid::to_string).collect();
+        expected.sort();
+        let self_authored = mine(ids_of(&c, root, "AUTHORED").await, &notes);
+        assert_eq!(self_authored, expected, "one edge per note, n1 not doubled");
+        assert_eq!(
+            mine(ids_of(&c, root, "LIVED").await, &[e1]),
+            vec![e1.to_string()]
+        );
+
+        // Replay: nothing moves, nothing is duplicated, the marker counts the runs.
+        let second = c.migrate_agent_edges_to_self(2).await.unwrap();
+        assert_eq!(second.moved_authored, 0);
+        assert_eq!(second.moved_lived, 0);
+        assert!(second.already_done);
+        assert_eq!(second.after, first.after);
+        assert_eq!(
+            mine(ids_of(&c, root, "AUTHORED").await, &notes),
+            expected,
+            "a replay duplicates nothing"
+        );
+
+        // Leave the instance as found: this test's nodes and their edges go.
+        for id in [n1, n2, n3, e1] {
+            run(
+                &c,
+                "MATCH (t {id: $id}) WHERE t:Note OR t:SessionEpisode DETACH DELETE t",
+                vec![("id", id.to_string())],
+            )
+            .await;
+        }
+    }
+}

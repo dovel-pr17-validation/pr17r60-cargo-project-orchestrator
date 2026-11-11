@@ -1,0 +1,10 @@
+# One local patch, and it is a security one: vendor/candle-core (see
+# vendor/candle-core/PATCH.md and the [patch.crates-io] block of Cargo.toml).
+# Everything else is resolved from crates.io or from a git rev.
+
+# `cargo xtask <subcommand>`: the after-merge checks of xtask/ (a standalone
+# std-only crate, excluded from the workspace). Run from the repo root.
+#   cargo xtask in-service   is the running backend the current main? (AM-1)
+#   cargo xtask pins         did main of each git-pinned repo reach Cargo.toml? (AM-2)
+[alias]
+xtask = "run --quiet --manifest-path xtask/Cargo.toml --"

@@ -1,0 +1,17922 @@
+//! End to end: a REGISTERED OpenAI-compatible instance opens a session through
+//! the native harness of nexus (`CHAT_PROVIDER_PATH=agent`), against the
+//! `fake_openai` and `fake_mcp` binaries of the nexus repository (loopback only,
+//! no network, no key).
+//!
+//! The two binaries are built from the nexus checkout the build is patched to:
+//! `cargo build -p nexus-claude --features "provider-native testkit" --bin
+//! fake_openai --bin fake_mcp`. `NEXUS_FAKES_DIR` names the directory holding
+//! them (default: `<repo>/../.target-nexus-fakes/debug`). Missing binaries FAIL
+//! the tests: a test that cannot run must not pass.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{Duration as ChronoDuration, Utc};
+use serde_json::{json, Value};
+use tokio::sync::broadcast;
+use uuid::Uuid;
+
+use super::config::ProviderPath;
+use super::manager::ChatManager;
+use super::provider::settings::{
+    ConsentRecord, InstanceRecord, CONSENT_PREFIX, GLOBAL, INSTANCE_PREFIX,
+};
+use super::types::{ChatEvent, ChatRequest};
+use crate::neo4j::mock::MockGraphStore;
+#[allow(unused_imports)]
+use crate::neo4j::GraphStore;
+use crate::test_helpers::mock_app_state;
+use crate::vault::grants::{GrantScope, SecretSelector};
+use crate::vault::VaultService;
+
+pub(super) fn fakes_dir() -> PathBuf {
+    std::env::var_os("NEXUS_FAKES_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.target-nexus-fakes/debug")
+        })
+}
+
+pub(super) fn fake_bin(name: &str) -> PathBuf {
+    let path = fakes_dir().join(name);
+    assert!(
+        path.exists(),
+        "{} is missing: build the nexus fakes (see the module doc; CI does it in the step 'Build the nexus fake servers')",
+        path.display()
+    );
+    path
+}
+
+/// A running `fake_openai`, killed on drop.
+pub(super) struct FakeOpenAi {
+    child: Child,
+    port: u16,
+    dir: tempfile::TempDir,
+}
+
+impl FakeOpenAi {
+    pub(super) fn start(routes: Value) -> Self {
+        Self::start_for(routes, 120_000)
+    }
+
+    /// [`Self::start`] with the watchdog of the fake set to `max_runtime_ms`.
+    pub(super) fn start_for(routes: Value, max_runtime_ms: u64) -> Self {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("script.json");
+        std::fs::write(&script, routes.to_string()).unwrap();
+        let mut child = Command::new(fake_bin("fake_openai"))
+            .env("FAKE_OPENAI_SCRIPT", &script)
+            .env(
+                "FAKE_OPENAI_REQUESTS_OUT",
+                dir.path().join("requests.jsonl"),
+            )
+            .env("FAKE_OPENAI_MAX_RUNTIME_MS", max_runtime_ms.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fake_openai");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let port = line
+            .trim()
+            .strip_prefix("LISTENING ")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected first line: {line:?}"));
+        Self { child, port, dir }
+    }
+
+    pub(super) fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}/v1", self.port)
+    }
+
+    pub(super) fn origin(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    pub(super) fn requests(&self) -> Vec<Value> {
+        std::fs::read_to_string(self.dir.path().join("requests.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    pub(super) fn chat_requests(&self) -> Vec<Value> {
+        self.requests()
+            .into_iter()
+            .filter(|r| r["path"] == "/v1/chat/completions")
+            .collect()
+    }
+}
+
+impl Drop for FakeOpenAi {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub(super) fn delta(d: Value) -> Value {
+    json!({"choices": [{"index": 0, "delta": d}]})
+}
+
+pub(super) fn sse_route(body_contains: &str, events: Vec<Value>) -> Value {
+    json!({"method": "POST", "path": "/v1/chat/completions", "status": 200,
+           "body_contains": body_contains, "sse": events})
+}
+
+fn script() -> Value {
+    json!([
+        // The probe: the model must be able to call a tool.
+        sse_route("Call the ping tool now", vec![
+            delta(json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]})),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+            json!("[DONE]"),
+        ]),
+        {"method": "GET", "path": "/v1/models", "status": 200,
+         "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}},
+        // The session turn.
+        sse_route("hi there", vec![
+            delta(json!({"content": "hello from "})),
+            delta(json!({"content": "the fake model"})),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}}),
+            json!("[DONE]"),
+        ]),
+    ])
+}
+
+pub(super) fn instance(fake: &FakeOpenAi, credential_ref: &str) -> InstanceRecord {
+    InstanceRecord {
+        id: "local".into(),
+        kind: "openai_compatible".into(),
+        preset: Some("llama_server".into()),
+        label: "Local".into(),
+        base_url: fake.base_url(),
+        origin: fake.origin(),
+        default_model: Some("m".into()),
+        cost_source: "free".into(),
+        credential_ref: credential_ref.into(),
+        ..Default::default()
+    }
+}
+
+pub(super) async fn store_instance(graph: &MockGraphStore, record: &InstanceRecord) {
+    graph
+        .put_llm_setting(
+            GLOBAL,
+            &format!("{INSTANCE_PREFIX}{}", record.id),
+            &serde_json::to_string(record).unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+/// Waits until `save_session_episode` was called `n` times: the episode of a close is
+/// written by a detached task (`ChatManager::record_close_episode`).
+pub(super) async fn wait_for_session_episode_saves(graph: &MockGraphStore, n: usize) {
+    for _ in 0..200 {
+        if graph
+            .session_episode_save_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= n
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the close episode was never written ({n} write(s) expected)");
+}
+
+pub(super) async fn consent(graph: &MockGraphStore, slug: &str, id: &str, origin: &str) {
+    // The consent names the credential reference the instance has NOW.
+    let credential_ref = graph
+        .get_llm_setting(GLOBAL, &format!("{INSTANCE_PREFIX}{id}"))
+        .await
+        .unwrap()
+        .and_then(|raw| serde_json::from_str::<InstanceRecord>(&raw).ok())
+        .map(|i| i.credential_ref)
+        .unwrap_or_else(|| "none".to_string());
+    let record = ConsentRecord {
+        provider_id: id.into(),
+        origin: origin.into(),
+        consented_by: "me@example.com".into(),
+        consented_at: Utc::now().to_rfc3339(),
+        credential_ref: Some(credential_ref.to_string()),
+        ..Default::default()
+    };
+    graph
+        .put_llm_setting(
+            &format!("project:{slug}"),
+            &format!("{CONSENT_PREFIX}{id}"),
+            &serde_json::to_string(&record).unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+fn manager(graph: Arc<MockGraphStore>, secure: bool) -> ChatManager {
+    let state = mock_app_state();
+    let dyn_graph: Arc<dyn GraphStore> = graph;
+    let config = super::config::ChatConfig {
+        provider_path: ProviderPath::Agent,
+        mcp_server_path: fake_bin("fake_mcp"),
+        nexus_tools_path: None,
+        nexus_browser_path: None,
+        obscura_path: None,
+        jwt_secret: secure.then(|| "test-secret-test-secret-test-secret".to_string()),
+        max_sessions: 10,
+        ..Default::default()
+    };
+    ChatManager::new_without_memory(dyn_graph, state.meili, config)
+}
+
+pub(super) fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatRequest {
+    ChatRequest {
+        file_scope_lifted: false,
+        access: None,
+        routing_pool: None,
+        routing_mode: None,
+        attachments: Vec::new(),
+        refs: Vec::new(),
+        message: "hi there".into(),
+        session_id: None,
+        cwd: std::env::temp_dir().display().to_string(),
+        project_slug: project.map(str::to_string),
+        model: None,
+        provider: provider.map(str::to_string),
+        task_alias: None,
+        persona_alias: None,
+        run_provider: None,
+        run_model: None,
+        max_tokens: None,
+        max_cost_usd: None,
+        task_class: None,
+        permission_mode: Some(mode.into()),
+        add_dirs: None,
+        workspace_slug: None,
+        user_claims: Some(crate::auth::jwt::Claims::service_account("e2e")),
+        spawned_by: None,
+        task_context: None,
+        subagent_type: None,
+        route_auto: false,
+        scaffolding_override: None,
+        runner_context: None,
+        routing_decision_id: None,
+        denied_tools: vec![],
+    }
+}
+
+async fn next_event(
+    rx: &mut broadcast::Receiver<ChatEvent>,
+    pred: impl Fn(&ChatEvent) -> bool,
+) -> ChatEvent {
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("an event within 20 s")
+            .expect("channel open");
+        if pred(&ev) {
+            return ev;
+        }
+    }
+}
+
+fn failure(err: &anyhow::Error) -> (u16, &'static str) {
+    let f = super::provider::errors::classify_open_error(err, Some("local"))
+        .unwrap_or_else(|| panic!("not a typed failure: {err:#}"));
+    (f.status, f.code)
+}
+
+#[tokio::test]
+async fn a_registered_instance_opens_a_native_session_and_streams_a_turn() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let manager = manager(graph.clone(), true);
+
+    let created = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+    let sid = created.session_id;
+    let mut rx = manager.subscribe(&sid).await.unwrap();
+
+    let text = next_event(
+        &mut rx,
+        |e| matches!(e, ChatEvent::AssistantText { content, .. } if content.contains("fake model")),
+    )
+    .await;
+    assert!(matches!(text, ChatEvent::AssistantText { .. }));
+    let result = next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+    match result {
+        ChatEvent::Result {
+            cost,
+            stop_reason,
+            model,
+            ..
+        } => {
+            assert_eq!(stop_reason.as_deref(), Some("completed"));
+            assert_eq!(model.as_deref(), Some("m"));
+            // The instance is declared free: the basis says so.
+            assert_eq!(cost.unwrap()["basis"], "free");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // The persisted session names the instance and carries the snapshot.
+    let node = graph
+        .get_chat_session(Uuid::parse_str(&sid).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(node.provider_id.as_deref(), Some("local"));
+    assert_eq!(node.routed_by.as_deref(), Some("request"));
+    let caps: Value = serde_json::from_str(node.capabilities.as_deref().unwrap()).unwrap();
+    assert_eq!(caps["tools"], true, "the probe called a tool");
+    assert_eq!(caps["sandbox"], "none");
+
+    // The model saw the project-orchestrator tools, and only through MCP.
+    let chats = fake.chat_requests();
+    let turn = chats
+        .iter()
+        .find(|r| r["body"].to_string().contains("hi there"))
+        .expect("the turn");
+    assert!(
+        turn["body"]
+            .to_string()
+            .contains("mcp__project-orchestrator__"),
+        "{turn}"
+    );
+
+    // The sending was journaled: who, which project, which origin.
+    let journal = graph.list_llm_settings("journal", "send:").await.unwrap();
+    assert_eq!(journal.len(), 1);
+    let entry: Value = serde_json::from_str(&journal[0].1).unwrap();
+    assert_eq!(entry["project"], "proj");
+    assert_eq!(entry["origin"], fake.origin());
+    assert_eq!(entry["provider"], "local");
+    assert!(
+        !journal[0].1.contains("hi there"),
+        "the journal never holds content"
+    );
+
+    manager.close_session(&sid).await.unwrap();
+}
+
+#[tokio::test]
+async fn without_consent_nothing_reaches_the_endpoint() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    let manager = manager(graph.clone(), true);
+
+    // A project that never consented.
+    let err = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (403, "endpoint_not_allowed"));
+    // No project, and nothing allowed for the chats outside one (B3).
+    let err = manager
+        .create_session(&request(Some("local"), None, "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (403, "endpoint_not_allowed"));
+    assert!(fake.requests().is_empty(), "no connection was made");
+    assert!(
+        graph.chat_sessions.read().await.is_empty(),
+        "nothing persisted"
+    );
+    assert!(graph
+        .list_llm_settings("journal", "")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_consent_for_another_origin_does_not_hold() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", "https://old.example.com").await;
+    let manager = manager(graph.clone(), true);
+    let err = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (403, "endpoint_not_allowed"));
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn the_endpoint_guard_runs_before_any_connection() {
+    let graph = Arc::new(MockGraphStore::new());
+    let record = InstanceRecord {
+        id: "internal".into(),
+        kind: "openai_compatible".into(),
+        preset: None,
+        label: "Internal".into(),
+        base_url: "https://10.0.0.5/v1".into(),
+        origin: "https://10.0.0.5".into(),
+        default_model: Some("m".into()),
+        cost_source: "unknown".into(),
+        credential_ref: "none".into(),
+        ..Default::default()
+    };
+    // Stored by an older version, or by hand: the guard must still refuse it.
+    store_instance(&graph, &record).await;
+    consent(&graph, "proj", "internal", "https://10.0.0.5").await;
+    let manager = manager(graph.clone(), true);
+    let err = manager
+        .create_session(&request(Some("internal"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (403, "endpoint_not_allowed"));
+    // The consent exists: the refusal must not ask for one (review of #722, finding 3).
+    let f = super::provider::errors::classify_open_error(&err, None).expect("typed");
+    assert_eq!(f.consent_scope, None);
+    assert_eq!(f.provider_id.as_deref(), Some("internal"));
+}
+
+#[tokio::test]
+async fn trust_opens_on_a_provider_without_a_sandbox_like_it_does_on_claude_code() {
+    // Decision of 2026-10-07 (replaces A35): a third-party provider behaves like Claude Code.
+    // The sandbox level informs the user, it gates nothing: Rock'n roll opens, and the sending
+    // is journaled like any other.
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let manager = manager(graph.clone(), true);
+    manager
+        .create_session(&request(Some("local"), Some("proj"), "bypassPermissions"))
+        .await
+        .expect("trust opens on a provider with no sandbox");
+    assert_eq!(
+        graph.list_llm_settings("journal", "").await.unwrap().len(),
+        1,
+        "the sending is journaled"
+    );
+}
+
+#[tokio::test]
+async fn a_third_party_is_refused_while_authentication_is_off() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let manager = manager(graph.clone(), false);
+    let err = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (422, "unsupported"));
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_locked_vault_is_credentials_locked_and_never_falls_back() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "vault:endpoint-key")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    // A vault that was never unlocked.
+    let manager = manager(graph.clone(), true).with_vault(VaultService::ephemeral());
+    let err = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (423, "credentials_locked"));
+    assert!(
+        fake.chat_requests().is_empty(),
+        "no request was sent unauthenticated"
+    );
+    assert!(graph.chat_sessions.read().await.len() <= 1);
+}
+
+#[tokio::test]
+async fn the_key_is_read_under_a_grant_for_that_instance_and_sent_as_a_header() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "vault:endpoint-key")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let vault = VaultService::ephemeral();
+    vault
+        .init(
+            "correct horse battery staple".into(),
+            ChronoDuration::hours(1),
+        )
+        .await
+        .unwrap();
+    let now = Utc::now();
+    vault
+        .put("endpoint-key", "sk-e2e-value-4321", None, now)
+        .unwrap();
+    vault
+        .grant(
+            SecretSelector::Names(["endpoint-key".to_string()].into()),
+            GrantScope::Provider("local".to_string()),
+            ChronoDuration::hours(1),
+            None,
+            now,
+        )
+        .unwrap();
+    let manager = manager(graph.clone(), true).with_vault(vault);
+    let created = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+    let mut rx = manager.subscribe(&created.session_id).await.unwrap();
+    next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+    let with_auth = fake
+        .requests()
+        .iter()
+        .filter(|r| r["path"] == "/v1/chat/completions")
+        .all(|r| r["authorization_present"] == true);
+    assert!(
+        with_auth,
+        "requests carry an Authorization header: {:?}",
+        fake.requests()
+    );
+    // The value itself is nowhere: not in the journal, not in a persisted event.
+    let journal = graph.list_llm_settings("journal", "").await.unwrap();
+    assert!(!journal[0].1.contains("sk-e2e"));
+    let events = graph
+        .get_chat_events(Uuid::parse_str(&created.session_id).unwrap(), 0, 100)
+        .await
+        .unwrap();
+    assert!(events.iter().all(|e| !e.data.contains("sk-e2e")));
+}
+
+#[tokio::test]
+async fn a_pilot_role_routes_a_project_to_the_instance_and_consent_still_applies() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    graph
+        .put_llm_setting(
+            "project:proj",
+            "roles",
+            &json!({"pilot": {"provider": "local"}}).to_string(),
+        )
+        .await
+        .unwrap();
+    let manager = manager(graph.clone(), true);
+    // The rule names the instance, the project has not consented: refused (a pilot never falls back).
+    let err = manager
+        .create_session(&request(None, Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (403, "endpoint_not_allowed"));
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let created = manager
+        .create_session(&request(None, Some("proj"), "default"))
+        .await
+        .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+    let node = graph
+        .get_chat_session(Uuid::parse_str(&created.session_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(node.provider_id.as_deref(), Some("local"));
+    assert_eq!(node.routed_by.as_deref(), Some("project_rule"));
+}
+
+/// A person allowed `id` for the chats outside any project (B3).
+async fn consent_no_project(graph: &MockGraphStore, id: &str, origin: &str) {
+    let record = ConsentRecord {
+        provider_id: id.into(),
+        origin: origin.into(),
+        consented_by: "me@example.com".into(),
+        consented_at: Utc::now().to_rfc3339(),
+        credential_ref: Some("none".into()),
+        ..Default::default()
+    };
+    graph
+        .put_llm_setting(
+            super::provider::settings::NO_PROJECT_SCOPE,
+            &format!("{CONSENT_PREFIX}{id}"),
+            &serde_json::to_string(&record).unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+/// A server WITHOUT the Claude Code CLI: the configured path points at nothing, and the
+/// manager looks for the CLI as the server does (`detecting_claude_cli`). Never a real CLI.
+fn manager_without_claude_cli(graph: Arc<MockGraphStore>) -> ChatManager {
+    let state = mock_app_state();
+    let dyn_graph: Arc<dyn GraphStore> = graph;
+    let config = super::config::ChatConfig {
+        provider_path: ProviderPath::Agent,
+        mcp_server_path: fake_bin("fake_mcp"),
+        nexus_tools_path: None,
+        nexus_browser_path: None,
+        obscura_path: None,
+        jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+        claude_cli_path: Some("/nonexistent/m1/claude".to_string()),
+        max_sessions: 10,
+        ..Default::default()
+    };
+    ChatManager::new_without_memory(dyn_graph, state.meili, config).detecting_claude_cli()
+}
+
+#[tokio::test]
+async fn without_the_claude_cli_a_chat_naming_nothing_opens_on_the_only_usable_instance() {
+    // B2 (M0 A/O): no pilot role, no provider in the request, no CLI on the server. Was 424
+    // cli_not_found on claude-code; opens on the one instance the project consented to.
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let manager = manager_without_claude_cli(graph.clone());
+    assert!(!manager.claude_code_usable().await);
+
+    let created = manager
+        .create_session(&request(None, Some("proj"), "default"))
+        .await
+        .unwrap_or_else(|e| panic!("a chat naming nothing must open on the instance: {e:#}"));
+    let mut rx = manager.subscribe(&created.session_id).await.unwrap();
+    next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+    let node = graph
+        .get_chat_session(Uuid::parse_str(&created.session_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(node.provider_id.as_deref(), Some("local"));
+    assert_eq!(node.routed_by.as_deref(), Some("sole_instance"));
+    assert_eq!(node.model, "m", "the instance's own default model");
+
+    // Naming claude-code is still honoured (never swapped for the instance): the opening
+    // fails on the missing CLI and says it was claude-code's.
+    let err = manager
+        .create_session(&request(Some("claude-code"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    let f = super::provider::errors::classify_open_error(&err, Some("local")).expect("typed");
+    assert_eq!(f.provider_id.as_deref(), Some("claude-code"), "{err:#}");
+}
+
+#[tokio::test]
+async fn outside_any_project_an_instance_opens_once_a_person_allowed_it_for_those_chats() {
+    // B3 (M0 G): outside any project only claude-code was allowed (403). A consent for the
+    // chats without a project now lets the instance serve them, bound to its origin (A28).
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    // A project's consent does not reach the chats outside any project.
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let manager = manager_without_claude_cli(graph.clone());
+    let err = manager
+        .create_session(&request(Some("local"), None, "default"))
+        .await
+        .unwrap_err();
+    let f = super::provider::errors::classify_open_error(&err, None).expect("typed");
+    assert_eq!((f.status, f.code), (403, "endpoint_not_allowed"));
+    assert_eq!(
+        f.consent_scope,
+        Some("no_project"),
+        "says which consent is missing"
+    );
+    assert_eq!(f.provider_id.as_deref(), Some("local"));
+    // Nothing named and the CLI missing: the refusal names the instance to allow.
+    let err = manager
+        .create_session(&request(None, None, "default"))
+        .await
+        .unwrap_err();
+    let f = super::provider::errors::classify_open_error(&err, None).expect("typed");
+    assert_eq!(
+        (f.code, f.consent_scope, f.provider_id.as_deref()),
+        ("endpoint_not_allowed", Some("no_project"), Some("local"))
+    );
+    assert!(
+        fake.chat_requests().is_empty(),
+        "nothing reached the endpoint"
+    );
+
+    // A consent for another origin does not hold (A28).
+    consent_no_project(&graph, "local", "https://old.example.com").await;
+    assert!(manager
+        .create_session(&request(Some("local"), None, "default"))
+        .await
+        .is_err());
+
+    consent_no_project(&graph, "local", &fake.origin()).await;
+    for provider in [Some("local"), None] {
+        let created = manager
+            .create_session(&request(provider, None, "default"))
+            .await
+            .unwrap_or_else(|e| panic!("open outside a project ({provider:?}): {e:#}"));
+        let mut rx = manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        manager.close_session(&created.session_id).await.unwrap();
+    }
+    // Journaled like any sending, with no project.
+    let journal = graph.list_llm_settings("journal", "send:").await.unwrap();
+    assert_eq!(journal.len(), 2);
+    let entry: Value = serde_json::from_str(&journal[0].1).unwrap();
+    assert!(entry["project"].is_null());
+    assert_eq!(entry["provider"], "local");
+
+    // The consent outside any project does not reach a project that never consented.
+    let err = manager
+        .create_session(&request(Some("local"), Some("other"), "default"))
+        .await
+        .unwrap_err();
+    let f = super::provider::errors::classify_open_error(&err, None).expect("typed");
+    assert_eq!(
+        (f.code, f.consent_scope),
+        ("endpoint_not_allowed", Some("project"))
+    );
+}
+
+#[tokio::test]
+async fn an_opening_error_names_the_instance_it_happened_on_not_claude_code() {
+    // B6 (M0 K, M): the pilot role routes to `local`, whose key is in a locked vault. The
+    // HTTP layer knows no provider (the request names none): the 423 must still name `local`.
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "vault:endpoint-key")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    graph
+        .put_llm_setting(
+            GLOBAL,
+            "roles",
+            &json!({"pilot": {"provider": "local"}}).to_string(),
+        )
+        .await
+        .unwrap();
+    let manager = manager(graph.clone(), true).with_vault(VaultService::ephemeral());
+    let err = manager
+        .create_session(&request(None, Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    let f = super::provider::errors::classify_open_error(&err, None).expect("typed");
+    assert_eq!((f.status, f.code), (423, "credentials_locked"));
+    assert_eq!(f.provider_id.as_deref(), Some("local"));
+    // What the handler used to pass is overridden by what the opening knew.
+    let f = super::provider::errors::classify_open_error(&err, Some("claude-code")).unwrap();
+    assert_eq!(f.provider_id.as_deref(), Some("local"));
+    assert!(fake.chat_requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_third_party_runs_on_the_agent_engine_without_any_flag() {
+    // A registered instance opens on the agent engine whatever CHAT_PROVIDER_PATH says (the
+    // agent engine serves third parties by design); here the flag is set to `legacy`, which
+    // only keeps Claude Code on the historical engine.
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let state = mock_app_state();
+    let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+    let config = super::config::ChatConfig {
+        provider_path: ProviderPath::Legacy,
+        mcp_server_path: fake_bin("fake_mcp"),
+        jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+        ..Default::default()
+    };
+    let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config);
+    let created = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_or_else(|e| panic!("a third party must open on the agent engine: {e:#}"));
+    assert!(manager.agent_runtime.owns(&created.session_id).await);
+    let mut rx = manager.subscribe(&created.session_id).await.unwrap();
+    next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+}
+
+async fn put_policy(graph: &MockGraphStore, mode: &str) {
+    graph
+        .put_llm_setting(
+            GLOBAL,
+            "model_aliases",
+            &json!([{"alias": "fast", "provider": "local", "model": "m"}]).to_string(),
+        )
+        .await
+        .unwrap();
+    graph
+        .put_llm_setting(
+            GLOBAL,
+            "model_policy",
+            &json!({"mode": mode, "rules": {"chat": "fast"}, "fallback": [], "caps": {}})
+                .to_string(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_enforced_policy_routes_the_chat_to_the_instance_and_records_the_rule() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    put_policy(&graph, "enforce").await;
+    let manager = manager(graph.clone(), true);
+    let created = manager
+        .create_session(&request(None, Some("proj"), "default"))
+        .await
+        .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+    let node = graph
+        .get_chat_session(Uuid::parse_str(&created.session_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(node.provider_id.as_deref(), Some("local"));
+    assert_eq!(node.routed_by.as_deref(), Some("global_rule"));
+    let note: Value = serde_json::from_str(
+        &graph
+            .get_llm_setting(&format!("routing:{}", created.session_id), "note")
+            .await
+            .unwrap()
+            .expect("the rule is recorded"),
+    )
+    .unwrap();
+    assert_eq!(note["route_rule"], "chat");
+    assert!(note["shadow_provider"].is_null());
+}
+
+#[tokio::test]
+async fn a_shadow_policy_changes_nothing_and_only_records_what_it_would_have_done() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    put_policy(&graph, "shadow").await;
+    // Claude Code is not installable here: use the legacy engine's refusal as the
+    // witness that the policy did NOT route to the instance, and read the note
+    // through the resolver directly.
+    let manager = manager(graph.clone(), true);
+    let choice = manager
+        .resolve_provider_choice(&request(None, Some("proj"), "default"), Some("proj"))
+        .await
+        .unwrap();
+    assert_eq!(choice.provider_id, "claude-code", "shadow never applies");
+    assert_eq!(choice.shadow.as_ref().map(|s| s.0.as_str()), Some("local"));
+    assert_eq!(choice.route_rule.as_deref(), Some("chat"));
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn an_off_policy_is_invisible() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    put_policy(&graph, "off").await;
+    let manager = manager(graph.clone(), true);
+    let choice = manager
+        .resolve_provider_choice(&request(None, Some("proj"), "default"), Some("proj"))
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            choice.provider_id.as_str(),
+            choice.route_rule,
+            choice.shadow
+        ),
+        ("claude-code", None, None)
+    );
+}
+
+fn draft_record(fake: &FakeOpenAi, credential_ref: &str) -> InstanceRecord {
+    instance(fake, credential_ref)
+}
+
+#[tokio::test]
+async fn the_connection_test_really_probes_a_tool_call_and_reads_the_window() {
+    let fake = FakeOpenAi::start(script());
+    let report = super::provider::native_factory::probe_instance(
+        &draft_record(&fake, "none"),
+        None,
+        Some("m"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.tools, Some(true), "{report:?}");
+    assert_eq!(report.context_window, Some(32_000));
+    assert!(report.models.contains(&"m".to_string()));
+    // The probe really called the endpoint with the ping tool.
+    assert!(fake
+        .chat_requests()
+        .iter()
+        .any(|r| r["body"].to_string().contains("Call the ping tool now")));
+}
+
+#[tokio::test]
+async fn a_model_that_cannot_call_tools_is_reported_not_swallowed() {
+    // The probe answers with plain text: no tool call.
+    let fake = FakeOpenAi::start(json!([
+        sse_route("Call the ping tool now", vec![
+            delta(json!({"content": "I cannot"})),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            json!("[DONE]"),
+        ]),
+        {"method": "GET", "path": "/v1/models", "status": 200,
+         "body": {"object": "list", "data": [{"id": "m"}]}},
+    ]));
+    let report = super::provider::native_factory::probe_instance(
+        &draft_record(&fake, "none"),
+        None,
+        Some("m"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.tools, Some(false), "{report:?}");
+}
+
+#[tokio::test]
+async fn a_probe_with_a_locked_vault_is_credentials_locked() {
+    let fake = FakeOpenAi::start(script());
+    let err = super::provider::native_factory::probe_instance(
+        &draft_record(&fake, "vault:endpoint-key"),
+        Some(VaultService::ephemeral()),
+        Some("m"),
+    )
+    .await;
+    // Either the health check or the probe surfaces it; nothing is sent unauthenticated.
+    match err {
+        Err(e) => assert_eq!(e.kind(), "credentials_locked"),
+        Ok(report) => {
+            let locked = report
+                .probe_error
+                .as_ref()
+                .is_some_and(|e| e.kind() == "credentials_locked")
+                || matches!(report.health.error, Some(ref e) if e.kind() == "credentials_locked");
+            assert!(locked, "{report:?}");
+        }
+    }
+    assert!(fake.chat_requests().is_empty());
+}
+
+#[tokio::test]
+async fn changing_the_credential_reference_after_consent_stops_the_sending() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    // The same instance is now pointed at a vault key the project never agreed to.
+    store_instance(&graph, &instance(&fake, "vault:another-key")).await;
+    let manager = manager(graph.clone(), true);
+    let err = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (403, "endpoint_not_allowed"));
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_window_too_small_for_the_tool_schemas_refuses_the_session_after_the_probe() {
+    // The endpoint says the model's window is 1 500 tokens: the tool schemas alone are larger.
+    let mut routes = script().as_array().unwrap().clone();
+    routes[1] = json!({"method": "GET", "path": "/v1/models", "status": 200,
+        "body": {"object": "list", "data": [{"id": "m", "context_length": 1500}]}});
+    let fake = FakeOpenAi::start(Value::Array(routes));
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let manager = manager(graph.clone(), true);
+    let err = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (422, "context_too_small"));
+    assert!(
+        manager.agent_runtime.len().await == 0,
+        "the session was closed"
+    );
+    assert!(
+        !fake
+            .chat_requests()
+            .iter()
+            .any(|r| r["body"].to_string().contains("hi there")),
+        "the user's message never reached the model"
+    );
+}
+
+/// H6: a third party a person opens in trust is given the FULL profile, whose
+/// schemas are larger than the restricted ones. The window check measures what
+/// the session is actually given: a window that holds the restricted schemas but
+/// not the full ones refuses a session in trust and still opens one in ask.
+#[tokio::test]
+async fn the_window_check_measures_the_profile_the_session_is_given() {
+    let restricted = crate::auth::tool_profile::ToolProfile::Restricted
+        .filter_tools(crate::mcp::tools::all_tools());
+    let full =
+        crate::auth::tool_profile::ToolProfile::Full.filter_tools(crate::mcp::tools::all_tools());
+    let tokens = |tools: &Vec<crate::mcp::protocol::ToolDefinition>| {
+        (serde_json::to_string(tools).unwrap().len() / 4) as u64
+    };
+    let window = tokens(&restricted) * 2 + 1;
+    assert!(
+        window < tokens(&full) * 2,
+        "the full profile must be larger for this test"
+    );
+    let mut routes = script().as_array().unwrap().clone();
+    routes[1] = json!({"method": "GET", "path": "/v1/models", "status": 200,
+        "body": {"object": "list", "data": [{"id": "m", "context_length": window}]}});
+    let fake = FakeOpenAi::start(Value::Array(routes));
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let manager = manager(graph.clone(), true);
+    let person = crate::auth::jwt::Claims {
+        sub: Uuid::new_v4().to_string(),
+        email: "alice@example.com".into(),
+        name: "Alice".into(),
+        iat: 0,
+        exp: 0,
+        token_type: None,
+        scope: None,
+        jti: None,
+    };
+    let mut ask = request(Some("local"), Some("proj"), "default");
+    ask.user_claims = Some(person.clone());
+    ask.message = String::new();
+    manager
+        .create_session(&ask)
+        .await
+        .unwrap_or_else(|e| panic!("the restricted schemas fit: {e:#}"));
+    let mut trust = request(Some("local"), Some("proj"), "bypassPermissions");
+    trust.user_claims = Some(person);
+    trust.message = String::new();
+    let err = manager.create_session(&trust).await.unwrap_err();
+    assert_eq!(failure(&err), (422, "context_too_small"));
+}
+
+/// B40: a `nexus-tools` that cannot be run (NEXUS_TOOLS_PATH naming a file that is
+/// gone, or not executable) leaves the native session with the project-orchestrator
+/// tools only. It never refuses the session.
+#[tokio::test]
+async fn a_nexus_tools_that_cannot_run_does_not_refuse_the_native_session() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let not_executable = dir.path().join("nexus-tools");
+    std::fs::write(&not_executable, "#!/bin/sh\nexit 1\n").unwrap();
+    for program in [dir.path().join("missing/nexus-tools"), not_executable] {
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: Some(program.clone()),
+            nexus_browser_path: None,
+            obscura_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config);
+        let req = request(Some("local"), Some("proj"), "default");
+        let created = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e:#}", program.display()));
+        let mut rx = manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        // And it says so: `nexus_tools` is among what the session does not have, on
+        // the `system_init` the interface reads (not only a line in the server log).
+        // The system_init is persisted by the out-of-turn pump, possibly after the Result.
+        let uuid = Uuid::parse_str(&created.session_id).unwrap();
+        let mut init = None;
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            let events = graph.get_chat_events(uuid, 0, 100).await.unwrap();
+            seen = events.iter().map(|r| r.event_type.clone()).collect();
+            init = events
+                .iter()
+                .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+                .find(|e| matches!(e, ChatEvent::SystemInit { .. }));
+            if init.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let Some(ChatEvent::SystemInit {
+            degraded_features, ..
+        }) = init
+        else {
+            panic!("{}: no system_init persisted: {seen:?}", program.display());
+        };
+        let degraded = degraded_features.unwrap_or_default();
+        assert!(
+            degraded
+                .iter()
+                .any(|f| f == super::agent_runtime::NEXUS_TOOLS_FEATURE),
+            "{}: {degraded:?}",
+            program.display()
+        );
+    }
+}
+
+#[test]
+fn the_tool_schemas_have_a_size_and_an_unknown_window_is_not_a_refusal() {
+    use nexus_claude::agent::{Capabilities, ContextWindow, ContextWindowSource};
+    let tokens =
+        super::manager::tool_schema_tokens(crate::auth::tool_profile::ToolProfile::Restricted);
+    assert!(
+        tokens > 500,
+        "the restricted profile still has tools: {tokens}"
+    );
+    let mut caps = Capabilities::none();
+    assert!(
+        super::manager::window_holds_the_tools(
+            &caps,
+            crate::auth::tool_profile::ToolProfile::Restricted
+        )
+        .is_ok(),
+        "unknown window"
+    );
+    caps.context_window = Some(ContextWindow {
+        value: tokens * 2 + 1,
+        source: ContextWindowSource::Probed,
+    });
+    assert!(super::manager::window_holds_the_tools(
+        &caps,
+        crate::auth::tool_profile::ToolProfile::Restricted
+    )
+    .is_ok());
+    caps.context_window = Some(ContextWindow {
+        value: tokens,
+        source: ContextWindowSource::Probed,
+    });
+    assert!(super::manager::window_holds_the_tools(
+        &caps,
+        crate::auth::tool_profile::ToolProfile::Restricted
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn verify4_authorize_refuses_a_project_without_consent_even_when_called_directly() {
+    // A resume re-checks consent (it may have been revoked meanwhile): the check
+    // of authorize_provider_use itself, not only the resolver's.
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    let manager = manager(graph.clone(), true);
+    let claims = crate::auth::jwt::Claims::service_account("e2e");
+    let r = manager
+        .authorize_provider_use(super::manager::ProviderUse {
+            provider_id: "local",
+            model: "m",
+            mode: nexus_claude::agent::PolicyMode::Ask,
+            project_slug: Some("proj"),
+            claims: Some(&claims),
+            session_id: "verify4-sid",
+        })
+        .await;
+    assert!(r.is_err(), "no consent: must be refused");
+}
+
+#[tokio::test]
+async fn verify4_a_refused_opening_revokes_the_session_token() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    // The refusal comes from the same gate (authorize_provider_use), after the token was
+    // bound to the session: no trace of the sending, no sending (A37).
+    graph
+        .fail_journal_writes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let manager = manager(graph.clone(), true);
+    let _ = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    let ids: Vec<_> = graph.chat_sessions.read().await.keys().cloned().collect();
+    assert_eq!(
+        ids.len(),
+        1,
+        "the persisted session node is still there: {ids:?}"
+    );
+    assert_eq!(
+        crate::auth::agent_tokens::revoke_session(&ids[0].to_string()),
+        0,
+        "the token of a refused opening was left live"
+    );
+}
+
+#[tokio::test]
+async fn an_opening_is_refused_when_the_send_journal_cannot_be_written() {
+    // A37: no trace of the sending, no sending. The refusal leaves nothing live.
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    graph
+        .fail_journal_writes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let manager = manager(graph.clone(), true);
+    let err = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (503, "provider_unavailable"));
+    assert!(manager.agent_runtime.is_empty().await, "no live session");
+    assert!(
+        fake.chat_requests().is_empty(),
+        "the model was never called: the content did not leave"
+    );
+    assert!(graph
+        .list_llm_settings("journal", "")
+        .await
+        .unwrap()
+        .is_empty());
+    // The token minted for the refused opening is dead.
+    let ids: Vec<_> = graph.chat_sessions.read().await.keys().cloned().collect();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(
+        crate::auth::agent_tokens::revoke_session(&ids[0].to_string()),
+        0,
+        "the token of a refused opening was left live"
+    );
+    // Once the journal is writable again, the same request opens.
+    graph
+        .fail_journal_writes
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_or_else(|e| panic!("opens once the journal works: {e:#}"));
+}
+
+#[test]
+fn only_a_remote_machine_that_does_not_allow_it_holds_trust_back() {
+    use super::manager::ChatManager;
+    use super::provider::settings::{InstanceRecord, KIND_CLAUDE_CODE_REMOTE};
+    let record = |kind: &str, allow_trust: bool| InstanceRecord {
+        kind: kind.into(),
+        allow_trust,
+        ..Default::default()
+    };
+    // A machine nobody watches keeps its own explicit switch ...
+    assert!(ChatManager::trust_needs_opt_in(&record(
+        KIND_CLAUDE_CODE_REMOTE,
+        false
+    )));
+    assert!(!ChatManager::trust_needs_opt_in(&record(
+        KIND_CLAUDE_CODE_REMOTE,
+        true
+    )));
+    // ... every other provider behaves like Claude Code (decision of 2026-10-07).
+    for kind in ["openai_compatible", "codex", "acp", "claude_code"] {
+        assert!(
+            !ChatManager::trust_needs_opt_in(&record(kind, false)),
+            "{kind}"
+        );
+    }
+}
+
+// ── Cognitive routing (R2, B-R4) ────────────────────────────────────────────
+//
+// `resolve_provider_choice` with the cognitive router wired, against a stored
+// instance served by `fake_openai`. The built-in Claude Code is hidden from the
+// provider source so the pool holds exactly one pair (`local`/`m`) and the
+// choice does not depend on what is installed on the machine.
+
+mod cognitive_routing {
+    use super::*;
+    use crate::chat::agent_runtime::ProviderSource;
+    use crate::chat::provider::cognitive::decider::CognitiveRouting;
+    use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
+    use crate::chat::provider::resolver::{ProviderChoice, RoutedBy};
+    use crate::neo4j::routing::Neo4jRoutingStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    struct NoBuiltin;
+
+    impl ProviderSource for NoBuiltin {
+        fn get(&self, _provider_id: &str) -> Option<Arc<dyn nexus_claude::agent::AgentProvider>> {
+            None
+        }
+    }
+
+    struct Setup {
+        _fake: FakeOpenAi,
+        graph: Arc<MockGraphStore>,
+        manager: ChatManager,
+    }
+
+    async fn setup(mode: &str, stage: &str, wired: bool) -> Setup {
+        setup_with(mode, stage, wired, true).await
+    }
+
+    /// `warm` opens one session first, which probes the instance as a side effect.
+    async fn setup_with(mode: &str, stage: &str, wired: bool, warm: bool) -> Setup {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                "routing",
+                &json!({"mode": mode, "stage": stage, "exploration_epsilon": 0.0}).to_string(),
+            )
+            .await
+            .unwrap();
+        let mut manager = manager(graph.clone(), true).with_provider_source(Arc::new(NoBuiltin));
+        // The router only trusts what an instance is KNOWN to do: a provider that
+        // was never probed reports no tools and an unknown window. Opening one
+        // session on the instance probes it and keeps the probe in the cache.
+        if warm {
+            let opened = manager
+                .create_session(&request(Some("local"), Some("proj"), "default"))
+                .await
+                .unwrap_or_else(|e| panic!("warm-up failed: {e:#}"));
+            let mut rx = manager.subscribe(&opened.session_id).await.unwrap();
+            next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        }
+        if wired {
+            let store = Arc::new(Neo4jRoutingStore::new(graph.clone()));
+            manager = manager.with_cognitive_routing(CognitiveRouting::new(store));
+        }
+        Setup {
+            _fake: fake,
+            graph,
+            manager,
+        }
+    }
+
+    fn executor_request() -> ChatRequest {
+        let mut r = request(None, Some("proj"), "default");
+        r.spawned_by = Some("{}".into());
+        r.task_class = Some("simple".into());
+        r
+    }
+
+    fn pilot_request() -> ChatRequest {
+        request(None, Some("proj"), "default")
+    }
+
+    /// An `Agent` call of a native parent in Auto: a child of a conversation, routing in
+    /// `full` mode, with the agent kind a model actually names. `complex` was a value no
+    /// model produces: it made the class assertion pass whatever `subagent_type` was read
+    /// as (review point 3).
+    fn subagent_request() -> ChatRequest {
+        let mut r = request(None, Some("proj"), "default");
+        r.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: Uuid::new_v4(),
+                tool_use_id: Some("toolu_subagent".into()),
+            }
+            .to_json_string(),
+        );
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
+        r.task_context = Some("refactor the parser".into());
+        r.subagent_type = Some("general-purpose".into());
+        r
+    }
+
+    async fn choose(s: &Setup, r: &ChatRequest) -> ProviderChoice {
+        s.manager
+            .resolve_provider_choice(r, Some("proj"))
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"))
+    }
+
+    async fn decisions(
+        s: &Setup,
+    ) -> Vec<crate::chat::provider::cognitive::decision::CognitiveDecision> {
+        Neo4jRoutingStore::new(s.graph.clone())
+            .decisions(&DecisionFilter::default())
+            .await
+            .unwrap()
+    }
+
+    /// What the choice is, without the recorded shadow.
+    fn essence(c: &ProviderChoice) -> (String, Option<String>, RoutedBy, Option<String>) {
+        (
+            c.provider_id.clone(),
+            c.model.clone(),
+            c.routed_by,
+            c.route_rule.clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn primary_changes_nothing_at_any_stage_for_anyone() {
+        for stage in ["shadow", "advisory", "auto"] {
+            let with = setup("primary", stage, true).await;
+            let without = setup("primary", stage, false).await;
+            let sent_after_warm_up = with._fake.chat_requests().len();
+            for r in [pilot_request(), executor_request()] {
+                let a = choose(&with, &r).await;
+                let b = choose(&without, &r).await;
+                assert_eq!(essence(&a), essence(&b), "primary/{stage}");
+                assert_ne!(a.routed_by, RoutedBy::Auto);
+                assert!(a.reason.is_none());
+            }
+            // Nothing was sent to the instance beyond the warm-up session.
+            assert_eq!(with._fake.chat_requests().len(), sent_after_warm_up);
+            // Every decision was stored, none applied, and the pick is only recorded.
+            let all = decisions(&with).await;
+            assert_eq!(all.len(), 2, "primary/{stage}");
+            assert!(all.iter().all(|d| !d.applied && d.chosen.is_some()));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unprobed_instance_is_probed_before_the_first_decision_and_the_decision_names_its_session(
+    ) {
+        let s = setup_with("executors_only", "auto", true, false).await;
+        let session = Uuid::new_v4();
+        let choice = s
+            .manager
+            .resolve_provider_choice_for(&executor_request(), Some("proj"), Some(session))
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"));
+        assert_eq!(
+            choice.routed_by,
+            RoutedBy::Auto,
+            "the probe made local/m eligible"
+        );
+        assert_eq!(choice.provider_id, "local");
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].session_id, Some(session));
+    }
+
+    // ── Probing every model of a native instance (task 58fa9980) ──────────────
+
+    /// One route per model: those in `tools` call the probe's tool, those in `no_tools`
+    /// answer the 400 a model without tool support gives. `/v1/models` lists `m` (the
+    /// default) and the others, in this order.
+    fn catalogue_script(tools: &[&str], no_tools: &[&str]) -> Value {
+        let mut routes = Vec::new();
+        for model in tools {
+            routes.push(json!({"method": "POST", "path": "/v1/chat/completions", "status": 200,
+                "body_contains": format!("\"model\":\"{model}\""),
+                "sse": [
+                    delta(json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]})),
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+                    "[DONE]",
+                ]}));
+        }
+        for model in no_tools {
+            routes.push(
+                json!({"method": "POST", "path": "/v1/chat/completions", "status": 400,
+                "body_contains": format!("\"model\":\"{model}\""),
+                "body": {"error": {"message": format!("{model} does not support tools")}}}),
+            );
+        }
+        let listed: Vec<Value> = tools
+            .iter()
+            .chain(no_tools)
+            .map(|id| json!({"id": id, "context_length": 32000}))
+            .collect();
+        routes.push(json!({"method": "GET", "path": "/v1/models", "status": 200,
+            "body": {"object": "list", "data": listed}}));
+        Value::Array(routes)
+    }
+
+    /// `script` with every probe answered after `delay_ms`.
+    fn slow(mut script: Value, delay_ms: u64) -> Value {
+        for route in script.as_array_mut().unwrap() {
+            if route["method"] == "POST" {
+                route["delay_ms"] = json!(delay_ms);
+            }
+        }
+        script
+    }
+
+    /// `script` with `model` listed and refused by the endpoint itself (a 404, like an
+    /// embeddings model behind `/chat/completions`).
+    fn refusing(script: Value, model: &str) -> Value {
+        refusing_with(script, model, 404)
+    }
+
+    /// `script` with `model` listed and every probe of it answered `status`.
+    fn refusing_with(mut script: Value, model: &str, status: u16) -> Value {
+        let routes = script.as_array_mut().unwrap();
+        routes.insert(
+            0,
+            json!({"method": "POST", "path": "/v1/chat/completions", "status": status,
+                "body_contains": format!("\"model\":\"{model}\""),
+                "body": {"error": {"message": format!("{model} is not a chat model")}}}),
+        );
+        let models = routes.last_mut().unwrap();
+        models["body"]["data"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": model, "context_length": 32000}));
+        script
+    }
+
+    /// A manager wired to the router over one instance (`local`, default model `m`)
+    /// served by `routes`, with no session opened before: nothing is probed yet.
+    async fn unwarmed(
+        routes: Value,
+        mode: &str,
+        stage: &str,
+        policy: crate::chat::provider::cognitive::decider::ProbePolicy,
+    ) -> Setup {
+        let fake = FakeOpenAi::start(routes);
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                "routing",
+                &json!({"mode": mode, "stage": stage, "exploration_epsilon": 0.0}).to_string(),
+            )
+            .await
+            .unwrap();
+        let store = Arc::new(Neo4jRoutingStore::new(graph.clone()));
+        let mut routing = CognitiveRouting::new(store);
+        routing.probe_policy = policy;
+        let manager = manager(graph.clone(), true)
+            .with_provider_source(Arc::new(NoBuiltin))
+            .with_cognitive_routing(routing);
+        Setup {
+            _fake: fake,
+            graph,
+            manager,
+        }
+    }
+
+    /// The probes sent so far: requests carrying the probe's prompt, by model.
+    fn probes_sent(s: &Setup) -> Vec<String> {
+        s._fake
+            .chat_requests()
+            .into_iter()
+            .filter(|r| r["body"].to_string().contains("Call the ping tool now"))
+            .filter_map(|r| r["body"]["model"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Probes the router has running on `local` now.
+    fn running_probes(s: &Setup) -> usize {
+        use crate::chat::provider::cognitive::decider::ProbeMark;
+        let routing = s.manager.cognitive_routing().unwrap();
+        let log = routing.probed.lock().unwrap();
+        log.iter()
+            .filter(|((id, _), mark)| id == "local" && matches!(mark, ProbeMark::InFlight { .. }))
+            .count()
+    }
+
+    fn with_tools(
+        pool: &[crate::chat::provider::cognitive::candidates::ModelFacts],
+    ) -> Vec<String> {
+        let mut known: Vec<String> = pool
+            .iter()
+            .filter(|f| f.provider_id == "local" && f.supports_tools)
+            .map(|f| f.model.clone())
+            .collect();
+        known.sort();
+        known
+    }
+
+    /// Before: only the instance's default model was probed, so `other` had no tools
+    /// until a session had been opened on it, and Auto could never pick it.
+    #[tokio::test]
+    async fn a_model_other_than_the_default_is_a_candidate_with_its_facts_without_any_session() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            catalogue_script(&["m", "other"], &[]),
+            "executors_only",
+            "auto",
+            ProbePolicy::standard(),
+        )
+        .await;
+        let choice = s
+            .manager
+            .resolve_provider_choice_for(&executor_request(), Some("proj"), None)
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"));
+        assert_eq!(choice.routed_by, RoutedBy::Auto);
+        let decision = decisions(&s).await.remove(0);
+        let other = decision
+            .alternatives
+            .iter()
+            .find(|a| a.pick.model == "other")
+            .unwrap_or_else(|| panic!("other is in the pool: {:?}", decision.alternatives));
+        assert!(
+            other.rejected.is_none() && other.score.is_some(),
+            "other is eligible, not rejected: {other:?}"
+        );
+        let pool = s.manager.routing_pool_for(Some("proj")).await;
+        assert_eq!(with_tools(&pool), ["m", "other"]);
+        let other_facts = pool.iter().find(|f| f.model == "other").unwrap();
+        assert_eq!(
+            other_facts.context_window,
+            Some(32_000),
+            "the window is known too"
+        );
+    }
+
+    /// `primary` + `shadow` is routing switched off: deciding and building the pool send
+    /// nothing to the instance (before: its default model was probed anyway).
+    #[tokio::test]
+    async fn primary_and_shadow_send_no_probe_at_all() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            catalogue_script(&["m", "other"], &[]),
+            "primary",
+            "shadow",
+            ProbePolicy::standard(),
+        )
+        .await;
+        for r in [pilot_request(), executor_request()] {
+            choose(&s, &r).await;
+        }
+        let pool = s.manager.routing_pool_for(Some("proj")).await;
+        assert!(
+            pool.iter().any(|f| f.model == "other"),
+            "listed all the same"
+        );
+        assert!(with_tools(&pool).is_empty());
+        assert!(s._fake.chat_requests().is_empty(), "{:?}", probes_sent(&s));
+    }
+
+    /// One build starts at most `per_instance` probes (three), the next builds take the
+    /// rest, the default model first. Read from the facts, not from the fake's log.
+    #[tokio::test]
+    async fn one_build_probes_at_most_its_budget_and_the_next_builds_take_the_rest() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            catalogue_script(&["a", "b", "m", "c", "d"], &[]),
+            "full",
+            "auto",
+            ProbePolicy::standard(),
+        )
+        .await;
+        // `/v1/models` order: a, b, m, c, d; the default `m` goes first.
+        let first = s.manager.routing_pool_for(Some("proj")).await;
+        assert_eq!(with_tools(&first), ["a", "b", "m"]);
+        let second = s.manager.routing_pool_for(Some("proj")).await;
+        assert_eq!(with_tools(&second), ["a", "b", "c", "d", "m"]);
+    }
+
+    /// A model that refused tools (`ModelNoTools`) is a conclusion: never asked again,
+    /// even with no retry delay at all. One probe per build here, so the fake's log has
+    /// no concurrent write to lose.
+    #[tokio::test]
+    async fn a_model_without_tools_is_asked_once_and_never_again() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let policy = ProbePolicy {
+            per_instance: 1,
+            retry_after: Duration::ZERO,
+            ..ProbePolicy::standard()
+        };
+        let s = unwarmed(
+            catalogue_script(&["m", "a"], &["plain"]),
+            "full",
+            "auto",
+            policy,
+        )
+        .await;
+        let count = |sent: &[String], model: &str| sent.iter().filter(|m| *m == model).count();
+        assert_eq!(
+            with_tools(&s.manager.routing_pool_for(Some("proj")).await),
+            ["m"]
+        );
+        assert_eq!(
+            with_tools(&s.manager.routing_pool_for(Some("proj")).await),
+            ["a", "m"]
+        );
+        let third = s.manager.routing_pool_for(Some("proj")).await;
+        assert!(
+            !third
+                .iter()
+                .find(|f| f.model == "plain")
+                .unwrap()
+                .supports_tools
+        );
+        let sent = probes_sent(&s);
+        assert_eq!((count(&sent, "m"), count(&sent, "a")), (1, 1), "{sent:?}");
+        // The forced call refused, then the same probe asks again with `auto`.
+        assert!((1..=2).contains(&count(&sent, "plain")), "{sent:?}");
+        let before = s._fake.chat_requests().len();
+        for _ in 0..3 {
+            s.manager.routing_pool_for(Some("proj")).await;
+        }
+        assert_eq!(
+            s._fake.chat_requests().len(),
+            before,
+            "nothing is left to probe: {:?}",
+            probes_sent(&s)
+        );
+    }
+
+    /// Review of #709 (C1): slow probes never hold the opening (or a turn) longer than
+    /// the pool's short wait, and no more than the instance's budget is sent.
+    #[tokio::test]
+    async fn slow_probes_do_not_hold_the_opening_and_stay_within_the_budget() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            slow(catalogue_script(&["m", "a", "b", "c", "d"], &[]), 5_000),
+            "full",
+            "auto",
+            ProbePolicy::standard(),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        s.manager
+            .resolve_provider_choice_for(&executor_request(), Some("proj"), None)
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"));
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(2_500), "{took:?}");
+        assert_eq!(
+            running_probes(&s),
+            3,
+            "the default and two more, still running"
+        );
+        let sent = probes_sent(&s);
+        assert!(sent.len() <= 3, "{sent:?}");
+    }
+
+    /// Review of #709 (C2): two builds at once share the instance's budget.
+    #[tokio::test]
+    async fn concurrent_builds_share_the_instance_budget() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            slow(
+                catalogue_script(&["m", "a", "b", "c", "d", "e"], &[]),
+                3_000,
+            ),
+            "full",
+            "auto",
+            ProbePolicy::standard(),
+        )
+        .await;
+        let _ = tokio::join!(
+            s.manager.routing_pool_for(Some("proj")),
+            s.manager.routing_pool_for(Some("proj"))
+        );
+        // The probes take 3 s, each build waited 1.5 s: all are still running. Read from
+        // the router's own log (the fake's log can lose concurrent lines before nexus#90).
+        assert_eq!(running_probes(&s), 3);
+    }
+
+    /// Review of #709 (C3): a model the endpoint refuses (404, not a chat model) is an
+    /// answer: asked once, never again, even with no retry delay.
+    #[tokio::test]
+    async fn a_model_the_endpoint_refuses_is_asked_once_and_never_again() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let policy = ProbePolicy {
+            per_instance: 1,
+            retry_after: Duration::ZERO,
+            ..ProbePolicy::standard()
+        };
+        let s = unwarmed(
+            refusing(catalogue_script(&["m"], &[]), "embed"),
+            "full",
+            "auto",
+            policy,
+        )
+        .await;
+        for _ in 0..2 {
+            s.manager.routing_pool_for(Some("proj")).await;
+        }
+        let asked = |s: &Setup| probes_sent(s).iter().filter(|m| *m == "embed").count();
+        let first = asked(&s);
+        assert!((1..=2).contains(&first), "{:?}", probes_sent(&s));
+        for _ in 0..3 {
+            s.manager.routing_pool_for(Some("proj")).await;
+        }
+        assert_eq!(asked(&s), first, "{:?}", probes_sent(&s));
+    }
+
+    /// Review of #709 (N1): an account out of credit (402) says nothing final about the
+    /// model: its probe is retried after the backoff (zero here), not marked unusable.
+    #[tokio::test]
+    async fn an_account_out_of_credit_is_retried_not_marked_unusable() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let policy = ProbePolicy {
+            per_instance: 1,
+            retry_after: Duration::ZERO,
+            ..ProbePolicy::standard()
+        };
+        let s = unwarmed(
+            refusing_with(catalogue_script(&["m"], &[]), "pay", 402),
+            "full",
+            "auto",
+            policy,
+        )
+        .await;
+        let asked = |s: &Setup| probes_sent(s).iter().filter(|m| *m == "pay").count();
+        // m first, then pay.
+        for _ in 0..2 {
+            s.manager.routing_pool_for(Some("proj")).await;
+        }
+        let first = asked(&s);
+        assert!(first >= 1, "{:?}", probes_sent(&s));
+        s.manager.routing_pool_for(Some("proj")).await;
+        assert!(asked(&s) > first, "retried: {:?}", probes_sent(&s));
+    }
+
+    /// Review of #709 (C4a): a conversation in Auto under `primary` + `shadow` has every
+    /// model of its provider probed after it opens, not only the first budget's worth.
+    #[tokio::test]
+    async fn a_conversation_in_auto_gets_every_model_of_its_provider_probed() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            catalogue_script(&["m", "a", "b", "c", "d"], &[]),
+            "primary",
+            "shadow",
+            ProbePolicy::standard(),
+        )
+        .await;
+        let mut auto = pilot_request();
+        auto.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
+        s.manager
+            .resolve_provider_choice_for(&auto, Some("proj"), None)
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"));
+        let mut known = Vec::new();
+        for _ in 0..100 {
+            known = with_tools(&s.manager.routing_pool_known(Some("proj")).await);
+            if known.len() == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(known, ["a", "b", "c", "d", "m"]);
+    }
+
+    /// A report on the routing reads the pool without spending a request.
+    #[tokio::test]
+    async fn the_known_pool_never_probes() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            catalogue_script(&["m", "other"], &[]),
+            "full",
+            "auto",
+            ProbePolicy::standard(),
+        )
+        .await;
+        let pool = s.manager.routing_pool_known(Some("proj")).await;
+        assert!(with_tools(&pool).is_empty());
+        assert!(s._fake.chat_requests().is_empty());
+    }
+
+    fn pool_of(models: &[(&str, &str)]) -> Option<Vec<crate::chat::types::RoutingPoolEntry>> {
+        Some(
+            models
+                .iter()
+                .map(|(provider, model)| crate::chat::types::RoutingPoolEntry {
+                    provider: (*provider).into(),
+                    model: (*model).into(),
+                })
+                .collect(),
+        )
+    }
+
+    /// The pool restricts the decision taken when the conversation OPENS, not only the
+    /// per-turn ones: a model nobody ticked never opens it.
+    #[tokio::test]
+    async fn the_models_ticked_are_the_only_candidates_when_a_conversation_opens() {
+        let s = setup("full", "auto", true).await;
+        let mut r = pilot_request();
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Mixed);
+        r.routing_pool = pool_of(&[("local", "not-m"), ("local", "other")]);
+        let c = choose(&s, &r).await;
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref(), c.routed_by),
+            ("local", Some("not-m"), RoutedBy::Request),
+            "local/m was not ticked: the first ticked model opens it"
+        );
+    }
+
+    /// A pool is routed at open inside it, whatever the settings' mode (primary here).
+    #[tokio::test]
+    async fn a_pool_is_routed_at_open_even_when_the_settings_say_primary() {
+        let s = setup("primary", "auto", true).await;
+        let mut r = pilot_request();
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Mixed);
+        r.routing_pool = pool_of(&[("local", "m"), ("claude-code", "x")]);
+        let c = choose(&s, &r).await;
+        assert_eq!(c.routed_by, RoutedBy::Auto);
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref()),
+            ("local", Some("m"))
+        );
+    }
+
+    /// R-S4: the menu sends its "pilot" (provider + model) WITH the pool. The opening is
+    /// still a decision among the pool (`routed_by: auto`): the pilot is no explicit choice.
+    /// Before R-S4 the pilot made the request `named` and opened the conversation itself.
+    #[tokio::test]
+    async fn the_opening_of_a_pool_is_decided_among_it_whatever_pilot_the_menu_names() {
+        let s = setup("primary", "auto", true).await;
+        let mut r = pilot_request();
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Mixed);
+        r.routing_pool = pool_of(&[("local", "m"), ("claude-code", "x")]);
+        r.provider = Some("claude-code".into());
+        r.model = Some("x".into());
+        let c = choose(&s, &r).await;
+        assert_eq!(c.routed_by, RoutedBy::Auto, "{c:?}");
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref()),
+            ("local", Some("m"))
+        );
+        let opening = decisions(&s).await.remove(0);
+        assert!(opening.applied, "{opening:?}");
+        assert_eq!(opening.chosen.map(|p| p.model).as_deref(), Some("m"));
+    }
+
+    /// R-S4: when no decision among the pool applies, the menu's pilot opens the
+    /// conversation (its provider AND its model), never a default nobody ticked.
+    #[tokio::test]
+    async fn the_menus_pilot_opens_a_pool_only_when_no_decision_applies() {
+        let s = setup("full", "auto", true).await;
+        let mut r = pilot_request();
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Mixed);
+        // Neither ticked model is offered by the instance: nothing to decide among.
+        r.routing_pool = pool_of(&[("local", "not-m"), ("local", "other")]);
+        r.provider = Some("local".into());
+        r.model = Some("other".into());
+        let c = choose(&s, &r).await;
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref(), c.routed_by),
+            ("local", Some("other"), RoutedBy::Request),
+            "the pilot is the fallback"
+        );
+    }
+
+    /// A decider that applies `other/o1` for every request: a pair the resolver refuses
+    /// (the project gave no consent to `other`). A test that wants to read the signature the
+    /// manager put in front of the router passes `seen`; the others leave it `None`.
+    #[derive(Default)]
+    struct AppliesOther {
+        seen: Option<
+            Arc<std::sync::Mutex<Vec<crate::chat::provider::cognitive::signature::TaskSignature>>>,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::chat::provider::cognitive::decision::Decider for AppliesOther {
+        async fn decide(
+            &self,
+            request: &crate::chat::provider::cognitive::decision::DecideRequest,
+        ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision> {
+            use crate::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
+            if let Some(seen) = &self.seen {
+                seen.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(request.signature.clone());
+            }
+            Ok(CognitiveDecision {
+                snapshot: None,
+                arms_snapshot: Vec::new(),
+                id: Uuid::new_v4(),
+                at: Utc::now(),
+                signature: request.signature.clone(),
+                chosen: Some(Pick::new("other", "o1")),
+                score: Some(0.9),
+                explored: false,
+                exploration_epsilon: 0.0,
+                confidence: None,
+                reason: "other/o1: fake".into(),
+                alternatives: Vec::new(),
+                applied: true,
+                mode: request.settings.mode,
+                stage: request.settings.stage,
+                session_id: request.session_id,
+                task_id: None,
+                run_id: None,
+                turn_index: request.turn_index,
+                outcome: None,
+                used: None,
+            })
+        }
+    }
+
+    /// AUTO-SUB: a sub-agent of a native parent in Auto routes over every candidate the
+    /// project allowed — the router's pair, not the parent's provider — attributed to Auto,
+    /// and the signature the manager puts in front of the router names the sub-task (the
+    /// class the model stated, an executor).
+    #[tokio::test]
+    async fn a_subagent_of_an_auto_parent_routes_over_the_full_pool() {
+        let Setup {
+            _fake,
+            graph,
+            manager,
+        } = setup_with("full", "auto", false, false).await;
+        // A second instance the project consented to, alongside `local`.
+        let mut record = instance(&_fake, "none");
+        record.id = "other".into();
+        record.label = "Other".into();
+        store_instance(&graph, &record).await;
+        consent(&graph, "proj", "other", &_fake.origin()).await;
+        // A router that applies `other/o1`, keeping every signature it is handed.
+        let seen: Arc<
+            std::sync::Mutex<Vec<crate::chat::provider::cognitive::signature::TaskSignature>>,
+        > = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let routing = CognitiveRouting::with_decider(Arc::new(AppliesOther {
+            seen: Some(seen.clone()),
+        }));
+        let s = Setup {
+            _fake,
+            graph,
+            manager: manager.with_cognitive_routing(routing),
+        };
+        let c = choose(&s, &subagent_request()).await;
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref(), c.routed_by),
+            ("other", Some("o1"), RoutedBy::Auto),
+            "the child opens on the router's pair, attributed to Auto"
+        );
+        // The signature the manager built names the sub-task — the class of the agent kind
+        // the model named (`subagent_type`), an executor — not a plain `simple` delegation.
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(seen.len(), 1, "the router was handed one signature");
+        assert_eq!(
+            seen[0].class,
+            crate::chat::provider::cognitive::signature::TaskClass::Complex
+        );
+        assert!(matches!(
+            seen[0].role,
+            crate::chat::provider::resolver::Role::Executor
+        ));
+    }
+
+    /// A decider that applies nothing: the fallback path of a routed sub-agent is the one
+    /// under test (review point 1).
+    struct DeclinesPick;
+
+    #[async_trait::async_trait]
+    impl crate::chat::provider::cognitive::decision::Decider for DeclinesPick {
+        async fn decide(
+            &self,
+            request: &crate::chat::provider::cognitive::decision::DecideRequest,
+        ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision> {
+            use crate::chat::provider::cognitive::decision::CognitiveDecision;
+            Ok(CognitiveDecision {
+                snapshot: None,
+                arms_snapshot: Vec::new(),
+                id: Uuid::new_v4(),
+                at: Utc::now(),
+                signature: request.signature.clone(),
+                chosen: None,
+                score: None,
+                explored: false,
+                exploration_epsilon: 0.0,
+                confidence: None,
+                reason: "declines: fake".into(),
+                alternatives: Vec::new(),
+                applied: false,
+                mode: request.settings.mode,
+                stage: request.settings.stage,
+                session_id: request.session_id,
+                task_id: None,
+                run_id: None,
+                turn_index: request.turn_index,
+                outcome: None,
+                used: None,
+            })
+        }
+    }
+
+    /// AUTO-SUB (review point 1): the router applies nothing — the child must open on the
+    /// pair of the session that spawned it, NEVER on the declared rules. The global
+    /// executor rule names `local` and the parent runs on `other`: the two differ, so only
+    /// the parent's pair can satisfy the assertion.
+    #[tokio::test]
+    async fn a_subagent_whose_router_applies_nothing_opens_on_its_parents_pair() {
+        let Setup {
+            _fake,
+            graph,
+            manager,
+        } = setup_with("full", "auto", false, true).await;
+        // The parent's instance: a second one the project consented to.
+        let mut record = instance(&_fake, "none");
+        record.id = "other".into();
+        record.label = "Other".into();
+        record.default_model = Some("o1".into());
+        store_instance(&graph, &record).await;
+        consent(&graph, "proj", "other", &_fake.origin()).await;
+        // The declared rule a child would otherwise fall through to.
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                "roles",
+                &json!({"executor": {"provider": "local", "model": "m"}}).to_string(),
+            )
+            .await
+            .unwrap();
+        // A real parent session, on `other`/`o1`.
+        let mut parent_request = request(Some("other"), Some("proj"), "default");
+        parent_request.model = Some("o1".into());
+        let parent = manager
+            .create_session(&parent_request)
+            .await
+            .unwrap_or_else(|e| panic!("the parent opens: {e:#}"));
+        let parent_uuid = Uuid::parse_str(&parent.session_id).unwrap();
+        let parent_node = graph.get_chat_session(parent_uuid).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                parent_node.provider_id.as_deref(),
+                parent_node.model.as_str()
+            ),
+            (Some("other"), "o1"),
+            "the parent is on the pair the child must inherit"
+        );
+        // The `Agent` call: a child of that conversation, routed by PO, no pair of its own.
+        let mut child = request(None, Some("proj"), "default");
+        child.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: parent_uuid,
+                tool_use_id: Some("toolu_fallback".into()),
+            }
+            .to_json_string(),
+        );
+        child.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
+        child.subagent_type = Some("Explore".into());
+        child.route_auto = true;
+        let s = Setup {
+            _fake,
+            graph,
+            manager: manager
+                .with_cognitive_routing(CognitiveRouting::with_decider(Arc::new(DeclinesPick))),
+        };
+        let c = choose(&s, &child).await;
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref()),
+            ("other", Some("o1")),
+            "the router applied nothing: the child opens on its parent's pair"
+        );
+        // The control: the declared rules would have opened it on `local`/`m`, so the
+        // assertion above is not just the global executor rule again.
+        let mut unrouted = child.clone();
+        unrouted.route_auto = false;
+        let c = choose(&s, &unrouted).await;
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref()),
+            ("local", Some("m")),
+            "without the fallback the declared executor rule opens it"
+        );
+    }
+
+    /// A manager whose router applies `other/o1` (consent not given), its decisions stored
+    /// in the graph, and a pool request naming `pilot` as the menu's pilot.
+    async fn refused_pick(pilot: &str) -> (Setup, ChatRequest) {
+        let Setup {
+            _fake,
+            graph,
+            manager,
+        } = setup_with("primary", "auto", false, false).await;
+        for id in ["other", "other2"] {
+            let mut record = instance(&_fake, "none");
+            record.id = id.into();
+            record.label = id.into();
+            store_instance(&graph, &record).await;
+        }
+        let mut routing = CognitiveRouting::with_decider(Arc::new(AppliesOther::default()));
+        routing.store = Some(Arc::new(Neo4jRoutingStore::new(graph.clone())));
+        let manager = manager.with_cognitive_routing(routing);
+        let mut r = pilot_request();
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Mixed);
+        r.routing_pool = pool_of(&[("other", "o1"), (pilot, "m")]);
+        r.provider = Some(pilot.into());
+        r.model = Some("m".into());
+        (
+            Setup {
+                _fake,
+                graph,
+                manager,
+            },
+            r,
+        )
+    }
+
+    /// Review of #713, C2: the pick among the pool is applied but the resolver refuses it
+    /// (here: no consent for its instance). A pilot never falls back inside the resolver;
+    /// the pool's own fallback — the menu's pilot — opens the conversation instead of the
+    /// opening failing. Before the fix: `not_allowed`, the conversation did not open.
+    /// The stored decision says what happened: not applied, `not_opened: endpoint_not_allowed`.
+    #[tokio::test]
+    async fn a_pool_pick_the_resolver_refuses_falls_back_to_the_menus_pilot() {
+        let (s, r) = refused_pick("local").await;
+        let c = s
+            .manager
+            .resolve_provider_choice(&r, Some("proj"))
+            .await
+            .unwrap_or_else(|e| panic!("the opening must fall back, not fail: {e:#}"));
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref(), c.routed_by),
+            ("local", Some("m"), RoutedBy::Request)
+        );
+        assert_eq!(
+            c.shadow,
+            Some(("other".to_owned(), Some("o1".to_owned()))),
+            "what the router chose is recorded, not applied"
+        );
+        let stored = decisions(&s).await;
+        assert_eq!(stored.len(), 1, "{stored:#?}");
+        assert!(!stored[0].applied, "{stored:#?}");
+        assert!(
+            stored[0]
+                .reason
+                .ends_with("; not_opened: endpoint_not_allowed"),
+            "{}",
+            stored[0].reason
+        );
+    }
+
+    /// Review of #713 (follow-up, nit 2): the fallback is refused too — nothing opens, and
+    /// the stored decision does not claim it was applied.
+    #[tokio::test]
+    async fn a_refused_pick_whose_fallback_is_refused_too_is_stored_not_applied() {
+        let (s, r) = refused_pick("other2").await;
+        let refused = s.manager.resolve_provider_choice(&r, Some("proj")).await;
+        assert!(refused.is_err(), "{refused:?}");
+        let stored = decisions(&s).await;
+        assert_eq!(stored.len(), 1, "{stored:#?}");
+        assert!(!stored[0].applied, "{stored:#?}");
+        assert!(
+            stored[0].reason.contains("not_opened:"),
+            "{}",
+            stored[0].reason
+        );
+    }
+
+    /// Auto in the chat menu (`routing_mode: full`) routes the opening too, whatever the settings.
+    #[tokio::test]
+    async fn auto_in_the_request_routes_the_opening_even_when_the_settings_say_primary() {
+        let s = setup("primary", "auto", true).await;
+        let mut r = pilot_request();
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
+        assert_eq!(choose(&s, &r).await.routed_by, RoutedBy::Auto);
+    }
+
+    #[tokio::test]
+    async fn a_manual_switch_to_another_model_counts_as_an_override_when_the_session_closes() {
+        let s = setup("full", "auto", true).await;
+        let session_id = open_routed_session(&s).await;
+
+        s.manager
+            .set_session_model(&session_id, "some-other-model")
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        s.manager.close_session(&session_id).await.unwrap();
+
+        let closed = decisions(&s).await.remove(0);
+        let outcome = closed.outcome.expect("the close recorded an outcome");
+        assert!(outcome.overridden, "the switch by hand is counted");
+        assert!(outcome.reward.is_some(), "an override closes with a reward");
+    }
+
+    #[tokio::test]
+    async fn an_override_that_closes_a_losing_class_demotes_it_to_shadow() {
+        use crate::chat::provider::cognitive::{
+            decision::{CognitiveDecision, DecisionOutcome},
+            load_routing, LearningStage,
+        };
+        let s = setup("full", "auto", true).await;
+        // The smallest window the settings accept.
+        s.graph
+            .put_llm_setting(
+                GLOBAL,
+                "routing",
+                &json!({
+                    "mode": "full",
+                    "stage": "auto",
+                    "exploration_epsilon": 0.0,
+                    "demote_after": 5
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let session_id = open_routed_session(&s).await;
+        let routed = decisions(&s).await.remove(0);
+
+        // Same class as the session's decision: four learnt choices that did badly
+        // (the session's own, closed below, is the fifth) and five declarative ones
+        // that did well.
+        let store = Neo4jRoutingStore::new(s.graph.clone());
+        let seed = |applied: bool, reward: f64, age: i64| {
+            let mut d: CognitiveDecision = routed.clone();
+            d.id = Uuid::new_v4();
+            d.at = routed.at - ChronoDuration::seconds(age);
+            d.applied = applied;
+            d.stage = if applied {
+                LearningStage::Auto
+            } else {
+                LearningStage::Shadow
+            };
+            d.session_id = None;
+            d.outcome = Some(DecisionOutcome {
+                reward: Some(reward),
+                ..DecisionOutcome::default()
+            });
+            d
+        };
+        for age in 1..=4 {
+            store.put_decision(&seed(true, 0.2, age)).await.unwrap();
+        }
+        for age in 1..=5 {
+            store.put_decision(&seed(false, 0.9, age)).await.unwrap();
+        }
+
+        let before = load_routing(s.graph.as_ref(), Some("proj"))
+            .await
+            .unwrap()
+            .0;
+        assert!(before.stage == LearningStage::Auto);
+
+        s.manager
+            .set_session_model(&session_id, "some-other-model")
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        s.manager.close_session(&session_id).await.unwrap();
+
+        let after = load_routing(s.graph.as_ref(), Some("proj"))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            after.stage == LearningStage::Shadow,
+            "the override closed a class the router does worse on: demoted"
+        );
+    }
+
+    #[tokio::test]
+    async fn executors_only_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary() {
+        let s = setup("executors_only", "auto", true).await;
+        let executor = choose(&s, &executor_request()).await;
+        assert_eq!(executor.provider_id, "local");
+        assert_eq!(executor.model.as_deref(), Some("m"));
+        assert_eq!(executor.routed_by, RoutedBy::Auto);
+        assert_eq!(executor.route_rule.as_deref(), Some("auto:simple"));
+        assert!(executor
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("local/m")));
+
+        let pilot = choose(&s, &pilot_request()).await;
+        assert_eq!(
+            pilot.provider_id, "claude-code",
+            "the pilot keeps the primary"
+        );
+        assert_ne!(pilot.routed_by, RoutedBy::Auto);
+        assert_eq!(
+            pilot.shadow.as_ref().map(|p| p.0.as_str()),
+            Some("local"),
+            "what the router would have chosen is recorded"
+        );
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.iter().filter(|d| d.applied).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_routes_the_pilot_too() {
+        let s = setup("full", "auto", true).await;
+        let pilot = choose(&s, &pilot_request()).await;
+        assert_eq!(pilot.provider_id, "local");
+        assert_eq!(pilot.routed_by, RoutedBy::Auto);
+        assert!(pilot
+            .route_rule
+            .as_deref()
+            .is_some_and(|r| r.starts_with("auto:chat")));
+        let executor = choose(&s, &executor_request()).await;
+        assert_eq!(executor.routed_by, RoutedBy::Auto);
+        assert!(decisions(&s).await.iter().all(|d| d.applied));
+    }
+
+    /// Opens a session on the automatic choice and waits for its first result.
+    async fn open_routed_session(s: &Setup) -> String {
+        let created = s
+            .manager
+            .create_session(&pilot_request())
+            .await
+            .unwrap_or_else(|e| panic!("create_session failed: {e:#}"));
+        let mut rx = s.manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        created.session_id
+    }
+
+    #[tokio::test]
+    async fn a_chat_decision_is_linked_to_its_session_and_the_completed_turn_teaches_the_arm() {
+        let s = setup("full", "auto", true).await;
+        let session_id = open_routed_session(&s).await;
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 1, "one decision for the one routed session");
+        let decision = &all[0];
+        assert_eq!(
+            decision.session_id.map(|id| id.to_string()).as_deref(),
+            Some(session_id.as_str()),
+            "the decision names the session it routed"
+        );
+        let arm = decision.arm().expect("the decision chose an arm");
+
+        // R0: the completed turn fed the arm — a plain `completed` is a success.
+        let store = Neo4jRoutingStore::new(s.graph.clone());
+        let taught = store
+            .arm(&arm)
+            .await
+            .unwrap()
+            .expect("the completed turn taught the arm");
+        assert!(
+            taught.mean() > 0.5,
+            "one success on a Beta(1,1) prior: {taught:?}"
+        );
+        assert_eq!(taught.n, 1, "one observation: {taught:?}");
+
+        s.manager.close_session(&session_id).await.unwrap();
+
+        // The close itself cannot tell success: its recorded outcome has no reward.
+        let closed = decisions(&s).await.remove(0);
+        let outcome = closed.outcome.expect("the close recorded what it saw");
+        assert!(outcome.duration_ms.is_some(), "{outcome:?}");
+        assert_eq!(
+            outcome.reward, None,
+            "a plain close cannot tell success: no reward"
+        );
+        assert!(s.manager.open_decisions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_model_switched_by_hand_closes_the_decision_with_the_override_and_teaches_the_arm() {
+        let s = setup("full", "auto", true).await;
+        let session_id = open_routed_session(&s).await;
+        let arm = decisions(&s).await[0].arm().unwrap();
+
+        // The switch itself may be refused by the fake; the user's intent counts.
+        let _ = s.manager.set_session_model(&session_id, "m2").await;
+        s.manager.close_session(&session_id).await.unwrap();
+
+        let closed = decisions(&s).await.remove(0);
+        let outcome = closed.outcome.expect("closed");
+        assert!(outcome.overridden, "{outcome:?}");
+        assert!(outcome.reward.is_some_and(|r| r < 0.5), "{outcome:?}");
+        let stats = Neo4jRoutingStore::new(s.graph.clone())
+            .arm(&arm)
+            .await
+            .unwrap()
+            .expect("the override taught the arm");
+        // R0: the completed turn taught a success before the override taught a
+        // failure — two observations land the Beta(1,1) mean exactly at 0.5.
+        assert_eq!(stats.n, 2, "one turn + one override: {stats:?}");
+        assert!(
+            (stats.mean() - 0.5).abs() < 1e-9,
+            "success then failure: {stats:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_the_router_a_session_keeps_no_open_decision() {
+        let s = setup("full", "auto", false).await;
+        let created = s
+            .manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap();
+        let mut rx = s.manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        let session_id = created.session_id;
+        assert!(s.manager.open_decisions.lock().unwrap().is_empty());
+        s.manager.close_session(&session_id).await.unwrap();
+        assert!(decisions(&s).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wire_learning_gives_the_per_turn_router_and_the_runner_a_handle() {
+        let s = setup("full", "auto", true).await;
+        let manager = Arc::new(s.manager);
+        crate::runner::routing::install(None);
+        assert!(crate::runner::routing::installed().is_none());
+        assert!(manager.turn_routing.configured().is_none());
+
+        crate::chat::provider::cognitive::wiring::wire_learning(&manager);
+        assert!(manager.turn_routing.configured().is_some());
+        let handle = crate::runner::routing::installed().expect("installed");
+        let pool = handle.pool.facts(Some("proj")).await;
+        assert!(
+            pool.iter().any(|f| f.provider_id == "local"),
+            "the runner pool is the manager's pool: {pool:?}"
+        );
+        crate::runner::routing::install(None);
+    }
+
+    #[tokio::test]
+    async fn the_shadow_stage_applies_nothing_in_any_mode() {
+        for mode in ["primary", "executors_only", "full"] {
+            let s = setup(mode, "shadow", true).await;
+            for r in [pilot_request(), executor_request()] {
+                let c = choose(&s, &r).await;
+                assert_eq!(c.provider_id, "claude-code", "{mode}/shadow");
+                assert_ne!(c.routed_by, RoutedBy::Auto);
+            }
+            let all = decisions(&s).await;
+            assert_eq!(all.len(), 2);
+            assert!(all.iter().all(|d| !d.applied), "{mode}/shadow");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_advisory_stage_applies_to_executors_only() {
+        let s = setup("full", "advisory", true).await;
+        assert_eq!(
+            choose(&s, &executor_request()).await.routed_by,
+            RoutedBy::Auto
+        );
+        assert_ne!(choose(&s, &pilot_request()).await.routed_by, RoutedBy::Auto);
+    }
+
+    #[tokio::test]
+    async fn a_choice_the_caller_named_is_never_substituted() {
+        let s = setup("full", "auto", true).await;
+        let mut explicit_provider = pilot_request();
+        explicit_provider.provider = Some("claude-code".into());
+        let mut explicit_model = executor_request();
+        explicit_model.model = Some("some-model".into());
+        let mut alias = executor_request();
+        alias.task_alias = Some("fast".into());
+        let mut run = executor_request();
+        run.run_provider = Some("claude-code".into());
+        for r in [explicit_provider, explicit_model, run] {
+            let c = choose(&s, &r).await;
+            assert_eq!(c.provider_id, "claude-code");
+            assert_ne!(c.routed_by, RoutedBy::Auto);
+        }
+        // An alias that is not defined is the caller's problem, not a reason to route.
+        assert!(s
+            .manager
+            .resolve_provider_choice(&alias, Some("proj"))
+            .await
+            .map(|c| c.routed_by != RoutedBy::Auto)
+            .unwrap_or(true));
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 4, "persisted in every case");
+        assert!(all.iter().all(|d| !d.applied && d.chosen.is_none()));
+        assert!(all.iter().all(|d| d.reason.contains("explicit")));
+    }
+
+    async fn put_aliases(s: &Setup, aliases: serde_json::Value) {
+        s.graph
+            .put_llm_setting(GLOBAL, "model_aliases", &aliases.to_string())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_persona_level_sits_between_the_task_alias_and_the_run() {
+        let s = setup("full", "auto", true).await;
+        put_aliases(
+            &s,
+            json!([
+                {"alias": "fast", "provider": "local", "model": "m"},
+                {"alias": "deep", "provider": "local", "model": "m-deep"}
+            ]),
+        )
+        .await;
+        // Persona alone: it is the persona level and names its model.
+        let mut persona = executor_request();
+        persona.persona_alias = Some("fast".into());
+        let c = choose(&s, &persona).await;
+        assert_eq!(
+            (c.routed_by, c.provider_id.as_str(), c.model.as_deref()),
+            (RoutedBy::Persona, "local", Some("m"))
+        );
+        // Persona beats the run.
+        let mut over_run = persona.clone();
+        over_run.run_provider = Some("claude-code".into());
+        assert_eq!(choose(&s, &over_run).await.routed_by, RoutedBy::Persona);
+        // The task alias beats the persona.
+        let mut over_persona = persona.clone();
+        over_persona.task_alias = Some("deep".into());
+        let c = choose(&s, &over_persona).await;
+        assert_eq!(
+            (c.routed_by, c.model.as_deref()),
+            (RoutedBy::Task, Some("m-deep"))
+        );
+        // The user's request beats everything.
+        let mut requested = persona.clone();
+        requested.provider = Some("claude-code".into());
+        assert_eq!(choose(&s, &requested).await.routed_by, RoutedBy::Request);
+        // Nothing the router chose replaced a named model.
+        assert!(decisions(&s).await.iter().all(|d| !d.applied));
+    }
+
+    #[tokio::test]
+    async fn a_preference_no_alias_maps_falls_through_and_never_reaches_a_decision() {
+        let s = setup("full", "auto", true).await;
+        let sentinel = "SENTINEL-persona-free-text-7f3a";
+        let mut r = executor_request();
+        r.persona_alias = Some(sentinel.into());
+        let c = choose(&s, &r).await;
+        // The choice stays the persona's to make: the router does not take over.
+        assert_ne!(c.routed_by, RoutedBy::Auto);
+        assert_ne!(c.routed_by, RoutedBy::Persona);
+        assert!(!format!("{c:?}").contains(sentinel));
+        let all = decisions(&s).await;
+        assert!(!all.is_empty());
+        assert!(all.iter().all(|d| !d.applied && d.chosen.is_none()));
+        assert!(!serde_json::to_string(&all).unwrap().contains(sentinel));
+    }
+
+    #[tokio::test]
+    async fn without_a_candidate_the_declared_rules_apply_and_the_decision_says_so() {
+        let s = setup("full", "auto", true).await;
+        // The project withdraws its consent: nothing is eligible.
+        s.graph
+            .delete_llm_setting("project:proj", "consent:local")
+            .await
+            .ok();
+        for (key, _) in s.graph.list_llm_settings("project:proj", "").await.unwrap() {
+            s.graph
+                .delete_llm_setting("project:proj", &key)
+                .await
+                .unwrap();
+        }
+        let c = choose(&s, &pilot_request()).await;
+        assert_eq!(c.provider_id, "claude-code");
+        assert_ne!(c.routed_by, RoutedBy::Auto);
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].reason, "no_candidate");
+        assert!(!all[0].applied && all[0].chosen.is_none());
+    }
+}
+
+// ============================================================================
+// Auto on a locked vault (#689): the refusal, wired, and the unlock that follows.
+// ============================================================================
+
+/// Auto refused on a locked vault, through `resolve_provider_choice` with the router
+/// wired (review of #689, finding 5: the refusal had only pure-function tests).
+mod auto_on_a_locked_vault {
+    use super::*;
+    use crate::chat::agent_runtime::ProviderSource;
+    use crate::chat::model_catalog::ModelCatalogCache;
+    use crate::chat::provider::cognitive::candidates::RejectReason;
+    use crate::chat::provider::cognitive::decider::CognitiveRouting;
+    use crate::chat::provider::cognitive::decision::CognitiveDecision;
+    use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
+    use crate::chat::provider::errors::{classify_open_error, AutoVaultLocked};
+    use crate::chat::provider::resolver::ProviderChoice;
+    use crate::neo4j::routing::Neo4jRoutingStore;
+    const PASS: &str = "correct horse battery staple";
+
+    struct NoBuiltin;
+
+    impl ProviderSource for NoBuiltin {
+        fn get(&self, _provider_id: &str) -> Option<Arc<dyn nexus_claude::agent::AgentProvider>> {
+            None
+        }
+    }
+
+    struct Setup {
+        _fake: FakeOpenAi,
+        graph: Arc<MockGraphStore>,
+        manager: ChatManager,
+        vault: Arc<VaultService>,
+    }
+
+    /// What the router is given.
+    struct Given {
+        /// Routing stage (mode `full`).
+        stage: &'static str,
+        /// `local`, keyed in the vault: stored, and consented by the project.
+        local: Option<bool>,
+        /// The Anthropic catalog the Claude Code candidates come from.
+        catalog: Option<Arc<ModelCatalogCache>>,
+    }
+
+    impl Default for Given {
+        fn default() -> Self {
+            Self {
+                stage: "auto",
+                local: Some(true),
+                catalog: None,
+            }
+        }
+    }
+
+    /// `free` (keyed nowhere) and, when asked, `local` (keyed in the vault under a
+    /// grant), both on one endpoint; then the vault is locked.
+    async fn setup(given: Given) -> Setup {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        if let Some(consented) = given.local {
+            store_instance(&graph, &instance(&fake, "vault:endpoint-key")).await;
+            if consented {
+                consent(&graph, "proj", "local", &fake.origin()).await;
+            }
+        }
+        let free = InstanceRecord {
+            id: "free".into(),
+            ..instance(&fake, "none")
+        };
+        store_instance(&graph, &free).await;
+        consent(&graph, "proj", "free", &fake.origin()).await;
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                "routing",
+                &json!({"mode": "full", "stage": given.stage, "exploration_epsilon": 0.0})
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        let vault = VaultService::ephemeral();
+        vault
+            .init(PASS.into(), ChronoDuration::hours(1))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        vault
+            .put("endpoint-key", "sk-e2e-value-4321", None, now)
+            .unwrap();
+        vault
+            .grant(
+                SecretSelector::Names(["endpoint-key".to_string()].into()),
+                GrantScope::Provider("local".to_string()),
+                ChronoDuration::hours(1),
+                None,
+                now,
+            )
+            .unwrap();
+        vault.lock_now();
+        let mut routing = CognitiveRouting::new(Arc::new(Neo4jRoutingStore::new(graph.clone())));
+        if let Some(catalog) = given.catalog {
+            routing = routing.with_claude_code_catalog(catalog);
+        }
+        let manager = manager(graph.clone(), true)
+            .with_provider_source(Arc::new(NoBuiltin))
+            .with_vault(Arc::clone(&vault))
+            .with_cognitive_routing(routing);
+        Setup {
+            _fake: fake,
+            graph,
+            manager,
+            vault,
+        }
+    }
+
+    async fn resolve(s: &Setup) -> anyhow::Result<ProviderChoice> {
+        s.manager
+            .resolve_provider_choice(&request(None, Some("proj"), "default"), Some("proj"))
+            .await
+    }
+
+    async fn decisions(s: &Setup) -> Vec<CognitiveDecision> {
+        Neo4jRoutingStore::new(s.graph.clone())
+            .decisions(&DecisionFilter::default())
+            .await
+            .unwrap()
+    }
+
+    fn refused(error: &anyhow::Error) -> Vec<(String, String)> {
+        let locked = error
+            .downcast_ref::<AutoVaultLocked>()
+            .unwrap_or_else(|| panic!("Auto refused on the locked vault, got: {error:#}"));
+        let failure = classify_open_error(error, None).expect("typed");
+        assert_eq!((failure.status, failure.code), (423, "credentials_locked"));
+        locked
+            .fallbacks
+            .iter()
+            .map(|f| (f.provider_id.clone(), f.model.clone()))
+            .collect()
+    }
+
+    /// Why `local/m` was not eligible in the latest decision, `None` = eligible.
+    async fn local_rejection(s: &Setup) -> Option<RejectReason> {
+        let latest = decisions(s).await.remove(0);
+        latest
+            .alternatives
+            .iter()
+            .find(|a| a.pick.provider_id == "local")
+            .unwrap_or_else(|| panic!("local is a candidate: {:?}", latest.alternatives))
+            .rejected
+            .clone()
+    }
+
+    async fn unlock(s: &Setup) {
+        s.vault
+            .unlock(PASS.into(), ChronoDuration::hours(1))
+            .await
+            .unwrap();
+    }
+
+    /// AUTO-SUB (review point 2): the `Agent` call of a parent that is ALREADY open still
+    /// runs on a locked vault. The refusal exists for a conversation the user put in Auto;
+    /// a routed child has a stated fallback (the pair of the session it came from), so
+    /// failing the tool call bought no safety — and it took only one vault-keyed instance
+    /// in the project to turn a working `Agent` call into an error.
+    #[tokio::test]
+    async fn a_routed_subagent_is_not_refused_on_a_locked_vault() {
+        let s = setup(Given::default()).await;
+        // What the user sends to an Auto conversation is refused, exactly as before.
+        let error = resolve(&s).await.unwrap_err();
+        assert_eq!(refused(&error), [("free".to_string(), "m".to_string())]);
+        // The parent, opened on `free` (keyed nowhere): the session that was already
+        // running when the vault locked again.
+        let parent = s
+            .manager
+            .create_session(&request(Some("free"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the parent opens: {e:#}"));
+        let mut child = request(None, Some("proj"), "default");
+        child.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: Uuid::parse_str(&parent.session_id).unwrap(),
+                tool_use_id: Some("toolu_vault".into()),
+            }
+            .to_json_string(),
+        );
+        child.subagent_type = Some("Explore".into());
+        child.route_auto = true;
+        let choice = s
+            .manager
+            .resolve_provider_choice(&child, Some("proj"))
+            .await
+            .unwrap_or_else(|e| panic!("the Agent call still opens: {e:#}"));
+        assert_eq!(
+            (choice.provider_id.as_str(), choice.model.as_deref()),
+            ("free", Some("m")),
+            "the child opens off the vault-keyed instance"
+        );
+    }
+
+    /// DELEG-500: `delegate_task` from a conversation that is ALREADY open. The vault
+    /// re-locks at every restart of the server; the delegation names nothing (its
+    /// router applied, so the parent's engine was not inherited) and was refused with
+    /// `credentials_locked` — a bare 500 until #825. Like the `Agent` call above, it has
+    /// a stated fallback, the pair of the session that delegated: it opens there.
+    #[tokio::test]
+    async fn a_delegation_of_an_open_parent_is_not_refused_on_a_locked_vault() {
+        let s = setup(Given::default()).await;
+        let parent = s
+            .manager
+            .create_session(&request(Some("free"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the parent opens: {e:#}"));
+        let mut child = request(None, Some("proj"), "bypassPermissions");
+        child.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Delegation {
+                plan_id: Uuid::new_v4(),
+                task_id: Uuid::new_v4(),
+                parent_session_id: Some(Uuid::parse_str(&parent.session_id).unwrap()),
+                scaffolding_level: None,
+            }
+            .to_json_string(),
+        );
+        let choice = s
+            .manager
+            .resolve_provider_choice(&child, Some("proj"))
+            .await
+            .unwrap_or_else(|e| panic!("the delegation still opens: {e:#}"));
+        assert_eq!(
+            (choice.provider_id.as_str(), choice.model.as_deref()),
+            ("free", Some("m")),
+            "the child opens off the vault-keyed instance, on its parent's engine"
+        );
+    }
+
+    /// A delegation that no session spawned (a person, from the plan page) has no
+    /// parent to fall back on: refused as any Auto opening is, with what needs no vault.
+    #[tokio::test]
+    async fn a_delegation_from_a_person_is_still_refused_on_a_locked_vault() {
+        let s = setup(Given::default()).await;
+        let mut child = request(None, Some("proj"), "bypassPermissions");
+        child.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Delegation {
+                plan_id: Uuid::new_v4(),
+                task_id: Uuid::new_v4(),
+                parent_session_id: None,
+                scaffolding_level: None,
+            }
+            .to_json_string(),
+        );
+        let error = s
+            .manager
+            .resolve_provider_choice(&child, Some("proj"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused(&error), [("free".to_string(), "m".to_string())]);
+    }
+
+    /// The refusal reaches the caller with the models that need no vault, and it is
+    /// decided BEFORE the decision is stored (review of #689, nit 6: each 423 left a
+    /// decision no session would ever close).
+    #[tokio::test]
+    async fn auto_is_refused_with_what_needs_no_vault_and_stores_no_decision() {
+        let s = setup(Given::default()).await;
+        let error = resolve(&s).await.unwrap_err();
+        assert_eq!(refused(&error), [("free".to_string(), "m".to_string())]);
+        assert!(decisions(&s).await.is_empty(), "{:?}", decisions(&s).await);
+    }
+
+    /// Review of #689, finding 1: the health measured while the vault was locked was
+    /// cached for 60 s, so the message sent again right after the unlock was routed
+    /// around the vault, in silence. Now the next opening routes with it.
+    #[tokio::test]
+    async fn right_after_the_unlock_auto_routes_with_the_vault() {
+        let s = setup(Given::default()).await;
+        resolve(&s).await.unwrap_err();
+        unlock(&s).await;
+        resolve(&s)
+            .await
+            .unwrap_or_else(|e| panic!("unlocked: opens, got {e:#}"));
+        assert_eq!(local_rejection(&s).await, None, "local is eligible again");
+    }
+
+    /// Review of #689, finding 1 (b): a "down" measured while the vault was locked but
+    /// cached anyway (a check that started before the lock) is forgotten by the unlock.
+    #[tokio::test]
+    async fn the_unlock_forgets_what_was_measured_before_it() {
+        let s = setup(Given::default()).await;
+        unlock(&s).await;
+        let routing = s.manager.cognitive_routing().unwrap();
+        routing
+            .health
+            .put("local", false, std::time::Instant::now());
+        s.manager.vault_unlocked().await;
+        resolve(&s)
+            .await
+            .unwrap_or_else(|e| panic!("unlocked: opens, got {e:#}"));
+        assert_eq!(local_rejection(&s).await, None);
+    }
+
+    /// Review of #689, finding 3: at the `shadow` stage the router's choice is never
+    /// applied (the declared rules open), so nothing is routed around the vault and
+    /// nothing is refused.
+    #[tokio::test]
+    async fn a_stage_that_does_not_apply_the_choice_never_refuses() {
+        let s = setup(Given {
+            stage: "shadow",
+            ..Given::default()
+        })
+        .await;
+        resolve(&s)
+            .await
+            .unwrap_or_else(|e| panic!("shadow: no refusal, got {e:#}"));
+    }
+
+    /// Review of #689, finding 3: an instance the project did not consent to never
+    /// enters the pool: unlocking would not make Auto take it, so it refuses nothing.
+    #[tokio::test]
+    async fn an_instance_the_project_did_not_consent_to_never_refuses() {
+        let s = setup(Given {
+            local: Some(false),
+            ..Given::default()
+        })
+        .await;
+        resolve(&s)
+            .await
+            .unwrap_or_else(|e| panic!("not consented: no refusal, got {e:#}"));
+    }
+
+    /// Review of #689, finding 2: no instance is keyed in the vault, but the Anthropic
+    /// catalog is offline because of it, so Claude Code is rejected ("catalog offline")
+    /// and Auto would fall back in silence: it refuses, and does not offer Claude Code.
+    #[tokio::test]
+    async fn claude_code_waiting_on_the_vault_refuses_too() {
+        let s = setup(Given {
+            local: None,
+            catalog: Some(ModelCatalogCache::offline_by_locked_vault()),
+            ..Given::default()
+        })
+        .await;
+        let error = resolve(&s).await.unwrap_err();
+        assert_eq!(refused(&error), [("free".to_string(), "m".to_string())]);
+    }
+}
+
+// ============================================================================
+// Per-turn model routing (`full` mode): `before_turn` on a scripted provider.
+// ============================================================================
+
+/// `before_turn` chooses the model of a turn. A scripted provider plays the
+/// harness of nexus (it calls the hooks and honours `set_model_live`); the
+/// decider is a fake that answers by turn, so the tests pin WHAT the hook does
+/// with an answer, not how a scorer would choose.
+mod turn_routing {
+    #[allow(unused_imports)]
+    use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+    use nexus_claude::agent::{
+        AgentProvider, AgentSession, Capabilities, HookSupport, ModelInfo, ProviderError,
+        ProviderHealth, ProviderKind, ResumeToken, SessionSpec,
+    };
+    use nexus_claude::testkit::{RecordedCall, Script, ScriptedProvider};
+
+    use super::*;
+    use crate::chat::agent_hooks::PoolSource;
+    use crate::chat::provider::cognitive::candidates::ModelFacts;
+    use crate::chat::provider::cognitive::decision::{
+        CognitiveDecision, DecideRequest, Decider, Pick,
+    };
+    use crate::chat::provider::cognitive::{
+        ConversationRoutingMode, LearningStage, ProviderRoutingMode, ROUTING_KEY,
+    };
+
+    /// The scripted provider under the id (and kind) of Claude Code, so the
+    /// engine hands it the graph hooks.
+    struct AsClaudeCode(Arc<ScriptedProvider>);
+
+    #[async_trait]
+    impl AgentProvider for AsClaudeCode {
+        fn id(&self) -> &str {
+            "claude-code"
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::ClaudeCode
+        }
+        async fn health(&self) -> ProviderHealth {
+            self.0.health().await
+        }
+        async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            self.0.catalog().await
+        }
+        fn capabilities(&self, model: Option<&str>) -> Capabilities {
+            self.0.capabilities(model)
+        }
+        async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.0.open(spec).await
+        }
+        async fn resume(
+            &self,
+            spec: SessionSpec,
+            token: ResumeToken,
+        ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.0.resume(spec, token).await
+        }
+    }
+
+    impl super::super::agent_runtime::ProviderSource for AsClaudeCode {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+            (provider_id == "claude-code")
+                .then(|| Arc::new(AsClaudeCode(Arc::clone(&self.0))) as Arc<dyn AgentProvider>)
+        }
+    }
+
+    struct Pool;
+
+    #[async_trait]
+    impl PoolSource for Pool {
+        async fn pool(&self, provider_id: &str) -> Vec<ModelFacts> {
+            ["small", "big"]
+                .iter()
+                .map(|m| ModelFacts {
+                    provider_id: provider_id.to_owned(),
+                    model: (*m).to_owned(),
+                    supports_tools: true,
+                    supports_images: true,
+                    context_window: Some(200_000),
+                    window_unknown: None,
+                    price: None,
+                    cost_basis: nexus_claude::agent::CostBasis::Unknown,
+                    healthy: Some(true),
+                    allowed_for_project: true,
+                    sandboxed: false,
+                    quota_exhausted: None,
+                    quota_utilization: None,
+                })
+                .collect()
+        }
+    }
+
+    /// What the fake decider does on one call.
+    #[derive(Clone)]
+    enum Answer {
+        /// Pick this model, applied when the request's mode and stage say so.
+        Pick(&'static str),
+        /// Pick the model the session runs on now.
+        Stay,
+        Fail,
+        Hang,
+    }
+
+    /// Answers from a queue (the last answer repeats) and remembers every request.
+    struct FakeDecider {
+        answers: StdMutex<VecDeque<Answer>>,
+        requests: StdMutex<Vec<DecideRequest>>,
+        decisions: StdMutex<Vec<CognitiveDecision>>,
+    }
+
+    impl FakeDecider {
+        fn new(answers: Vec<Answer>) -> Arc<Self> {
+            Arc::new(Self {
+                answers: StdMutex::new(answers.into()),
+                requests: StdMutex::new(Vec::new()),
+                decisions: StdMutex::new(Vec::new()),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl Decider for FakeDecider {
+        async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+            self.requests.lock().unwrap().push(request.clone());
+            let answer = {
+                let mut queue = self.answers.lock().unwrap();
+                if queue.len() > 1 {
+                    queue.pop_front().unwrap()
+                } else {
+                    queue.front().cloned().unwrap_or(Answer::Fail)
+                }
+            };
+            let model: String = match answer {
+                Answer::Pick(model) => model.to_owned(),
+                Answer::Stay => request
+                    .current
+                    .as_ref()
+                    .map(|pick| pick.model.clone())
+                    .unwrap_or_default(),
+                Answer::Fail => anyhow::bail!("the scorer is down"),
+                Answer::Hang => {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            };
+            let applied = request.settings.mode == ProviderRoutingMode::Full
+                && request.settings.stage == LearningStage::Auto;
+            let decision = CognitiveDecision {
+                snapshot: None,
+                arms_snapshot: Vec::new(),
+                id: Uuid::new_v4(),
+                at: Utc::now(),
+                signature: request.signature.clone(),
+                chosen: Some(Pick::new(
+                    request.restrict_provider.clone().unwrap_or_default(),
+                    model.clone(),
+                )),
+                score: Some(0.9),
+                explored: false,
+                exploration_epsilon: 0.0,
+                confidence: None,
+                reason: format!("fake: {model}"),
+                alternatives: Vec::new(),
+                applied,
+                mode: request.settings.mode,
+                stage: request.settings.stage,
+                session_id: request.session_id,
+                task_id: None,
+                run_id: None,
+                turn_index: request.turn_index,
+                outcome: None,
+                used: None,
+            };
+            self.decisions.lock().unwrap().push(decision.clone());
+            Ok(decision)
+        }
+    }
+
+    fn caps(set_model_live: bool) -> Capabilities {
+        let mut caps = Capabilities::none();
+        caps.set_model_live = set_model_live;
+        caps.hooks = HookSupport::InProtocol;
+        caps.per_session_mcp = true;
+        caps.tools = true;
+        caps
+    }
+
+    struct Rig {
+        manager: ChatManager,
+        decider: Arc<FakeDecider>,
+        graph: Arc<MockGraphStore>,
+        provider: Arc<ScriptedProvider>,
+        sid: String,
+        rx: broadcast::Receiver<ChatEvent>,
+    }
+
+    async fn rig(
+        mode: &str,
+        stage: &str,
+        set_model_live: bool,
+        explicit_model: Option<&str>,
+        answers: Vec<Answer>,
+    ) -> Rig {
+        let graph = Arc::new(MockGraphStore::new());
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                ROUTING_KEY,
+                &json!({ "mode": mode, "stage": stage }).to_string(),
+            )
+            .await
+            .unwrap();
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            obscura_path: None,
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let provider = Arc::new(ScriptedProvider::new(
+            "claude-code",
+            Script::builder().capabilities(caps(set_model_live)).build(),
+        ));
+        let decider = FakeDecider::new(answers);
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(AsClaudeCode(Arc::clone(&provider))))
+            .with_turn_decider(decider.clone(), Arc::new(Pool));
+        let mut req = request(None, None, "default");
+        // No opening message: every turn below is sent by `turn`, from index 0.
+        req.message = String::new();
+        req.model = explicit_model.map(str::to_owned);
+        let created = manager.create_session(&req).await.unwrap();
+        let rx = manager.subscribe(&created.session_id).await.unwrap();
+        Rig {
+            manager,
+            decider,
+            graph,
+            provider,
+            sid: created.session_id,
+            rx,
+        }
+    }
+
+    impl Rig {
+        /// Sends one message and waits for its turn to end; returns the models
+        /// announced by `model_changed` during it.
+        async fn turn(&mut self, text: &str) -> Vec<String> {
+            self.manager.send_message(&self.sid, text).await.unwrap();
+            let mut changed = Vec::new();
+            loop {
+                match next_event(&mut self.rx, |e| {
+                    matches!(
+                        e,
+                        ChatEvent::ModelChanged { .. }
+                            | ChatEvent::StreamingStatus {
+                                is_streaming: false
+                            }
+                    )
+                })
+                .await
+                {
+                    ChatEvent::ModelChanged { model, .. } => changed.push(model),
+                    _ => return changed,
+                }
+            }
+        }
+    }
+
+    const SIMPLE: &str = "rename this variable";
+    const DEBUG: &str = "why does this crash with a stack trace error";
+
+    /// A turn the queue starts (a held message sent to an idle session here) is
+    /// routed on ITS text, not on the message sent before it.
+    #[tokio::test]
+    async fn a_turn_started_by_a_held_message_is_routed_on_its_own_text() {
+        use crate::chat::provider::cognitive::signature::{ContextHints, TaskSignature};
+        let mut r = rig("full", "shadow", true, None, vec![Answer::Stay]).await;
+        r.turn(SIMPLE).await;
+        let held = r.manager.queue_user_message(&r.sid, DEBUG).await.unwrap();
+        assert!(!held, "an idle session sends it at once");
+        next_event(&mut r.rx, |e| {
+            matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            )
+        })
+        .await;
+        let requests = r.decider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let expected =
+            TaskSignature::from_chat_request(DEBUG, false, None, ContextHints::default());
+        assert_eq!(
+            format!("{:?}", requests[1].signature),
+            format!("{expected:?}"),
+            "the second turn is routed on its own message"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_auto_a_simple_turn_then_a_debug_turn_changes_the_model_of_the_second() {
+        let mut r = rig(
+            "full",
+            "auto",
+            true,
+            None,
+            vec![Answer::Stay, Answer::Pick("big")],
+        )
+        .await;
+        let first = r.turn(SIMPLE).await;
+        let second = r.turn(DEBUG).await;
+        assert_eq!(r.decider.calls(), 2);
+        assert!(
+            first.is_empty(),
+            "the simple turn keeps its model: {first:?}"
+        );
+        assert_eq!(second, ["big"], "the debug turn runs on the other model");
+        let requests = r.decider.requests.lock().unwrap();
+        assert_eq!(requests[0].turn_index, Some(0));
+        assert_eq!(requests[1].turn_index, Some(1));
+        assert_eq!(
+            requests[1].restrict_provider.as_deref(),
+            Some("claude-code")
+        );
+        assert!(requests[0].session_id.is_some());
+        assert_eq!(requests[0].pool.len(), 2, "the pool of that provider only");
+        assert!(r
+            .provider
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::SendTurn(_))));
+    }
+
+    #[tokio::test]
+    async fn without_set_model_live_there_is_no_directive_and_no_error() {
+        let mut r = rig("full", "auto", false, None, vec![Answer::Pick("big")]).await;
+        assert!(r.turn(SIMPLE).await.is_empty());
+        assert!(r.turn(DEBUG).await.is_empty());
+        assert_eq!(r.decider.calls(), 0, "nothing to apply: nothing is asked");
+    }
+
+    #[tokio::test]
+    async fn the_shadow_stage_records_the_decision_and_changes_nothing() {
+        let mut r = rig("full", "shadow", true, None, vec![Answer::Pick("big")]).await;
+        assert!(r.turn(SIMPLE).await.is_empty());
+        assert!(r.turn(DEBUG).await.is_empty());
+        assert_eq!(r.decider.calls(), 2, "asked, so the decision is recorded");
+        let decisions = r.decider.decisions.lock().unwrap();
+        assert!(decisions
+            .iter()
+            .all(|d| !d.applied && d.stage == LearningStage::Shadow));
+    }
+
+    #[tokio::test]
+    async fn executors_only_and_primary_modes_leave_the_pilot_alone() {
+        // `mixed` is the old name of `executors_only` in a stored document: same reading.
+        for mode in ["executors_only", "mixed", "primary"] {
+            let mut r = rig(mode, "auto", true, None, vec![Answer::Pick("big")]).await;
+            assert!(r.turn(DEBUG).await.is_empty(), "{mode}");
+            assert_eq!(r.decider.calls(), 0, "{mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_named_by_the_request_is_never_replaced() {
+        let mut r = rig(
+            "full",
+            "auto",
+            true,
+            Some("explicit-model"),
+            vec![Answer::Pick("big")],
+        )
+        .await;
+        assert!(r.turn(DEBUG).await.is_empty());
+        assert_eq!(r.decider.calls(), 0);
+    }
+
+    /// R-S3: the guard is per CLASS, no more "never two changes in consecutive turns":
+    /// alternating classes change the model on every turn (not one turn late); a second
+    /// turn of the same class right after a change is decided without exploration, and
+    /// the pair in force stays.
+    #[tokio::test]
+    async fn alternating_classes_change_the_model_on_every_turn() {
+        let mut r = rig(
+            "full",
+            "auto",
+            true,
+            None,
+            vec![
+                Answer::Pick("small"),
+                Answer::Pick("big"),
+                Answer::Pick("small"),
+                Answer::Pick("big"),
+                Answer::Pick("big"),
+            ],
+        )
+        .await;
+        let mut flips = Vec::new();
+        for text in [SIMPLE, DEBUG, SIMPLE, DEBUG, DEBUG] {
+            flips.push(!r.turn(text).await.is_empty());
+        }
+        assert_eq!(flips[1..], [true, true, true, false], "{flips:?}");
+        let requests = r.decider.requests.lock().unwrap();
+        let last = requests.last().unwrap();
+        assert_eq!(
+            last.settings.exploration_epsilon, 0.0,
+            "same class right after a change: no exploration"
+        );
+        let decisions = r.decider.decisions.lock().unwrap();
+        assert!(
+            decisions.iter().all(|d| d.applied),
+            "every turn decided at the auto stage: {decisions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_or_hanging_decider_never_fails_the_turn() {
+        let mut r = rig("full", "auto", true, None, vec![Answer::Fail, Answer::Hang]).await;
+        assert!(
+            r.turn(SIMPLE).await.is_empty(),
+            "an error: the turn completes"
+        );
+        assert!(
+            r.turn(DEBUG).await.is_empty(),
+            "a timeout: the turn completes"
+        );
+        assert_eq!(r.decider.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_manual_model_change_ends_the_automatic_ones_for_the_session() {
+        let mut r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
+        assert!(r
+            .manager
+            .set_session_model(&r.sid, "manual-model")
+            .await
+            .unwrap());
+        // The confirmation of the user's own change is the first model_changed.
+        let changed = r.turn(DEBUG).await;
+        assert_eq!(
+            changed,
+            ["manual-model"],
+            "no automatic change after it: {changed:?}"
+        );
+        assert_eq!(r.decider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_model_stays_pinned_when_the_session_is_resumed() {
+        use crate::chat::manager::OpeningTurn;
+        let r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
+        r.manager
+            .set_session_model(&r.sid, "manual-model")
+            .await
+            .unwrap();
+        // A resume builds a new router that knows nothing of the hand change: the
+        // stored pin must carry it.
+        let router = r
+            .manager
+            .register_turn_router(
+                &r.sid,
+                "claude-code",
+                "manual-model",
+                None,
+                OpeningTurn {
+                    provider_imposed: false,
+                    moved_in: false,
+                    routing_pool: None,
+                    routing_mode: None,
+                    explicit_model: false,
+                    permission_mode: None,
+                    message: DEBUG,
+                    next_turn: 0,
+                    segments: None,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("a router is registered");
+        router.set_model_live(true);
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert_eq!(r.decider.calls(), 0, "a pinned model is never routed again");
+    }
+
+    /// Opens a router the way a conversation does, with the mode its request named.
+    async fn reopen_with_mode(
+        r: &Rig,
+        mode: Option<ConversationRoutingMode>,
+    ) -> Arc<crate::chat::agent_hooks::TurnRouter> {
+        reopen_with_pool(r, mode, None).await
+    }
+
+    async fn reopen_with_pool(
+        r: &Rig,
+        mode: Option<ConversationRoutingMode>,
+        pool: Option<&[&str]>,
+    ) -> Arc<crate::chat::agent_hooks::TurnRouter> {
+        use crate::chat::manager::OpeningTurn;
+        let router = r
+            .manager
+            .register_turn_router(
+                &r.sid,
+                "claude-code",
+                "small",
+                None,
+                OpeningTurn {
+                    provider_imposed: false,
+                    moved_in: false,
+                    routing_pool: pool.map(|models| {
+                        models
+                            .iter()
+                            .map(|m| crate::chat::types::RoutingPoolEntry {
+                                provider: "claude-code".to_owned(),
+                                model: (*m).to_owned(),
+                            })
+                            .collect()
+                    }),
+                    routing_mode: mode,
+                    explicit_model: false,
+                    permission_mode: None,
+                    message: DEBUG,
+                    next_turn: 0,
+                    segments: None,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("a router is registered");
+        router.set_model_live(true);
+        router
+    }
+
+    #[tokio::test]
+    async fn a_conversation_opened_in_strict_is_never_routed_even_when_the_settings_say_full() {
+        let r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
+        reopen_with_mode(&r, Some(ConversationRoutingMode::Primary)).await;
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert_eq!(r.decider.calls(), 0, "strict: PO is not even asked");
+    }
+
+    #[tokio::test]
+    async fn a_conversation_opened_in_auto_is_routed_even_when_the_settings_say_primary() {
+        let r = rig("primary", "auto", true, None, vec![Answer::Pick("big")]).await;
+        reopen_with_mode(&r, Some(ConversationRoutingMode::Full)).await;
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert_eq!(
+            r.decider.calls(),
+            1,
+            "auto: PO decides for this conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_conversation_is_routed_among_its_pool_only() {
+        let mut r = rig("primary", "auto", true, None, vec![Answer::Pick("big")]).await;
+        // Two ticks ("medium" is not offered by this provider): one alone would be strict.
+        reopen_with_pool(
+            &r,
+            Some(ConversationRoutingMode::Mixed),
+            Some(&["big", "medium"]),
+        )
+        .await;
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        let requests = r.decider.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a pool is routed whatever the settings say"
+        );
+        let offered: Vec<&str> = requests[0].pool.iter().map(|f| f.model.as_str()).collect();
+        assert_eq!(offered, ["big"], "only the ticked models are candidates");
+        drop(requests);
+        let ev = next_event(&mut r.rx, |e| matches!(e, ChatEvent::ModelChanged { .. })).await;
+        assert!(matches!(ev, ChatEvent::ModelChanged { ref model, .. } if model == "big"));
+    }
+
+    #[tokio::test]
+    async fn a_pilot_named_with_a_pool_is_not_a_pin() {
+        use crate::chat::manager::OpeningTurn;
+        let r = rig("primary", "auto", true, None, vec![Answer::Pick("big")]).await;
+        // The request names its pilot (explicit_model) AND a pool: PO still routes.
+        let router = r
+            .manager
+            .register_turn_router(
+                &r.sid,
+                "claude-code",
+                "small",
+                None,
+                OpeningTurn {
+                    provider_imposed: false,
+                    moved_in: false,
+                    routing_mode: Some(ConversationRoutingMode::Mixed),
+                    routing_pool: Some(vec![
+                        crate::chat::types::RoutingPoolEntry {
+                            provider: "claude-code".to_owned(),
+                            model: "small".to_owned(),
+                        },
+                        crate::chat::types::RoutingPoolEntry {
+                            provider: "claude-code".to_owned(),
+                            model: "big".to_owned(),
+                        },
+                    ]),
+                    explicit_model: true,
+                    permission_mode: None,
+                    message: DEBUG,
+                    next_turn: 0,
+                    segments: None,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("a router is registered");
+        router.set_model_live(true);
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert_eq!(r.decider.calls(), 1);
+    }
+
+    // ── PUT /api/chat/sessions/{id}/routing: the menu of an open conversation ──
+
+    fn auto() -> crate::chat::types::SessionRoutingRequest {
+        crate::chat::types::SessionRoutingRequest {
+            auto: true,
+            routing_pool: Vec::new(),
+        }
+    }
+
+    fn ticked(models: &[(&str, &str)]) -> crate::chat::types::SessionRoutingRequest {
+        crate::chat::types::SessionRoutingRequest {
+            auto: false,
+            routing_pool: models
+                .iter()
+                .map(|(provider, model)| crate::chat::types::RoutingPoolEntry {
+                    provider: (*provider).to_owned(),
+                    model: (*model).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    async fn pinned(r: &Rig) -> bool {
+        r.graph
+            .get_llm_setting(&format!("session:{}", r.sid), "model_pinned")
+            .await
+            .unwrap()
+            .is_some_and(|v| v == "true")
+    }
+
+    /// "Rendre la main a PO": Auto on a conversation whose model was imposed releases it.
+    #[tokio::test]
+    async fn auto_on_an_open_conversation_hands_an_imposed_model_back_to_po() {
+        let mut r = rig(
+            "primary",
+            "auto",
+            true,
+            Some("small"),
+            vec![Answer::Pick("big")],
+        )
+        .await;
+        assert!(r.turn(DEBUG).await.is_empty());
+        assert_eq!(r.decider.calls(), 0, "imposed: PO is not even asked");
+        assert!(pinned(&r).await);
+
+        let node = r
+            .manager
+            .set_session_routing(&r.sid, &auto())
+            .await
+            .unwrap();
+        assert_eq!(node.routing_mode.as_deref(), Some("full"));
+        assert_eq!(node.routed_by.as_deref(), Some("auto"));
+        assert_eq!(node.routing_pool, None);
+        assert!(
+            !pinned(&r).await,
+            "the pin is released, a resume routes too"
+        );
+
+        assert_eq!(r.turn(DEBUG).await, ["big"], "the next turn is routed");
+    }
+
+    /// A model changed by hand ends the automatic changes; Auto starts them again.
+    #[tokio::test]
+    async fn auto_after_a_model_changed_by_hand_routes_the_next_turn_again() {
+        let mut r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
+        r.manager.set_session_model(&r.sid, "small").await.unwrap();
+        let by_hand = r.turn(DEBUG).await;
+        assert!(!by_hand.iter().any(|m| m == "big"), "{by_hand:?}");
+        assert_eq!(r.decider.calls(), 0, "set by hand: PO is not asked");
+
+        r.manager
+            .set_session_routing(&r.sid, &auto())
+            .await
+            .unwrap();
+        assert!(!pinned(&r).await);
+        assert_eq!(r.turn(DEBUG).await, ["big"]);
+    }
+
+    /// A16: one model ticked is imposed, and never substituted afterwards.
+    #[tokio::test]
+    async fn one_model_ticked_on_an_open_conversation_is_imposed_and_never_substituted() {
+        let mut r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
+        let node = r
+            .manager
+            .set_session_routing(&r.sid, &ticked(&[("claude-code", "small")]))
+            .await
+            .unwrap();
+        assert_eq!(node.routing_mode.as_deref(), Some("primary"));
+        assert_eq!(node.routed_by.as_deref(), Some("request"));
+        assert_eq!(node.model, "small", "set now, not at some later turn");
+        assert!(pinned(&r).await);
+
+        let mut seen = r.turn(DEBUG).await;
+        seen.extend(r.turn(DEBUG).await);
+        assert!(
+            !seen.iter().any(|m| m == "big"),
+            "the router never replaces an imposed model: {seen:?}"
+        );
+        assert_eq!(
+            r.decider.calls(),
+            0,
+            "full settings, but this conversation is strict"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_ticked_on_an_open_conversation_restrict_its_next_turns() {
+        let mut r = rig("primary", "auto", true, None, vec![Answer::Pick("big")]).await;
+        assert!(r.turn(DEBUG).await.is_empty());
+        assert_eq!(
+            r.decider.calls(),
+            0,
+            "primary: not routed before the change"
+        );
+
+        let node = r
+            .manager
+            .set_session_routing(
+                &r.sid,
+                &ticked(&[("claude-code", "big"), ("local-llama", "qwen")]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(node.routing_mode.as_deref(), Some("mixed"));
+        let stored: Vec<crate::chat::types::RoutingPoolEntry> =
+            serde_json::from_str(node.routing_pool.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            stored.len(),
+            2,
+            "every tick is kept, the other provider's too"
+        );
+
+        assert_eq!(r.turn(DEBUG).await, ["big"]);
+        let requests = r.decider.requests.lock().unwrap();
+        let offered: Vec<&str> = requests[0].pool.iter().map(|f| f.model.as_str()).collect();
+        assert_eq!(
+            offered,
+            ["big"],
+            "only this provider's ticked models are candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversations_routing_never_writes_the_global_or_project_settings() {
+        let r = rig("primary", "shadow", true, None, vec![Answer::Stay]).await;
+        let settings = || async {
+            let all = r.graph.llm_settings.read().await;
+            let mut kept: Vec<((String, String), String)> = all
+                .iter()
+                .filter(|((scope, _), _)| !scope.starts_with("session:"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            kept.sort();
+            kept
+        };
+        let before = settings().await;
+        for body in [
+            auto(),
+            ticked(&[("claude-code", "small")]),
+            ticked(&[("claude-code", "small"), ("claude-code", "big")]),
+            auto(),
+        ] {
+            r.manager.set_session_routing(&r.sid, &body).await.unwrap();
+        }
+        assert_eq!(
+            settings().await,
+            before,
+            "only the session's own scope changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_routing_that_needs_another_provider_or_no_model_is_refused_and_changes_nothing() {
+        use crate::chat::types::SessionRoutingError as Refused;
+        let r = rig("primary", "auto", true, None, vec![Answer::Stay]).await;
+        let refusal = |body| {
+            let manager = &r.manager;
+            let sid = r.sid.clone();
+            async move {
+                manager
+                    .set_session_routing(&sid, &body)
+                    .await
+                    .unwrap_err()
+                    .downcast::<Refused>()
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            refusal(ticked(&[("local-llama", "qwen")])).await,
+            Refused::OtherProvider("claude-code".into())
+        );
+        assert_eq!(
+            refusal(ticked(&[("local-llama", "qwen"), ("local-llama", "mini")])).await,
+            Refused::OtherProvider("claude-code".into())
+        );
+        assert_eq!(refusal(ticked(&[])).await, Refused::EmptyPool);
+        assert_eq!(
+            refusal(ticked(&[("claude-code", " ")])).await,
+            Refused::BlankEntry(0)
+        );
+        let node = r
+            .graph
+            .get_chat_session(Uuid::parse_str(&r.sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.routing_mode, None);
+        assert_eq!(node.routing_pool, None);
+        let missing = r
+            .manager
+            .set_session_routing(&Uuid::new_v4().to_string(), &auto())
+            .await
+            .unwrap_err();
+        assert_eq!(missing.downcast_ref::<Refused>(), Some(&Refused::NotFound));
+    }
+
+    /// One model ticked when the conversation opens is strict: imposed, not a pool of one.
+    #[tokio::test]
+    async fn one_model_ticked_at_open_is_strict() {
+        let mut req = request(None, None, "default");
+        req.routing_mode = Some(ConversationRoutingMode::Mixed);
+        req.routing_pool = Some(vec![crate::chat::types::RoutingPoolEntry {
+            provider: "claude-code".into(),
+            model: "small".into(),
+        }]);
+        let settled = req.settled_routing().expect("a pool of one is settled");
+        assert_eq!(settled.provider.as_deref(), Some("claude-code"));
+        assert_eq!(settled.model.as_deref(), Some("small"));
+        assert_eq!(settled.routing_mode, Some(ConversationRoutingMode::Primary));
+        assert_eq!(settled.routing_pool, None);
+        req.routing_pool = Some(Vec::new());
+        assert_eq!(req.settled_routing().unwrap().routing_pool, None);
+    }
+
+    #[tokio::test]
+    async fn without_a_mode_in_the_request_the_settings_decide() {
+        let r = rig("primary", "auto", true, None, vec![Answer::Pick("big")]).await;
+        reopen_with_mode(&r, None).await;
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert_eq!(r.decider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_legacy_engines_entry_point_applies_the_same_decision_as_a_set_model() {
+        // `apply_turn_directive` is what the legacy engine (Claude Code CLI) calls from
+        // `send_message` before writing the message; here it drives a session whose
+        // `set_model` the scripted provider records.
+        let mut r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        let ev = next_event(&mut r.rx, |e| matches!(e, ChatEvent::ModelChanged { .. })).await;
+        assert!(matches!(ev, ChatEvent::ModelChanged { ref model, .. } if model == "big"));
+        assert!(r
+            .provider
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::SetModel(m) if m == "big")));
+        // Same guard as on the agent engine: no second change on the next turn.
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert_eq!(r.decider.calls(), 2);
+        let set_models = r
+            .provider
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::SetModel(_)))
+            .count();
+        assert_eq!(set_models, 1);
+    }
+
+    /// Review of #702 (3): a change the session refuses (its `set_model` fails) leaves the
+    /// turn on the old model, and the stored decision says so: not applied, and why (as a
+    /// refused provider move does).
+    #[tokio::test]
+    async fn a_model_change_the_session_refuses_is_stored_not_applied() {
+        use crate::chat::manager::OpeningTurn;
+        use crate::chat::provider::cognitive::decider::CognitiveRouting;
+        use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
+        use crate::neo4j::routing::Neo4jRoutingStore;
+        // The session cannot switch model live: its `set_model` fails.
+        let r = rig("full", "auto", false, None, vec![Answer::Pick("big")]).await;
+        let store = Arc::new(Neo4jRoutingStore::new(r.graph.clone()));
+        let manager = r
+            .manager
+            .with_cognitive_routing(CognitiveRouting::new(store.clone()));
+        let router = manager
+            .register_turn_router(
+                &r.sid,
+                "claude-code",
+                "small",
+                None,
+                OpeningTurn {
+                    provider_imposed: false,
+                    moved_in: false,
+                    routing_pool: None,
+                    routing_mode: None,
+                    explicit_model: false,
+                    permission_mode: None,
+                    message: DEBUG,
+                    next_turn: 0,
+                    segments: None,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("a router is registered");
+        // The router believes it can: the change is decided, applied, then refused.
+        router.set_model_live(true);
+        manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert!(r
+            .provider
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::SetModel(m) if m == "big")));
+        let decided = r.decider.decisions.lock().unwrap()[0].clone();
+        assert!(decided.applied, "the decider applied it: {decided:#?}");
+        let stored = store
+            .decisions(&DecisionFilter::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == decided.id)
+            .expect("the refused change is stored on its decision");
+        assert!(!stored.applied, "{stored:#?}");
+        assert!(
+            stored.reason.ends_with("; not_changed: set_model_failed"),
+            "{}",
+            stored.reason
+        );
+    }
+}
+
+// ── Provider switch (B-SW) ──────────────────────────────────────────────────
+//
+// A conversation moves to another provider: a new session on the target gets the
+// earlier conversation as a relay in front of the next message, the old session
+// closes, and a refusal leaves the old one untouched.
+
+mod provider_switch {
+    use super::*;
+    use crate::chat::types::SwitchProviderError;
+    fn two_turn_script() -> Value {
+        json!([
+            sse_route("Call the ping tool now", vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]),
+            {"method": "GET", "path": "/v1/models", "status": 200,
+             "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}},
+            // Listed first: the relayed request also contains "hi there".
+            sse_route("second question", vec![
+                delta(json!({"content": "the answer"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}}),
+                json!("[DONE]"),
+            ]),
+            sse_route("hi there", vec![
+                delta(json!({"content": "hello from "})),
+                delta(json!({"content": "the fake model"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}}),
+                json!("[DONE]"),
+            ]),
+        ])
+    }
+
+    struct World {
+        fake: FakeOpenAi,
+        graph: Arc<MockGraphStore>,
+        manager: ChatManager,
+    }
+
+    async fn world() -> World {
+        let fake = FakeOpenAi::start(two_turn_script());
+        let graph = Arc::new(MockGraphStore::new());
+        for id in ["local", "local2"] {
+            let mut record = instance(&fake, "none");
+            record.id = id.into();
+            store_instance(&graph, &record).await;
+            consent(&graph, "proj", id, &fake.origin()).await;
+        }
+        // A third instance the project never consented to.
+        let mut unconsented = instance(&fake, "none");
+        unconsented.id = "local3".into();
+        store_instance(&graph, &unconsented).await;
+        let manager = manager(graph.clone(), true);
+        World {
+            fake,
+            graph,
+            manager,
+        }
+    }
+
+    /// Opens a session on `local`, runs its first turn, and waits until the turn is stored.
+    async fn first_turn(w: &World) -> String {
+        let created = w
+            .manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+        let mut rx = w.manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        stored_until(w, &created.session_id, |events| {
+            events.iter().any(|e| e.event_type == "assistant_text")
+        })
+        .await;
+        created.session_id
+    }
+
+    async fn stored_until(
+        w: &World,
+        session_id: &str,
+        done: impl Fn(&[crate::neo4j::models::ChatEventRecord]) -> bool,
+    ) -> Vec<crate::neo4j::models::ChatEventRecord> {
+        let id = Uuid::parse_str(session_id).unwrap();
+        for _ in 0..100 {
+            let events = w.graph.get_chat_events(id, 0, 500).await.unwrap();
+            if done(&events) {
+                return events;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the expected events were never stored for {session_id}");
+    }
+
+    /// P18 / A17: a child session that moves stays a child (its `spawned_by` goes with it), so
+    /// the moved session cannot delegate and keeps its third-party lineage.
+    #[tokio::test]
+    async fn a_child_session_stays_a_child_when_it_moves() {
+        let w = world().await;
+        let parent = Uuid::new_v4();
+        let mut req = request(Some("local"), Some("proj"), "default");
+        req.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: parent,
+                tool_use_id: Some("ca1".into()),
+            }
+            .to_json_string(),
+        );
+        let created = w.manager.create_session(&req).await.unwrap();
+        let mut rx = w.manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        stored_until(&w, &created.session_id, |events| {
+            events.iter().any(|e| e.event_type == "assistant_text")
+        })
+        .await;
+        let moved = w
+            .manager
+            .switch_session_provider(&created.session_id, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        let node = w
+            .graph
+            .get_chat_session(Uuid::parse_str(&moved.session_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let ctx = node
+            .spawned_by
+            .as_deref()
+            .and_then(crate::chat::manager::parse_spawned_by)
+            .expect("the moved child keeps its spawned_by");
+        assert_eq!(ctx.parent_session_id, Some(parent.to_string()));
+        assert!(!w.manager.spawned_by_nothing(&moved.session_id).await);
+    }
+
+    /// A close leaves exactly one episode; an in-place switch, which is not an end,
+    /// leaves none (`close_session_for_switch` does not announce).
+    #[tokio::test]
+    async fn a_closed_session_leaves_one_episode_and_a_switch_leaves_none() {
+        let w = world().await;
+        let project = crate::test_helpers::test_project_named("proj");
+        w.graph.create_project(&project).await.unwrap();
+        let sid = first_turn(&w).await;
+        let id = Uuid::parse_str(&sid).unwrap();
+        // T5: the session has two notes in context at the close, which welds them (SYNAPSE).
+        // The switch, which is not an end, must weld nothing. The registry is process-wide and
+        // another test's snapshot forgets the sessions it does not see live: this session is
+        // pinned, so the assertion no longer depends on what the other tests do.
+        crate::chat::activation_registry::pin_for_test(id);
+        w.manager
+            .switch_session_provider(&sid, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        stored_until(&w, &sid, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            w.graph.synapses.read().await.is_empty(),
+            "a switch welds nothing: {:?}",
+            w.graph.synapses.read().await.len()
+        );
+
+        crate::chat::activation_registry::record_notes(id, [Uuid::new_v4(), Uuid::new_v4()]);
+        w.manager.close_session(&sid).await.unwrap();
+        for _ in 0..200 {
+            if !w.graph.synapses.read().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            w.graph.synapses.read().await.len(),
+            1,
+            "the close welds the two notes in context: one pair"
+        );
+        // Detached write: wait for it, then count EVERY write — a switch that wrote one
+        // would show as a second call (the stable id would hide it in the store).
+        super::wait_for_session_episode_saves(&w.graph, 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            w.graph
+                .session_episode_save_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a switch is not an end: the close is the only write"
+        );
+        let episodes = w.graph.list_session_episodes(project.id, 10).await.unwrap();
+        assert_eq!(episodes.len(), 1, "exactly one episode: {episodes:?}");
+        assert_eq!(
+            episodes[0].id,
+            crate::episodes::collector::session_episode_id(id)
+        );
+        let episode = &episodes[0];
+        let trace = episode.session.as_ref().expect("a session episode");
+        assert_eq!(trace.session_id, id);
+        assert_eq!(
+            trace.close_reason,
+            crate::episodes::models::close_reason::USER_CLOSED
+        );
+        assert!(trace.message_count > 0, "{trace:?}");
+        assert!(
+            episode.stimulus.request.contains("hi there"),
+            "the first user message: {:?}",
+            episode.stimulus.request
+        );
+        assert_eq!(episode.source_run_id, None);
+    }
+
+    /// T0: the episode counts the messages the closed session counts. A user message whose
+    /// count write is still in flight at the close (`drain::spawn_count_write`, past its step
+    /// budget) is counted by the episode too: the close captures the counter AFTER that write,
+    /// it does not read a counter that is about to move.
+    #[tokio::test]
+    async fn a_closed_session_episode_counts_what_the_session_counts_even_a_late_write() {
+        let w = world().await;
+        let project = crate::test_helpers::test_project_named("proj");
+        w.graph.create_project(&project).await.unwrap();
+        let sid = first_turn(&w).await;
+        let id = Uuid::parse_str(&sid).unwrap();
+
+        // The count of a queued message, written by the drain, lands late.
+        *w.graph.slow_chat_session_update.lock().unwrap() = Some(Duration::from_millis(800));
+        let late = crate::chat::drain::spawn_count_write(
+            sid.clone(),
+            id,
+            w.graph.clone() as Arc<dyn GraphStore>,
+        );
+        w.manager.close_session(&sid).await.unwrap();
+        super::wait_for_session_episode_saves(&w.graph, 1).await;
+        late.await.unwrap();
+        *w.graph.slow_chat_session_update.lock().unwrap() = None;
+
+        let node = w.graph.get_chat_session(id).await.unwrap().unwrap();
+        assert_eq!(node.message_count, 2, "the late write landed: {node:?}");
+        let episodes = w.graph.list_session_episodes(project.id, 10).await.unwrap();
+        assert_eq!(episodes.len(), 1, "{episodes:?}");
+        let trace = episodes[0].session.as_ref().expect("a session episode");
+        assert_eq!(
+            trace.message_count, node.message_count,
+            "the episode counts what the closed session counts"
+        );
+    }
+
+    /// With an embedding provider on the manager, the close episode carries the vector
+    /// the reflex stage recalls it by.
+    #[tokio::test]
+    async fn a_closed_session_leaves_its_vector_when_a_provider_is_wired() {
+        let World {
+            fake,
+            graph,
+            manager,
+        } = world().await;
+        let manager =
+            manager.with_embeddings(Arc::new(crate::embeddings::MockEmbeddingProvider::new(16)));
+        let w = World {
+            fake,
+            graph,
+            manager,
+        };
+        let project = crate::test_helpers::test_project_named("proj");
+        w.graph.create_project(&project).await.unwrap();
+        let sid = first_turn(&w).await;
+        w.manager.close_session(&sid).await.unwrap();
+        super::wait_for_session_episode_saves(&w.graph, 1).await;
+        let episodes = w.graph.list_session_episodes(project.id, 10).await.unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(
+            episodes[0].embedding.as_ref().map(Vec::len),
+            Some(16),
+            "{:?}",
+            episodes[0].session
+        );
+    }
+
+    /// An episode that cannot be stored never keeps a session open.
+    #[tokio::test]
+    async fn a_session_closes_even_when_its_episode_cannot_be_stored() {
+        let w = world().await;
+        let project = crate::test_helpers::test_project_named("proj");
+        w.graph.create_project(&project).await.unwrap();
+        let sid = first_turn(&w).await;
+        w.graph
+            .fail_session_episode_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        w.manager.close_session(&sid).await.unwrap();
+        assert!(
+            !w.manager.is_session_active(&sid).await,
+            "closed all the same"
+        );
+        // The write was attempted (detached), failed, and left nothing.
+        super::wait_for_session_episode_saves(&w.graph, 1).await;
+        assert!(w.graph.session_episodes.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_conversation_moves_to_another_provider_with_its_history_relayed() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        assert_eq!(moved.session_id, old, "the SAME thread continues in place");
+        assert_eq!(moved.previous_session_id, old);
+        assert!(
+            moved.relayed_entries >= 2,
+            "the user and the assistant turn"
+        );
+        assert_eq!(moved.omitted_entries, 0);
+
+        // The new session runs on the target and answers.
+        // Read what was stored, not the live stream: the answer may be out before we subscribe.
+        stored_until(&w, &moved.session_id, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        let node = w
+            .graph
+            .get_chat_session(Uuid::parse_str(&moved.session_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.provider_id.as_deref(), Some("local2"));
+        assert_eq!(node.project_slug.as_deref(), Some("proj"));
+
+        // The model of the target saw the earlier conversation, then the new question.
+        let chats = w.fake.chat_requests();
+        let turn = chats
+            .iter()
+            .find(|r| r["body"].to_string().contains("second question"))
+            .expect("the relayed turn");
+        let body = turn["body"].to_string();
+        assert!(body.contains("<conversation_relay"), "{body}");
+        assert!(body.contains("hi there"), "the earlier user message");
+        assert!(
+            body.contains("hello from the fake model"),
+            "the earlier answer"
+        );
+        assert!(
+            body.find("<conversation_relay").unwrap() < body.find("second question").unwrap(),
+            "the relay comes first"
+        );
+
+        // The conversation shows the user's words only: the relay is not a message. In the
+        // in-place flow the SAME thread already holds the pre-move "hi there", so the user's
+        // new words are the user_message that carries them, not the first one.
+        let stored = stored_until(&w, &moved.session_id, |events| {
+            events.iter().any(|e| e.event_type == "user_message")
+        })
+        .await;
+        let moved_user = stored
+            .iter()
+            .filter(|e| e.event_type == "user_message")
+            .find(|e| e.data.contains("second question"))
+            .expect("the moved turn's user message");
+        assert!(
+            !moved_user.data.contains("conversation_relay"),
+            "the relay must not be stored as the user's message: {}",
+            moved_user.data
+        );
+
+        // The SAME session stays live (in place) and the handoff is traceable.
+        assert!(w.manager.is_session_active(&old).await);
+        let note = w
+            .graph
+            .get_llm_setting(&format!("handoff:{}", moved.session_id), "note")
+            .await
+            .unwrap()
+            .expect("the handoff note");
+        let note: Value = serde_json::from_str(&note).unwrap();
+        assert_eq!(note["from_session"], old.as_str());
+        assert_eq!(note["from_provider"], "local");
+    }
+
+    /// A move made while the answer is still streaming keeps what was produced: the text lives
+    /// only in the session's buffer until its turn ends, and the target must read it in the relay.
+    #[tokio::test]
+    async fn a_switch_during_a_streamed_answer_keeps_the_text_already_produced() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+        // A turn still streaming: its text is in the buffer, not yet stored as the answer.
+        let handle = w
+            .manager
+            .agent_runtime
+            .get(&old)
+            .await
+            .expect("a live agent session");
+        handle
+            .streaming_text
+            .lock()
+            .await
+            .push_str("the half answer");
+        handle
+            .is_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+
+        // The target answers the moved turn: wait for that answer, as the sibling test does.
+        stored_until(&w, &moved.session_id, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        let chats = w.fake.chat_requests();
+        let turn = chats
+            .iter()
+            .find(|r| r["body"].to_string().contains("second question"))
+            .expect("the relayed turn");
+        assert!(
+            turn["body"].to_string().contains("the half answer"),
+            "the target must read the answer the user was reading: {}",
+            turn["body"]
+        );
+        let stored = w
+            .graph
+            .get_chat_events(Uuid::parse_str(&moved.session_id).unwrap(), 0, 5_000)
+            .await
+            .unwrap();
+        assert!(
+            stored
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the half answer")),
+            "the thread keeps the cut answer too"
+        );
+    }
+
+    /// A turn still streaming while the switch waits for it: its text keeps growing in the
+    /// buffer, then the turn ends with one more word. The answer kept is the whole text.
+    #[tokio::test]
+    async fn a_switch_keeps_the_answer_that_streams_until_the_turn_ends() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+        let handle = w
+            .manager
+            .agent_runtime
+            .get(&old)
+            .await
+            .expect("a live agent session");
+        handle.streaming_text.lock().await.push_str("half answer");
+        handle
+            .is_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let writer = handle.clone();
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                writer.streaming_text.lock().await.push('+');
+            }
+            writer.streaming_text.lock().await.push_str(" and more");
+            writer
+                .is_streaming
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+
+        let stored = stored_until(&w, &moved.session_id, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        let cut = stored
+            .iter()
+            .find(|e| e.event_type == "assistant_text" && e.data.contains("half answer"))
+            .expect("the cut answer is stored");
+        assert!(
+            cut.data.contains("and more"),
+            "the text up to the end of the turn is kept: {}",
+            cut.data
+        );
+    }
+
+    /// The turn ends by clearing its buffer, as the agent engine does. What the switch saw while
+    /// the text grew is kept, even though the buffer is empty by the time the switch looks again.
+    #[tokio::test]
+    async fn a_switch_keeps_the_longest_text_seen_when_the_turn_clears_its_buffer() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+        let handle = w
+            .manager
+            .agent_runtime
+            .get(&old)
+            .await
+            .expect("a live agent session");
+        handle.streaming_text.lock().await.push_str("half answer");
+        handle
+            .is_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let writer = handle.clone();
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                writer.streaming_text.lock().await.push('+');
+            }
+            writer.streaming_text.lock().await.clear();
+            writer
+                .is_streaming
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+
+        let stored = stored_until(&w, &moved.session_id, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        let cut = stored
+            .iter()
+            .find(|e| e.event_type == "assistant_text" && e.data.contains("half answer"))
+            .expect("the cut answer is stored");
+        assert!(
+            cut.data.contains("++"),
+            "the longest text seen while streaming is kept, not the one before it: {}",
+            cut.data
+        );
+    }
+
+    /// A turn streaming nothing but whitespace has no answer to keep: no blank answer is stored.
+    /// Its flag never clears, so the switch waits out its bound before it moves on.
+    #[tokio::test]
+    async fn a_switch_while_streaming_only_whitespace_stores_no_blank_answer() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+        let handle = w
+            .manager
+            .agent_runtime
+            .get(&old)
+            .await
+            .expect("a live agent session");
+        handle.streaming_text.lock().await.push_str("  \n ");
+        handle
+            .is_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+
+        let stored = stored_until(&w, &moved.session_id, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        let answers: Vec<String> = stored
+            .iter()
+            .filter(|e| e.event_type == "assistant_text")
+            .map(|e| e.data.clone())
+            .collect();
+        assert_eq!(
+            answers.len(),
+            2,
+            "the first answer and the moved one, and no blank answer: {answers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_switch_leaves_the_old_session_untouched() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+        let sessions_before = w.fake.chat_requests().len();
+
+        // An unknown provider, and one the project never consented to.
+        for target in ["ghost", "local3"] {
+            let err = w
+                .manager
+                .switch_session_provider(&old, target, None, "second question", None)
+                .await
+                .expect_err(target);
+            assert!(
+                err.downcast_ref::<SwitchProviderError>().is_none(),
+                "{target}: a refusal from the resolver, not a switch error: {err:#}"
+            );
+            assert!(
+                w.manager.is_session_active(&old).await,
+                "{target}: the old session must stay open"
+            );
+        }
+        assert_eq!(
+            w.fake.chat_requests().len(),
+            sessions_before,
+            "nothing was sent anywhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_provider_and_an_empty_message_are_refused_before_anything_opens() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+
+        let same = w
+            .manager
+            .switch_session_provider(&old, "local", None, "second question", None)
+            .await
+            .expect_err("same provider");
+        assert_eq!(
+            same.downcast_ref::<SwitchProviderError>(),
+            Some(&SwitchProviderError::SameProvider("local".into()))
+        );
+        let empty = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "   ", None)
+            .await
+            .expect_err("empty message");
+        assert_eq!(
+            empty.downcast_ref::<SwitchProviderError>(),
+            Some(&SwitchProviderError::EmptyMessage)
+        );
+        let missing = w
+            .manager
+            .switch_session_provider(
+                &Uuid::new_v4().to_string(),
+                "local2",
+                None,
+                "second question",
+                None,
+            )
+            .await
+            .expect_err("unknown session");
+        assert_eq!(
+            missing.downcast_ref::<SwitchProviderError>(),
+            Some(&SwitchProviderError::NotFound)
+        );
+        assert!(w.manager.is_session_active(&old).await);
+    }
+
+    // ── Both directions, across engines: Claude Code → native → Claude Code ──
+    //
+    // Claude Code stays on its historical engine (the Claude CLI): here the
+    // `fake_claude` of nexus, behind a wrapper that hands it a transcript and records
+    // what it reads. The native target is `fake_openai`. Decision 896b7d7c: the two
+    // are interchangeable at any point of a conversation.
+
+    use crate::chat::provider::cognitive::decider::CognitiveRouting;
+    use crate::chat::provider::cognitive::decision::CognitiveDecision;
+    use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
+    use crate::neo4j::models::ChatEventRecord;
+    use crate::neo4j::routing::Neo4jRoutingStore;
+
+    const CLAUDE_ANSWER: &str = "first answer, from claude";
+
+    /// A Claude CLI: `fake_claude` behind a shell wrapper. Every CLI it starts plays
+    /// one turn (waits for the user's message, answers [`CLAUDE_ANSWER`]) and appends
+    /// every line it reads to `stdin.jsonl`.
+    struct FakeClaude {
+        dir: tempfile::TempDir,
+    }
+
+    impl FakeClaude {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let transcript = dir.path().join("transcript.jsonl");
+            let lines = [
+                json!({"op": "capture_hooks", "optional": true, "timeout_ms": 3000}),
+                json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+                json!({"op": "emit_json", "json": {"type": "system", "subtype": "init",
+                    "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                    "permissionMode": "default", "apiKeySource": "none"}}),
+                json!({"op": "emit_json", "json": {"type": "assistant", "message": {
+                    "id": "msg_fake_1", "type": "message", "role": "assistant",
+                    "model": "fake-claude", "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": CLAUDE_ANSWER}]}}}),
+                json!({"op": "emit_json", "json": {"type": "result", "subtype": "success",
+                    "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                    "session_id": "fake-cli-session", "total_cost_usd": 0.0,
+                    "result": CLAUDE_ANSWER}}),
+                json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+            ];
+            let text: Vec<String> = lines.iter().map(Value::to_string).collect();
+            std::fs::write(&transcript, text.join("\n")).unwrap();
+            let wrapper = dir.path().join("claude");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                     FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                    transcript.display(),
+                    dir.path().join("stdin.jsonl").display(),
+                    fake_bin("fake_claude").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self { dir }
+        }
+
+        fn path(&self) -> String {
+            self.dir.path().join("claude").display().to_string()
+        }
+
+        /// Every line the CLIs read, in order.
+        fn stdin(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("stdin.jsonl")).unwrap_or_default()
+        }
+    }
+
+    /// `world()` as deployed: Claude Code on the Claude CLI (the legacy engine), every
+    /// other provider on the agent engine, the cognitive router wired.
+    async fn hybrid_world(cli: &FakeClaude) -> World {
+        let mut w = world().await;
+        let dyn_graph: Arc<dyn GraphStore> = w.graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Legacy,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            obscura_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let store = Arc::new(Neo4jRoutingStore::new(w.graph.clone()));
+        w.manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+            .with_cognitive_routing(CognitiveRouting::new(store));
+        w.manager.update_claude_cli_path(Some(cli.path())).await;
+        w
+    }
+
+    async fn stored_events(w: &World, session_id: &str) -> Vec<ChatEvent> {
+        w.graph
+            .get_chat_events(Uuid::parse_str(session_id).unwrap(), 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| serde_json::from_str(&r.data).ok())
+            .collect()
+    }
+
+    /// The events stating a provider move. A move is now in place (same thread), so it is
+    /// stated with [`ChatEvent::ProviderSwitched`] — never a new-session relay.
+    fn switched_of(events: &[ChatEvent]) -> Vec<&ChatEvent> {
+        events
+            .iter()
+            .filter(|e| matches!(e, ChatEvent::ProviderSwitched { .. }))
+            .collect()
+    }
+
+    async fn decision_of(w: &World, session_id: &str) -> Option<CognitiveDecision> {
+        let id = Uuid::parse_str(session_id).unwrap();
+        Neo4jRoutingStore::new(w.graph.clone())
+            .decisions(&DecisionFilter::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.session_id == Some(id))
+    }
+
+    /// The line the CLIs read that carries `needle`.
+    fn cli_line_with(cli: &FakeClaude, needle: &str) -> String {
+        cli.stdin()
+            .lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no line with {needle:?} reached the CLI: {}", cli.stdin()))
+            .to_string()
+    }
+
+    /// The session request `delegate_task` builds when the delegation names neither engine
+    /// nor model: `inherit_parent_engine` copies the parent's provider (and model) onto the
+    /// RUN level, the caller is the server's service account, the spawn is a delegation.
+    fn delegation_request(run_model: Option<&str>) -> ChatRequest {
+        let mut req = request(None, Some("proj"), "bypassPermissions");
+        req.run_provider = Some("claude-code".into());
+        req.run_model = run_model.map(str::to_string);
+        req.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Delegation {
+                plan_id: Uuid::new_v4(),
+                task_id: Uuid::new_v4(),
+                parent_session_id: None,
+                scaffolding_level: None,
+            }
+            .to_json_string(),
+        );
+        req.user_claims = Some(crate::auth::jwt::Claims::service_account(
+            "delegate-agent:probe",
+        ));
+        req
+    }
+
+    /// DELEG-500, the control: a delegation that inherits its parent's ENGINE only opens.
+    #[tokio::test]
+    async fn a_delegation_inheriting_its_parents_engine_opens() {
+        let cli = FakeClaude::new();
+        let w = hybrid_world(&cli).await;
+        let opened = w.manager.create_session(&delegation_request(None)).await;
+        assert!(opened.is_ok(), "control failed: {:#}", opened.unwrap_err());
+    }
+
+    /// DELEG-500: a delegation that inherits its parent's engine AND MODEL
+    /// (`claude-fable-5-1`) must open too.
+    #[tokio::test]
+    async fn a_delegation_inheriting_its_parents_engine_and_model_opens() {
+        let cli = FakeClaude::new();
+        let w = hybrid_world(&cli).await;
+        let opened = w
+            .manager
+            .create_session(&delegation_request(Some("claude-fable-5-1")))
+            .await;
+        assert!(
+            opened.is_ok(),
+            "inherited model refused: {:#}",
+            opened.unwrap_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_to_native_and_back_the_target_knows_the_history_and_the_thread_says_so() {
+        let cli = FakeClaude::new();
+        let w = hybrid_world(&cli).await;
+
+        // 1. A conversation on Claude Code, served by the Claude CLI.
+        let cc1 = w
+            .manager
+            .create_session(&request(None, Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|err| panic!("open on claude-code failed: {err:#}"))
+            .session_id;
+        assert!(w.manager.is_session_active(&cc1).await);
+        assert!(
+            !w.manager.agent_runtime.owns(&cc1).await,
+            "Claude Code runs on the legacy engine"
+        );
+        stored_until(&w, &cc1, |events| {
+            events
+                .iter()
+                .any(|ev| ev.event_type == "assistant_text" && ev.data.contains(CLAUDE_ANSWER))
+        })
+        .await;
+        cli_line_with(&cli, "hi there");
+        // The memory conversation the move must keep.
+        w.graph
+            .update_chat_session(
+                Uuid::parse_str(&cc1).unwrap(),
+                None,
+                None,
+                None,
+                None,
+                Some("conv-kept".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let first_decision = decision_of(&w, &cc1)
+            .await
+            .expect("the routed opening left a decision on the session");
+        assert!(
+            first_decision.outcome.is_none(),
+            "open while the session runs"
+        );
+        // 2. Claude Code → native: the SAME thread is re-targeted in place, and the target
+        // answers knowing the history.
+        let moved = w
+            .manager
+            .switch_session_provider(&cc1, "local", None, "second question", None)
+            .await
+            .unwrap_or_else(|err| panic!("switch to local failed: {err:#}"));
+        assert_eq!(
+            moved.session_id, cc1,
+            "the move re-targets the SAME thread in place"
+        );
+        assert_eq!(moved.previous_session_id, cc1);
+        assert_eq!((moved.relayed_entries, moved.omitted_entries), (2, 0));
+        assert_eq!(moved.conversation_id.as_deref(), Some("conv-kept"));
+        assert!(
+            w.manager.agent_runtime.owns(&cc1).await,
+            "native: agent engine, same session"
+        );
+        assert!(
+            w.manager.is_session_active(&cc1).await,
+            "the SAME session stays live across the switch"
+        );
+        stored_until(&w, &cc1, |events| {
+            events
+                .iter()
+                .any(|ev| ev.event_type == "assistant_text" && ev.data.contains("the answer"))
+        })
+        .await;
+        let body = w
+            .fake
+            .chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .find(|b| b.contains("second question"))
+            .expect("the relayed turn reached the native model");
+        assert!(
+            body.contains("<conversation_relay from=\\\"claude-code\\\" to=\\\"local\\\">"),
+            "{body}"
+        );
+        assert!(
+            body.contains("hi there") && body.contains(CLAUDE_ANSWER),
+            "{body}"
+        );
+        let node = w
+            .graph
+            .get_chat_session(Uuid::parse_str(&cc1).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            node.provider_id.as_deref(),
+            Some("local"),
+            "the node was re-targeted in place"
+        );
+        assert_eq!(node.conversation_id.as_deref(), Some("conv-kept"));
+
+        // The routing decision of the session is closed by the switch (the move was its
+        // outcome), as on the legacy close path.
+        assert!(w.manager.open_decisions.lock().unwrap().get(&cc1).is_none());
+        let closed = decision_of(&w, &cc1).await.unwrap();
+        assert!(
+            closed.outcome.is_some(),
+            "closed with what the session saw: {closed:?}"
+        );
+
+        // 3. Native → Claude Code: back, with everything so far, still on the SAME thread.
+        let back = w
+            .manager
+            .switch_session_provider(&cc1, "claude-code", None, "third question", None)
+            .await
+            .unwrap_or_else(|err| panic!("switch back to claude-code failed: {err:#}"));
+        assert_eq!(
+            back.session_id, cc1,
+            "the back-switch stays on the SAME thread"
+        );
+        assert_eq!(back.previous_session_id, cc1);
+        // In the in-place flow the SAME thread holds every entry — the two earlier ones and
+        // the two native turns — so the back-switch relays all four (the fresh CLI needs the
+        // whole conversation), not just the native session's own two.
+        assert_eq!(
+            (back.relayed_entries, back.omitted_entries),
+            (4, 0),
+            "the whole thread relays, on the SAME thread"
+        );
+        assert_eq!(back.conversation_id.as_deref(), Some("conv-kept"));
+        // The SAME thread already holds step 1's Claude answer: wait for the reopened CLI to
+        // answer "third question" (a second Claude answer on the thread), so the CLI has then
+        // read the relayed message in front of it.
+        stored_until(&w, &cc1, |events| {
+            events
+                .iter()
+                .filter(|ev| ev.event_type == "assistant_text" && ev.data.contains(CLAUDE_ANSWER))
+                .count()
+                >= 2
+        })
+        .await;
+        let third = cli_line_with(&cli, "third question");
+        assert!(
+            third.contains(r#"<conversation_relay from=\"local\" to=\"claude-code\">"#),
+            "{third}"
+        );
+        assert!(
+            third.contains("second question") && third.contains("the answer"),
+            "the native turn is in the relay: {third}"
+        );
+        assert!(
+            !w.manager.agent_runtime.owns(&cc1).await,
+            "back on the legacy engine, same session"
+        );
+        assert!(w.manager.is_session_active(&cc1).await);
+        let node = w
+            .graph
+            .get_chat_session(Uuid::parse_str(&cc1).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.conversation_id.as_deref(), Some("conv-kept"));
+        assert_eq!(
+            node.routed_by.as_deref(),
+            Some("request"),
+            "the user chose: explicit"
+        );
+        w.manager.close_session(&cc1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_switch_from_claude_code_refused_by_consent_states_nothing_and_closes_nothing() {
+        let cli = FakeClaude::new();
+        let w = hybrid_world(&cli).await;
+        let cc1 = w
+            .manager
+            .create_session(&request(None, Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        stored_until(&w, &cc1, |events| {
+            events.iter().any(|ev| ev.event_type == "result")
+        })
+        .await;
+        let sent_before = w.fake.chat_requests().len();
+
+        // No consent of the project for `local3`: a typed refusal.
+        let err = w
+            .manager
+            .switch_session_provider(&cc1, "local3", None, "second question", None)
+            .await
+            .expect_err("no consent");
+        assert_eq!(failure(&err), (403, "endpoint_not_allowed"));
+
+        assert!(
+            w.manager.is_session_active(&cc1).await,
+            "the conversation stays"
+        );
+        assert!(
+            switched_of(&stored_events(&w, &cc1).await).is_empty(),
+            "nothing stated"
+        );
+        assert!(
+            decision_of(&w, &cc1).await.unwrap().outcome.is_none(),
+            "its decision stays open"
+        );
+        assert_eq!(
+            w.fake.chat_requests().len(),
+            sent_before,
+            "nothing was sent"
+        );
+        w.manager.close_session(&cc1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_history_longer_than_the_targets_window_is_bounded_and_the_omission_is_stated() {
+        let w = world().await;
+        // A stored Claude Code conversation far larger than 40 % of a 32k window.
+        let mut node = crate::test_helpers::test_chat_session(Some("proj"));
+        node.provider_id = Some("claude-code".into());
+        node.cwd = std::env::temp_dir().display().to_string();
+        let old = node.id;
+        w.graph.create_chat_session(&node).await.unwrap();
+        let filler = "w".repeat(2_000);
+        let records: Vec<ChatEventRecord> = (0..80)
+            .map(|i| ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id: old,
+                seq: i + 1,
+                event_type: "user_message".into(),
+                data: serde_json::to_string(&ChatEvent::UserMessage {
+                    content: format!("turn-{i:02} {filler}"),
+                })
+                .unwrap(),
+                created_at: Utc::now(),
+            })
+            .collect();
+        w.graph.store_chat_events(old, records).await.unwrap();
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old.to_string(), "local", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        assert_eq!(
+            moved.session_id,
+            old.to_string(),
+            "the switch re-targets the SAME thread in place"
+        );
+        assert!(moved.omitted_entries > 0, "{moved:?}");
+        assert!(moved.relayed_entries > 0, "{moved:?}");
+        assert_eq!(moved.relayed_entries + moved.omitted_entries, 80);
+
+        stored_until(&w, &moved.session_id, |events| {
+            events.iter().any(|e| e.event_type == "assistant_text")
+        })
+        .await;
+        let body = w
+            .fake
+            .chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .find(|b| b.contains("second question"))
+            .expect("the relayed turn");
+        assert!(
+            body.contains("left out to fit your context window"),
+            "the omission is stated to the model"
+        );
+        assert!(body.contains("turn-79"), "the newest turn is kept");
+        assert!(!body.contains("turn-00"), "the oldest turn is dropped");
+        // The relay alone (the request also carries the system prompt and the tool
+        // schemas) stays within its budget: 40 % of a 32k window = 51 200 chars, or the
+        // 48 000 of an unknown window, whichever the target reported at the switch.
+        let start = body.find("<conversation_relay").unwrap();
+        let end = body.find("</conversation_relay>").unwrap();
+        let relay_chars = body[start..end].chars().count();
+        assert!(
+            relay_chars <= 51_200 + 1_000,
+            "the relay is bounded by the window: {relay_chars} chars"
+        );
+        // The SAME thread states the switch and how much was left out: a bounded relay is
+        // never a silent truncation.
+        let stated = stored_events(&w, &moved.session_id).await;
+        match stated
+            .iter()
+            .filter(|e| matches!(e, ChatEvent::ProviderSwitched { .. }))
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [ChatEvent::ProviderSwitched {
+                session_id,
+                relayed_entries,
+                omitted_entries,
+                ..
+            }] => {
+                assert_eq!(session_id, &moved.session_id);
+                assert_eq!(*relayed_entries, Some(moved.relayed_entries as u64));
+                assert_eq!(*omitted_entries, Some(moved.omitted_entries as u64));
+            }
+            other => panic!("one provider_switched statement expected: {other:?}"),
+        }
+    }
+
+    // ── The router moves a conversation (P1c): mode `full`, stage `auto` ──
+    //
+    // Before a turn starts, the decision of a conversation in `full` may name another
+    // provider: the conversation then moves through the same relay as the switch route,
+    // `moved_by: auto`, and the turn's message is answered by the new provider only.
+
+    mod auto_move {
+        use super::*;
+        use crate::chat::agent_hooks::PoolSource;
+        use crate::chat::provider::cognitive::candidates::ModelFacts;
+        use crate::chat::provider::cognitive::decision::{
+            DecideRequest, Decider, DecisionAlternative, Pick,
+        };
+        use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, ROUTING_KEY};
+        use crate::chat::types::{RoutingPoolEntry, SessionRoutingRequest};
+        #[allow(unused_imports)]
+        use crate::neo4j::traits::*;
+        #[allow(unused_imports)]
+        use std::collections::VecDeque;
+        use std::sync::Mutex as StdMutex;
+
+        /// The instances of `world()` as the routing pool sees them: `local3` without the
+        /// project's consent.
+        struct Instances;
+
+        #[async_trait::async_trait]
+        impl PoolSource for Instances {
+            async fn pool(&self, provider_id: &str) -> Vec<ModelFacts> {
+                self.project_pool(None)
+                    .await
+                    .into_iter()
+                    .filter(|f| f.provider_id == provider_id)
+                    .collect()
+            }
+            async fn project_pool(&self, _project_slug: Option<&str>) -> Vec<ModelFacts> {
+                [
+                    ("claude-code", true),
+                    ("local", true),
+                    ("local2", true),
+                    ("local3", false),
+                ]
+                .iter()
+                .map(|(provider, allowed)| ModelFacts {
+                    provider_id: (*provider).into(),
+                    model: if *provider == "claude-code" {
+                        "fake-claude"
+                    } else {
+                        "m"
+                    }
+                    .into(),
+                    supports_tools: true,
+                    supports_images: false,
+                    context_window: Some(32_000),
+                    window_unknown: None,
+                    price: None,
+                    cost_basis: nexus_claude::agent::CostBasis::Free,
+                    healthy: Some(true),
+                    allowed_for_project: *allowed,
+                    sandboxed: false,
+                    quota_exhausted: None,
+                    quota_utilization: None,
+                })
+                .collect()
+            }
+        }
+
+        /// Answers each provider check (a request across providers) with the next
+        /// provider of its queue (the last one repeats), clearly ahead of the current pair;
+        /// a model decision of the session's own provider keeps the current model.
+        struct Mover {
+            answers: StdMutex<VecDeque<&'static str>>,
+            checks: StdMutex<Vec<DecideRequest>>,
+            /// The model decisions of one provider (`restrict_provider` set).
+            restricted: StdMutex<Vec<DecideRequest>>,
+        }
+
+        impl Mover {
+            fn new(answers: Vec<&'static str>) -> Arc<Self> {
+                Arc::new(Self {
+                    answers: StdMutex::new(answers.into()),
+                    checks: StdMutex::new(Vec::new()),
+                    restricted: StdMutex::new(Vec::new()),
+                })
+            }
+            fn checks(&self) -> Vec<DecideRequest> {
+                self.checks.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Decider for Mover {
+            async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+                let current = request.current.clone().unwrap_or_else(|| Pick::new("", ""));
+                let chosen = match &request.restrict_provider {
+                    Some(_) => {
+                        self.restricted.lock().unwrap().push(request.clone());
+                        current.clone()
+                    }
+                    None => {
+                        self.checks.lock().unwrap().push(request.clone());
+                        let mut queue = self.answers.lock().unwrap();
+                        let provider = if queue.len() > 1 {
+                            queue.pop_front().unwrap()
+                        } else {
+                            *queue.front().unwrap()
+                        };
+                        let model = if provider == "claude-code" {
+                            "fake-claude"
+                        } else {
+                            "m"
+                        };
+                        Pick::new(provider, model)
+                    }
+                };
+                let mut alternatives = vec![DecisionAlternative {
+                    pick: chosen.clone(),
+                    score: Some(0.9),
+                    rejected: None,
+                    p_top1: None,
+                    propensity: None,
+                }];
+                if chosen != current {
+                    alternatives.push(DecisionAlternative {
+                        pick: current,
+                        score: Some(0.3),
+                        rejected: None,
+                        p_top1: None,
+                        propensity: None,
+                    });
+                }
+                Ok(CognitiveDecision {
+                    snapshot: None,
+                    arms_snapshot: Vec::new(),
+                    id: Uuid::new_v4(),
+                    at: Utc::now(),
+                    signature: request.signature.clone(),
+                    chosen: Some(chosen.clone()),
+                    score: Some(0.9),
+                    explored: false,
+                    exploration_epsilon: 0.0,
+                    confidence: None,
+                    reason: format!("fake: {}/{}", chosen.provider_id, chosen.model),
+                    alternatives,
+                    applied: request.settings.mode == ProviderRoutingMode::Full
+                        && request.settings.stage == LearningStage::Auto,
+                    mode: request.settings.mode,
+                    stage: request.settings.stage,
+                    session_id: request.session_id,
+                    task_id: None,
+                    run_id: None,
+                    turn_index: request.turn_index,
+                    outcome: None,
+                    used: None,
+                })
+            }
+        }
+
+        async fn routing(w: &World, mode: &str, stage: &str) {
+            w.graph
+                .put_llm_setting(
+                    GLOBAL,
+                    ROUTING_KEY,
+                    &json!({ "mode": mode, "stage": stage }).to_string(),
+                )
+                .await
+                .unwrap();
+        }
+
+        /// `world()` with the router wired (and its decision store when `store`).
+        async fn auto_world(
+            stage: &str,
+            answers: Vec<&'static str>,
+            store: bool,
+        ) -> (World, Arc<Mover>) {
+            let mut w = world().await;
+            routing(&w, "full", stage).await;
+            let mover = Mover::new(answers);
+            let mut manager = manager(w.graph.clone(), true);
+            if store {
+                manager = manager.with_cognitive_routing(CognitiveRouting::new(Arc::new(
+                    Neo4jRoutingStore::new(w.graph.clone()),
+                )));
+            }
+            w.manager = manager.with_turn_decider(mover.clone(), Arc::new(Instances));
+            (w, mover)
+        }
+
+        /// "Auto" in the menu: the provider named at the opening is no longer imposed.
+        async fn hand_back_to_po(w: &World, session_id: &str) {
+            w.manager
+                .set_session_routing(
+                    session_id,
+                    &SessionRoutingRequest {
+                        auto: true,
+                        routing_pool: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn idle(w: &World, session_id: &str) {
+            for _ in 0..200 {
+                if !w.manager.is_session_streaming(session_id).await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("{session_id} never went idle");
+        }
+
+        fn requests_with(w: &World, needle: &str) -> Vec<String> {
+            w.fake
+                .chat_requests()
+                .iter()
+                .map(|r| r["body"].to_string())
+                .filter(|b| b.contains(needle))
+                .collect()
+        }
+
+        fn answers_on(events: &[ChatEvent]) -> usize {
+            events
+                .iter()
+                .filter(|e| matches!(e, ChatEvent::AssistantText { .. }))
+                .count()
+        }
+
+        /// Sends `text` to a session that stays, and waits for its answer there.
+        async fn answered_in_place(w: &World, session_id: &str, text: &str) {
+            let answers_before = answers_on(&stored_events(w, session_id).await);
+            let switched_before = switched_of(&stored_events(w, session_id).await).len();
+            w.manager.send_message(session_id, text).await.unwrap();
+            stored_until(w, session_id, |records| {
+                records
+                    .iter()
+                    .filter(|r| r.event_type == "assistant_text")
+                    .count()
+                    > answers_before
+            })
+            .await;
+            assert!(
+                w.manager.is_session_active(session_id).await,
+                "the conversation stays"
+            );
+            assert_eq!(
+                switched_of(&stored_events(w, session_id).await).len(),
+                switched_before,
+                "no move stated"
+            );
+        }
+
+        /// Waits for the in-place move to be stated on the SAME thread and returns the
+        /// `ProviderSwitched` event. The in-place switch replaces the live broadcast channel,
+        /// so a subscription taken before `send_message` would observe `RecvError::Closed`;
+        /// the stored thread the session keeps is the reliable view.
+        async fn switched_in_place(w: &World, session_id: &str) -> ChatEvent {
+            stored_until(w, session_id, |records| {
+                records.iter().any(|r| r.event_type == "provider_switched")
+            })
+            .await;
+            let stated = stored_events(w, session_id).await;
+            let switched = switched_of(&stated);
+            assert_eq!(switched.len(), 1, "exactly one move stated: {stated:?}");
+            switched[0].clone()
+        }
+
+        #[tokio::test]
+        async fn full_auto_a_turn_for_another_provider_moves_through_the_relay_and_is_answered_there(
+        ) {
+            let (w, mover) = auto_world("auto", vec!["local2"], false).await;
+            let old = first_turn(&w).await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+
+            w.manager
+                .send_message(&old, "second question")
+                .await
+                .unwrap();
+
+            let on_old = switched_in_place(&w, &old).await;
+            let ChatEvent::ProviderSwitched {
+                session_id,
+                from_provider,
+                to_provider,
+                ..
+            } = on_old.clone()
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                (from_provider.as_str(), to_provider.as_str()),
+                ("local", "local2")
+            );
+            assert_eq!(
+                session_id, old,
+                "the move re-targets the SAME thread in place"
+            );
+
+            // Answered by the new provider, sent ONCE, with the history relayed in front.
+            stored_until(&w, &old, |records| {
+                records
+                    .iter()
+                    .any(|r| r.event_type == "assistant_text" && r.data.contains("the answer"))
+            })
+            .await;
+            let sent = requests_with(&w, "second question");
+            assert_eq!(sent.len(), 1, "the turn is sent once: {sent:?}");
+            assert!(
+                sent[0].contains("<conversation_relay from=\\\"local\\\" to=\\\"local2\\\">"),
+                "{}",
+                sent[0]
+            );
+            // The SAME session stays live across the move: the turn ran on the new provider
+            // only, on the thread it already owned.
+            assert!(
+                w.manager.is_session_active(&old).await,
+                "the SAME session stays live across the move"
+            );
+            // The SAME thread carries the statement, exactly once.
+            let as_json = |ev: &ChatEvent| serde_json::to_value(ev).unwrap();
+            let stated = stored_events(&w, &old).await;
+            let switched = switched_of(&stated);
+            assert_eq!(switched.len(), 1);
+            assert_eq!(as_json(switched[0]), as_json(&on_old));
+            // Nobody imposed the target: the router goes on choosing there.
+            let node = w
+                .graph
+                .get_chat_session(Uuid::parse_str(&old).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(node.provider_id.as_deref(), Some("local2"));
+            assert_eq!(node.model, "m");
+            assert_eq!(node.routed_by.as_deref(), Some("auto"));
+            assert_eq!(node.routing_mode.as_deref(), Some("full"));
+            let checks = mover.checks();
+            assert_eq!(checks.len(), 1);
+            assert!(checks[0].pool.iter().any(|f| f.provider_id == "local2"));
+        }
+
+        #[tokio::test]
+        async fn two_consecutive_turns_do_not_flip_flop_between_providers() {
+            let (w, mover) = auto_world("auto", vec!["local2", "local"], false).await;
+            let old = first_turn(&w).await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+            w.manager
+                .send_message(&old, "second question")
+                .await
+                .unwrap();
+            let ChatEvent::ProviderSwitched { session_id, .. } = switched_in_place(&w, &old).await
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                session_id, old,
+                "the move re-targets the SAME thread in place"
+            );
+            stored_until(&w, &old, |records| {
+                records
+                    .iter()
+                    .any(|r| r.event_type == "assistant_text" && r.data.contains("the answer"))
+            })
+            .await;
+            idle(&w, &old).await;
+
+            // The router now prefers the way back: right after a move, no second move (R-S3):
+            // the turn is decided among the models of the provider it moved to.
+            answered_in_place(&w, &old, "second question, again").await;
+            assert_eq!(
+                switched_of(&stored_events(&w, &old).await).len(),
+                1,
+                "the move in only"
+            );
+            // The Mover records only the requests across providers: the turn after the move
+            // was asked with `restrict_provider = local2` (its model may change, never its
+            // provider), so the way back was never even a candidate.
+            let checks = mover.checks();
+            assert_eq!(checks.len(), 1, "no provider question right after a move");
+            assert_eq!(checks[0].current, Some(Pick::new("local", "m")));
+            let restricted = mover.restricted.lock().unwrap().clone();
+            let after = restricted
+                .iter()
+                .find(|r| r.current == Some(Pick::new("local2", "m")))
+                .expect("the turn after the move is decided on the arrival provider");
+            assert_eq!(after.restrict_provider.as_deref(), Some("local2"));
+            assert!(after.narrowed.contains(&"after_provider_move"), "{after:?}");
+        }
+
+        /// A session driven by the settings (`full` + `shadow`, nothing chosen on the
+        /// conversation): the provider decision is taken and recorded in shadow, nothing moves.
+        #[tokio::test]
+        async fn the_shadow_stage_records_the_provider_decision_and_moves_nothing() {
+            let (w, mover) = auto_world("shadow", vec!["local2"], false).await;
+            // The settings' roles name the instance: the request names nothing.
+            w.graph
+                .put_llm_setting(
+                    GLOBAL,
+                    crate::chat::provider::settings::ROLES_KEY,
+                    &json!({"pilot": {"provider": "local"}}).to_string(),
+                )
+                .await
+                .unwrap();
+            let created = w
+                .manager
+                .create_session(&request(None, Some("proj"), "default"))
+                .await
+                .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+            let old = created.session_id;
+            stored_until(&w, &old, |records| {
+                records.iter().any(|r| r.event_type == "assistant_text")
+            })
+            .await;
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question").await;
+            let checks = mover.checks();
+            assert_eq!(checks.len(), 1, "the decision is taken, so recorded");
+            assert_eq!(checks[0].settings.stage, LearningStage::Shadow);
+            assert_eq!(requests_with(&w, "conversation_relay").len(), 0);
+        }
+
+        /// Decision R-S1: Auto chosen on the conversation (handed back to PO) is the user's
+        /// choice, decided at the `auto` stage even when the settings say `shadow`.
+        #[tokio::test]
+        async fn a_conversation_handed_back_to_po_moves_even_under_a_shadow_setting() {
+            let (w, mover) = auto_world("shadow", vec!["local2"], false).await;
+            let old = first_turn(&w).await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+            w.manager
+                .send_message(&old, "second question")
+                .await
+                .unwrap();
+            switched_in_place(&w, &old).await;
+            let checks = mover.checks();
+            assert_eq!(checks.len(), 1);
+            assert_eq!(checks[0].settings.stage, LearningStage::Auto);
+        }
+
+        #[tokio::test]
+        async fn a_model_imposed_by_the_request_is_never_moved() {
+            let (w, mover) = auto_world("auto", vec!["local2"], false).await;
+            let mut req = request(Some("local"), Some("proj"), "default");
+            req.model = Some("m".into());
+            let old = w.manager.create_session(&req).await.unwrap().session_id;
+            stored_until(&w, &old, |records| {
+                records.iter().any(|r| r.event_type == "assistant_text")
+            })
+            .await;
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question").await;
+            assert!(
+                mover.checks().is_empty(),
+                "an imposed pair is not even asked about"
+            );
+        }
+
+        /// Decision R-S2: a `mixed` pool ticked across two providers (here through
+        /// `PUT .../routing` on a live conversation opened on `local`) lets the router move
+        /// the conversation to the other provider of the pool, in place, exactly as `full`
+        /// does — restricted to the pool. Before R-S2 this test asserted the opposite
+        /// ("mixed never leaves the session's provider"): the pool was dropped by
+        /// `reroute` and `routing_of` kept the provider closed under `mixed`. A pool on ONE
+        /// provider still never moves (`routing_modes_e2e_tests`, `provider_move_tests`).
+        #[tokio::test]
+        async fn a_mixed_pool_spanning_providers_may_leave_the_sessions_provider() {
+            let (w, mover) = auto_world("auto", vec!["local2"], false).await;
+            let old = first_turn(&w).await;
+            w.manager
+                .set_session_routing(
+                    &old,
+                    &SessionRoutingRequest {
+                        auto: false,
+                        routing_pool: vec![pair("local"), pair("local2")],
+                    },
+                )
+                .await
+                .unwrap();
+            idle(&w, &old).await;
+            let to = moved_by_auto(&w, &old, "second question").await;
+            assert_eq!(to, "local2", "moved among the pool's two providers");
+            let checks = mover.checks();
+            assert_eq!(checks.len(), 1, "one provider question, for the pool");
+            let mut providers: Vec<&str> = checks[0]
+                .pool
+                .iter()
+                .map(|f| f.provider_id.as_str())
+                .collect();
+            providers.sort_unstable();
+            providers.dedup();
+            assert_eq!(
+                providers,
+                vec!["local", "local2"],
+                "decided among the pool only: {:?}",
+                checks[0].pool
+            );
+            assert_eq!(
+                (checks[0].settings.mode, checks[0].settings.stage),
+                (ProviderRoutingMode::Full, LearningStage::Auto),
+                "asked as full inside the pool"
+            );
+            let node = w
+                .graph
+                .get_chat_session(Uuid::parse_str(&old).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(node.provider_id.as_deref(), Some("local2"));
+            assert_eq!(
+                node.routing_mode.as_deref(),
+                Some("mixed"),
+                "the ticks stay"
+            );
+        }
+
+        /// Anti-flapping under a mixed pool (R-S3): the turn right after a move is decided
+        /// among the models of the provider it moved to, so no second provider move follows.
+        #[tokio::test]
+        async fn a_mixed_pool_move_is_not_flipped_back_on_the_next_turn() {
+            let (w, mover) = auto_world("auto", vec!["local2", "local"], false).await;
+            let old = first_turn(&w).await;
+            w.manager
+                .set_session_routing(
+                    &old,
+                    &SessionRoutingRequest {
+                        auto: false,
+                        routing_pool: vec![pair("local"), pair("local2")],
+                    },
+                )
+                .await
+                .unwrap();
+            idle(&w, &old).await;
+            assert_eq!(moved_by_auto(&w, &old, "second question").await, "local2");
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question, again").await;
+            assert_eq!(
+                switched_of(&stored_events(&w, &old).await).len(),
+                1,
+                "the move in only: no flip back"
+            );
+            assert_eq!(
+                mover.checks().len(),
+                1,
+                "no provider question right after a move"
+            );
+        }
+
+        /// Consent (`allowed_for_project`): a provider the project did not consent to (`local3`)
+        /// is never in the pool the decider sees, and a decision naming it moves nothing: the
+        /// conversation answers in place on its own provider.
+        #[tokio::test]
+        async fn a_mixed_pool_never_moves_to_a_provider_the_project_did_not_consent_to() {
+            let (w, mover) = auto_world("auto", vec!["local3"], false).await;
+            let old = first_turn(&w).await;
+            w.manager
+                .set_session_routing(
+                    &old,
+                    &SessionRoutingRequest {
+                        auto: false,
+                        routing_pool: vec![pair("local"), pair("local2")],
+                    },
+                )
+                .await
+                .unwrap();
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question").await;
+            for check in mover.checks() {
+                assert!(
+                    check.pool.iter().all(|f| f.provider_id != "local3"),
+                    "a non-consented provider is never offered: {:?}",
+                    check.pool
+                );
+            }
+            let node = w
+                .graph
+                .get_chat_session(Uuid::parse_str(&old).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(node.provider_id.as_deref(), Some("local"));
+        }
+
+        fn pair(provider: &str) -> RoutingPoolEntry {
+            RoutingPoolEntry {
+                provider: provider.into(),
+                model: "m".into(),
+            }
+        }
+
+        /// Sends `text` and waits for the conversation to move in place (same session);
+        /// returns the provider it moved to.
+        async fn moved_by_auto(w: &World, old: &str, text: &str) -> String {
+            w.manager.send_message(old, text).await.unwrap();
+            let ChatEvent::ProviderSwitched {
+                session_id,
+                to_provider,
+                ..
+            } = switched_in_place(w, old).await
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                session_id, old,
+                "the move re-targets the SAME thread in place"
+            );
+            stored_until(w, old, |records| {
+                records
+                    .iter()
+                    .any(|r| r.event_type == "assistant_text" && r.data.contains("the answer"))
+            })
+            .await;
+            to_provider
+        }
+
+        // ── AUTO-L: the person's "models Auto may use" ───────────────────────────────
+
+        async fn first_turn_of(w: &World, sub: &str) -> String {
+            let mut req = request(Some("local"), Some("proj"), "default");
+            req.user_claims = Some(crate::chat::agent_e2e_tests::permission_scopes::person(sub));
+            let created = w
+                .manager
+                .create_session(&req)
+                .await
+                .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+            let mut rx = w.manager.subscribe(&created.session_id).await.unwrap();
+            next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+            created.session_id
+        }
+
+        async fn auto_models_of(w: &World, sub: &str, models: Vec<RoutingPoolEntry>) {
+            crate::chat::provider::cognitive::auto_models::store(w.graph.as_ref(), sub, &models)
+                .await
+                .unwrap();
+        }
+
+        /// AUTO-L: with a list, Auto never leaves it, the relay included: the decision would
+        /// move to `local2`, which the person did not list, so no provider question is even
+        /// asked and the turn is answered in place.
+        #[tokio::test]
+        async fn auto_never_moves_outside_the_persons_list() {
+            let (w, mover) = auto_world("auto", vec!["local2"], false).await;
+            auto_models_of(&w, "alice", vec![pair("local")]).await;
+            let old = first_turn_of(&w, "alice").await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question").await;
+            assert!(mover.checks().is_empty(), "{:?}", mover.checks());
+        }
+
+        /// AUTO-L: the list moves the conversation to the model it names, through the relay,
+        /// and the decision says it was narrowed; the moved conversation stays its person's.
+        #[tokio::test]
+        async fn auto_moves_within_the_persons_list_and_stays_its_persons() {
+            let (w, mover) = auto_world("auto", vec!["local2"], false).await;
+            auto_models_of(&w, "alice", vec![pair("local2")]).await;
+            let old = first_turn_of(&w, "alice").await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+            let provider = moved_by_auto(&w, &old, "second question").await;
+            assert_eq!(provider, "local2");
+            let checks = mover.checks();
+            assert!(checks[0].pool.iter().all(|f| f.provider_id == "local2"));
+            assert_eq!(checks[0].narrowed, vec!["auto_models"]);
+            // The conversation stays alice's across the move (her list goes on applying).
+            let node = w
+                .graph
+                .get_chat_session(Uuid::parse_str(&old).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(node.owner.as_deref(), Some("alice"));
+        }
+
+        /// AUTO-L: one person's list never steers another's: alice listed one model, bob listed
+        /// nothing, and bob's Auto is asked among every model, not narrowed.
+        #[tokio::test]
+        async fn another_persons_list_never_steers_this_auto() {
+            let (w, mover) = auto_world("auto", vec!["local2"], false).await;
+            auto_models_of(&w, "alice", vec![pair("local2")]).await;
+            let bob = first_turn_of(&w, "bob").await;
+            hand_back_to_po(&w, &bob).await;
+            idle(&w, &bob).await;
+            w.manager
+                .send_message(&bob, "bob's question")
+                .await
+                .unwrap();
+            for _ in 0..100 {
+                if !mover.checks().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let checks = mover.checks();
+            assert_eq!(checks.len(), 1, "one provider question");
+            assert!(checks[0].pool.iter().any(|f| f.provider_id == "local"));
+            assert!(checks[0].narrowed.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_move_the_projects_consent_refuses_stays_and_its_decision_says_why() {
+            // The fake decider ignores the consent the filter would apply: the relay's
+            // opening refuses on its own (endpoint_not_allowed), whoever asked.
+            let (w, _mover) = auto_world("auto", vec!["local3"], true).await;
+            let old = first_turn(&w).await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question").await;
+            let sent = requests_with(&w, "second question");
+            assert_eq!(sent.len(), 1);
+            assert!(
+                !sent[0].contains("conversation_relay"),
+                "sent to the old session"
+            );
+            let decisions = Neo4jRoutingStore::new(w.graph.clone())
+                .decisions(&DecisionFilter::default())
+                .await
+                .unwrap();
+            let refused = decisions
+                .iter()
+                .find(|d| d.chosen.as_ref().is_some_and(|p| p.provider_id == "local3"))
+                .expect("the decision of the refused move is stored");
+            assert!(!refused.applied);
+            assert!(
+                refused.reason.ends_with("not_moved: endpoint_not_allowed"),
+                "{}",
+                refused.reason
+            );
+        }
+
+        /// The legacy engine (the Claude CLI) moves the same way: the check is on the
+        /// manager's send path, before either engine starts the turn.
+        #[tokio::test]
+        async fn a_claude_code_cli_conversation_moves_too() {
+            let cli = FakeClaude::new();
+            let mut w = hybrid_world(&cli).await;
+            // Opened under `primary` (so the opening itself stays on Claude Code), stage auto.
+            routing(&w, "primary", "auto").await;
+            let mover = Mover::new(vec!["local"]);
+            w.manager = std::mem::replace(&mut w.manager, manager(w.graph.clone(), true))
+                .with_turn_decider(mover.clone(), Arc::new(Instances));
+            let cc1 = w
+                .manager
+                .create_session(&request(None, Some("proj"), "default"))
+                .await
+                .unwrap()
+                .session_id;
+            assert!(!w.manager.agent_runtime.owns(&cc1).await, "legacy engine");
+            stored_until(&w, &cc1, |records| {
+                records.iter().any(|r| r.event_type == "result")
+            })
+            .await;
+            idle(&w, &cc1).await;
+            hand_back_to_po(&w, &cc1).await;
+
+            w.manager
+                .send_message(&cc1, "second question")
+                .await
+                .unwrap();
+
+            let ChatEvent::ProviderSwitched {
+                session_id,
+                from_provider,
+                to_provider,
+                ..
+            } = switched_in_place(&w, &cc1).await
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                session_id, cc1,
+                "the move re-targets the SAME thread in place"
+            );
+            assert_eq!(
+                (from_provider.as_str(), to_provider.as_str()),
+                ("claude-code", "local")
+            );
+            stored_until(&w, &cc1, |records| {
+                records
+                    .iter()
+                    .any(|r| r.event_type == "assistant_text" && r.data.contains("the answer"))
+            })
+            .await;
+            assert!(
+                w.manager.is_session_active(&cc1).await,
+                "the SAME session stays live across the move"
+            );
+            assert!(
+                !cli.stdin().contains("second question"),
+                "the CLI never got the turn: {}",
+                cli.stdin()
+            );
+            assert_eq!(mover.checks().len(), 1);
+            w.manager.close_session(&cc1).await.ok();
+        }
+    }
+}
+
+// ============================================================================
+// References (`refs_v1`) on the native engine
+// ============================================================================
+//
+// A native session never goes through `stream_response`: it sends the text to
+// the model itself (`agent_runtime`). These tests prove the references reach
+// the model there too, as pointers, against the real wire of the fake server.
+
+mod refs_native {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::refs::compose::compose_user_message;
+    use crate::refs::test_support::{world, World};
+
+    fn script_for(keys: &[&str]) -> Value {
+        let mut routes = script().as_array().cloned().unwrap();
+        for key in keys {
+            routes.push(sse_route(
+                key,
+                vec![
+                    delta(json!({"content": format!("answer to {key}")})),
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                    json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+                    json!("[DONE]"),
+                ],
+            ));
+        }
+        Value::Array(routes)
+    }
+
+    async fn setup(keys: &[&str]) -> (FakeOpenAi, World, ChatManager) {
+        let fake = FakeOpenAi::start(script_for(keys));
+        let w = world().await;
+        store_instance(&w.graph, &instance(&fake, "none")).await;
+        consent(&w.graph, "alpha", "local", &fake.origin()).await;
+        let manager = manager(w.graph.clone(), true);
+        (fake, w, manager)
+    }
+
+    async fn stored(w: &World, text: &str, refs: &[Value]) -> String {
+        let graph: Arc<dyn GraphStore> = w.graph.clone();
+        compose_user_message(&graph, text, refs, &[], true)
+            .await
+            .unwrap()
+    }
+
+    fn task_ref(w: &World) -> Value {
+        json!({"kind": "task", "id": w.task_a.id})
+    }
+
+    /// The body the model received for the turn named by `key`.
+    fn body_for(fake: &FakeOpenAi, key: &str) -> String {
+        fake.chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .find(|b| b.contains(key))
+            .unwrap_or_else(|| panic!("no request to the model mentions {key}"))
+    }
+
+    async fn persisted_types(w: &World, sid: &str) -> Vec<(i64, String)> {
+        w.graph
+            .get_chat_events(Uuid::parse_str(sid).unwrap(), 0, 200)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.seq, r.event_type))
+            .collect()
+    }
+
+    async fn wait_for_persisted(w: &World, sid: &str, event_type: &str, count: usize) {
+        for _ in 0..200 {
+            let n = persisted_types(w, sid)
+                .await
+                .iter()
+                .filter(|e| e.1 == event_type)
+                .count();
+            if n >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{count} {event_type} event(s) never persisted");
+    }
+
+    #[tokio::test]
+    async fn a_native_session_opened_with_references_gives_the_model_the_pointers() {
+        let (fake, w, manager) = setup(&["PINNED-ONE"]).await;
+        let mut req = request(Some("local"), Some("alpha"), "default");
+        req.message = stored(&w, "PINNED-ONE #task:x", &[task_ref(&w)]).await;
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id;
+        wait_for_persisted(&w, &sid, "result", 1).await;
+
+        let body = body_for(&fake, "PINNED-ONE");
+        assert!(body.contains("po-context"), "{body}");
+        assert!(body.contains("Tâche alpha refs"), "{body}");
+        assert!(
+            !body.contains("po-refs"),
+            "the model must never see the raw block: {body}"
+        );
+        assert!(
+            !body.contains("Faire les refs"),
+            "pointer depth: no content"
+        );
+
+        // Stored and replayed: the message as written, then what it resolved to.
+        let events = persisted_types(&w, &sid).await;
+        let user = events.iter().find(|e| e.1 == "user_message").unwrap().0;
+        let resolved = events.iter().find(|e| e.1 == "refs_resolved").unwrap().0;
+        assert!(user < resolved);
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_native_session_that_is_sent_a_message_with_references_gives_the_model_the_pointers()
+    {
+        let (fake, w, manager) = setup(&["hi there", "PINNED-TWO"]).await;
+        let created = manager
+            .create_session(&request(Some("local"), Some("alpha"), "default"))
+            .await
+            .unwrap();
+        let sid = created.session_id;
+        wait_for_persisted(&w, &sid, "result", 1).await;
+
+        manager
+            .send_message(&sid, &stored(&w, "PINNED-TWO", &[task_ref(&w)]).await)
+            .await
+            .unwrap();
+        wait_for_persisted(&w, &sid, "result", 2).await;
+        let body = body_for(&fake, "PINNED-TWO");
+        assert!(
+            body.contains("po-context") && body.contains("Tâche alpha refs"),
+            "{body}"
+        );
+        assert!(!body.contains("po-refs"), "{body}");
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_native_message_without_references_is_sent_untouched() {
+        let (fake, w, manager) = setup(&["hi there"]).await;
+        let created = manager
+            .create_session(&request(Some("local"), Some("alpha"), "default"))
+            .await
+            .unwrap();
+        let sid = created.session_id;
+        wait_for_persisted(&w, &sid, "result", 1).await;
+        let body = body_for(&fake, "hi there");
+        // The system prompt may NAME the block (citation section); no block was injected.
+        assert!(!body.contains("<po-context nonce="), "{body}");
+        assert!(persisted_types(&w, &sid)
+            .await
+            .iter()
+            .all(|e| e.1 != "refs_resolved"));
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_resumed_native_session_expands_the_references_of_the_message_that_resumes_it() {
+        let (fake, w, manager) = setup(&["hi there", "PINNED-THREE"]).await;
+        let created = manager
+            .create_session(&request(Some("local"), Some("alpha"), "default"))
+            .await
+            .unwrap();
+        let sid = created.session_id;
+        wait_for_persisted(&w, &sid, "result", 1).await;
+        manager.close_session(&sid).await.unwrap();
+
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        manager
+            .resume_session(
+                &sid,
+                &stored(&w, "PINNED-THREE", &[task_ref(&w)]).await,
+                Some(&claims),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        wait_for_persisted(&w, &sid, "result", 2).await;
+        let body = body_for(&fake, "PINNED-THREE");
+        assert!(
+            body.contains("po-context") && body.contains("Tâche alpha refs"),
+            "{body}"
+        );
+        assert!(!body.contains("po-refs"), "{body}");
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+// ============================================================================
+// Engine parity: what the Claude Code engine does around a turn, the agent
+// engine does too, on a scripted provider (no process, no network).
+// ============================================================================
+
+mod parity {
+    #[allow(unused_imports)]
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+    use nexus_claude::agent::{
+        AgentEvent, AgentProvider, AgentSession, Capabilities, CompactionInfo, CompactionPhase,
+        CompactionTrigger, HookSupport, HookVerdict, ModelInfo, ProviderError, ProviderHealth,
+        ProviderKind, ResumeToken, SessionHooks, SessionSpec, ToolCallInfo, ToolResultInfo,
+        TurnContext, TurnDirective,
+    };
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::{RecordedCall, Script, ScriptedProvider, Step};
+
+    use super::*;
+
+    /// What the graph hooks answered while the scripted provider played its turns.
+    #[derive(Default)]
+    pub(super) struct Answers {
+        pub after_tool: StdMutex<Vec<Option<String>>>,
+        pub before_compaction: StdMutex<Vec<Option<String>>>,
+    }
+
+    /// The hooks the engine gave the session, with their answers recorded (the
+    /// scripted provider observes a hook's answer, it does not apply it).
+    struct Recording {
+        inner: Arc<dyn SessionHooks>,
+        answers: Arc<Answers>,
+    }
+
+    #[async_trait]
+    impl SessionHooks for Recording {
+        async fn before_tool(&self, call: &ToolCallInfo) -> HookVerdict {
+            self.inner.before_tool(call).await
+        }
+        async fn after_tool(&self, result: &ToolResultInfo) -> Option<String> {
+            let said = self.inner.after_tool(result).await;
+            self.answers.after_tool.lock().unwrap().push(said.clone());
+            said
+        }
+        async fn before_compaction(&self, info: &CompactionInfo) -> Option<String> {
+            let said = self.inner.before_compaction(info).await;
+            self.answers
+                .before_compaction
+                .lock()
+                .unwrap()
+                .push(said.clone());
+            said
+        }
+        async fn before_turn(&self, ctx: &TurnContext) -> TurnDirective {
+            self.inner.before_turn(ctx).await
+        }
+    }
+
+    /// The scripted provider under the id of Claude Code and the kind asked.
+    #[derive(Clone)]
+    pub(super) struct Tapped {
+        pub inner: Arc<ScriptedProvider>,
+        pub kind: ProviderKind,
+        pub answers: Arc<Answers>,
+    }
+
+    impl Tapped {
+        fn tap(&self, mut spec: SessionSpec) -> SessionSpec {
+            if let Some(inner) = spec.hooks.take() {
+                spec.hooks = Some(Arc::new(Recording {
+                    inner,
+                    answers: Arc::clone(&self.answers),
+                }));
+            }
+            spec
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for Tapped {
+        fn id(&self) -> &str {
+            "claude-code"
+        }
+        fn kind(&self) -> ProviderKind {
+            self.kind
+        }
+        async fn health(&self) -> ProviderHealth {
+            self.inner.health().await
+        }
+        async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            self.inner.catalog().await
+        }
+        fn capabilities(&self, model: Option<&str>) -> Capabilities {
+            self.inner.capabilities(model)
+        }
+        async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.inner.open(self.tap(spec)).await
+        }
+        async fn resume(
+            &self,
+            spec: SessionSpec,
+            token: ResumeToken,
+        ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.inner.resume(self.tap(spec), token).await
+        }
+    }
+
+    impl super::super::agent_runtime::ProviderSource for Tapped {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+            (provider_id == "claude-code").then(|| Arc::new(self.clone()) as Arc<dyn AgentProvider>)
+        }
+    }
+
+    pub(super) fn caps() -> Capabilities {
+        let mut caps = Capabilities::none();
+        caps.hooks = HookSupport::InProtocol;
+        caps.per_session_mcp = true;
+        caps.tools = true;
+        caps.tool_cancel = true;
+        caps
+    }
+
+    pub(super) struct Rig {
+        pub manager: ChatManager,
+        pub graph: Arc<MockGraphStore>,
+        pub provider: Tapped,
+        pub sid: String,
+        pub rx: broadcast::Receiver<ChatEvent>,
+        pub project: crate::neo4j::models::ProjectNode,
+        _dir: tempfile::TempDir,
+    }
+
+    /// A session of `kind` opened on a project, no opening message: the turns
+    /// below are played in order by the scripted provider.
+    pub(super) async fn rig(kind: ProviderKind, turns: Vec<Vec<Step>>) -> Rig {
+        rig_with(kind, turns, None).await
+    }
+
+    /// [`rig`], the manager connected to NATS when `nats` is given.
+    pub(super) async fn rig_with(
+        kind: ProviderKind,
+        turns: Vec<Vec<Step>>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+    ) -> Rig {
+        rig_full(kind, turns, nats, None, false).await
+    }
+
+    /// [`rig_with`], the manager in the given anchor mode (`None`: the default) and
+    /// the session opened without project nor cwd (a neutral session) when `neutral`.
+    pub(super) async fn rig_full(
+        kind: ProviderKind,
+        turns: Vec<Vec<Step>>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+        anchor_mode: Option<crate::chat::anchor_resolver::AnchorContextMode>,
+        neutral: bool,
+    ) -> Rig {
+        rig_tweaked(kind, turns, nats, anchor_mode, neutral, |m| m).await
+    }
+
+    /// [`rig_full`], the manager passed through `tweak` before the session opens.
+    pub(super) async fn rig_tweaked(
+        kind: ProviderKind,
+        turns: Vec<Vec<Step>>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+        anchor_mode: Option<crate::chat::anchor_resolver::AnchorContextMode>,
+        neutral: bool,
+        tweak: impl FnOnce(ChatManager) -> ChatManager,
+    ) -> Rig {
+        rig_caps(kind, caps(), turns, nats, anchor_mode, neutral, tweak).await
+    }
+
+    /// [`rig_tweaked`], the provider declaring `capabilities`.
+    pub(super) async fn rig_caps(
+        kind: ProviderKind,
+        capabilities: Capabilities,
+        turns: Vec<Vec<Step>>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+        anchor_mode: Option<crate::chat::anchor_resolver::AnchorContextMode>,
+        neutral: bool,
+        tweak: impl FnOnce(ChatManager) -> ChatManager,
+    ) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let mut project = crate::test_helpers::test_project();
+        project.root_path = dir.path().display().to_string();
+        graph.create_project(&project).await.unwrap();
+        crate::skills::project_resolver::seed_resolve_cache_for_tests(std::slice::from_ref(
+            &project,
+        ));
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let mut builder = Script::builder().capabilities(capabilities);
+        for turn in turns {
+            builder = builder.turn(turn);
+        }
+        let provider = Tapped {
+            inner: Arc::new(ScriptedProvider::new("claude-code", builder.build())),
+            kind,
+            answers: Arc::default(),
+        };
+        let mut manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(provider.clone()));
+        if let Some(nats) = nats {
+            manager = manager.with_nats(nats);
+        }
+        if let Some(mode) = anchor_mode {
+            manager = manager.with_anchor_context_mode(mode);
+        }
+        let manager = tweak(manager);
+        let mut req = request(None, Some(&project.slug), "default");
+        req.message = String::new();
+        req.cwd = project.root_path.clone();
+        if neutral {
+            req.project_slug = None;
+            req.cwd = String::new();
+        }
+        let created = manager.create_session(&req).await.unwrap();
+        let rx = manager.subscribe(&created.session_id).await.unwrap();
+        Rig {
+            manager,
+            graph,
+            provider,
+            sid: created.session_id,
+            rx,
+            project,
+            _dir: dir,
+        }
+    }
+
+    impl Rig {
+        /// Waits for the end of the running turn (`streaming_status: false`).
+        pub(super) async fn turn_end(&mut self) {
+            next_event(&mut self.rx, |e| {
+                matches!(
+                    e,
+                    ChatEvent::StreamingStatus {
+                        is_streaming: false
+                    }
+                )
+            })
+            .await;
+        }
+
+        /// The texts of the turns the provider was sent, in order.
+        pub(super) fn sent(&self) -> Vec<String> {
+            self.provider
+                .inner
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    RecordedCall::SendTurn(input) => Some(
+                        input
+                            .blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                nexus_claude::agent::InputBlock::Text { text } => {
+                                    Some(text.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn compaction_started() -> Step {
+        Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Started,
+            trigger: Some(CompactionTrigger::Auto),
+            pre_tokens: None,
+        })
+    }
+
+    /// H2: a session of the agent engine receives the graph's context after a
+    /// tool and before a compaction — through the very hooks the Claude Code
+    /// engine registers (one table, `graph_hook_table`), whatever the kind.
+    #[tokio::test]
+    async fn the_graph_hooks_answer_after_a_tool_and_before_a_compaction() {
+        for kind in [ProviderKind::Native, ProviderKind::ClaudeCode] {
+            let noisy: String = (0..30)
+                .map(|i| format!("src/chat/manager.rs:{i}: build_agent_spec(input)\n"))
+                .collect();
+            let mut r = rig(
+                kind,
+                vec![vec![
+                    steps::tool_call(
+                        "t1",
+                        "Grep",
+                        json!({ "pattern": "build_agent_spec", "path": "." }),
+                    ),
+                    steps::tool_result("t1", noisy),
+                    compaction_started(),
+                    steps::done(&caps()),
+                ]],
+            )
+            .await;
+            r.manager
+                .send_message(&r.sid, "where is it built?")
+                .await
+                .unwrap();
+            r.turn_end().await;
+            assert_eq!(r.sent().len(), 1, "one turn played");
+
+            let after = r.provider.answers.after_tool.lock().unwrap().clone();
+            let advice = after
+                .first()
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| panic!("{kind:?}: no context after the tool: {after:?}"));
+            assert!(
+                advice.contains("find_references") && advice.contains("build_agent_spec"),
+                "{kind:?}: the redirect advice of the graph: {advice}"
+            );
+            let compaction = r.provider.answers.before_compaction.lock().unwrap().clone();
+            let guidance = compaction
+                .first()
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| panic!("{kind:?}: no compaction guidance: {compaction:?}"));
+            assert!(
+                guidance.contains(&r.project.name),
+                "{kind:?}: the compaction is told what the session works on: {guidance}"
+            );
+        }
+    }
+
+    /// B14: a provider that runs no hook gets the graph through the host's door — the
+    /// skill context with each turn (the per-tool injection it cannot take), the
+    /// redirect advice after a noisy tool as a system hint, carried in front of the
+    /// next turn.
+    #[tokio::test]
+    async fn a_provider_without_hooks_gets_the_skill_per_turn_and_the_redirect_as_a_system_hint() {
+        let mut hookless = caps();
+        hookless.hooks = HookSupport::None;
+        let noisy: String = (0..30)
+            .map(|i| format!("src/chat/manager.rs:{i}: build_agent_spec(input)\n"))
+            .collect();
+        let mut r = rig_caps(
+            ProviderKind::Codex,
+            hookless,
+            vec![
+                vec![
+                    steps::tool_call(
+                        "t1",
+                        "Grep",
+                        json!({ "pattern": "build_agent_spec", "path": "." }),
+                    ),
+                    steps::tool_result("t1", noisy),
+                    steps::done(&caps()),
+                ],
+                vec![steps::done(&caps())],
+            ],
+            None,
+            None,
+            false,
+            |m| m,
+        )
+        .await;
+        let mut skill =
+            crate::skills::models::SkillNode::new(Some(r.project.id), "Widget Porting B14");
+        skill.status = crate::skills::models::SkillStatus::Active;
+        skill.energy = 0.9;
+        skill.trigger_patterns = vec![crate::skills::models::SkillTrigger {
+            pattern_type: crate::skills::models::TriggerType::Regex,
+            pattern_value: "port the widget".into(),
+            confidence_threshold: 0.7,
+            quality_score: Some(0.9),
+        }];
+        r.graph.skills.write().await.insert(skill.id, skill);
+
+        r.manager
+            .send_message(&r.sid, "please port the widget")
+            .await
+            .unwrap();
+        let hint = match next_event(&mut r.rx, |e| matches!(e, ChatEvent::SystemHint { .. })).await
+        {
+            ChatEvent::SystemHint { content } => content,
+            _ => unreachable!(),
+        };
+        r.turn_end().await;
+        assert!(
+            hint.contains("find_references") && hint.contains("build_agent_spec"),
+            "the redirect advice, as a system hint: {hint}"
+        );
+        assert!(
+            r.provider.answers.after_tool.lock().unwrap().is_empty(),
+            "no hook was handed to a provider that runs none"
+        );
+        let sent = r.sent();
+        assert!(
+            sent[0].contains("Widget Porting B14"),
+            "the skill context arrives with the turn: {}",
+            sent[0]
+        );
+
+        r.manager.send_message(&r.sid, "and now?").await.unwrap();
+        r.turn_end().await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "the advice plays no turn of its own");
+        assert!(
+            sent[1].contains("find_references") && sent[1].ends_with("and now?"),
+            "the advice is carried in front of the next turn: {}",
+            sent[1]
+        );
+    }
+
+    /// B14 (review of #814): on a provider without hooks, the redirect advice is given
+    /// once (the ledger), and again after a compaction — the compaction signal resets
+    /// the ledger the advice is deduplicated by.
+    #[tokio::test]
+    async fn without_hooks_the_redirect_advice_is_given_again_after_a_compaction() {
+        let mut hookless = caps();
+        hookless.hooks = HookSupport::None;
+        let noisy: String = (0..30)
+            .map(|i| format!("src/chat/manager.rs:{i}: build_agent_spec(input)\n"))
+            .collect();
+        let grep = |id: &str| {
+            vec![
+                steps::tool_call(
+                    id,
+                    "Grep",
+                    json!({ "pattern": "build_agent_spec", "path": "." }),
+                ),
+                steps::tool_result(id, noisy.clone()),
+            ]
+        };
+        let mut third = vec![compaction_started()];
+        third.extend(grep("t3"));
+        third.push(steps::done(&caps()));
+        let mut first = grep("t1");
+        first.push(steps::done(&caps()));
+        let mut second = grep("t2");
+        second.push(steps::done(&caps()));
+        let mut r = rig_caps(
+            ProviderKind::Codex,
+            hookless,
+            vec![first, second, third],
+            None,
+            None,
+            false,
+            |m| m,
+        )
+        .await;
+        let mut hints = Vec::new();
+        for text in ["one", "two", "three"] {
+            r.manager.send_message(&r.sid, text).await.unwrap();
+            let mut n = 0;
+            loop {
+                match next_event(&mut r.rx, |e| {
+                    matches!(
+                        e,
+                        ChatEvent::SystemHint { .. }
+                            | ChatEvent::StreamingStatus {
+                                is_streaming: false
+                            }
+                    )
+                })
+                .await
+                {
+                    ChatEvent::SystemHint { content } if content.contains("find_references") => {
+                        n += 1
+                    }
+                    ChatEvent::SystemHint { .. } => {}
+                    _ => break,
+                }
+            }
+            hints.push(n);
+        }
+        assert_eq!(
+            hints,
+            vec![1, 0, 1],
+            "once, not repeated, given again after the compaction"
+        );
+    }
+
+    /// H3 enrichment: a turn of the agent engine receives, in front of the message,
+    /// the knowledge graph context the Claude Code engine puts in front of the same
+    /// message (`enrichment_for_turn`, called by `stream_response`).
+    #[tokio::test]
+    async fn a_turn_of_the_agent_engine_gets_the_graph_context_of_a_claude_code_turn() {
+        let mut r = rig(ProviderKind::Native, vec![]).await;
+        let mut plan = crate::test_helpers::test_plan();
+        plan.title = "Port the enrichment".into();
+        plan.status = crate::neo4j::models::PlanStatus::InProgress;
+        plan.project_id = Some(r.project.id);
+        r.graph.create_plan(&plan).await.unwrap();
+        r.graph
+            .link_plan_to_project(plan.id, r.project.id)
+            .await
+            .unwrap();
+        let message = "what is left on the port?";
+        let graph: Arc<dyn GraphStore> = r.graph.clone();
+        let expected = super::super::manager::enrichment_for_turn(
+            &graph,
+            &r.manager.enrichment_pipeline,
+            &r.sid,
+            message,
+            Default::default(),
+            Default::default(),
+            &r.manager.anchor_session(),
+            None,
+        )
+        .await
+        .expect("the graph has context for this message");
+        assert!(expected.contains("Port the enrichment"), "{expected}");
+
+        r.manager.send_message(&r.sid, message).await.unwrap();
+        r.turn_end().await;
+        assert_eq!(
+            r.sent()
+                .iter()
+                .map(|s| crate::chat::untrusted::mask_nonces(s))
+                .collect::<Vec<_>>(),
+            vec![crate::chat::untrusted::mask_nonces(
+                &super::super::manager::prepend_enrichment(&expected, message)
+            )]
+        );
+    }
+
+    impl Rig {
+        /// Waits until the provider was sent `n` turns.
+        async fn turns_sent(&self, n: usize) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while self.sent().len() < n {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{n} turns within 20 s: {:?}",
+                    self.sent()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        pub(super) fn interrupts(&self) -> usize {
+            self.provider
+                .inner
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, RecordedCall::Interrupt(_)))
+                .count()
+        }
+    }
+
+    /// H3 message queue: a message sent while a turn runs is queued, and the turn
+    /// interrupted so it is read sooner — as on the Claude Code engine. It used to
+    /// be refused (`turn_in_progress`).
+    #[tokio::test]
+    async fn a_message_sent_during_a_turn_is_queued_and_read_next_not_refused() {
+        let mut r = rig(ProviderKind::Native, vec![vec![Step::AwaitInterrupt]]).await;
+        r.manager.send_message(&r.sid, "first").await.unwrap();
+        r.turns_sent(1).await;
+        r.manager
+            .send_message(&r.sid, "second")
+            .await
+            .expect("queued, not refused");
+        r.turn_end().await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[1].ends_with("second"), "{sent:?}");
+        assert_eq!(r.interrupts(), 1, "the running turn is cut short");
+    }
+
+    /// H3 message queue: a HELD message (`queue_user_message`) waits for the turn
+    /// to end, is listed meanwhile, and interrupts nothing.
+    #[tokio::test]
+    async fn a_held_message_is_listed_waits_for_the_turn_and_interrupts_nothing() {
+        let mut r = rig(
+            ProviderKind::Native,
+            vec![vec![
+                Step::Sleep { ms: 300 },
+                steps::text("done"),
+                steps::done(&caps()),
+            ]],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "first").await.unwrap();
+        r.turns_sent(1).await;
+        assert!(r
+            .manager
+            .queue_user_message(&r.sid, "after you")
+            .await
+            .unwrap());
+        let listed = next_event(&mut r.rx, |e| matches!(e, ChatEvent::PendingQueue { .. })).await;
+        assert!(
+            matches!(&listed, ChatEvent::PendingQueue { messages } if messages.len() == 1 && messages[0].content == "after you"),
+            "{listed:?}"
+        );
+        assert_eq!(r.sent().len(), 1, "it waits for the turn");
+        r.turn_end().await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[1].ends_with("after you"), "{sent:?}");
+        assert_eq!(r.interrupts(), 0);
+        assert_eq!(r.manager.pending_queue_snapshot(&r.sid).await, Some(vec![]));
+    }
+
+    /// H3 message queue: "send now" on a held message interrupts the turn and
+    /// sends it next.
+    #[tokio::test]
+    async fn send_now_cuts_the_turn_short_for_the_held_message() {
+        let mut r = rig(ProviderKind::Native, vec![vec![Step::AwaitInterrupt]]).await;
+        r.manager.send_message(&r.sid, "first").await.unwrap();
+        r.turns_sent(1).await;
+        assert!(r.manager.queue_user_message(&r.sid, "later").await.unwrap());
+        let held = r.manager.pending_queue_snapshot(&r.sid).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert!(r
+            .manager
+            .pending_queue_op(
+                &r.sid,
+                &crate::chat::pending_queue::QueueOp::SendNow { id: held[0].id }
+            )
+            .await
+            .unwrap());
+        r.turn_end().await;
+        let sent = r.sent();
+        assert!(sent.len() == 2 && sent[1].ends_with("later"), "{sent:?}");
+        assert_eq!(r.interrupts(), 1);
+    }
+
+    /// The user's sequence on a held message (QSN): queued while the agent answers,
+    /// moved to the front ("next"), then "send now". Each queue operation answers
+    /// at once (the WS loop awaits it inline), the running turn is cut short, the
+    /// message is SHOWN (`user_message`) and sent as the next turn, and the queue is
+    /// left empty. Returns every event seen from the queue operations to the end of
+    /// the run.
+    async fn queue_prioritize_send_now(r: &mut Rig, text: &str) -> Vec<ChatEvent> {
+        use crate::chat::pending_queue::QueueOp;
+        assert!(r.manager.queue_user_message(&r.sid, text).await.unwrap());
+        let held = r.manager.pending_queue_snapshot(&r.sid).await.unwrap();
+        assert_eq!(held.len(), 1, "{held:?}");
+        let id = held[0].id;
+        for op in [QueueOp::Prioritize { id }, QueueOp::SendNow { id }] {
+            let reached = tokio::time::timeout(
+                Duration::from_secs(2),
+                r.manager.pending_queue_op(&r.sid, &op),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{op:?} blocks the WS loop"))
+            .unwrap();
+            assert!(reached, "{op:?}");
+        }
+        let mut seen = Vec::new();
+        loop {
+            let e = next_event(&mut r.rx, |_| true).await;
+            let end = matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            );
+            seen.push(e);
+            if end {
+                return seen;
+            }
+        }
+    }
+
+    fn assert_delivered(r: &Rig, seen: &[ChatEvent], text: &str) {
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, ChatEvent::UserMessage { content } if content == text)),
+            "the message sent now is shown: {seen:?}"
+        );
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[1].ends_with(text), "sent as the next turn: {sent:?}");
+        assert!(r.interrupts() >= 1, "the running turn is cut short");
+    }
+
+    /// QSN, mid-text: the agent is writing when the message is sent now.
+    #[tokio::test]
+    async fn queue_prioritize_send_now_mid_text_shows_and_sends_the_message() {
+        for kind in [ProviderKind::Native, ProviderKind::ClaudeCode] {
+            let mut r = rig(
+                kind,
+                vec![
+                    vec![steps::text("partial answer"), Step::AwaitInterrupt],
+                    vec![steps::text("read it"), steps::done(&caps())],
+                ],
+            )
+            .await;
+            r.manager.send_message(&r.sid, "first").await.unwrap();
+            next_event(&mut r.rx, |e| {
+                matches!(
+                    e,
+                    ChatEvent::StreamDelta { .. } | ChatEvent::AssistantText { .. }
+                )
+            })
+            .await;
+            let seen = queue_prioritize_send_now(&mut r, "now please").await;
+            assert_delivered(&r, &seen, "now please");
+            assert_eq!(
+                r.manager.pending_queue_snapshot(&r.sid).await,
+                Some(vec![]),
+                "{kind:?}"
+            );
+            assert!(!r.manager.is_session_streaming(&r.sid).await, "{kind:?}");
+        }
+    }
+
+    /// QSN, mid tool call: the agent waits on a long tool when the message is sent
+    /// now — the tool is cut with the turn.
+    #[tokio::test]
+    async fn queue_prioritize_send_now_during_a_long_tool_shows_and_sends_the_message() {
+        for kind in [ProviderKind::Native, ProviderKind::ClaudeCode] {
+            let mut r = rig(
+                kind,
+                vec![
+                    vec![
+                        steps::tool_call("long1", "slow", json!({})),
+                        Step::Sleep { ms: 60_000 },
+                        steps::text("never"),
+                        steps::done(&caps()),
+                    ],
+                    vec![steps::text("read it"), steps::done(&caps())],
+                ],
+            )
+            .await;
+            r.manager.send_message(&r.sid, "first").await.unwrap();
+            next_event(
+                &mut r.rx,
+                |e| matches!(e, ChatEvent::ToolUse { id, .. } if id == "long1"),
+            )
+            .await;
+            let seen = queue_prioritize_send_now(&mut r, "stop the tool").await;
+            assert_delivered(&r, &seen, "stop the tool");
+            assert!(
+                !seen.iter().any(
+                    |e| matches!(e, ChatEvent::AssistantText { content, .. } if content == "never")
+                ),
+                "{kind:?}: the tool's turn did not go on: {seen:?}"
+            );
+            assert!(!r.manager.is_session_streaming(&r.sid).await, "{kind:?}");
+        }
+    }
+
+    /// QSN, the turn is ending: the provider's turn is over (its interrupt finds
+    /// no turn and does nothing) while the session still streams — here, the
+    /// pause before an auto-continue. The message must still be shown and sent
+    /// next, promptly, instead of the "continue" hint; not stranded in the queue.
+    #[tokio::test]
+    async fn queue_prioritize_send_now_after_the_provider_turn_ended_still_delivers() {
+        for kind in [ProviderKind::Native, ProviderKind::ClaudeCode] {
+            let mut r = rig(
+                kind,
+                vec![
+                    stopped_on_its_turn_limit(),
+                    vec![steps::text("read it"), steps::done(&caps())],
+                ],
+            )
+            .await;
+            r.manager.send_message(&r.sid, "go").await.unwrap();
+            next_event(&mut r.rx, |e| matches!(e, ChatEvent::AutoContinue { .. })).await;
+            let started = tokio::time::Instant::now();
+            let seen = queue_prioritize_send_now(&mut r, "late send now").await;
+            assert_delivered(&r, &seen, "late send now");
+            assert!(
+                !seen.iter().any(|e| matches!(e, ChatEvent::SystemHint { content } if content.starts_with("Continue where you left off"))),
+                "{kind:?}: the auto-continue gave way to the message: {seen:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{kind:?}: delivered promptly ({:?})",
+                started.elapsed()
+            );
+            assert!(!r.manager.is_session_streaming(&r.sid).await, "{kind:?}");
+        }
+    }
+
+    fn stopped_on_its_turn_limit() -> Vec<Step> {
+        vec![
+            steps::text("partial"),
+            Step::Emit(nexus_claude::testkit::done_event(
+                &caps(),
+                nexus_claude::agent::StopReason::MaxTurns,
+                None,
+            )),
+        ]
+    }
+
+    /// Every event of the run, up to the end of streaming.
+    async fn run_events(r: &mut Rig) -> Vec<ChatEvent> {
+        let mut seen = Vec::new();
+        loop {
+            let e = next_event(&mut r.rx, |_| true).await;
+            let end = matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            );
+            seen.push(e);
+            if end {
+                return seen;
+            }
+        }
+    }
+
+    /// Waits until `n` turns were sent and the session no longer streams, then a little
+    /// longer: a further continuation would have been sent by then.
+    async fn settled_after(r: &Rig, n: usize) -> Vec<String> {
+        for _ in 0..400 {
+            if r.sent().len() >= n && !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(
+            crate::chat::post_stream::AUTO_CONTINUE_DELAY_MS + 300,
+        ))
+        .await;
+        r.sent()
+    }
+
+    /// Auto-continue is always on (decision 7b95342a): a NEW session, with no toggle
+    /// message at all, announces (`auto_continue`) and continues a turn that stopped on
+    /// its turn limit with the "continue" hint of the Claude Code engine.
+    #[tokio::test]
+    async fn a_new_session_continues_a_turn_stopped_on_its_limit() {
+        let mut r = rig(ProviderKind::Native, vec![stopped_on_its_turn_limit()]).await;
+        assert!(r.manager.get_auto_continue_state(&r.sid).await.unwrap());
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        let events = run_events(&mut r).await;
+        assert!(
+            events.iter().any(
+                |e| matches!(e, ChatEvent::AutoContinue { session_id, .. } if *session_id == r.sid)
+            ),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, ChatEvent::SystemHint { content } if content.starts_with("Continue where you left off"))),
+            "{events:?}"
+        );
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[1].contains("Continue where you left off"), "{sent:?}");
+    }
+
+    /// The cap still stops it: `MAX_AUTO_CONTINUES` continuations in a row, then the turn
+    /// stays stopped (auto-continue stays on). The next message starts a new chain.
+    #[tokio::test]
+    async fn the_cap_stops_a_chain_of_continuations_and_the_next_message_starts_a_new_one() {
+        let max = crate::chat::post_stream::MAX_AUTO_CONTINUES as usize;
+        // The message and its `max` continuations all stop on their limit; then the next
+        // message stops on it too and its continuation answers.
+        let mut turns: Vec<Vec<Step>> =
+            (0..=max + 1).map(|_| stopped_on_its_turn_limit()).collect();
+        turns.push(vec![steps::done(&caps())]);
+        let r = rig(ProviderKind::Native, turns).await;
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        let sent = settled_after(&r, max + 1).await;
+        assert_eq!(
+            sent.len(),
+            max + 1,
+            "the message, then {max} continuations: {sent:#?}"
+        );
+        assert!(
+            sent[1..]
+                .iter()
+                .all(|s| s.contains("Continue where you left off")),
+            "{sent:#?}"
+        );
+        assert!(r.manager.get_auto_continue_state(&r.sid).await.unwrap());
+
+        r.manager.send_message(&r.sid, "again").await.unwrap();
+        let sent = settled_after(&r, max + 3).await;
+        assert_eq!(sent.len(), max + 3, "a new chain: {sent:#?}");
+        assert!(sent[max + 1].ends_with("again"), "{sent:#?}");
+        assert!(
+            sent[max + 2].contains("Continue where you left off"),
+            "{sent:#?}"
+        );
+    }
+
+    /// The operator's kill switch (`CHAT_AUTO_CONTINUE=false`): the turn stays stopped.
+    #[tokio::test]
+    async fn a_turn_stopped_on_its_limit_stays_stopped_under_the_kill_switch() {
+        let mut r = rig_tweaked(
+            ProviderKind::Native,
+            vec![stopped_on_its_turn_limit()],
+            None,
+            None,
+            false,
+            |mut m| {
+                m.config.auto_continue = false;
+                m
+            },
+        )
+        .await;
+        assert!(!r.manager.get_auto_continue_state(&r.sid).await.unwrap());
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        let events = run_events(&mut r).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ChatEvent::AutoContinue { .. })),
+            "{events:?}"
+        );
+        assert_eq!(r.sent().len(), 1);
+    }
+
+    /// A Stop of the user during the auto-continue pause cancels the continuation,
+    /// as on Claude Code (the Stop goes through the session handle, not around it).
+    #[tokio::test]
+    async fn a_stop_cancels_a_pending_auto_continue() {
+        let mut r = rig(ProviderKind::Native, vec![stopped_on_its_turn_limit()]).await;
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        next_event(&mut r.rx, |e| matches!(e, ChatEvent::AutoContinue { .. })).await;
+        r.manager.interrupt(&r.sid).await.unwrap();
+        r.turn_end().await;
+        assert_eq!(r.sent().len(), 1, "{:?}", r.sent());
+    }
+
+    /// An older frontend's `set_auto_continue {enabled:false}`, relayed by another
+    /// instance (NATS RPC), is accepted and IGNORED: the session still continues.
+    #[tokio::test]
+    async fn an_older_frontends_set_auto_continue_off_is_ignored() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let mut r = rig_with(
+            ProviderKind::Native,
+            vec![stopped_on_its_turn_limit()],
+            Some(owner),
+        )
+        .await;
+        let other = NatsEmitter::new(broker.client().await, "events");
+        other.client().flush().await.unwrap();
+        // The listener may still be subscribing: ask again until it answers.
+        let mut answered = None;
+        for _ in 0..20 {
+            answered = other
+                .request_send_message(&r.sid, r#"{"enabled":false}"#, "set_auto_continue")
+                .await;
+            if answered.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            answered.as_ref().is_some_and(|a| a.success),
+            "accepted: {answered:?}"
+        );
+        assert!(r.manager.get_auto_continue_state(&r.sid).await.unwrap());
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        let events = run_events(&mut r).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ChatEvent::AutoContinue { .. })),
+            "{events:?}"
+        );
+        assert_eq!(r.sent().len(), 2, "{:?}", r.sent());
+    }
+
+    /// H3 NATS: another instance sees the session's events and reaches the session
+    /// (a message, a held message, a snapshot, an interrupt), as for a Claude
+    /// Code session. A real transport client against an in-process broker.
+    #[tokio::test]
+    async fn another_instance_sees_the_events_and_reaches_the_session_through_nats() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+        use futures::StreamExt;
+
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let mut r = rig_with(
+            ProviderKind::Native,
+            vec![vec![Step::AwaitInterrupt]],
+            Some(owner),
+        )
+        .await;
+        let other = NatsEmitter::new(broker.client().await, "events");
+        let mut seen = other.subscribe_chat_events(&r.sid).await.unwrap();
+        other.client().flush().await.unwrap();
+
+        // A message sent on the other instance runs here (the listener may still be
+        // subscribing: ask again until it answers).
+        let mut answered = None;
+        for _ in 0..5 {
+            answered = other
+                .request_send_message(&r.sid, "from afar", "user_message")
+                .await;
+            if answered.is_some() {
+                break;
+            }
+        }
+        assert!(answered.expect("the owner answers").success);
+        r.turns_sent(1).await;
+        assert!(r.sent()[0].ends_with("from afar"));
+
+        // Its events reach the other instance.
+        let shown = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(msg) = seen.next().await {
+                let event: ChatEvent = serde_json::from_slice(&msg.payload).unwrap();
+                if matches!(&event, ChatEvent::UserMessage { content } if content == "from afar") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(shown, Ok(true), "the user message is published");
+
+        // A client joining there mid-turn gets the snapshot.
+        let snapshot = other
+            .request_streaming_snapshot(&r.sid)
+            .await
+            .expect("a snapshot");
+        assert!(snapshot.is_streaming);
+
+        // A message held from there waits here.
+        let held = other
+            .request_send_message(&r.sid, "after", "queued_user_message")
+            .await
+            .unwrap();
+        assert!(held.success, "{:?}", held.error);
+        assert_eq!(
+            r.manager
+                .pending_queue_snapshot(&r.sid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A Stop from there stops the turn here; the held message then runs.
+        other.publish_interrupt(&r.sid);
+        r.turn_end().await;
+        let sent = r.sent();
+        assert!(sent.len() == 2 && sent[1].ends_with("after"), "{sent:?}");
+        assert_eq!(r.interrupts(), 1);
+    }
+
+    // ----- references (`refs_v1`) × the H3 queue of the agent engine -----
+
+    /// A decider that is never right: the router of the test only records the text.
+    struct NoDecider;
+
+    #[async_trait]
+    impl crate::chat::provider::cognitive::decision::Decider for NoDecider {
+        async fn decide(
+            &self,
+            _request: &crate::chat::provider::cognitive::decision::DecideRequest,
+        ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision> {
+            anyhow::bail!("not asked in this test")
+        }
+    }
+
+    struct NoPool;
+
+    #[async_trait]
+    impl crate::chat::agent_hooks::PoolSource for NoPool {
+        async fn pool(
+            &self,
+            _provider_id: &str,
+        ) -> Vec<crate::chat::provider::cognitive::candidates::ModelFacts> {
+            Vec::new()
+        }
+    }
+
+    /// refs × H3 message queue: a message HELD with `#` references while a turn
+    /// runs is listed with its references (not the raw block); when the queue plays
+    /// it, the model gets the typed text and the `<po-context>` pointers — never the
+    /// `<po-refs>` block — behind ONE enrichment computed on the typed text; the
+    /// `refs_resolved` event is stored; the turn router reads the typed text.
+    #[tokio::test]
+    async fn a_held_message_with_references_keeps_them_and_reaches_the_model_expanded() {
+        use crate::refs::types::{EntityRef, RefKind};
+
+        let mut r = rig(
+            ProviderKind::Native,
+            vec![vec![
+                Step::Sleep { ms: 300 },
+                steps::text("done"),
+                steps::done(&caps()),
+            ]],
+        )
+        .await;
+        let mut plan = crate::test_helpers::test_plan();
+        plan.title = "Wire the references".into();
+        plan.status = crate::neo4j::models::PlanStatus::InProgress;
+        plan.project_id = Some(r.project.id);
+        r.graph.create_plan(&plan).await.unwrap();
+        r.graph
+            .link_plan_to_project(plan.id, r.project.id)
+            .await
+            .unwrap();
+        let router = Arc::new(crate::chat::agent_hooks::TurnRouter::new(
+            crate::chat::agent_hooks::TurnRouterSpec {
+                decider: Arc::new(NoDecider),
+                pool: Arc::new(NoPool),
+                routing: Default::default(),
+                provider_id: "claude-code".into(),
+                session_id: Uuid::parse_str(&r.sid).ok(),
+                project_slug: None,
+                trust: false,
+                explicit_model: false,
+                provider_imposed: false,
+                allowed_models: None,
+                current_model: "m".into(),
+                next_turn: 0,
+                routing_pool: None,
+                auto_models: None,
+                conversation_routes: false,
+                moved_in: false,
+                segment_store: None,
+                segments: None,
+            },
+        ));
+        r.manager.turn_routing.insert(&r.sid, Arc::clone(&router));
+
+        r.manager.send_message(&r.sid, "first").await.unwrap();
+        r.turns_sent(1).await;
+        let typed = "after you, see #plan:wire";
+        let pointed = EntityRef::new(RefKind::Plan, plan.id);
+        let stored = crate::refs::block::encode(typed, std::slice::from_ref(&pointed));
+        assert!(r.manager.queue_user_message(&r.sid, &stored).await.unwrap());
+
+        // Listed with its references, the block kept out of the text.
+        let listed = next_event(&mut r.rx, |e| matches!(e, ChatEvent::PendingQueue { .. })).await;
+        let ChatEvent::PendingQueue { messages } = listed else {
+            unreachable!()
+        };
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, typed);
+        assert_eq!(messages[0].refs, vec![pointed]);
+
+        r.turn_end().await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        let second = &sent[1];
+        assert!(!second.contains("<po-refs>"), "the raw block: {second}");
+        assert!(second.contains("<po-context nonce=\""), "{second}");
+        assert!(
+            second.contains(&format!(
+                "- plan \"Wire the references\" [in_progress] id={}",
+                plan.id
+            )),
+            "the pointer: {second}"
+        );
+        assert_eq!(second.matches(typed).count(), 1, "{second}");
+
+        // One enrichment, on what the user typed, in front of the expanded text.
+        let graph: Arc<dyn GraphStore> = r.graph.clone();
+        let enrichment = super::super::manager::enrichment_for_turn(
+            &graph,
+            &r.manager.enrichment_pipeline,
+            &r.sid,
+            typed,
+            Default::default(),
+            Default::default(),
+            &r.manager.anchor_session(),
+            None,
+        )
+        .await
+        .expect("the graph has context for this message");
+        assert!(
+            crate::chat::untrusted::mask_nonces(second).starts_with(
+                &crate::chat::untrusted::mask_nonces(&super::super::manager::prepend_enrichment(
+                    &enrichment,
+                    typed
+                ))
+            ),
+            "{second}"
+        );
+
+        // What the references resolved to is stored for replay.
+        let stored_events = r
+            .graph
+            .get_chat_events(Uuid::parse_str(&r.sid).unwrap(), 0, 500)
+            .await
+            .unwrap();
+        assert!(
+            stored_events
+                .iter()
+                .any(|e| e.event_type == "refs_resolved" && e.data.contains(&plan.id.to_string())),
+            "{:?}",
+            stored_events
+                .iter()
+                .map(|e| &e.event_type)
+                .collect::<Vec<_>>()
+        );
+
+        // The router of the session reads the typed text of the queued turn.
+        assert_eq!(router.last_message().as_deref(), Some(typed));
+    }
+
+    // ── Anchor context (PO_ANCHOR_CONTEXT) through a whole turn ────────────
+
+    use crate::chat::anchor::{AnchorActor, AnchorOp, AnchorRole, AnchorTargetType, NewAnchor};
+    use crate::chat::anchor_resolver::AnchorContextMode;
+
+    /// A plan of the project with a task beside it.
+    async fn anchor_plan(r: &Rig, by: AnchorActor) {
+        let plan = crate::test_helpers::seed_plan_with_task(&r.graph, r.project.id).await;
+        r.graph
+            .apply_anchor_op(
+                Uuid::parse_str(&r.sid).unwrap(),
+                AnchorOp::Add(NewAnchor::new(
+                    AnchorTargetType::Plan,
+                    plan,
+                    [role_of(by)],
+                    by,
+                    "e2e",
+                )),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// An agent can only mention; a human focuses.
+    fn role_of(by: AnchorActor) -> AnchorRole {
+        if by == AnchorActor::Agent {
+            AnchorRole::Mention
+        } else {
+            AnchorRole::Focus
+        }
+    }
+
+    async fn anchor_project(r: &Rig, by: AnchorActor) {
+        r.graph
+            .apply_anchor_op(
+                Uuid::parse_str(&r.sid).unwrap(),
+                AnchorOp::Add(NewAnchor::new(
+                    AnchorTargetType::Project,
+                    r.project.id.to_string(),
+                    [role_of(by)],
+                    by,
+                    "e2e",
+                )),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The system prompt the manager builds for the session of `r` now.
+    async fn system_prompt_of(r: &Rig) -> String {
+        let node = r
+            .graph
+            .get_chat_session(Uuid::parse_str(&r.sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        r.manager
+            .build_system_prompt_anchored(
+                node.execution_place,
+                &node.cwd,
+                node.project_slug.as_deref(),
+                "hello",
+                None,
+                None,
+                &r.sid,
+                None,
+            )
+            .await
+            .0
+    }
+
+    /// Opens a neutral session in `mode`, optionally anchors the project, plays one
+    /// turn; returns (the rig, the prompt of the turn, the system prompt built after).
+    async fn anchored_turn(
+        mode: AnchorContextMode,
+        anchored_by: Option<AnchorActor>,
+    ) -> (Rig, String, String) {
+        let mut r = rig_full(ProviderKind::Native, vec![], None, Some(mode), true).await;
+        if let Some(by) = anchored_by {
+            anchor_project(&r, by).await;
+            anchor_plan(&r, by).await;
+        }
+        r.manager.send_message(&r.sid, "hello").await.unwrap();
+        r.turn_end().await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let prompt = sent[0].clone();
+        let system = system_prompt_of(&r).await;
+        (r, prompt, system)
+    }
+
+    /// A neutral session whose project is anchored by a human, in mode `on`: the
+    /// turn carries the live block at its head, the system prompt the map in the
+    /// untrusted container; the same anchor put by an agent decides nothing.
+    #[tokio::test]
+    async fn on_mode_a_human_project_anchor_reaches_the_turn_and_an_agent_one_does_not() {
+        let (r, prompt, system) =
+            anchored_turn(AnchorContextMode::On, Some(AnchorActor::User)).await;
+        assert!(
+            prompt.starts_with("<untrusted_data"),
+            "the live block opens the turn: {prompt}"
+        );
+        assert!(prompt.contains(&r.project.name), "{prompt}");
+        assert!(
+            !prompt.contains(crate::chat::anchor_resolver::NOTICE_NO_CONTEXT),
+            "{prompt}"
+        );
+        let map_at = system
+            .find("anchor_map")
+            .expect("the map is in the system prompt");
+        assert!(
+            system[..map_at].contains("<untrusted_data"),
+            "the map sits in the untrusted container: {system}"
+        );
+
+        let (r2, prompt2, system2) =
+            anchored_turn(AnchorContextMode::On, Some(AnchorActor::Agent)).await;
+        // an agent's mention decides no project: nothing of the project reaches the turn
+        assert!(
+            !prompt2.contains("Task mid") && !prompt2.contains("anchor_context"),
+            "an agent's project anchor decides no project: {prompt2}"
+        );
+        assert!(!prompt2.contains(&r2.project.name), "{prompt2}");
+        assert!(!system2.contains(&r2.project.name), "{system2}");
+    }
+
+    /// Mode `shadow` is invisible: the turn and the system prompt are the very bytes
+    /// of mode `off` (the resolver only journals).
+    #[tokio::test]
+    async fn shadow_mode_turn_and_system_prompt_are_byte_identical_to_off() {
+        let mut seen = Vec::new();
+        for mode in [AnchorContextMode::Off, AnchorContextMode::Shadow] {
+            let (r, prompt, system) = anchored_turn(mode, Some(AnchorActor::User)).await;
+            let norm = |s: &str| {
+                crate::chat::untrusted::mask_nonces(s)
+                    .replace(&r.sid, "<sid>")
+                    .replace(&r.project.id.to_string(), "<pid>")
+            };
+            seen.push((norm(&prompt), norm(&system)));
+        }
+        assert_eq!(seen[0].0.as_bytes(), seen[1].0.as_bytes(), "the turn");
+        assert_eq!(
+            seen[0].1.as_bytes(),
+            seen[1].1.as_bytes(),
+            "the system prompt"
+        );
+        assert!(!seen[1].0.contains("anchor_context"), "{}", seen[1].0);
+    }
+}
+
+// ============================================================================
+// The resume token of a Claude Code session on the agent engine
+// ============================================================================
+
+/// Claude Code on the agent engine, the REAL nexus façade against `fake_claude`: the CLI
+/// names its session only with its first `system/init` (and each `result`), never at
+/// open. The token must still reach the graph, and a session resumed after a restart
+/// must give the CLI `--resume <that id>` — not open a blank conversation.
+mod claude_code_resume_token {
+    #[allow(unused_imports)]
+    use async_trait::async_trait;
+    use nexus_claude::agent::{
+        AgentProvider, AgentSession, Capabilities, ModelInfo, ProviderError, ProviderHealth,
+        ProviderKind, ResumeToken, SessionSpec,
+    };
+    use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+
+    use super::*;
+
+    const CLI_SESSION: &str = "cli-session-7f3a";
+
+    /// The Claude Code provider of nexus, its CLI the fake, which gets its transcript and
+    /// its recording file through the session's environment.
+    #[derive(Clone)]
+    pub(super) struct FakeCli {
+        pub(super) inner: Arc<ClaudeCodeProvider>,
+        pub(super) env: Vec<(String, String)>,
+    }
+
+    impl FakeCli {
+        fn tap(&self, mut spec: SessionSpec) -> SessionSpec {
+            spec.env.set.extend(self.env.iter().cloned());
+            spec
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for FakeCli {
+        fn id(&self) -> &str {
+            "claude-code"
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::ClaudeCode
+        }
+        async fn health(&self) -> ProviderHealth {
+            ProviderHealth::ok(None)
+        }
+        async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            self.inner.catalog().await
+        }
+        fn capabilities(&self, model: Option<&str>) -> Capabilities {
+            self.inner.capabilities(model)
+        }
+        async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.inner.open(self.tap(spec)).await
+        }
+        async fn resume(
+            &self,
+            spec: SessionSpec,
+            token: ResumeToken,
+        ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.inner.resume(self.tap(spec), token).await
+        }
+    }
+
+    impl super::super::agent_runtime::ProviderSource for FakeCli {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+            (provider_id == "claude-code").then(|| Arc::new(self.clone()) as Arc<dyn AgentProvider>)
+        }
+    }
+
+    /// One turn as the CLI plays it: it reads the user's message, opens with
+    /// `system/init` (its session id, the first time anyone hears of it), answers, ends
+    /// with a `result`, and stays up until stdin closes. Both processes (open, resume)
+    /// replay it.
+    fn cli_turn() -> String {
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            json!({"op": "emit_json", "json": {
+                "type": "system", "subtype": "init", "session_id": CLI_SESSION,
+                "model": "fake-claude", "cwd": ".", "tools": ["Read"],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude",
+                "content": [{"type": "text", "text": "hello"}], "stop_reason": "end_turn"}}}),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": CLI_SESSION, "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": "hello"}}),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    async fn stored_token(graph: &MockGraphStore, sid: &str) -> Option<String> {
+        graph
+            .get_chat_session(Uuid::parse_str(sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_token
+    }
+
+    #[tokio::test]
+    async fn a_claude_code_session_resumes_the_cli_session_it_learned_after_open() {
+        let cli = fake_bin("fake_claude");
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let argv_out = dir.path().join("argv.json");
+        std::fs::write(&transcript, cli_turn()).unwrap();
+        let mut config = ClaudeCodeConfig::default();
+        config.cli_path = Some(cli);
+        let provider = FakeCli {
+            inner: Arc::new(ClaudeCodeProvider::new(config)),
+            env: vec![
+                (
+                    "FAKE_CLAUDE_TRANSCRIPT".into(),
+                    transcript.display().to_string(),
+                ),
+                (
+                    "FAKE_CLAUDE_ARGS_OUT".into(),
+                    argv_out.display().to_string(),
+                ),
+            ],
+        };
+        let graph = Arc::new(MockGraphStore::new());
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(provider));
+
+        let mut req = request(None, None, "default");
+        req.message = "first".into();
+        req.cwd = dir.path().display().to_string();
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+
+        // The CLI named its session during the turn: the graph knows it now.
+        let token = stored_token(&graph, &sid)
+            .await
+            .expect("the resume token is persisted once the CLI named its session");
+        let token = ResumeToken::from_wire(&token).unwrap();
+        assert_eq!(token.data()["session_id"], CLI_SESSION);
+
+        // A restart: the live session is gone, the next message resumes it.
+        manager.close_session(&sid).await.unwrap();
+        assert!(!manager.agent_runtime.owns(&sid).await);
+        std::fs::remove_file(&argv_out).unwrap();
+        manager.resume_session(&sid, "second", None).await.unwrap();
+        for _ in 0..200 {
+            if argv_out.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let recorded: Value =
+            serde_json::from_str(&std::fs::read_to_string(&argv_out).expect("argv recorded"))
+                .unwrap();
+        let argv: Vec<String> = recorded["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str().map(str::to_string))
+            .collect();
+        let resume_at = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .unwrap_or_else(|| panic!("the resumed CLI gets --resume: {argv:?}"));
+        assert_eq!(
+            argv.get(resume_at + 1).map(String::as_str),
+            Some(CLI_SESSION)
+        );
+        // The resumed CLI plays the second turn (it may end before anyone subscribes).
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        let mut results = 0;
+        for _ in 0..400 {
+            results = graph
+                .get_chat_events(uuid, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "result")
+                .count();
+            if results >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(results, 2, "the resumed session answered its turn");
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+/// M2, "no conversation broken by the upgrade": the default engine of Claude Code moved to
+/// the agent engine. A conversation opened on the historical engine BEFORE (no capability
+/// snapshot) is resumed AFTER, by a server on the new default, on the historical engine:
+/// the same CLI session (`--resume`), never handed to the agent engine. The CLI is
+/// `fake_claude`, one transcript per spawn.
+mod legacy_conversation_after_the_switch {
+    use super::*;
+    const CLI_SESSION: &str = "legacy-cli-session-1";
+
+    fn turn(answer: &str) -> String {
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            json!({"op": "emit_json", "json": {
+                "type": "system", "subtype": "init", "session_id": CLI_SESSION,
+                "model": "fake-claude", "cwd": ".", "tools": ["Read"],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude",
+                "content": [{"type": "text", "text": answer}], "stop_reason": "end_turn"}}}),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": CLI_SESSION, "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": answer}}),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    /// `fake_claude` behind a wrapper: `--version` probes pass through; spawn `n` plays
+    /// `transcript.<n>.jsonl` and records its argv in `args.<n>.json`.
+    fn wrapper(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = fake_bin("fake_claude");
+        let path = dir.join("claude");
+        let script = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do if [ \"$a\" = \"--version\" ]; then exec \"{fake}\" \"$@\"; fi; done\n\
+             n=$(cat \"{dir}/count\" 2>/dev/null || echo 0)\n\
+             echo $((n+1)) > \"{dir}/count\"\n\
+             FAKE_CLAUDE_TRANSCRIPT=\"{dir}/transcript.$n.jsonl\" \
+             FAKE_CLAUDE_ARGS_OUT=\"{dir}/args.$n.json\" \
+             FAKE_CLAUDE_MAX_RUNTIME_MS=60000 \
+             exec \"{fake}\" \"$@\"\n",
+            fake = fake.display(),
+            dir = dir.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn config(cli: &std::path::Path, path: ProviderPath) -> super::super::config::ChatConfig {
+        super::super::config::ChatConfig {
+            provider_path: path,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            claude_cli_path: Some(cli.display().to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        }
+    }
+
+    async fn results(graph: &MockGraphStore, sid: &str, at_least: usize) -> usize {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        let mut n = 0;
+        for _ in 0..400 {
+            n = graph
+                .get_chat_events(uuid, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "result")
+                .count();
+            if n >= at_least {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn a_legacy_conversation_resumes_on_the_legacy_engine_after_the_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("transcript.0.jsonl"), turn("before")).unwrap();
+        std::fs::write(dir.path().join("transcript.1.jsonl"), turn("after")).unwrap();
+        let cli = wrapper(dir.path());
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+
+        // Before the upgrade: Claude Code on the historical engine.
+        let before = ChatManager::new_without_memory(
+            dyn_graph.clone(),
+            mock_app_state().meili,
+            config(&cli, ProviderPath::Legacy),
+        );
+        let mut req = request(None, None, "default");
+        req.message = "first".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = before.create_session(&req).await.unwrap().session_id;
+        assert!(
+            !before.agent_runtime.owns(&sid).await,
+            "the historical engine"
+        );
+        assert_eq!(results(&graph, &sid, 1).await, 1, "the first turn answered");
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            node.capabilities.is_none(),
+            "no agent snapshot: a legacy session"
+        );
+
+        // After the upgrade: the server runs on the new default, the agent engine.
+        let after = ChatManager::new_without_memory(
+            dyn_graph,
+            mock_app_state().meili,
+            config(&cli, ProviderPath::default()),
+        );
+        assert_eq!(after.config.provider_path, ProviderPath::Agent);
+        after.resume_session(&sid, "second", None).await.unwrap();
+        assert!(
+            !after.agent_runtime.owns(&sid).await,
+            "a legacy conversation stays on the historical engine"
+        );
+        let args = dir.path().join("args.1.json");
+        for _ in 0..200 {
+            if args.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let recorded: Value =
+            serde_json::from_str(&std::fs::read_to_string(&args).expect("the CLI respawned"))
+                .unwrap();
+        let argv: Vec<String> = recorded["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str().map(str::to_string))
+            .collect();
+        let at = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .unwrap_or_else(|| panic!("the same CLI conversation: {argv:?}"));
+        assert_eq!(argv.get(at + 1).map(String::as_str), Some(CLI_SESSION));
+        assert_eq!(
+            results(&graph, &sid, 2).await,
+            2,
+            "the resumed turn answered"
+        );
+        after.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P13: a permission of a legacy Claude Code session granted from ANOTHER instance
+/// (NATS RPC) reaches the CLI as the same `control_response` as a local answer —
+/// subtype, request_id, behavior —, exactly once, while the turn waits for it.
+mod legacy_nats_permission {
+    use super::*;
+    use crate::chat::manager::{DeliveryRoute, PermissionDeliveryError};
+    use crate::events::nats_broker_test::TestBroker;
+    use crate::events::NatsEmitter;
+    fn emit(v: Value) -> Value {
+        json!({"op": "emit_json", "json": v})
+    }
+
+    /// One turn that asks `req-nats` for `Bash pwd` and waits, up to 15 s, for an
+    /// answer naming it before it goes on.
+    fn transcript() -> Vec<Value> {
+        vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            emit(json!({"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"})),
+            emit(json!({"type": "assistant", "message": {
+                "id": "msg_fake_1", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": "t8", "name": "Bash",
+                             "input": {"command": "pwd"}}]}})),
+            emit(json!({"type": "control_request", "request_id": "req-nats",
+                "request": {"subtype": "can_use_tool", "tool_name": "Bash",
+                            "input": {"command": "pwd"}, "tool_use_id": "t8"}})),
+            json!({"op": "await_stdin", "contains": "req-nats", "timeout_ms": 15000}),
+            emit(json!({"type": "assistant", "message": {
+                "id": "msg_fake_2", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "allowed and done"}]}})),
+            emit(json!({"type": "result", "subtype": "success",
+                "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                "session_id": "fake-cli-session", "total_cost_usd": 0.0,
+                "result": "allowed and done"})),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ]
+    }
+
+    /// `fake_claude` behind a wrapper that plays the transcript and records stdin.
+    fn wrapper(dir: &std::path::Path) -> String {
+        wrapper_of(dir, transcript())
+    }
+
+    /// [`wrapper`] playing `transcript`.
+    fn wrapper_of(dir: &std::path::Path, transcript: Vec<Value>) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("transcript.jsonl");
+        let lines: String = transcript.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&script, lines).unwrap();
+        let wrapper = dir.join("claude");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                 FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                script.display(),
+                dir.join("stdin.jsonl").display(),
+                fake_bin("fake_claude").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wrapper.display().to_string()
+    }
+
+    /// The `control_response` lines the CLI read.
+    fn control_responses(dir: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(dir.join("stdin.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["type"] == "control_response")
+            .collect()
+    }
+
+    async fn stored_until(graph: &MockGraphStore, sid: &str, needle: &str) {
+        let id = Uuid::parse_str(sid).unwrap();
+        for _ in 0..400 {
+            let events = graph.get_chat_events(id, 0, 500).await.unwrap();
+            if events.iter().any(|e| e.data.contains(needle)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{needle:?} was never stored for {sid}");
+    }
+
+    /// Review of #712 (legacy gap): a permission request of the CLI is pending BEFORE it is
+    /// broadcast, so a strict answer (`require_pending`, the REST and WS paths) sent the
+    /// moment a client sees the request is delivered, never `NotPending`. The test holds
+    /// the session's pending map while the request arrives: a broadcast seen during that
+    /// hold is a request not yet stored (it used to be broadcast first, then stored).
+    #[tokio::test]
+    async fn a_strict_answer_sent_the_moment_the_request_is_seen_finds_it_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = transcript();
+        // The request comes a little after the tool call: the map is held by then.
+        let at = lines
+            .iter()
+            .position(|l| l.to_string().contains("can_use_tool"))
+            .unwrap();
+        lines.insert(at, json!({"op": "sleep", "ms": 400}));
+        let cli = wrapper_of(dir.path(), lines);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: fake_bin("fake_mcp"),
+                nexus_tools_path: None,
+                nexus_browser_path: None,
+                obscura_path: None,
+                jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+        };
+        manager.update_claude_cli_path(Some(cli)).await;
+        let mut req = request(None, None, "default");
+        req.message = "run pwd".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        let pending = manager
+            .active_sessions
+            .read()
+            .await
+            .get(&sid)
+            .expect("the session is live")
+            .pending_permission_inputs
+            .clone();
+
+        async fn next_request(rx: &mut tokio::sync::broadcast::Receiver<ChatEvent>) {
+            loop {
+                match rx.recv().await {
+                    Ok(ChatEvent::PermissionRequest { id, .. }) if id == "req-nats" => return,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(e) => panic!("channel closed: {e}"),
+                }
+            }
+        }
+        {
+            let held = pending.lock().await;
+            // Long enough for the request to come (400 ms after the tool call).
+            if tokio::time::timeout(Duration::from_secs(3), next_request(&mut rx))
+                .await
+                .is_ok()
+            {
+                assert!(
+                    held.contains_key("req-nats"),
+                    "the request was broadcast before it was pending: a strict answer \
+                     sent now is refused NotPending"
+                );
+            }
+        }
+        // Released: the request, stored first, now leaves the backend.
+        tokio::time::timeout(Duration::from_secs(10), next_request(&mut rx))
+            .await
+            .expect("the request is broadcast once pending");
+        let answered = manager
+            .route_permission_response(
+                &sid,
+                "req-nats",
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                true,
+            )
+            .await;
+        assert!(
+            matches!(answered, Ok(DeliveryRoute::Local)),
+            "the strict answer is delivered: {answered:?}"
+        );
+        stored_until(&graph, &sid, "allowed and done").await;
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_permission_granted_from_another_instance_reaches_the_cli_once_with_its_request_id() {
+        let broker = TestBroker::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cli = wrapper(dir.path());
+
+        // The owner: Claude Code on the legacy engine, on NATS.
+        let graph = Arc::new(MockGraphStore::new());
+        let owner = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: fake_bin("fake_mcp"),
+                nexus_tools_path: None,
+                nexus_browser_path: None,
+                obscura_path: None,
+                jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            let nats = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+                .with_nats(nats)
+        };
+        owner.update_claude_cli_path(Some(cli)).await;
+        // The other instance: no session of its own.
+        let other = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let far = {
+            let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(graph, mock_app_state().meili, config)
+                .with_nats(Arc::clone(&other))
+        };
+
+        let mut req = request(None, None, "default");
+        req.message = "run pwd".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = owner
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!owner.agent_runtime.owns(&sid).await, "legacy engine");
+        // The CLI asked: the request waits on the owner.
+        let id = Uuid::parse_str(&sid).unwrap();
+        let mut asked = false;
+        for _ in 0..400 {
+            let snap = owner.live_session_snapshot().await;
+            if snap
+                .pending_permissions
+                .get(&id)
+                .is_some_and(|ids| ids.contains("req-nats"))
+            {
+                asked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(asked, "the CLI's can_use_tool never waited on the owner");
+
+        // The owner's RPC listener is up (a harmless RPC answers) before the ONE
+        // permission answer: a resend would write it twice.
+        let mut listening = false;
+        for _ in 0..20 {
+            if other
+                .request_send_message(&sid, r#"{"enabled":false}"#, "set_auto_continue")
+                .await
+                .is_some()
+            {
+                listening = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(listening, "the owner's RPC listener never answered");
+
+        let routed = far
+            .route_permission_response(
+                &sid,
+                "req-nats",
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                true,
+            )
+            .await;
+        assert!(
+            matches!(routed, Ok(DeliveryRoute::Remote)),
+            "delivered by the owner: {routed:?}"
+        );
+        // The CLI matched it to its can_use_tool: the tool ran, the turn ended.
+        stored_until(&graph, &sid, "allowed and done").await;
+
+        let answers = control_responses(dir.path());
+        assert_eq!(answers.len(), 1, "one RPC, one write: {answers:?}");
+        let answer = &answers[0]["response"];
+        assert_eq!(answer["subtype"], "success", "{answer}");
+        assert_eq!(answer["request_id"], "req-nats", "{answer}");
+        assert_eq!(answer["response"]["behavior"], "allow", "{answer}");
+        assert_eq!(
+            answer["response"]["updatedInput"],
+            json!({"command": "pwd"}),
+            "the original input goes back: {answer}"
+        );
+
+        // The same request answered again: no longer waiting, a typed refusal, and
+        // nothing more reaches the CLI.
+        let again = far
+            .route_permission_response(
+                &sid,
+                "req-nats",
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                true,
+            )
+            .await;
+        assert!(
+            matches!(again, Err(PermissionDeliveryError::NotPending)),
+            "{again:?}"
+        );
+        assert_eq!(control_responses(dir.path()).len(), 1);
+        owner.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P5 (parity): `cancel_tools` on the agent engine stops the running tools and
+/// keeps the turn — from this instance (the WS handler calls
+/// `cancel_running_tools`), from another instance over NATS, and under the cap
+/// of the Claude Code engine.
+mod cancel_tools {
+    #[allow(unused_imports)]
+    use nexus_claude::agent::{CancelScope, ProviderKind};
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::{RecordedCall, Step};
+
+    use super::parity::{caps, rig, rig_with, Rig};
+    use super::*;
+
+    /// A turn calling one tool that runs until it is cancelled, then goes on.
+    fn slow_tool_turn() -> Vec<Step> {
+        vec![
+            steps::tool_call("s1", "slow", json!({})),
+            Step::AwaitCancel,
+            steps::text("I carry on"),
+            steps::done(&caps()),
+        ]
+    }
+
+    impl Rig {
+        /// How many times the provider was asked to cancel all its tools.
+        fn cancels(&self) -> usize {
+            self.provider
+                .inner
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, RecordedCall::CancelTools(CancelScope::All)))
+                .count()
+        }
+    }
+
+    /// The events received up to and including the first one matching `pred`,
+    /// and whether it came within `within`.
+    async fn collect_until(
+        rx: &mut broadcast::Receiver<ChatEvent>,
+        within: Duration,
+        pred: impl Fn(&ChatEvent) -> bool,
+    ) -> (Vec<ChatEvent>, bool) {
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let Ok(Ok(event)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+                return (events, false);
+            };
+            let found = pred(&event);
+            events.push(event);
+            if found {
+                return (events, true);
+            }
+        }
+    }
+
+    fn turn_ended(e: &ChatEvent) -> bool {
+        matches!(
+            e,
+            ChatEvent::StreamingStatus {
+                is_streaming: false
+            }
+        )
+    }
+
+    /// The turn went on after the cancel: the cut tool ended in a cancelled
+    /// `tool_result`, the model spoke again, and the turn completed.
+    fn assert_the_turn_went_on(events: &[ChatEvent], tool_id: &str) {
+        let types: Vec<&str> = events.iter().map(|e| e.event_type()).collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::ToolResult { id, is_error: true, result, .. }
+                    if id == tool_id && result.to_string().contains("cancelled")
+            )),
+            "a cancelled tool_result: {types:?}"
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, ChatEvent::AssistantText { content, .. } if content.contains("I carry on"))
+            ),
+            "the model went on: {types:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::Result { stop_reason, .. } if stop_reason.as_deref() == Some("completed")
+            )),
+            "the turn completed: {types:?}"
+        );
+    }
+
+    /// (a) From this instance: the tool is stopped, `tools_cancelled` is on the
+    /// wire (and stored for replay), the turn goes on — nothing interrupted it.
+    #[tokio::test]
+    async fn a_cancel_tools_from_this_instance_stops_the_tool_and_the_turn_goes_on() {
+        let mut r = rig(ProviderKind::Native, vec![slow_tool_turn()]).await;
+        r.manager.send_message(&r.sid, "slow").await.unwrap();
+        next_event(
+            &mut r.rx,
+            |e| matches!(e, ChatEvent::ToolUse { id, .. } if id == "s1"),
+        )
+        .await;
+
+        let result = r.manager.cancel_running_tools(&r.sid).await.unwrap();
+        assert!(!result.capped);
+
+        let (events, ended) = collect_until(&mut r.rx, Duration::from_secs(20), turn_ended).await;
+        assert!(ended, "the turn ended");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::ToolsCancelled { killed_count: 1, requested_by, .. } if requested_by == "user"
+            )),
+            "{:?}",
+            events.iter().map(|e| e.event_type()).collect::<Vec<_>>()
+        );
+        assert_the_turn_went_on(&events, "s1");
+        assert_eq!(r.cancels(), 1);
+        assert_eq!(r.interrupts(), 0, "the turn was not interrupted");
+
+        let stored = r
+            .graph
+            .get_chat_events(Uuid::parse_str(&r.sid).unwrap(), 0, 500)
+            .await
+            .unwrap();
+        assert!(
+            stored.iter().any(|e| e.event_type == "tools_cancelled"),
+            "stored for replay: {:?}",
+            stored.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+        );
+    }
+
+    /// (b) From another instance: its `cancel_running_tools` holds no session and
+    /// publishes over NATS; the owner stops the tool, keeps the turn, and the
+    /// other instance sees `tools_cancelled` in the session's feed.
+    #[tokio::test]
+    async fn a_cancel_tools_from_another_instance_stops_the_tool_here_and_keeps_the_turn() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+        use futures::StreamExt;
+
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let mut r = rig_with(ProviderKind::Native, vec![slow_tool_turn()], Some(owner)).await;
+
+        let other = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let mut seen = other.subscribe_chat_events(&r.sid).await.unwrap();
+        other.client().flush().await.unwrap();
+        // The other instance: no session of its own, the WS cancel goes through
+        // its manager and out over NATS.
+        let far = {
+            let state = mock_app_state();
+            let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Agent,
+                mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(graph, state.meili, config)
+                .with_nats(Arc::clone(&other))
+        };
+
+        r.manager.send_message(&r.sid, "slow").await.unwrap();
+        next_event(
+            &mut r.rx,
+            |e| matches!(e, ChatEvent::ToolUse { id, .. } if id == "s1"),
+        )
+        .await;
+
+        // The owner's listener may still be subscribing: ask again until it answers.
+        let mut events = Vec::new();
+        let mut cancelled = false;
+        for _ in 0..5 {
+            let routed = far.cancel_running_tools(&r.sid).await.unwrap();
+            assert!(
+                !routed.capped && routed.killed_pids.is_empty(),
+                "{routed:?}"
+            );
+            let (got, found) = collect_until(&mut r.rx, Duration::from_secs(1), |e| {
+                matches!(e, ChatEvent::ToolsCancelled { .. })
+            })
+            .await;
+            events.extend(got);
+            if found {
+                cancelled = true;
+                break;
+            }
+        }
+        assert!(cancelled, "the owner announced the cancel");
+        let (rest, ended) = collect_until(&mut r.rx, Duration::from_secs(20), turn_ended).await;
+        assert!(ended, "the turn ended");
+        events.extend(rest);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::ToolsCancelled {
+                    killed_count: 1,
+                    ..
+                }
+            )),
+            "{:?}",
+            events.iter().map(|e| e.event_type()).collect::<Vec<_>>()
+        );
+        assert_the_turn_went_on(&events, "s1");
+        assert!(r.cancels() >= 1);
+        assert_eq!(r.interrupts(), 0, "the turn was not interrupted");
+
+        // The other instance sees the cancel in the session's feed.
+        let shown = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(msg) = seen.next().await {
+                let event: ChatEvent = serde_json::from_slice(&msg.payload).unwrap();
+                if matches!(event, ChatEvent::ToolsCancelled { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(shown, Ok(true), "tools_cancelled is published");
+    }
+
+    /// (c) The cap of the Claude Code engine (`CANCEL_TOOLS_CAP` per window)
+    /// applies: the call past it says `capped` and never reaches the provider.
+    #[tokio::test]
+    async fn the_cancel_tools_cap_applies_on_the_agent_engine_as_on_claude_code() {
+        use super::super::manager::CANCEL_TOOLS_CAP;
+
+        let r = rig(ProviderKind::Native, vec![]).await;
+        for i in 0..CANCEL_TOOLS_CAP {
+            let result = r.manager.cancel_running_tools(&r.sid).await.unwrap();
+            assert!(!result.capped, "call {i} is within the cap");
+        }
+        let past = r.manager.cancel_running_tools(&r.sid).await.unwrap();
+        assert!(past.capped, "the call past the cap is refused");
+        assert_eq!(
+            r.cancels(),
+            CANCEL_TOOLS_CAP as usize,
+            "the refused call never reaches the provider"
+        );
+    }
+
+    /// (a) over the real chat WebSocket, on a real native session (the nexus
+    /// harness against `fake_openai` and `fake_mcp`): the model calls the `slow`
+    /// tool of the project-orchestrator server, which runs until it is told to
+    /// stop; the client's `cancel_tools` frame stops it, `tools_cancelled` and
+    /// the cancelled `tool_result` come back on the socket, the model is told
+    /// and answers, and the turn completes.
+    #[tokio::test]
+    async fn a_ws_cancel_tools_on_a_native_session_stops_the_running_mcp_tool_and_the_turn_goes_on()
+    {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let script = json!([
+            // The probe: the model must be able to call a tool.
+            sse_route("Call the ping tool now", vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]),
+            {"method": "GET", "path": "/v1/models", "status": 200,
+             "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}},
+            // The turn: one call of the slow tool.
+            sse_route("slow please", vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "s1", "type": "function",
+                    "function": {"name": "mcp__project-orchestrator__slow", "arguments": "{}"}}]})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]),
+            // Once the model hears of the cancelled tool, it answers (the first
+            // unused matching route answers: the slow call above is used by then).
+            sse_route("\"role\":\"tool\"", vec![
+                delta(json!({"content": "I carry on"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!("[DONE]"),
+            ]),
+        ]);
+        let fake = FakeOpenAi::start(script);
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let manager = Arc::new(manager(graph.clone(), true));
+
+        let mut req = request(Some("local"), Some("proj"), "default");
+        req.message = "slow please".into();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(&mut rx, |e| {
+            matches!(e, ChatEvent::ToolUse { id, tool, .. } if id == "s1" && tool.ends_with("slow"))
+        })
+        .await;
+
+        // The client: the real handler, nothing replayed (the tool already runs).
+        let addr = crate::test_helpers::serve_chat(Arc::clone(&manager), graph.clone()).await;
+        let url = format!("ws://{addr}/ws/chat/{sid}?last_event=999999999999999");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        ws.send(WsMessage::text("ready")).await.unwrap();
+        ws.send(WsMessage::text(json!({"type": "cancel_tools"}).to_string()))
+            .await
+            .unwrap();
+
+        // The frames up to the end of the turn.
+        let mut frames: Vec<Value> = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(Ok(msg)) = ws.next().await {
+                let WsMessage::Text(t) = msg else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(t.as_str()) else {
+                    continue;
+                };
+                let done = v["type"] == "streaming_status" && v["is_streaming"] == false;
+                frames.push(v);
+                if done {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| f["type"].as_str().unwrap_or("?").to_string())
+            .collect();
+        assert!(ended, "the turn ended on the socket: {types:?}");
+        let cancelled = frames
+            .iter()
+            .find(|f| f["type"] == "tools_cancelled")
+            .unwrap_or_else(|| panic!("tools_cancelled on the socket: {types:?}"));
+        assert_eq!(cancelled["killed_count"], 1, "{cancelled}");
+        assert_eq!(cancelled["requested_by"], "user", "{cancelled}");
+        assert!(
+            cancelled.get("cli_pid").is_none(),
+            "no PID on the agent engine: {cancelled}"
+        );
+        assert!(
+            frames.iter().any(|f| f["type"] == "tool_result"
+                && f["id"] == "s1"
+                && f["is_error"] == true
+                && f["result"].to_string().contains("cancelled")),
+            "a cancelled tool_result on the socket: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| f["type"] == "assistant_text"
+                && f["content"].as_str().unwrap_or("").contains("I carry on")),
+            "the model went on: {types:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "result" && f["stop_reason"] == "completed"),
+            "the turn completed: {frames:?}"
+        );
+
+        // The model was told: the request that followed carries the cancelled result.
+        let chats = fake.chat_requests();
+        let last = chats.last().expect("a request after the cancel")["body"].to_string();
+        assert!(last.contains("cancelled"), "{last}");
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P3c (parity): the images a user attaches reach the model on the agent engine,
+/// inline with the turn — the native harness on a model with vision (an
+/// `image_url` part), Claude Code (an `image` block on the CLI's stdin) — and a
+/// model without vision refuses them on the wire, nothing sent.
+mod attached_images {
+    #[allow(unused_imports)]
+    use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+
+    use super::claude_code_resume_token::FakeCli;
+    use super::*;
+    use crate::documents::store::DocumentStore;
+    use crate::documents::DocumentFormat;
+    use crate::neo4j::document::Document;
+
+    /// A 1×1 PNG.
+    const PIXEL: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0x60, 0xf8, 0x5f, 0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47, 0xba, 0x92, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn pixel_base64() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(PIXEL)
+    }
+
+    /// The pixel uploaded as a document (blob in `store`, node in `graph`), and
+    /// the stored form of a message `text` that attaches it — what the API layer
+    /// hands the manager (`message_attachments::compose`).
+    async fn attach_pixel(
+        graph: &Arc<MockGraphStore>,
+        store: &DocumentStore,
+        text: &str,
+    ) -> String {
+        attach_image(graph, store, text, "pixel.png", "image/png").await
+    }
+
+    /// [`attach_pixel`] under another name and recorded media type.
+    async fn attach_image(
+        graph: &Arc<MockGraphStore>,
+        store: &DocumentStore,
+        text: &str,
+        filename: &str,
+        media_type: &str,
+    ) -> String {
+        let id = Uuid::new_v4();
+        let sha256 = store.put(PIXEL).unwrap();
+        graph.documents.write().await.insert(
+            id,
+            Document {
+                id,
+                filename: filename.to_string(),
+                format: DocumentFormat::Binary,
+                sha256,
+                size_bytes: PIXEL.len() as u64,
+                page_count: 0,
+                chunk_count: 0,
+                warnings: vec![],
+                created_at: Utc::now(),
+                project_id: None,
+                session_id: None,
+                extracted: false,
+                mime_type: Some(media_type.to_string()),
+            },
+        );
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        super::super::message_attachments::compose(&dyn_graph, text, &[id])
+            .await
+            .unwrap()
+    }
+
+    /// `fake_openai` serving model `m` with `catalogue` as its `/models` entry: the
+    /// tool probe, the opening turn (`hi there`), and the turn of the image.
+    fn script_with(catalogue: Value) -> Value {
+        json!([
+            sse_route("Call the ping tool now", vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]),
+            {"method": "GET", "path": "/v1/models", "status": 200,
+             "body": {"object": "list", "data": [catalogue]}},
+            sse_route("look at this", vec![
+                delta(json!({"content": "a single pixel"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!("[DONE]"),
+            ]),
+            sse_route("hi there", vec![
+                delta(json!({"content": "hello"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!("[DONE]"),
+            ]),
+        ])
+    }
+
+    /// A native session on `fake_openai`, its opening turn played; the receiver
+    /// subscribed before the next message.
+    async fn native_session(
+        catalogue: Value,
+    ) -> (
+        FakeOpenAi,
+        Arc<MockGraphStore>,
+        DocumentStore,
+        tempfile::TempDir,
+        ChatManager,
+        String,
+        broadcast::Receiver<ChatEvent>,
+    ) {
+        let fake = FakeOpenAi::start(script_with(catalogue));
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let blobs = tempfile::tempdir().unwrap();
+        let store = DocumentStore::new(blobs.path());
+        let manager = manager(graph.clone(), true).with_document_store(store.clone());
+        let created = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+        let sid = created.session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(&mut rx, |e| {
+            matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            )
+        })
+        .await;
+        (fake, graph, store, blobs, manager, sid, rx)
+    }
+
+    /// (a) A model whose catalogue says vision: the image is an `image_url` part
+    /// of the user message the endpoint receives, and the session does not list
+    /// `images` among what it cannot do.
+    #[tokio::test]
+    async fn a_native_model_with_vision_receives_the_attached_image_as_an_image_url_part() {
+        let (fake, graph, store, _blobs, manager, sid, mut rx) =
+            native_session(json!({"id": "m", "context_length": 32000, "capabilities": ["vision"]}))
+                .await;
+        let caps = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .unwrap()
+            .capabilities
+            .clone();
+        assert!(caps.images, "the catalogue says vision");
+        assert!(
+            !super::super::agent_runtime::degraded_features(&caps)
+                .iter()
+                .any(|d| d == "images"),
+            "a vision model does not lose images"
+        );
+
+        let message = attach_pixel(&graph, &store, "look at this").await;
+        manager.send_message(&sid, &message).await.unwrap();
+        next_event(
+            &mut rx,
+            |e| matches!(e, ChatEvent::AssistantText { content, .. } if content.contains("single pixel")),
+        )
+        .await;
+
+        let chats = fake.chat_requests();
+        let turn = chats
+            .iter()
+            .find(|r| r["body"].to_string().contains("look at this"))
+            .expect("the turn of the image reached the endpoint");
+        let user = turn["body"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "user")
+            .unwrap();
+        let text = user["content"].to_string();
+        assert!(
+            !text.contains("no text could be extracted"),
+            "the image is sent, its /raw line is not: {text}"
+        );
+        assert!(
+            text.contains("pixel.png"),
+            "the document heading stays: {text}"
+        );
+        let parts = user["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a list of parts: {user}"));
+        assert_eq!(parts[0]["type"], "text", "{user}");
+        let image = parts
+            .iter()
+            .find(|p| p["type"] == "image_url")
+            .unwrap_or_else(|| panic!("an image_url part: {user}"));
+        assert_eq!(
+            image["image_url"]["url"],
+            format!("data:image/png;base64,{}", pixel_base64())
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// (c) A model whose catalogue says text only: the turn is refused with a
+    /// typed error on the wire (`images_refused` / `unsupported`), nothing reaches
+    /// the endpoint, and the session is usable again.
+    #[tokio::test]
+    async fn a_native_model_without_vision_refuses_the_image_on_the_wire_and_sends_nothing() {
+        let (fake, graph, store, _blobs, manager, sid, mut rx) = native_session(
+            json!({"id": "m", "context_length": 32000, "input_modalities": ["text"]}),
+        )
+        .await;
+        let caps = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .unwrap()
+            .capabilities
+            .clone();
+        assert!(!caps.images);
+
+        let message = attach_pixel(&graph, &store, "look at this").await;
+        manager.send_message(&sid, &message).await.unwrap();
+        let error = next_event(&mut rx, |e| matches!(e, ChatEvent::Error { .. })).await;
+        match &error {
+            ChatEvent::Error {
+                message,
+                code,
+                reason,
+                ..
+            } => {
+                assert_eq!(code.as_deref(), Some("images_refused"), "{error:?}");
+                assert_eq!(reason.as_deref(), Some("unsupported"), "{error:?}");
+                assert!(message.contains("not sent"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        next_event(&mut rx, |e| {
+            matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            )
+        })
+        .await;
+        assert!(
+            !fake
+                .chat_requests()
+                .iter()
+                .any(|r| r["body"].to_string().contains("look at this")),
+            "nothing was sent"
+        );
+        // Stored for replay: a reload shows the refusal.
+        let stored = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 500)
+            .await
+            .unwrap();
+        assert!(
+            stored
+                .iter()
+                .any(|e| e.event_type == "error" && e.data.contains("images_refused")),
+            "{:?}",
+            stored.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// (b) Claude Code on the agent engine (the real nexus façade, `fake_claude`
+    /// as its CLI): the user line written on stdin carries the text and the image
+    /// block, base64 inline.
+    #[tokio::test]
+    async fn claude_code_on_the_agent_engine_writes_the_attached_image_on_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let stdin_out = dir.path().join("stdin.jsonl");
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            json!({"op": "emit_json", "json": {
+                "type": "system", "subtype": "init", "session_id": "cli-images",
+                "model": "fake-claude", "cwd": ".", "tools": ["Read"],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude",
+                "content": [{"type": "text", "text": "a pixel"}], "stop_reason": "end_turn"}}}),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": "cli-images", "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": "a pixel"}}),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        std::fs::write(
+            &transcript,
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let mut config = ClaudeCodeConfig::default();
+        config.cli_path = Some(fake_bin("fake_claude"));
+        let provider = FakeCli {
+            inner: Arc::new(ClaudeCodeProvider::new(config)),
+            env: vec![
+                (
+                    "FAKE_CLAUDE_TRANSCRIPT".into(),
+                    transcript.display().to_string(),
+                ),
+                (
+                    "FAKE_CLAUDE_STDIN_OUT".into(),
+                    stdin_out.display().to_string(),
+                ),
+            ],
+        };
+        let graph = Arc::new(MockGraphStore::new());
+        let store = DocumentStore::new(dir.path().join("blobs"));
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let chat_config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, chat_config)
+            .with_provider_source(Arc::new(provider))
+            .with_document_store(store.clone());
+
+        let mut req = request(None, None, "default");
+        req.message = attach_pixel(&graph, &store, "look at this").await;
+        req.cwd = dir.path().display().to_string();
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        let mut answered = false;
+        for _ in 0..400 {
+            answered = graph
+                .get_chat_events(uuid, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.event_type == "result");
+            if answered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(answered, "the CLI answered the turn");
+
+        let written = std::fs::read_to_string(&stdin_out).expect("stdin recorded");
+        assert!(
+            !written.contains("no text could be extracted"),
+            "the image is sent, its /raw line is not: {written}"
+        );
+        assert!(
+            written.contains("pixel.png"),
+            "the document heading stays: {written}"
+        );
+        let user: Value = written
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|l| l["type"] == "user")
+            .unwrap_or_else(|| panic!("a user line: {written}"));
+        let blocks = user["message"]["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a list of blocks: {user}"));
+        assert!(
+            blocks.iter().any(|b| b["type"] == "text"
+                && b["text"].as_str().unwrap_or("").contains("look at this")),
+            "{user}"
+        );
+        let image = blocks
+            .iter()
+            .find(|b| b["type"] == "image")
+            .unwrap_or_else(|| panic!("an image block: {user}"));
+        assert_eq!(image["source"]["type"], "base64");
+        assert_eq!(image["source"]["media_type"], "image/png");
+        assert_eq!(image["source"]["data"], pixel_base64());
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// Claude Code on its historical engine (the Claude CLI driven by the manager,
+    /// `ProviderPath::Legacy`, the default for a local Claude Code): the CLI is
+    /// nexus' `fake_claude` behind a wrapper that plays `transcript` and records
+    /// every line it reads on stdin.
+    mod legacy_engine {
+        use super::*;
+        struct LegacyCli {
+            dir: tempfile::TempDir,
+            graph: Arc<MockGraphStore>,
+            store: DocumentStore,
+            manager: ChatManager,
+        }
+
+        impl LegacyCli {
+            async fn start(transcript: &[Value]) -> Self {
+                use std::os::unix::fs::PermissionsExt;
+                let dir = tempfile::tempdir().unwrap();
+                let script = dir.path().join("transcript.jsonl");
+                std::fs::write(
+                    &script,
+                    transcript
+                        .iter()
+                        .map(|l| format!("{l}\n"))
+                        .collect::<String>(),
+                )
+                .unwrap();
+                let wrapper = dir.path().join("claude");
+                std::fs::write(
+                    &wrapper,
+                    format!(
+                        "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                         FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                        script.display(),
+                        dir.path().join("stdin.jsonl").display(),
+                        fake_bin("fake_claude").display()
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let graph = Arc::new(MockGraphStore::new());
+                let store = DocumentStore::new(dir.path().join("blobs"));
+                let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+                let config = super::super::super::config::ChatConfig {
+                    provider_path: ProviderPath::Legacy,
+                    mcp_server_path: fake_bin("fake_mcp"),
+                    nexus_tools_path: None,
+                    nexus_browser_path: None,
+                    obscura_path: None,
+                    jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                    max_sessions: 10,
+                    retry: super::super::super::config::RetryConfig {
+                        max_attempts: 3,
+                        initial_delay_ms: 10,
+                        backoff_multiplier: 1.0,
+                    },
+                    ..Default::default()
+                };
+                let manager =
+                    ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+                        .with_document_store(store.clone());
+                manager
+                    .update_claude_cli_path(Some(wrapper.display().to_string()))
+                    .await;
+                Self {
+                    dir,
+                    graph,
+                    store,
+                    manager,
+                }
+            }
+
+            /// Opens a conversation whose first message is `message`, on the
+            /// legacy engine.
+            async fn open(&self, message: String) -> String {
+                let mut req = request(None, None, "default");
+                req.message = message;
+                req.cwd = self.dir.path().display().to_string();
+                let sid = self
+                    .manager
+                    .create_session(&req)
+                    .await
+                    .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+                    .session_id;
+                assert!(
+                    !self.manager.agent_runtime.owns(&sid).await,
+                    "Claude Code runs on the legacy engine"
+                );
+                sid
+            }
+
+            /// The stored events of `sid` once `done` holds.
+            async fn stored_until(
+                &self,
+                sid: &str,
+                done: impl Fn(&[crate::neo4j::models::ChatEventRecord]) -> bool,
+            ) -> Vec<crate::neo4j::models::ChatEventRecord> {
+                let id = Uuid::parse_str(sid).unwrap();
+                for _ in 0..400 {
+                    let events = self.graph.get_chat_events(id, 0, 500).await.unwrap();
+                    if done(&events) {
+                        return events;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                panic!("the expected events were never stored for {sid}");
+            }
+
+            /// The `user` lines the CLI read on stdin, as written.
+            fn user_lines(&self) -> Vec<String> {
+                std::fs::read_to_string(self.dir.path().join("stdin.jsonl"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| {
+                        serde_json::from_str::<Value>(l)
+                            .map(|v| v["type"] == "user")
+                            .unwrap_or(false)
+                    })
+                    .map(str::to_string)
+                    .collect()
+            }
+        }
+
+        fn init() -> Value {
+            json!({"op": "emit_json", "json": {"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"}})
+        }
+
+        fn await_user() -> Value {
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000})
+        }
+
+        /// One answered turn: `text`, then a successful result.
+        fn answer(text: &str) -> [Value; 2] {
+            [
+                json!({"op": "emit_json", "json": {"type": "assistant", "message": {
+                    "id": "msg_fake_1", "type": "message", "role": "assistant",
+                    "model": "fake-claude", "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": text}]}}}),
+                json!({"op": "emit_json", "json": {"type": "result", "subtype": "success",
+                    "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                    "session_id": "fake-cli-session", "total_cost_usd": 0.0, "result": text}}),
+            ]
+        }
+
+        fn eof() -> Value {
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000})
+        }
+
+        fn answered(events: &[crate::neo4j::models::ChatEventRecord], text: &str) -> bool {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains(text))
+        }
+
+        /// The blocks of a user line written as content blocks, else a panic.
+        fn blocks_of(line: &str) -> Vec<Value> {
+            let user: Value = serde_json::from_str(line).unwrap();
+            user["message"]["content"]
+                .as_array()
+                .unwrap_or_else(|| panic!("a list of blocks: {user}"))
+                .clone()
+        }
+
+        fn assert_text_then_pixel(line: &str) {
+            assert!(
+                !line.contains("no text could be extracted"),
+                "the image is sent, its /raw line is not: {line}"
+            );
+            assert!(
+                line.contains("pixel.png"),
+                "the document heading stays: {line}"
+            );
+            let blocks = blocks_of(line);
+            assert_eq!(blocks.len(), 2, "text, then the image: {line}");
+            assert_eq!(blocks[0]["type"], "text", "{line}");
+            assert!(
+                blocks[0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("look at this"),
+                "{line}"
+            );
+            assert_eq!(blocks[1]["type"], "image", "{line}");
+            assert_eq!(blocks[1]["source"]["type"], "base64");
+            assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+            assert_eq!(blocks[1]["source"]["data"], pixel_base64());
+        }
+
+        /// An image attached to the message reaches the CLI: the user line on
+        /// stdin is a list of blocks, the text then the image (base64 inline),
+        /// and the text no longer carries the image's "/raw" line.
+        #[tokio::test]
+        async fn the_legacy_engine_writes_the_attached_image_on_the_cli_stdin() {
+            let mut transcript = vec![await_user(), init()];
+            transcript.extend(answer("a pixel"));
+            transcript.push(eof());
+            let cli = LegacyCli::start(&transcript).await;
+            let message = attach_pixel(&cli.graph, &cli.store, "look at this").await;
+            let sid = cli.open(message).await;
+            cli.stored_until(&sid, |e| answered(e, "a pixel")).await;
+
+            let lines = cli.user_lines();
+            assert_eq!(lines.len(), 1, "one user line: {lines:?}");
+            assert_text_then_pixel(&lines[0]);
+            cli.manager.close_session(&sid).await.unwrap();
+        }
+
+        /// A text-only turn is written as it always was: `content` is one
+        /// string, the line is byte for byte `InputMessage::user` of it.
+        #[tokio::test]
+        async fn a_text_only_turn_on_the_legacy_engine_writes_the_same_stdin_line_as_before() {
+            let mut transcript = vec![await_user(), init()];
+            transcript.extend(answer("hello"));
+            transcript.push(eof());
+            let cli = LegacyCli::start(&transcript).await;
+            let sid = cli.open("hi there".to_string()).await;
+            cli.stored_until(&sid, |e| answered(e, "hello")).await;
+
+            let lines = cli.user_lines();
+            assert_eq!(lines.len(), 1, "one user line: {lines:?}");
+            let user: Value = serde_json::from_str(&lines[0]).unwrap();
+            let content = user["message"]["content"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a string content: {user}"))
+                .to_string();
+            assert!(content.contains("hi there"), "{content}");
+            let historical = serde_json::to_string(&nexus_claude::transport::InputMessage::user(
+                content,
+                "default".to_string(),
+            ))
+            .unwrap();
+            assert_eq!(lines[0], historical);
+            cli.manager.close_session(&sid).await.unwrap();
+        }
+
+        /// An image nexus will not hand the CLI (a media type outside png, jpeg,
+        /// gif, webp): `images_refused` / `invalid` on the wire and stored,
+        /// nothing written on stdin, no retry; the next message is served.
+        #[tokio::test]
+        async fn an_invalid_image_on_the_legacy_engine_is_refused_and_nothing_reaches_the_cli() {
+            let mut transcript = vec![await_user(), init()];
+            transcript.extend(answer("hello again"));
+            transcript.push(eof());
+            let cli = LegacyCli::start(&transcript).await;
+            let message = attach_image(
+                &cli.graph,
+                &cli.store,
+                "look at this",
+                "pixel.svg",
+                "image/svg+xml",
+            )
+            .await;
+            let sid = cli.open(message).await;
+            let stored = cli
+                .stored_until(&sid, |e| {
+                    e.iter()
+                        .any(|e| e.event_type == "error" && e.data.contains("images_refused"))
+                })
+                .await;
+            let refusal: ChatEvent = stored
+                .iter()
+                .find(|e| e.event_type == "error")
+                .map(|e| serde_json::from_str(&e.data).unwrap())
+                .unwrap();
+            match &refusal {
+                ChatEvent::Error {
+                    message,
+                    code,
+                    reason,
+                    ..
+                } => {
+                    assert_eq!(code.as_deref(), Some("images_refused"), "{refusal:?}");
+                    assert_eq!(reason.as_deref(), Some("invalid"), "{refusal:?}");
+                    assert!(message.contains("image/svg+xml"), "{message}");
+                    assert!(message.contains("not sent"), "{message}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(
+                !stored.iter().any(|e| e.event_type == "retrying"),
+                "a refusal is not retried"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                cli.user_lines().is_empty(),
+                "nothing was written on stdin: {:?}",
+                cli.user_lines()
+            );
+
+            // The session is usable: the next message is sent (as a string).
+            cli.manager.send_message(&sid, "hi again").await.unwrap();
+            cli.stored_until(&sid, |e| answered(e, "hello again")).await;
+            let lines = cli.user_lines();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains("hi again"), "{}", lines[0]);
+            assert!(!lines[0].contains("\"type\":\"image\""), "{}", lines[0]);
+            cli.manager.close_session(&sid).await.unwrap();
+        }
+
+        /// A retryable failure (529 overloaded, nothing streamed) makes the
+        /// engine send the turn again: the second user line carries the image
+        /// too, never the text alone.
+        #[tokio::test]
+        async fn a_retried_turn_on_the_legacy_engine_sends_the_image_again() {
+            let mut transcript = vec![
+                await_user(),
+                init(),
+                json!({"op": "emit_json", "json": {"type": "result",
+                    "subtype": "error_during_execution", "duration_ms": 1,
+                    "duration_api_ms": 1, "is_error": true, "num_turns": 1,
+                    "session_id": "fake-cli-session", "total_cost_usd": 0.0,
+                    "result": "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}"}}),
+                await_user(),
+            ];
+            transcript.extend(answer("a pixel"));
+            transcript.push(eof());
+            let cli = LegacyCli::start(&transcript).await;
+            let message = attach_pixel(&cli.graph, &cli.store, "look at this").await;
+            let sid = cli.open(message).await;
+            let stored = cli.stored_until(&sid, |e| answered(e, "a pixel")).await;
+            assert!(
+                stored.iter().any(|e| e.event_type == "retrying"),
+                "the turn was retried: {:?}",
+                stored.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+            );
+
+            let lines = cli.user_lines();
+            assert_eq!(lines.len(), 2, "the turn, then its retry: {lines:?}");
+            assert_text_then_pixel(&lines[0]);
+            assert_text_then_pixel(&lines[1]);
+            assert_eq!(lines[0], lines[1], "the retry sends the same blocks");
+            cli.manager.close_session(&sid).await.unwrap();
+        }
+    }
+}
+
+/// The session record of a conversation on the legacy Claude Code engine (P15): the
+/// counter of user messages survives every turn of the CLI.
+mod legacy_session_record {
+    use super::*;
+    fn turn(text: &str, cost: f64) -> [Value; 3] {
+        [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            json!({"op": "emit_json", "json": {"type": "assistant", "message": {
+                "id": "msg_fake_1", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": text}]}}}),
+            json!({"op": "emit_json", "json": {"type": "result", "subtype": "success",
+                "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                "session_id": "fake-cli-session", "total_cost_usd": cost, "result": text}}),
+        ]
+    }
+
+    /// `fake_claude` behind a wrapper that plays `transcript`, and a manager on the
+    /// legacy engine that starts it.
+    async fn legacy(transcript: &[Value]) -> (tempfile::TempDir, Arc<MockGraphStore>, ChatManager) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &script,
+            transcript
+                .iter()
+                .map(|l| format!("{l}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let wrapper = dir.path().join("claude");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_MAX_RUNTIME_MS=120000 \
+                 exec '{}' \"$@\"\n",
+                script.display(),
+                fake_bin("fake_claude").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Legacy,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            obscura_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config);
+        manager
+            .update_claude_cli_path(Some(wrapper.display().to_string()))
+            .await;
+        (dir, graph, manager)
+    }
+
+    /// The record of `sid` once `done` holds.
+    async fn record_until(
+        graph: &MockGraphStore,
+        sid: &str,
+        done: impl Fn(&crate::neo4j::models::ChatSessionNode) -> bool,
+    ) -> crate::neo4j::models::ChatSessionNode {
+        let id = Uuid::parse_str(sid).unwrap();
+        let mut last = None;
+        for _ in 0..400 {
+            let node = graph.get_chat_session(id).await.unwrap();
+            if let Some(node) = node {
+                if done(&node) {
+                    return node;
+                }
+                last = Some(node);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the record of {sid} never got there: {last:?}");
+    }
+
+    /// Three user messages, three turns of the CLI: the record counts three, each
+    /// `result` of the CLI still leaves its cost and its session id (it used to write
+    /// `message_count = 1` on every `result`: 1 measured for 13 messages).
+    #[tokio::test]
+    async fn the_message_count_of_a_legacy_session_counts_every_user_message() {
+        let mut transcript = turn("answer one", 0.01).to_vec();
+        transcript.insert(
+            1,
+            json!({"op": "emit_json", "json": {"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+        );
+        transcript.extend(turn("answer two", 0.02));
+        transcript.extend(turn("answer three", 0.03));
+        transcript.push(json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}));
+        let (dir, graph, manager) = legacy(&transcript).await;
+
+        let mut req = request(None, None, "default");
+        req.message = "message one".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(
+            !manager.agent_runtime.owns(&sid).await,
+            "Claude Code runs on the legacy engine"
+        );
+        let node = record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.01)).await;
+        assert_eq!(node.message_count, 1, "after the first turn: {node:?}");
+
+        manager.send_message(&sid, "message two").await.unwrap();
+        let node = record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.02)).await;
+        assert_eq!(node.message_count, 2, "after the second turn: {node:?}");
+
+        manager.send_message(&sid, "message three").await.unwrap();
+        let node = record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.03)).await;
+        assert_eq!(node.message_count, 3, "after the third turn: {node:?}");
+        assert_eq!(node.cli_session_id.as_deref(), Some("fake-cli-session"));
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// The legacy engine closes on its own path (`close_session_inner_with` past the agent
+    /// runtime): it leaves its episode too, read once the CLI is disconnected.
+    #[tokio::test]
+    async fn a_closed_legacy_session_leaves_its_episode() {
+        let mut transcript = turn("answer one", 0.01).to_vec();
+        transcript.push(json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}));
+        let (dir, graph, manager) = legacy(&transcript).await;
+        let project = crate::test_helpers::test_project_named("proj");
+        graph.create_project(&project).await.unwrap();
+
+        let mut req = request(None, Some("proj"), "default");
+        req.message = "legacy first words".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "the legacy engine");
+        record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.01)).await;
+
+        manager.close_session(&sid).await.unwrap();
+        super::wait_for_session_episode_saves(&graph, 1).await;
+        let episodes = graph.list_session_episodes(project.id, 10).await.unwrap();
+        assert_eq!(episodes.len(), 1, "{episodes:?}");
+        let trace = episodes[0].session.as_ref().unwrap();
+        assert_eq!(trace.session_id.to_string(), sid);
+        assert_eq!(
+            trace.close_reason,
+            crate::episodes::models::close_reason::USER_CLOSED
+        );
+        assert_eq!(trace.total_cost_usd, Some(0.01));
+        assert!(episodes[0].stimulus.request.contains("legacy first words"));
+    }
+
+    /// A turn whose wrap-up never returns, on the legacy engine with a real
+    /// (fake) CLI: the CLI has answered (`result`), then the store that should
+    /// save the turn never answers. Measured on 2026-10-05 (note 1a31aadb) and
+    /// 2026-10-09 (session b4c28b9f): the turn stayed "streaming" for hours and
+    /// every Stop was delivered to nothing.
+    mod stuck_after_result {
+        use super::*;
+        #[allow(unused_imports)]
+        use std::sync::atomic::Ordering;
+
+        async fn is_streaming(manager: &ChatManager, sid: &str) -> bool {
+            manager
+                .active_sessions
+                .read()
+                .await
+                .get(sid)
+                .is_some_and(|s| s.is_streaming.load(Ordering::SeqCst))
+        }
+
+        /// Waits up to `secs` for the session to be idle; says whether it got there.
+        async fn idle_within(manager: &ChatManager, sid: &str, secs: u64) -> bool {
+            for _ in 0..secs * 20 {
+                if !is_streaming(manager, sid).await {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            false
+        }
+
+        /// The persisted events of `sid` whose type is `event_type`, once there
+        /// are `count` of them.
+        async fn persisted_until(
+            graph: &MockGraphStore,
+            sid: &str,
+            event_type: &str,
+            count: usize,
+        ) {
+            let id = Uuid::parse_str(sid).unwrap();
+            let mut seen = 0;
+            for _ in 0..400 {
+                seen = graph
+                    .chat_events
+                    .read()
+                    .await
+                    .get(&id)
+                    .map(|events| events.iter().filter(|e| e.event_type == event_type).count())
+                    .unwrap_or(0);
+                if seen >= count {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("{count} `{event_type}` event(s) never persisted for {sid}: {seen}");
+        }
+
+        fn received(rx: &mut broadcast::Receiver<ChatEvent>) -> Vec<ChatEvent> {
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            events
+        }
+
+        fn has_error(events: &[ChatEvent], code: &str, reason: Option<&str>) -> bool {
+            events.iter().any(|e| {
+                matches!(e, ChatEvent::Error { code: Some(c), reason: r, .. }
+                    if c == code && (reason.is_none() || r.as_deref() == reason))
+            })
+        }
+
+        /// `turns` turns of the CLI (costs 0.01, 0.02...); the second one takes
+        /// its time, room to hold a message during it.
+        fn transcript(turns: usize) -> Vec<Value> {
+            let mut transcript = vec![];
+            for n in 1..=turns {
+                let mut t = turn(&format!("answer {n}"), n as f64 / 100.0).to_vec();
+                if n == 1 {
+                    t.insert(
+                        1,
+                        json!({"op": "emit_json", "json": {"type": "system", "subtype": "init",
+                            "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                            "permissionMode": "default", "apiKeySource": "none"}}),
+                    );
+                }
+                if n == 2 {
+                    t.insert(1, json!({"op": "sleep", "ms": 1500}));
+                }
+                transcript.extend(t);
+            }
+            transcript.push(json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}));
+            transcript
+        }
+
+        /// A session whose first turn is over and saved, then a store that
+        /// never saves a `result` again, then a second turn with a message held
+        /// during it (`queue_user_message`: it interrupts nothing). Returns once
+        /// the CLI has answered the second turn (its cost is written).
+        ///
+        /// The held message is what keeps the session "streaming" past the CLI's
+        /// answer: `finalize_streaming_status` leaves it for the drain to send —
+        /// the drain that comes after the write that never answers.
+        async fn stuck_after_second_result(
+            turns: usize,
+            budget: Option<Duration>,
+        ) -> (
+            tempfile::TempDir,
+            Arc<MockGraphStore>,
+            ChatManager,
+            String,
+            broadcast::Receiver<ChatEvent>,
+        ) {
+            let (dir, graph, manager) = legacy(&transcript(turns)).await;
+            let mut req = request(None, None, "default");
+            req.message = "message one".into();
+            req.cwd = dir.path().display().to_string();
+            let sid = manager
+                .create_session(&req)
+                .await
+                .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+                .session_id;
+            record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.01)).await;
+            assert!(idle_within(&manager, &sid, 15).await, "the first turn ends");
+            persisted_until(&graph, &sid, "result", 1).await;
+
+            if let Some(budget) = budget {
+                manager
+                    .active_sessions
+                    .write()
+                    .await
+                    .get_mut(&sid)
+                    .unwrap()
+                    .post_stream_budget = budget;
+            }
+            graph.stall_chat_events("result");
+            let rx = manager.subscribe(&sid).await.unwrap();
+            manager.send_message(&sid, "message two").await.unwrap();
+            for _ in 0..100 {
+                if is_streaming(&manager, &sid).await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(is_streaming(&manager, &sid).await, "the second turn runs");
+            assert!(
+                manager
+                    .queue_user_message(&sid, "message three")
+                    .await
+                    .unwrap(),
+                "held during the second turn"
+            );
+            record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.02)).await;
+            (dir, graph, manager, sid, rx)
+        }
+
+        /// The Stop on a turn stuck after `result`: the interrupt watchdog ends
+        /// it, the clients learn why, the turn's events still land once the store
+        /// answers, the session takes the next message and the held one goes
+        /// out after it. Red without the watchdog: the session stays "streaming"
+        /// whatever the Stop (until the 30 s step budget, without it for good).
+        #[tokio::test]
+        async fn a_stop_frees_a_turn_whose_wrap_up_never_returns() {
+            let (_dir, graph, manager, sid, mut rx) = stuck_after_second_result(4, None).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                is_streaming(&manager, &sid).await,
+                "the reproduction: the turn is stuck after its result"
+            );
+
+            let outcome = manager.interrupt_scoped(&sid, true).await.unwrap();
+            assert!(outcome.delivered, "the session is local: {outcome:?}");
+            assert!(
+                idle_within(&manager, &sid, 30).await,
+                "a delivered Stop frees the session even when its turn ignores the token"
+            );
+            let events = received(&mut rx);
+            assert!(
+                has_error(&events, "turn_abandoned", None),
+                "the clients learn why: {events:?}"
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    ChatEvent::StreamingStatus {
+                        is_streaming: false
+                    }
+                )),
+                "the composer is released: {events:?}"
+            );
+
+            // The turn's events were not dropped with it: they land when the
+            // store answers.
+            graph.release_chat_events("result");
+            persisted_until(&graph, &sid, "result", 2).await;
+
+            // The session is free: the next message gets its turn, and the
+            // message held during the abandoned one goes out after it.
+            manager.send_message(&sid, "message four").await.unwrap();
+            record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.04)).await;
+            assert!(idle_within(&manager, &sid, 15).await, "the last turn ends");
+            persisted_until(&graph, &sid, "result", 4).await;
+            manager.close_session(&sid).await.unwrap();
+        }
+
+        /// Without any Stop, the case of note 1a31aadb: the write before the
+        /// drain never answers. Past the step budget it no longer holds the turn:
+        /// the held message goes out, the clients learn that the save is late
+        /// (`persistence_delayed`, the step named), every write lands when the
+        /// store answers. Red without the budget: the held message is never
+        /// sent, the session "streaming" for good.
+        #[tokio::test]
+        async fn a_wrap_up_that_never_returns_no_longer_holds_the_queue() {
+            let (_dir, graph, manager, sid, mut rx) =
+                stuck_after_second_result(3, Some(Duration::from_millis(300))).await;
+
+            record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.03)).await;
+            assert!(
+                idle_within(&manager, &sid, 10).await,
+                "a store that never answers no longer pins the turn"
+            );
+            let events = received(&mut rx);
+            assert!(
+                has_error(&events, "persistence_delayed", Some("persist_events")),
+                "the clients learn that the save is late, and which one: {events:?}"
+            );
+
+            graph.release_chat_events("result");
+            persisted_until(&graph, &sid, "result", 3).await;
+            manager.close_session(&sid).await.unwrap();
+        }
+    }
+}
+
+/// P14: a native session's conversation lives in a transcript the resume token only
+/// names. Kept on disk (owner-only), the session resumes after a restart with its
+/// whole history; a deletion of the session removes it.
+mod native_transcripts {
+    use super::*;
+    fn answer(key: &str) -> Value {
+        sse_route(
+            key,
+            vec![
+                delta(json!({"content": format!("answer to {key}")})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+                json!("[DONE]"),
+            ],
+        )
+    }
+
+    /// The most specific routes first: the fake answers with the first unused match,
+    /// and a later turn's body holds the earlier turns' text.
+    fn script_with_turns() -> Value {
+        let mut routes = vec![answer("AFTER-RESTART"), answer("SECOND-TURN")];
+        routes.extend(script().as_array().cloned().unwrap());
+        Value::Array(routes)
+    }
+
+    async fn wait_results(graph: &MockGraphStore, sid: &str, count: usize) {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        for _ in 0..400 {
+            let n = graph
+                .get_chat_events(uuid, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "result")
+                .count();
+            if n >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{count} result event(s) never persisted");
+    }
+
+    #[tokio::test]
+    async fn a_native_session_resumes_its_history_after_a_restart_and_its_deletion_removes_the_transcript(
+    ) {
+        let fake = FakeOpenAi::start(script_with_turns());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        // Before the restart: two turns.
+        let before = manager(graph.clone(), true).with_native_transcripts(&root);
+        let created = before
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap();
+        let sid = created.session_id;
+        assert!(before.agent_runtime.owns(&sid).await, "the agent engine");
+        wait_results(&graph, &sid, 1).await;
+        // CTX6: text that only LOOKS like a secret (fields named `*_tokens`, a word of
+        // more than 400 bytes) must come back after the restart exactly as it was sent.
+        let second = format!(
+            "SECOND-TURN {{\"input_tokens\":12,\"max_tokens\":3}} /{}",
+            "segment/".repeat(60)
+        );
+        before.send_message(&sid, &second).await.unwrap();
+        wait_results(&graph, &sid, 2).await;
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+
+        // The transcript the token names is on disk, owner-only.
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        let token = graph
+            .get_chat_session(uuid)
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_token
+            .expect("a native session persists its resume token");
+        let id = super::super::provider::transcripts::transcript_id_of(&token)
+            .expect("a native token names a transcript");
+        let file = root.join("local").join(format!("{id}.json"));
+        assert!(
+            file.exists(),
+            "the transcript is on disk: {}",
+            file.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&file), 0o600, "the transcript file");
+            assert_eq!(mode(&root.join("local")), 0o700, "the instance directory");
+            assert_eq!(mode(&root), 0o700, "the root");
+        }
+
+        // A restart: a new manager on the same graph and the same data directory.
+        let after = manager(graph.clone(), true).with_native_transcripts(&root);
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        after
+            .resume_session(&sid, "AFTER-RESTART", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("resume after a restart failed: {e:#}"));
+        wait_results(&graph, &sid, 3).await;
+        let body = fake
+            .chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .find(|b| b.contains("AFTER-RESTART"))
+            .expect("the resumed turn reached the model");
+        for earlier in [
+            "hi there",
+            "hello from the fake model",
+            "SECOND-TURN",
+            "answer to SECOND-TURN",
+        ] {
+            assert!(
+                body.contains(earlier),
+                "the resumed turn carries the history ({earlier}): {body}"
+            );
+        }
+
+        // CTX6: the history the resumed request replays is, message for message and
+        // byte for byte, the one the live session sent (the system prompt aside: the
+        // host rebuilds it at every opening). The native resume reloads the transcript
+        // FILE, never the graph's chat events.
+        let requests = fake.chat_requests();
+        let messages_of = |needle: &str, without: Option<&str>| {
+            requests
+                .iter()
+                .map(|r| r["body"].clone())
+                .find(|b| {
+                    let text = b.to_string();
+                    text.contains(needle) && without.is_none_or(|w| !text.contains(w))
+                })
+                .and_then(|b| b["messages"].as_array().cloned())
+                .expect("the request")
+        };
+        let live = messages_of("SECOND-TURN", Some("AFTER-RESTART"));
+        let resumed = messages_of("AFTER-RESTART", None);
+        assert!(resumed.len() > live.len(), "{resumed:?}");
+        assert_eq!(
+            &resumed[1..live.len()],
+            &live[1..],
+            "the resumed history departs from the live one"
+        );
+        assert!(!serde_json::to_string(&resumed)
+            .unwrap()
+            .contains("<redacted"));
+
+        // Deleting the session removes its transcript, then the node.
+        assert!(after.delete_session(uuid).await.unwrap());
+        assert!(!file.exists(), "the transcript goes with the session");
+        assert!(graph.get_chat_session(uuid).await.unwrap().is_none());
+        assert!(!after.delete_session(uuid).await.unwrap(), "already gone");
+    }
+
+    fn script_lost() -> Value {
+        let mut routes = vec![answer("AFTER-LOST"), answer("SECOND-TURN")];
+        routes.extend(script().as_array().cloned().unwrap());
+        Value::Array(routes)
+    }
+
+    /// A native session whose transcript FILE is gone must still resume: the resume token
+    /// names a transcript written only when a turn commits, so a session cut before its
+    /// first committed turn (a fresh open, notably the first turn after a provider switch)
+    /// carried a token that named nothing. Every resume then failed with
+    /// `"unknown transcript: nothing to resume"` and the conversation was bricked even
+    /// though the graph held it whole (05716244). The repair reopens FRESH with the stored
+    /// history relayed in front of the message: the conversation is never lost.
+    #[tokio::test]
+    async fn a_native_session_whose_transcript_is_gone_resumes_by_relaying_the_stored_history() {
+        let fake = FakeOpenAi::start(script_lost());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        // Two committed turns: the transcript the token names is written to disk.
+        let before = manager(graph.clone(), true).with_native_transcripts(&root);
+        let sid = before
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        wait_results(&graph, &sid, 1).await;
+        before.send_message(&sid, "SECOND-TURN").await.unwrap();
+        wait_results(&graph, &sid, 2).await;
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        let token = graph
+            .get_chat_session(uuid)
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_token
+            .expect("a native session persists its resume token");
+        let old_id = super::super::provider::transcripts::transcript_id_of(&token)
+            .expect("a native token names a transcript");
+        let file = root.join("local").join(format!("{old_id}.json"));
+        assert!(file.exists(), "the transcript is on disk");
+        // Simulate the bug: the token still names the transcript, but the file — never
+        // written because no turn ever committed — is absent.
+        std::fs::remove_file(&file).unwrap();
+        assert!(!file.exists());
+
+        // A restart. The resume must NOT fail with "unknown transcript": it reopens fresh
+        // and relays the stored history in front of the message.
+        let after = manager(graph.clone(), true).with_native_transcripts(&root);
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        after
+            .resume_session(&sid, "AFTER-LOST", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("resume with a lost transcript failed: {e:#}"));
+        wait_results(&graph, &sid, 3).await;
+
+        // The model's request carries the earlier conversation, rebuilt from the graph
+        // (the absent transcript could no longer provide it).
+        let body = fake
+            .chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .find(|b| b.contains("AFTER-LOST"))
+            .expect("the repaired turn reached the model");
+        for earlier in ["hi there", "hello from the fake model", "SECOND-TURN"] {
+            assert!(
+                body.contains(earlier),
+                "the repaired resume carries the stored history ({earlier}): {body}"
+            );
+        }
+
+        // A fresh transcript is on disk under a NEW token: the session is whole again and
+        // will resume after the next restart too.
+        let new_token = graph
+            .get_chat_session(uuid)
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_token
+            .expect("the repaired session persists a resume token");
+        let new_id = super::super::provider::transcripts::transcript_id_of(&new_token)
+            .expect("a native token names a transcript");
+        assert_ne!(new_id, old_id, "the repair opened a fresh transcript");
+        assert!(
+            root.join("local").join(format!("{new_id}.json")).exists(),
+            "the repaired session wrote a fresh transcript"
+        );
+    }
+
+    /// RESUME — what the MODEL sees when a conversation is resumed (the gap the audit of
+    /// 2026-11-08 named: no test read the resumed request's CONTENT, only counts or `contains`).
+    /// Three user turns, a clean close, a resume through `resume_session` (the production
+    /// path), then the request that reaches the endpoint is read message by message: the
+    /// user texts are exactly the four sent, in order, once each, the new one last, and
+    /// every assistant answer sits right after the question it answers.
+    #[tokio::test]
+    async fn a_resumed_native_conversation_shows_the_model_every_turn_in_order_once() {
+        let mut routes = vec![
+            answer("MSG-FOUR"),
+            answer("MSG-THREE"),
+            answer("MSG-TWO"),
+            answer("MSG-ONE"),
+        ];
+        routes.extend(script().as_array().cloned().unwrap());
+        let fake = FakeOpenAi::start(Value::Array(routes));
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        let before = manager(graph.clone(), true).with_native_transcripts(&root);
+        let mut open = request(Some("local"), Some("proj"), "default");
+        open.message = "MSG-ONE".into();
+        let sid = before.create_session(&open).await.unwrap().session_id;
+        wait_results(&graph, &sid, 1).await;
+        before.send_message(&sid, "MSG-TWO").await.unwrap();
+        wait_results(&graph, &sid, 2).await;
+        before.send_message(&sid, "MSG-THREE").await.unwrap();
+        wait_results(&graph, &sid, 3).await;
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+
+        let after = manager(graph.clone(), true).with_native_transcripts(&root);
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        after
+            .resume_session(&sid, "MSG-FOUR", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        wait_results(&graph, &sid, 4).await;
+
+        let resumed = fake
+            .chat_requests()
+            .iter()
+            .map(|r| r["body"].clone())
+            .find(|b| b.to_string().contains("MSG-FOUR"))
+            .and_then(|b| b["messages"].as_array().cloned())
+            .expect("the resumed turn reached the model");
+        let text_of = |m: &Value| match &m["content"] {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let of_role = |role: &str| -> Vec<String> {
+            resumed
+                .iter()
+                .filter(|m| m["role"] == role)
+                .map(text_of)
+                .collect()
+        };
+        assert_eq!(
+            of_role("user"),
+            ["MSG-ONE", "MSG-TWO", "MSG-THREE", "MSG-FOUR"],
+            "the user turns the model sees: all, in order, once, the new one last: {resumed:#?}"
+        );
+        assert_eq!(
+            of_role("assistant"),
+            [
+                "answer to MSG-ONE",
+                "answer to MSG-TWO",
+                "answer to MSG-THREE"
+            ],
+            "each answer is kept once, in order"
+        );
+        let last = resumed.last().expect("messages");
+        assert_eq!(
+            (last["role"].as_str(), text_of(last).as_str()),
+            (Some("user"), "MSG-FOUR"),
+            "the last message is the new user message"
+        );
+    }
+
+    /// The `degraded_features` of the session's `system_init`, as persisted.
+    async fn degraded_of(graph: &MockGraphStore, sid: &str) -> Vec<String> {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        for _ in 0..400 {
+            let found = graph
+                .get_chat_events(uuid, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+                .find_map(|e| match e {
+                    ChatEvent::SystemInit {
+                        degraded_features, ..
+                    } => Some(degraded_features.unwrap_or_default()),
+                    _ => None,
+                });
+            if let Some(degraded) = found {
+                return degraded;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no system_init persisted");
+    }
+
+    /// CTX6 follow-up (review of #752, point 1): a transcript root inside a git work tree
+    /// (a versioned HOME) keeps the conversation in memory — and the session SAYS it will
+    /// not resume after a restart, instead of only a server-side `warn!`.
+    #[tokio::test]
+    async fn a_transcript_root_inside_a_git_work_tree_is_declared_on_the_session() {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".git")).unwrap();
+        let root = home.path().join("Library").join("native-transcripts");
+
+        let manager = manager(graph.clone(), true).with_native_transcripts(&root);
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        let degraded = degraded_of(&graph, &sid).await;
+        assert!(
+            degraded
+                .iter()
+                .any(|f| f == super::super::agent_runtime::RESUME_AFTER_RESTART_FEATURE),
+            "the session declares it: {degraded:?}"
+        );
+        assert!(!root.exists(), "nothing written inside the work tree");
+    }
+
+    /// …and a root outside any work tree declares nothing (the transcripts are on disk).
+    #[tokio::test]
+    async fn a_transcript_root_outside_a_work_tree_declares_nothing() {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        let manager = manager(graph.clone(), true).with_native_transcripts(&root);
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        let degraded = degraded_of(&graph, &sid).await;
+        assert!(
+            !degraded
+                .iter()
+                .any(|f| f == super::super::agent_runtime::RESUME_AFTER_RESTART_FEATURE),
+            "{degraded:?}"
+        );
+    }
+}
+
+/// A message sent during a turn of the legacy Claude Code engine interrupts it, then
+/// runs. The CLI ends the interrupted turn with its own `result`, which may come
+/// LATE: after the queued turn has already subscribed to the CLI's output. That
+/// stale `result` must not end the queued turn (it used to: the queued turn ended at
+/// once, its real answer arrived with no turn to read it, and every later turn was
+/// one `result` behind — the parity matrix saw it under CI load).
+mod legacy_interrupt_stale_result {
+    use super::*;
+    fn emit(v: Value) -> Value {
+        json!({"op": "emit_json", "json": v})
+    }
+
+    fn text(t: &str, id: &str) -> Value {
+        emit(json!({"type": "assistant", "message": {
+            "id": id, "type": "message", "role": "assistant",
+            "model": "fake-claude", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": t}]}}))
+    }
+
+    fn result(subtype: &str, t: &str, is_error: bool) -> Value {
+        emit(json!({"type": "result", "subtype": subtype,
+            "duration_ms": 1, "duration_api_ms": 1, "is_error": is_error, "num_turns": 1,
+            "session_id": "fake-cli-session", "total_cost_usd": 0.0, "result": t}))
+    }
+
+    fn await_in(needle: &str) -> Value {
+        json!({"op": "await_stdin", "contains": needle, "timeout_ms": 15000, "optional": true})
+    }
+
+    /// The first turn stalls until it is interrupted; the CLI answers the interrupt
+    /// with its `result` only after `late_ms`; then the queued message is answered,
+    /// then a third one.
+    fn transcript(late_ms: u64) -> Vec<Value> {
+        vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            emit(json!({"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"})),
+            text("working on it", "msg_1"),
+            await_in("\"interrupt\""),
+            json!({"op": "sleep", "ms": late_ms}),
+            result("error_during_execution", "", true),
+            await_in("SECOND-MESSAGE"),
+            text("answered second", "msg_2"),
+            result("success", "answered second", false),
+            await_in("THIRD-MESSAGE"),
+            text("answered third", "msg_3"),
+            result("success", "answered third", false),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ]
+    }
+
+    struct Cli {
+        dir: tempfile::TempDir,
+        graph: Arc<MockGraphStore>,
+        manager: ChatManager,
+    }
+
+    impl Cli {
+        async fn start(late_ms: u64) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("transcript.jsonl");
+            let lines: String = transcript(late_ms)
+                .iter()
+                .map(|l| format!("{l}\n"))
+                .collect();
+            std::fs::write(&script, lines).unwrap();
+            let wrapper = dir.path().join("claude");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                     FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                    script.display(),
+                    dir.path().join("stdin.jsonl").display(),
+                    fake_bin("fake_claude").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let graph = Arc::new(MockGraphStore::new());
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: fake_bin("fake_mcp"),
+                nexus_tools_path: None,
+                nexus_browser_path: None,
+                obscura_path: None,
+                jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            let manager =
+                ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config);
+            manager
+                .update_claude_cli_path(Some(wrapper.display().to_string()))
+                .await;
+            Self {
+                dir,
+                graph,
+                manager,
+            }
+        }
+
+        fn stdin(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("stdin.jsonl")).unwrap_or_default()
+        }
+
+        async fn read_by_cli(&self, needle: &str) {
+            for _ in 0..400 {
+                if self.stdin().contains(needle) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the CLI never read {needle:?}: {}", self.stdin());
+        }
+
+        /// Whether `text` was stored as an answer of the assistant within `secs`.
+        async fn answered(&self, sid: &str, text: &str, secs: u64) -> bool {
+            let id = Uuid::parse_str(sid).unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+            while tokio::time::Instant::now() < deadline {
+                let events = self.graph.get_chat_events(id, 0, 500).await.unwrap();
+                if events
+                    .iter()
+                    .any(|e| e.event_type == "assistant_text" && e.data.contains(text))
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            false
+        }
+    }
+
+    async fn queued_message_after(late_ms: u64) {
+        let cli = Cli::start(late_ms).await;
+        let mut req = request(None, None, "default");
+        req.message = "FIRST-MESSAGE".into();
+        req.cwd = cli.dir.path().display().to_string();
+        let sid = cli
+            .manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!cli.manager.agent_runtime.owns(&sid).await, "legacy engine");
+        cli.read_by_cli("FIRST-MESSAGE").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            cli.manager.is_session_streaming(&sid).await,
+            "the first turn runs"
+        );
+
+        // Sent while the first turn runs: queued, the turn is interrupted.
+        cli.manager
+            .send_message(&sid, "SECOND-MESSAGE")
+            .await
+            .unwrap();
+        cli.read_by_cli("SECOND-MESSAGE").await;
+        assert!(
+            cli.answered(&sid, "answered second", 10).await,
+            "the queued turn read its own answer (CLI result {late_ms} ms after the interrupt): {:?}\nstdin: {}",
+            cli.graph.get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 500).await.unwrap().iter().map(|e| (e.event_type.clone(), e.data.chars().take(90).collect::<String>())).collect::<Vec<_>>(),
+            cli.stdin()
+        );
+
+        // And the turns stay in step.
+        for _ in 0..200 {
+            if !cli.manager.is_session_streaming(&sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        cli.manager
+            .send_message(&sid, "THIRD-MESSAGE")
+            .await
+            .unwrap();
+        assert!(
+            cli.answered(&sid, "answered third", 10).await,
+            "the next turn reads its own answer"
+        );
+        cli.manager.close_session(&sid).await.unwrap();
+    }
+
+    /// The CLI answers the interrupt at once: the queued message runs.
+    #[tokio::test]
+    async fn a_queued_message_runs_after_the_interrupt() {
+        queued_message_after(0).await;
+    }
+
+    /// The CLI answers the interrupt late (a loaded machine): its stale `result`
+    /// does not end the queued turn.
+    #[tokio::test]
+    async fn a_late_result_of_the_interrupted_turn_does_not_end_the_queued_turn() {
+        queued_message_after(1500).await;
+    }
+}
+
+/// The listener of out-of-turn output (`oob_listener`) reads the CLI's output on a
+/// subscription of its own, and decides "in a turn or not" from `is_streaming` when
+/// it gets to a message. Lagging behind the turn (a loaded machine), it used to get
+/// to the turn's last `tool_result` after the turn had ended, took it for background
+/// output and started a turn of its own with it ("[tool_result] …"): every later
+/// turn was then one `result` behind. Seen by the parity matrix on main (cancel_tools
+/// and nats.cancel_tools, "tour poursuivi=false").
+mod legacy_oob_lag {
+    use super::*;
+    fn emit(v: Value) -> Value {
+        json!({"op": "emit_json", "json": v})
+    }
+
+    fn text(t: &str, id: &str) -> Value {
+        emit(json!({"type": "assistant", "message": {
+            "id": id, "type": "message", "role": "assistant",
+            "model": "fake-claude", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": t}]}}))
+    }
+
+    fn result_ok(t: &str) -> Value {
+        emit(json!({"type": "result", "subtype": "success",
+            "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+            "session_id": "fake-cli-session", "total_cost_usd": 0.0, "result": t}))
+    }
+
+    fn transcript() -> Vec<Value> {
+        vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            emit(json!({"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"})),
+            text("ready", "msg_1"),
+            result_ok("ready"),
+            // A turn whose last tool_result is followed at once by its answer.
+            json!({"op": "await_stdin", "contains": "SECOND-MESSAGE", "timeout_ms": 30000}),
+            emit(json!({"type": "assistant", "message": {
+                "id": "msg_2", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                             "input": {"command": "ls"}}]}})),
+            emit(
+                json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "a.rs",
+                 "is_error": false}]}}),
+            ),
+            text("answered second", "msg_3"),
+            result_ok("answered second"),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ]
+    }
+
+    /// A listener a little behind (150 ms per message).
+    #[tokio::test]
+    async fn a_lagging_oob_listener_does_not_replay_the_turns_tool_result_as_a_new_turn() {
+        lagging_listener(Duration::from_millis(150)).await;
+    }
+
+    /// A listener far behind: more than 3 s for the turn's four messages, longer than
+    /// any bounded wait of the turn — only a rule on the listener's side holds.
+    #[tokio::test]
+    async fn a_listener_lagging_longer_than_any_bound_still_does_not_replay_the_tool_result() {
+        lagging_listener(Duration::from_millis(800)).await;
+    }
+
+    async fn lagging_listener(lag: Duration) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("transcript.jsonl");
+        let lines: String = transcript().iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&script, lines).unwrap();
+        let wrapper = dir.path().join("claude");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                 FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                script.display(),
+                dir.path().join("stdin.jsonl").display(),
+                fake_bin("fake_claude").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Legacy,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            obscura_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config);
+        manager
+            .update_claude_cli_path(Some(wrapper.display().to_string()))
+            .await;
+
+        let mut req = request(None, None, "default");
+        req.message = "FIRST-MESSAGE".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
+        let id = Uuid::parse_str(&sid).unwrap();
+        let stored = |needle: &'static str| {
+            let graph = graph.clone();
+            async move {
+                graph
+                    .get_chat_events(id, 0, 500)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.data.contains(needle))
+            }
+        };
+        let mut ready = false;
+        for _ in 0..400 {
+            if stored("\"ready\"").await && !manager.is_session_streaming(&sid).await {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(ready, "the first turn ended");
+
+        // From now on the OOB listener of this session lags behind the turn.
+        crate::chat::oob_listener::TEST_LAG
+            .lock()
+            .unwrap()
+            .push((sid.clone(), lag));
+        manager.send_message(&sid, "SECOND-MESSAGE").await.unwrap();
+        let mut answered = false;
+        for _ in 0..400 {
+            if stored("answered second").await {
+                answered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Long enough for the lagging listener to get to every message of the turn.
+        tokio::time::sleep(lag * 6 + Duration::from_secs(1)).await;
+        crate::chat::oob_listener::TEST_LAG
+            .lock()
+            .unwrap()
+            .retain(|(s, _)| s != &sid);
+
+        let stdin = std::fs::read_to_string(dir.path().join("stdin.jsonl")).unwrap_or_default();
+        let events: Vec<(String, String)> = graph
+            .get_chat_events(id, 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| (e.event_type.clone(), e.data.chars().take(80).collect()))
+            .collect();
+        assert!(answered, "the turn answered: {events:?}");
+        assert!(
+            !stdin.contains("[tool_result]"),
+            "the turn's own tool_result started a turn of its own: {stdin}"
+        );
+        assert!(
+            !events.iter().any(|(t, _)| t == "background_output"),
+            "the turn's own output was taken for background output: {events:?}"
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P11a: an approval lasts `once` or for the `session`, on both engines, and the backend
+/// decides what a session grant covers (`chat::session_grants`): the identical call (any
+/// call of a read-only tool), answered by the backend in THIS session only, never handed
+/// to the provider as a rule. `always` (P11b): kept by the backend for a person and a project,
+/// never by the provider; refused, typed, elsewhere.
+mod permission_scopes {
+    use super::*;
+    use crate::chat::manager::PermissionDeliveryError;
+    use crate::chat::types::PermissionAnswerScope;
+    fn emit(v: Value) -> Value {
+        json!({"op": "emit_json", "json": v})
+    }
+
+    // ---------------------------------------------------------------- legacy
+
+    /// One turn, five `can_use_tool` the CLI waits on in turn: `ls -la` twice, then
+    /// `ls -la >> ~/.zshrc`, then `sudo ls`, then `./x.sh`.
+    fn legacy_transcript() -> Vec<Value> {
+        let ask = |id: &str, command: &str| {
+            vec![
+                emit(
+                    json!({"type": "control_request", "request_id": id, "request": {
+                    "subtype": "can_use_tool", "tool_name": "Bash",
+                    "input": {"command": command}, "tool_use_id": id}}),
+                ),
+                json!({"op": "await_stdin", "contains": id, "timeout_ms": 15000}),
+            ]
+        };
+        let mut t = vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            emit(json!({"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"})),
+        ];
+        t.extend(ask("req-s1", "ls -la"));
+        t.extend(ask("req-s2", "ls -la"));
+        t.extend(ask("req-redirect", "ls -la >> ~/.zshrc"));
+        t.extend(ask("req-wrap", "sudo ls"));
+        t.extend(ask("req-script", "./x.sh"));
+        t.extend(vec![
+            emit(json!({"type": "assistant", "message": {
+                "id": "msg_fake_2", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "scopes done"}]}})),
+            emit(json!({"type": "result", "subtype": "success",
+                "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                "session_id": "fake-cli-session", "total_cost_usd": 0.0,
+                "result": "scopes done"})),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ]);
+        t
+    }
+
+    fn legacy_wrapper(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("transcript.jsonl");
+        let lines: String = legacy_transcript()
+            .iter()
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&script, lines).unwrap();
+        let wrapper = dir.join("claude");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                 FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                script.display(),
+                dir.join("stdin.jsonl").display(),
+                fake_bin("fake_claude").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wrapper.display().to_string()
+    }
+
+    /// The `control_response` the CLI read for `request_id`, once it is there.
+    async fn answer_read(dir: &std::path::Path, request_id: &str) -> Value {
+        for _ in 0..400 {
+            let found = std::fs::read_to_string(dir.join("stdin.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .find(|v| {
+                    v["type"] == "control_response" && v["response"]["request_id"] == request_id
+                });
+            if let Some(v) = found {
+                return v["response"]["response"].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the CLI never read an answer to {request_id}");
+    }
+
+    async fn waits(manager: &ChatManager, sid: &str, request_id: &str) {
+        let id = Uuid::parse_str(sid).unwrap();
+        for _ in 0..400 {
+            let snap = manager.live_session_snapshot().await;
+            if snap
+                .pending_permissions
+                .get(&id)
+                .is_some_and(|ids| ids.contains(request_id))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{request_id} never waited on the session");
+    }
+
+    /// `(scope, rule)` of each `permission_decision` of a session, in order, once
+    /// `count` are stored (or after a few seconds).
+    async fn decisions(graph: &MockGraphStore, sid: &str, count: usize) -> Vec<(Value, Value)> {
+        let id = Uuid::parse_str(sid).unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..200 {
+            seen = graph
+                .get_chat_events(id, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "permission_decision")
+                .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+                .map(|v| (v["scope"].clone(), v["rule"].clone()))
+                .collect();
+            if seen.len() >= count {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn legacy_session_grant_covers_the_identical_call_only_and_is_never_a_cli_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = legacy_wrapper(dir.path());
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: fake_bin("fake_mcp"),
+                nexus_tools_path: None,
+                nexus_browser_path: None,
+                obscura_path: None,
+                jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+        };
+        manager.update_claude_cli_path(Some(cli)).await;
+        let mut req = request(None, None, "default");
+        req.message = "run the scoped tools".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
+
+        // `session` on `ls -la`: a plain allow for the CLI, no rule handed to it.
+        waits(&manager, &sid, "req-s1").await;
+        manager
+            .route_permission_response(&sid, "req-s1", true, PermissionAnswerScope::Session, true)
+            .await
+            .unwrap();
+        let answer = answer_read(dir.path(), "req-s1").await;
+        assert_eq!(answer["behavior"], "allow", "{answer}");
+        assert_eq!(
+            answer["updatedInput"],
+            json!({"command": "ls -la"}),
+            "{answer}"
+        );
+        assert!(answer.get("updatedPermissions").is_none(), "{answer}");
+
+        // The identical call again: the backend answers it, nobody is asked.
+        let answer = answer_read(dir.path(), "req-s2").await;
+        assert_eq!(answer["behavior"], "allow", "{answer}");
+        assert!(answer.get("updatedPermissions").is_none(), "{answer}");
+        // A Deny clicked just before the backend's answer, through the WebSocket: refused
+        // like REST and NATS (the request no longer waits), never a second answer to the CLI
+        // nor a stored refusal of a call that ran.
+        let late = crate::api::ws_chat_handler::answer_permission_frame(
+            &manager,
+            &sid,
+            "req-s2",
+            false,
+            PermissionAnswerScope::Once,
+        )
+        .await;
+        assert!(
+            matches!(late, Err(PermissionDeliveryError::NotPending)),
+            "{late:?}"
+        );
+
+        // `ls -la >> ~/.zshrc` is not covered: it waits for the user; `always` is
+        // refused, typed, and the request still waits.
+        waits(&manager, &sid, "req-redirect").await;
+        let refused = manager
+            .route_permission_response(
+                &sid,
+                "req-redirect",
+                true,
+                PermissionAnswerScope::Always,
+                true,
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Always
+                ))
+            ),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(
+                &sid,
+                "req-redirect",
+                false,
+                PermissionAnswerScope::Once,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // `sudo ls` runs another command: no session grant, refused, typed.
+        waits(&manager, &sid, "req-wrap").await;
+        let refused = manager
+            .route_permission_response(&sid, "req-wrap", true, PermissionAnswerScope::Session, true)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Session
+                ))
+            ),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(&sid, "req-wrap", false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+
+        // A local script: the model could edit it and rerun the "identical" call. Refused.
+        waits(&manager, &sid, "req-script").await;
+        let refused = manager
+            .route_permission_response(
+                &sid,
+                "req-script",
+                true,
+                PermissionAnswerScope::Session,
+                true,
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Session
+                ))
+            ),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(&sid, "req-script", false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+
+        // The decisions say how long, and exactly what, was granted (the backend's own
+        // decision is stored with the turn: compare without the order).
+        let mut seen: Vec<String> = decisions(&graph, &sid, 5)
+            .await
+            .iter()
+            .map(|(scope, rule)| format!("{scope} {rule}"))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "\"session\" \"Bash: ls -la\"",
+                "\"session\" \"Bash: ls -la\"",
+                "null null",
+                "null null",
+                "null null",
+            ]
+        );
+        // One answer per request reached the CLI (the late Deny wrote nothing).
+        let stdin = std::fs::read_to_string(dir.path().join("stdin.jsonl")).unwrap_or_default();
+        let answers_to_s2 = stdin
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["type"] == "control_response" && v["response"]["request_id"] == "req-s2")
+            .count();
+        assert_eq!(answers_to_s2, 1, "{stdin}");
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// One turn, three `can_use_tool` the CLI waits on in turn: `cat README.md` twice (the
+    /// CLI suggesting, as it does, rules that would set a mode, add a directory and allow
+    /// a whole program), then `cat README.md >> ~/.zshrc`.
+    fn legacy_lasting_transcript() -> Vec<Value> {
+        let suggestions = json!([
+            {"type": "setMode", "mode": "acceptEdits", "destination": "session"},
+            {"type": "addDirectories", "directories": ["/"], "destination": "session"},
+            {"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "cat:*"}],
+             "behavior": "allow", "destination": "session"}
+        ]);
+        let ask = |id: &str, command: &str| {
+            vec![
+                emit(
+                    json!({"type": "control_request", "request_id": id, "request": {
+                    "subtype": "can_use_tool", "tool_name": "Bash",
+                    "input": {"command": command}, "tool_use_id": id,
+                    "permission_suggestions": suggestions}}),
+                ),
+                json!({"op": "await_stdin", "contains": id, "timeout_ms": 15000}),
+            ]
+        };
+        let mut t = vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            emit(json!({"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"})),
+        ];
+        t.extend(ask("req-a1", "cat README.md"));
+        t.extend(ask("req-a2", "cat README.md"));
+        t.extend(ask("req-a3", "cat README.md >> ~/.zshrc"));
+        t.extend(vec![
+            emit(json!({"type": "assistant", "message": {
+                "id": "msg_fake_2", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "lasting done"}]}})),
+            emit(json!({"type": "result", "subtype": "success",
+                "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                "session_id": "fake-cli-session", "total_cost_usd": 0.0,
+                "result": "lasting done"})),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ]);
+        t
+    }
+
+    /// The review of P11a, blocker 3, on the legacy engine: `always` hands NOTHING to the
+    /// CLI — no `updatedPermissions`, none of its suggestions (`setMode`, `addDirectories`,
+    /// a whole-program rule) to `localSettings` or anywhere, no `.claude/settings.local.json`
+    /// written in the project. The backend keeps the identical call and answers it.
+    #[tokio::test]
+    async fn legacy_always_hands_nothing_to_the_cli_and_covers_the_identical_call_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("transcript.jsonl");
+        let lines: String = legacy_lasting_transcript()
+            .iter()
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&script, lines).unwrap();
+        let cli = {
+            use std::os::unix::fs::PermissionsExt;
+            let wrapper = dir.path().join("claude");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                     FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                    script.display(),
+                    dir.path().join("stdin.jsonl").display(),
+                    fake_bin("fake_claude").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            wrapper.display().to_string()
+        };
+        let rules = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        project_at(&graph, dir.path()).await;
+        let manager = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: fake_bin("fake_mcp"),
+                nexus_tools_path: None,
+                nexus_browser_path: None,
+                obscura_path: None,
+                jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                max_sessions: 10,
+                lasting_rules_dir: Some(rules.path().join("rules")),
+                native_turn_timeout_secs: None,
+                native_session_max_tokens: None,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+        };
+        manager.update_claude_cli_path(Some(cli)).await;
+        let mut req = request(None, Some("proj"), "default");
+        req.message = "run the lasting tools".into();
+        req.cwd = dir.path().display().to_string();
+        req.user_claims = Some(person("alice"));
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
+
+        waits(&manager, &sid, "req-a1").await;
+        manager
+            .route_permission_response(&sid, "req-a1", true, PermissionAnswerScope::Always, true)
+            .await
+            .unwrap();
+        let answer = answer_read(dir.path(), "req-a1").await;
+        assert_eq!(answer["behavior"], "allow", "{answer}");
+        assert_eq!(
+            answer["updatedInput"],
+            json!({"command": "cat README.md"}),
+            "{answer}"
+        );
+        assert!(answer.get("updatedPermissions").is_none(), "{answer}");
+
+        // The identical call: answered by the backend, `always`.
+        let answer = answer_read(dir.path(), "req-a2").await;
+        assert_eq!(answer["behavior"], "allow", "{answer}");
+        assert!(answer.get("updatedPermissions").is_none(), "{answer}");
+
+        // The redirection waits for the user, and cannot be approved for good.
+        waits(&manager, &sid, "req-a3").await;
+        let refused = manager
+            .route_permission_response(&sid, "req-a3", true, PermissionAnswerScope::Always, true)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Always
+                ))
+            ),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(&sid, "req-a3", false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+
+        let mut seen: Vec<String> = decisions(&graph, &sid, 3)
+            .await
+            .iter()
+            .map(|(scope, rule)| format!("{scope} {rule}"))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "\"always\" \"Bash: cat README.md\"",
+                "\"always\" \"Bash: cat README.md\"",
+                "null null",
+            ]
+        );
+        // Nothing of the CLI's suggestions went anywhere.
+        let stdin = std::fs::read_to_string(dir.path().join("stdin.jsonl")).unwrap_or_default();
+        for word in [
+            "updatedPermissions",
+            "setMode",
+            "addDirectories",
+            "localSettings",
+            "addRules",
+        ] {
+            assert!(!stdin.contains(word), "{word} reached the CLI: {stdin}");
+        }
+        assert!(
+            !dir.path().join(".claude").exists(),
+            "no settings written in the project"
+        );
+        // `system_init` offered `always` on this session.
+        let id = Uuid::parse_str(&sid).unwrap();
+        let init = graph
+            .get_chat_events(id, 0, 500)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "system_init")
+            .map(|e| e.data)
+            .unwrap_or_default();
+        assert!(init.contains("\"always\""), "{init}");
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// One CLI process of a legacy session: asks `asks` for `Bash cat README.md` (and
+    /// waits for its answer), then, when `then_runs` is given, runs that command (a
+    /// `tool_use` of `Bash`), and ends its turn.
+    fn legacy_resume_transcript(asks: &str, then_runs: Option<&str>) -> Vec<Value> {
+        let mut t = vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            emit(json!({"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"})),
+            emit(
+                json!({"type": "control_request", "request_id": asks, "request": {
+                "subtype": "can_use_tool", "tool_name": "Bash",
+                "input": {"command": "cat README.md"}, "tool_use_id": asks}}),
+            ),
+            json!({"op": "await_stdin", "contains": asks, "timeout_ms": 15000}),
+        ];
+        if let Some(command) = then_runs {
+            t.push(emit(json!({"type": "assistant", "message": {
+                "id": "msg_fake_run", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": "toolu_run", "name": "Bash",
+                    "input": {"command": command}}]}})));
+        }
+        t.extend(vec![
+            emit(json!({"type": "assistant", "message": {
+                "id": "msg_fake_end", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "turn done"}]}})),
+            emit(json!({"type": "result", "subtype": "success",
+                "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                "session_id": "fake-cli-session", "total_cost_usd": 0.0,
+                "result": "turn done"})),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ]);
+        t
+    }
+
+    /// A legacy session of alice on `proj` whose first CLI process approves
+    /// `cat README.md` for good then runs `first_command`; the session is closed and
+    /// resumed (`claude --resume`, a new process, whose answers are read from
+    /// `<dir>/resumed/stdin.jsonl`), and its CLI asks `cat README.md` again (`req-r1`).
+    /// Returns the manager, the session, the project directory and the rules directory.
+    async fn legacy_resumed_after(
+        first_command: &str,
+    ) -> (
+        ChatManager,
+        Arc<MockGraphStore>,
+        String,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("resumed")).unwrap();
+        let write = |name: &str, lines: Vec<Value>| {
+            let path = dir.path().join(name);
+            let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let first = write(
+            "first.jsonl",
+            legacy_resume_transcript("req-f1", Some(first_command)),
+        );
+        let second = write("second.jsonl", legacy_resume_transcript("req-r1", None));
+        let cli = {
+            use std::os::unix::fs::PermissionsExt;
+            let wrapper = dir.path().join("claude");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\ncase \" $* \" in\n  *\" --resume \"*) T='{second}'; S='{resumed}';;\n  \
+                     *) T='{first}'; S='{stdin}';;\nesac\n\
+                     FAKE_CLAUDE_TRANSCRIPT=\"$T\" FAKE_CLAUDE_STDIN_OUT=\"$S\" \
+                     FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{bin}' \"$@\"\n",
+                    second = second.display(),
+                    first = first.display(),
+                    resumed = dir.path().join("resumed").join("stdin.jsonl").display(),
+                    stdin = dir.path().join("stdin.jsonl").display(),
+                    bin = fake_bin("fake_claude").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            wrapper.display().to_string()
+        };
+        let rules = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        project_at(&graph, dir.path()).await;
+        let manager = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: fake_bin("fake_mcp"),
+                nexus_tools_path: None,
+                nexus_browser_path: None,
+                obscura_path: None,
+                jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                max_sessions: 10,
+                lasting_rules_dir: Some(rules.path().join("rules")),
+                native_turn_timeout_secs: None,
+                native_session_max_tokens: None,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+        };
+        manager.update_claude_cli_path(Some(cli)).await;
+        let mut req = request(None, Some("proj"), "default");
+        req.message = "first turn".into();
+        req.cwd = dir.path().display().to_string();
+        req.user_claims = Some(person("alice"));
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
+        waits(&manager, &sid, "req-f1").await;
+        manager
+            .route_permission_response(&sid, "req-f1", true, PermissionAnswerScope::Always, true)
+            .await
+            .unwrap();
+        assert_eq!(answer_read(dir.path(), "req-f1").await["behavior"], "allow");
+        // The first turn ends (its `tool_use` was seen), then the CLI process goes.
+        decisions(&graph, &sid, 1).await;
+        let id = Uuid::parse_str(&sid).unwrap();
+        for _ in 0..400 {
+            let events = graph.get_chat_events(id, 0, 500).await.unwrap();
+            if events.iter().any(|e| e.event_type == "result") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        manager.close_session(&sid).await.unwrap();
+
+        manager
+            .resume_session(&sid, "second turn", Some(&person("alice")))
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        (manager, graph, sid, dir, rules)
+    }
+
+    /// Step 55f02275 (P11b follow-up, nit D of the follow-up review of #714): a resumed
+    /// legacy session starts a new CLI (`--resume`), and whether that CLI restores the Bash
+    /// tool's last `cd` is not proven. After a `cd`, the session's shell is taken as moved
+    /// across the resume: the lasting `cat README.md` rule no longer answers, the request
+    /// waits for the person.
+    #[tokio::test]
+    async fn a_session_resumed_after_a_cd_is_asked_again_for_a_command_approved_for_good() {
+        let (manager, graph, sid, dir, _rules) = legacy_resumed_after("cd sub").await;
+        let id = Uuid::parse_str(&sid).unwrap();
+        assert_eq!(
+            graph.get_chat_session_shell_moved(id).await.unwrap(),
+            Some(true),
+            "the move is kept with the session"
+        );
+        waits(&manager, &sid, "req-r1").await;
+        let resumed = dir.path().join("resumed");
+        let answered = std::fs::read_to_string(resumed.join("stdin.jsonl")).unwrap_or_default();
+        assert!(
+            !answered.contains("\"control_response\""),
+            "nothing answered for the person: {answered}"
+        );
+        manager
+            .route_permission_response(&sid, "req-r1", true, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        assert_eq!(answer_read(&resumed, "req-r1").await["behavior"], "allow");
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// The other side: a session whose shell never moved keeps its lasting rules across a
+    /// resume (the flag is written `false` at creation; only a session recorded before the
+    /// flag existed is taken as moved).
+    #[tokio::test]
+    async fn a_session_resumed_without_a_move_keeps_its_lasting_rules() {
+        let (manager, graph, sid, dir, _rules) = legacy_resumed_after("ls").await;
+        let id = Uuid::parse_str(&sid).unwrap();
+        assert_eq!(
+            graph.get_chat_session_shell_moved(id).await.unwrap(),
+            Some(false)
+        );
+        let answer = answer_read(&dir.path().join("resumed"), "req-r1").await;
+        assert_eq!(answer["behavior"], "allow", "{answer}");
+        let seen: Vec<String> = decisions(&graph, &sid, 2)
+            .await
+            .iter()
+            .map(|(scope, _)| scope.to_string())
+            .collect();
+        assert_eq!(seen, vec!["\"always\"", "\"always\""]);
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// Review of #716, S1: the stored `shell_moved: false` is only an optimisation. A
+    /// resume replays the session's stored tool calls, so a move whose flag write was lost
+    /// (a failed write, a crash, a resume overtaking it) still counts; an event that
+    /// cannot be read back counts as a move; an absent flag (a session recorded before it
+    /// existed) too.
+    #[tokio::test]
+    async fn a_resume_finds_a_move_in_the_events_whatever_the_stored_flag_says() {
+        use crate::chat::session_grants::Asker;
+        use crate::neo4j::models::{ChatEventRecord, ChatSessionNode};
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            ChatManager::new_without_memory(
+                dyn_graph,
+                mock_app_state().meili,
+                super::super::config::ChatConfig::default(),
+            )
+        };
+        let session = |id: Uuid| ChatSessionNode {
+            file_scope_lifted: false,
+            mirror_of: None,
+            id,
+            cli_session_id: None,
+            project_slug: None,
+            workspace_slug: None,
+            cwd: "/tmp".into(),
+            title: None,
+            model: "m".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            message_count: 0,
+            total_cost_usd: None,
+            conversation_id: None,
+            preview: None,
+            permission_mode: None,
+            add_dirs: None,
+            spawned_by: None,
+            provider_id: None,
+            routed_by: None,
+            routing_mode: None,
+            routing_pool: None,
+            capabilities: None,
+            engine: None,
+            resume_token: None,
+            execution_place: Default::default(),
+            project_inferred: false,
+            access: Default::default(),
+            owner: None,
+        };
+        let record = |id: Uuid, seq: i64, event_type: &str, data: String| ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: id,
+            seq,
+            event_type: event_type.into(),
+            data,
+            created_at: Utc::now(),
+        };
+        let bash = |command: &str| {
+            serde_json::to_string(&ChatEvent::ToolUse {
+                id: "t".into(),
+                tool: "Bash".into(),
+                input: json!({ "command": command }),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .unwrap()
+        };
+        let resumed = |id: Uuid| {
+            let manager = &manager;
+            async move {
+                manager
+                    .session_grants_for(&id.to_string(), None, None, true, Asker::ClaudeCode)
+                    .await
+                    .shell_moved()
+            }
+        };
+        let fresh = |id: Uuid| {
+            let manager = &manager;
+            async move {
+                manager
+                    .session_grants_for(&id.to_string(), None, None, false, Asker::ClaudeCode)
+                    .await
+                    .shell_moved()
+            }
+        };
+
+        // Stored `false`, only plain read-only commands: not moved.
+        let quiet = Uuid::new_v4();
+        graph.create_chat_session(&session(quiet)).await.unwrap();
+        let mut events: Vec<_> = (1..=600)
+            .map(|seq| record(quiet, seq, "assistant_text", "{}".into()))
+            .collect();
+        events.push(record(quiet, 601, "tool_use", bash("ls")));
+        graph.store_chat_events(quiet, events).await.unwrap();
+        assert!(!resumed(quiet).await);
+
+        // Stored `false` (the write of `true` was lost), a `cd` past the first page: moved.
+        let lost = Uuid::new_v4();
+        graph.create_chat_session(&session(lost)).await.unwrap();
+        let mut events: Vec<_> = (1..=600)
+            .map(|seq| record(lost, seq, "assistant_text", "{}".into()))
+            .collect();
+        events.push(record(lost, 601, "tool_use", bash("cd sub")));
+        graph.store_chat_events(lost, events).await.unwrap();
+        assert_eq!(
+            graph.get_chat_session_shell_moved(lost).await.unwrap(),
+            Some(false)
+        );
+        assert!(resumed(lost).await, "the move is in the events");
+        assert!(!fresh(lost).await, "an opening starts at home");
+
+        // A stored tool call that cannot be read back: moved.
+        let garbled = Uuid::new_v4();
+        graph.create_chat_session(&session(garbled)).await.unwrap();
+        graph
+            .store_chat_events(garbled, vec![record(garbled, 1, "tool_use", "{".into())])
+            .await
+            .unwrap();
+        assert!(resumed(garbled).await);
+
+        // No flag at all (recorded before it existed): moved, once.
+        let old = Uuid::new_v4();
+        graph.chat_sessions.write().await.insert(old, session(old));
+        assert!(resumed(old).await);
+    }
+
+    /// Review of #716, S2: the agent engine too. A native session of alice runs `cd sub`
+    /// (asked, approved once); it is closed and resumed; `cat README.md`, approved for good
+    /// in the project, is asked again in the resumed session instead of being answered by
+    /// the rule. Red when the resume of the agent engine builds its grants as an opening.
+    #[tokio::test]
+    async fn a_native_session_resumed_after_a_cd_is_asked_again_for_a_command_approved_for_good() {
+        let bash = |key: &str, id: &str, command: &str| {
+            calls(key, id, "mcp__nexus__Bash", json!({ "command": command }))
+        };
+        let mut routes = vec![
+            bash("RESUMED-AFTER", "r2", "cat README.md"),
+            says("RESUMED-AFTER", "done after"),
+            bash("BEFORE-RESUME", "r1", "cd sub"),
+            says("BEFORE-RESUME", "done before"),
+        ];
+        routes.extend(script().as_array().cloned().unwrap());
+        let fake = FakeOpenAi::start(Value::Array(routes));
+        let graph = stage(&fake).await;
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("README.md"), "readme").unwrap();
+        std::fs::create_dir(cwd.path().join("sub")).unwrap();
+        project_at(&graph, cwd.path()).await;
+        let rules = tempfile::tempdir().unwrap();
+        let manager = {
+            let mut m = native_manager(graph.clone()).await;
+            m.config.lasting_rules_dir = Some(rules.path().join("rules"));
+            m
+        };
+        // `cat README.md` approved for good by alice in this project.
+        let place = manager
+            .lasting_scope(
+                Some("alice"),
+                Some("proj"),
+                &cwd.path().display().to_string(),
+            )
+            .await
+            .unwrap();
+        let call = crate::chat::session_grants::AskedCall {
+            asker: crate::chat::session_grants::Asker::Native,
+            tool: "mcp__nexus__Bash".into(),
+            canonical: Some("Bash".into()),
+            input: json!({"command": "cat README.md"}),
+        };
+        let grant = crate::chat::session_grants::lasting_grant_for(&call).unwrap();
+        place.keep(&call, &grant, "seed").unwrap();
+
+        let sid = open_as(&manager, cwd.path(), "alice").await;
+        manager.send_message(&sid, "BEFORE-RESUME").await.unwrap();
+        let cd = asked(&graph, &sid, "cd sub", Duration::from_secs(10))
+            .await
+            .expect("nexus asks the cd");
+        manager
+            .route_permission_response(&sid, &cd, true, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        assert!(ran(&fake, "BEFORE-RESUME").await, "the cd ran");
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        assert!(handle.shell_moved());
+        manager.close_session(&sid).await.unwrap();
+
+        manager
+            .resume_session(&sid, "RESUMED-AFTER", Some(&person("alice")))
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        assert!(handle.shell_moved(), "the resumed session starts moved");
+        let again = asked(&graph, &sid, "cat README.md", Duration::from_secs(10))
+            .await
+            .expect("nexus asks the command");
+        let seen = decisions(&graph, &sid, 2).await;
+        assert!(
+            seen.iter().all(|(scope, _)| scope != &json!("always")),
+            "no lasting rule answered in the resumed session: {seen:?}"
+        );
+        manager
+            .route_permission_response(&sid, &again, true, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        assert!(ran(&fake, "RESUMED-AFTER").await);
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    // ---------------------------------------------------------------- native
+
+    fn calls(key: &str, id: &str, tool: &str, arguments: Value) -> Value {
+        sse_route(
+            key,
+            vec![
+                delta(
+                    json!({"tool_calls": [{"index": 0, "id": id, "type": "function", "function": {
+                    "name": tool, "arguments": arguments.to_string()}}]}),
+                ),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ],
+        )
+    }
+
+    fn says(key: &str, text: &str) -> Value {
+        sse_route(
+            key,
+            vec![
+                delta(json!({"content": text})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!("[DONE]"),
+            ],
+        )
+    }
+
+    const PO_WRITE: &str = "mcp__project-orchestrator__write";
+
+    /// The later turns first: a turn's body holds the earlier turns' text.
+    fn native_script() -> Value {
+        let mut routes = vec![
+            calls("ECHO-AGAIN", "e4", PO_WRITE, json!({"text": "first-echo"})),
+            says("ECHO-AGAIN", "done again"),
+            calls("ECHO-THREE", "e3", PO_WRITE, json!({"text": "other-text"})),
+            says("ECHO-THREE", "done three"),
+            calls("ECHO-TWO", "e2", PO_WRITE, json!({"text": "first-echo"})),
+            says("ECHO-TWO", "done two"),
+            calls("ECHO-ONE", "e1", PO_WRITE, json!({"text": "first-echo"})),
+            says("ECHO-ONE", "done one"),
+            calls(
+                "BASH-LS",
+                "b1",
+                "mcp__nexus__Bash",
+                json!({"command": "ls"}),
+            ),
+            says("BASH-LS", "done ls"),
+        ];
+        routes.extend(script().as_array().cloned().unwrap());
+        Value::Array(routes)
+    }
+
+    /// A native manager whose tools are ASKED (no `allow` list), with nexus-tools.
+    async fn native_manager(graph: Arc<MockGraphStore>) -> ChatManager {
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph;
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: Some(fake_bin("nexus-tools")),
+            nexus_browser_path: None,
+            obscura_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            // A third-party MCP tool is granted for the session only when the operator
+            // declared it read-only: the fake server's tool is, for the grant mechanics.
+            read_only_mcp_tools: vec![PO_WRITE.to_string()],
+            ..Default::default()
+        };
+        let m = ChatManager::new_without_memory(dyn_graph, state.meili, config);
+        m.update_permission_config(super::super::config::PermissionConfig {
+            mode: "default".into(),
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+        })
+        .await
+        .unwrap();
+        m
+    }
+
+    /// The ids of the permission requests whose input holds `needle`.
+    async fn asked_ids(graph: &MockGraphStore, sid: &str, needle: &str) -> Vec<String> {
+        let id = Uuid::parse_str(sid).unwrap();
+        graph
+            .get_chat_events(id, 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.event_type == "permission_request" && e.data.contains(needle))
+            .filter_map(|e| match serde_json::from_str(&e.data) {
+                Ok(ChatEvent::PermissionRequest { id, .. }) => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The id of the first permission request whose input holds `needle`.
+    async fn asked(
+        graph: &MockGraphStore,
+        sid: &str,
+        needle: &str,
+        within: Duration,
+    ) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if let Some(id) = asked_ids(graph, sid, needle).await.into_iter().next() {
+                return Some(id);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Whether the model got the tool's result for `key` (its second request).
+    async fn ran(fake: &FakeOpenAi, key: &str) -> bool {
+        for _ in 0..400 {
+            let n = fake
+                .chat_requests()
+                .iter()
+                .filter(|r| r["body"].to_string().contains(key))
+                .count();
+            if n >= 2 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    async fn open(
+        manager: &ChatManager,
+        cwd: &std::path::Path,
+        access: Option<crate::chat::provider::policy::SessionAccess>,
+    ) -> String {
+        let mut req = request(Some("local"), Some("proj"), "default");
+        req.cwd = cwd.display().to_string();
+        req.access = access;
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        sid
+    }
+
+    async fn stage(fake: &FakeOpenAi) -> Arc<MockGraphStore> {
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        graph
+    }
+
+    #[tokio::test]
+    async fn native_session_grant_covers_the_identical_call_in_this_session_only() {
+        let fake = FakeOpenAi::start(native_script());
+        let graph = stage(&fake).await;
+        let cwd = tempfile::tempdir().unwrap();
+        let manager = native_manager(graph.clone()).await;
+        let sid = open(&manager, cwd.path(), None).await;
+
+        // A session without an owner keeps no lasting rule: `always` is not offered.
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        let scopes = handle.offered_capabilities().permission_scopes;
+        assert!(
+            !scopes.contains(&nexus_claude::agent::PermissionScope::Always),
+            "{scopes:?}"
+        );
+
+        manager.send_message(&sid, "ECHO-ONE").await.unwrap();
+        let id = asked(&graph, &sid, "first-echo", Duration::from_secs(10))
+            .await
+            .expect("the PO write tool is asked");
+        // always: refused, typed, nothing answered...
+        let refused = manager
+            .route_permission_response(&sid, &id, true, PermissionAnswerScope::Always, true)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Always
+                ))
+            ),
+            "{refused:?}"
+        );
+        // ...the request still waits: session goes through.
+        manager
+            .route_permission_response(&sid, &id, true, PermissionAnswerScope::Session, true)
+            .await
+            .unwrap();
+        assert!(
+            ran(&fake, "ECHO-ONE").await,
+            "the tool ran after the approval"
+        );
+
+        // The identical call again in this session: answered by the backend.
+        manager.send_message(&sid, "ECHO-TWO").await.unwrap();
+        assert!(
+            ran(&fake, "ECHO-TWO").await,
+            "the identical call ran without the user"
+        );
+        let all = decisions(&graph, &sid, 2).await;
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert_eq!(all[1].0, json!("session"), "{all:?}");
+
+        // Another input of the same tool: asked again.
+        manager.send_message(&sid, "ECHO-THREE").await.unwrap();
+        let other = asked(&graph, &sid, "other-text", Duration::from_secs(10))
+            .await
+            .expect("another input is asked again");
+        manager
+            .route_permission_response(&sid, &other, false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        manager.close_session(&sid).await.unwrap();
+
+        // Another session: the grant does not follow, the identical call is asked.
+        let sid2 = open(&manager, cwd.path(), None).await;
+        manager.send_message(&sid2, "ECHO-AGAIN").await.unwrap();
+        let again = asked(&graph, &sid2, "first-echo", Duration::from_secs(10)).await;
+        assert!(
+            again.is_some(),
+            "a session grant does not survive into another session"
+        );
+        manager
+            .route_permission_response(
+                &sid2,
+                &again.unwrap(),
+                false,
+                PermissionAnswerScope::Once,
+                true,
+            )
+            .await
+            .unwrap();
+        manager.close_session(&sid2).await.unwrap();
+    }
+
+    // ------------------------------------------------------------ lasting (P11b)
+
+    /// A person signed in with their own session token.
+    pub(super) fn person(sub: &str) -> crate::auth::jwt::Claims {
+        crate::auth::jwt::Claims {
+            sub: sub.to_string(),
+            email: format!("{sub}@ffs.holdings"),
+            name: sub.to_string(),
+            iat: 0,
+            exp: i64::MAX / 2,
+            token_type: None,
+            scope: None,
+            jti: None,
+        }
+    }
+
+    /// The later turns first: a turn's body holds the earlier turns' text.
+    fn lasting_script() -> Value {
+        let bash = |key: &str, id: &str, command: &str| {
+            calls(key, id, "mcp__nexus__Bash", json!({ "command": command }))
+        };
+        let mut routes = vec![
+            bash("ALWAYS-ELSEWHERE", "a6", "cat README.md"),
+            says("ALWAYS-ELSEWHERE", "done elsewhere"),
+            bash("ALWAYS-BOB", "a5", "cat README.md"),
+            says("ALWAYS-BOB", "done bob"),
+            bash("ALWAYS-REVOKED", "a4", "cat README.md"),
+            says("ALWAYS-REVOKED", "done revoked"),
+            bash("ALWAYS-REDIRECT", "a3", "cat README.md >> zshrc"),
+            says("ALWAYS-REDIRECT", "done redirect"),
+            bash("ALWAYS-TWO", "a2", "cat README.md"),
+            says("ALWAYS-TWO", "done two"),
+            bash("ALWAYS-ONE", "a1", "cat README.md"),
+            says("ALWAYS-ONE", "done one"),
+        ];
+        routes.extend(script().as_array().cloned().unwrap());
+        Value::Array(routes)
+    }
+
+    /// The project `proj`, rooted at `root`: lasting rules are bound to that root.
+    pub(super) async fn project_at(graph: &MockGraphStore, root: &std::path::Path) {
+        let mut project = crate::test_helpers::test_project();
+        project.slug = "proj".into();
+        project.root_path = root.display().to_string();
+        graph.create_project(&project).await.unwrap();
+    }
+
+    /// A native session of `sub` on project `proj`, its lasting rules kept in `rules`.
+    async fn open_as(manager: &ChatManager, cwd: &std::path::Path, sub: &str) -> String {
+        let mut req = request(Some("local"), Some("proj"), "default");
+        req.cwd = cwd.display().to_string();
+        req.user_claims = Some(person(sub));
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        sid
+    }
+
+    /// The review of P11a, blocker 1, end to end on the native engine (real nexus-tools,
+    /// its policy deciding each call through `policy_args::decide_call`): an `always`
+    /// approval of `cat README.md` is NEVER put in the session's `allow` list — nexus still
+    /// ASKS the identical call in the next session, and the backend answers it (decision
+    /// `always`); `cat README.md >> zshrc` is asked of the user and never runs; another
+    /// person's session, or the same person after a revocation, is asked again.
+    #[tokio::test]
+    async fn native_always_rule_is_kept_by_the_backend_never_by_nexus() {
+        let fake = FakeOpenAi::start(lasting_script());
+        let graph = stage(&fake).await;
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("README.md"), "readme").unwrap();
+        project_at(&graph, cwd.path()).await;
+        let rules = tempfile::tempdir().unwrap();
+        let manager = {
+            let mut m = native_manager(graph.clone()).await;
+            m.config.lasting_rules_dir = Some(rules.path().join("rules"));
+            m
+        };
+        let sid = open_as(&manager, cwd.path(), "alice").await;
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        assert!(
+            handle
+                .offered_capabilities()
+                .permission_scopes
+                .contains(&nexus_claude::agent::PermissionScope::Always),
+            "a session of a person on a project offers always"
+        );
+        manager.send_message(&sid, "ALWAYS-ONE").await.unwrap();
+        let id = asked(&graph, &sid, "cat README.md", Duration::from_secs(10))
+            .await
+            .expect("nexus asks the command");
+        manager
+            .route_permission_response(&sid, &id, true, PermissionAnswerScope::Always, true)
+            .await
+            .unwrap();
+        assert!(ran(&fake, "ALWAYS-ONE").await, "the tool ran");
+        let first = decisions(&graph, &sid, 1).await;
+        assert_eq!(
+            first[0],
+            (json!("always"), json!("mcp__nexus__Bash: cat README.md"))
+        );
+        manager.close_session(&sid).await.unwrap();
+
+        // The next session of the same person on the same project: nexus ASKS again (no
+        // rule was handed to it), the backend answers.
+        let sid2 = open_as(&manager, cwd.path(), "alice").await;
+        manager.send_message(&sid2, "ALWAYS-TWO").await.unwrap();
+        assert!(ran(&fake, "ALWAYS-TWO").await, "answered without the user");
+        assert_eq!(
+            asked_ids(&graph, &sid2, "cat README.md").await.len(),
+            1,
+            "nexus asked: its allow list holds no lasting rule"
+        );
+        let seen = decisions(&graph, &sid2, 1).await;
+        assert_eq!(
+            seen,
+            vec![(json!("always"), json!("mcp__nexus__Bash: cat README.md"))]
+        );
+
+        // The same program with a redirection: asked of the user, never covered.
+        manager
+            .send_message(&sid2, "ALWAYS-REDIRECT")
+            .await
+            .unwrap();
+        let redirect = asked(&graph, &sid2, ">> zshrc", Duration::from_secs(10))
+            .await
+            .expect("a redirection is asked");
+        assert_eq!(decisions(&graph, &sid2, 2).await.len(), 1, "not answered");
+        // ...and it cannot be approved for good either.
+        let refused = manager
+            .route_permission_response(&sid2, &redirect, true, PermissionAnswerScope::Always, true)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Always
+                ))
+            ),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(&sid2, &redirect, false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        assert!(ran(&fake, "ALWAYS-REDIRECT").await);
+        assert!(
+            !cwd.path().join("zshrc").exists(),
+            "the redirection never ran"
+        );
+
+        // Revoked: asked again at once, in this very session.
+        let store = manager.lasting_rule_store().unwrap();
+        let rule = store.rules("alice").remove(0);
+        assert!(store.revoke("alice", rule.id).unwrap());
+        manager.send_message(&sid2, "ALWAYS-REVOKED").await.unwrap();
+        let again = asked_ids_after(&graph, &sid2, "cat README.md\"", 1).await;
+        manager
+            .route_permission_response(&sid2, &again, false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        manager.close_session(&sid2).await.unwrap();
+
+        // Another person on the same project: asked.
+        let sid3 = open_as(&manager, cwd.path(), "bob").await;
+        manager.send_message(&sid3, "ALWAYS-BOB").await.unwrap();
+        let bob = asked(&graph, &sid3, "cat README.md", Duration::from_secs(10)).await;
+        assert!(bob.is_some(), "another person's rule never holds");
+        manager
+            .route_permission_response(
+                &sid3,
+                &bob.unwrap(),
+                false,
+                PermissionAnswerScope::Once,
+                true,
+            )
+            .await
+            .unwrap();
+        manager.close_session(&sid3).await.unwrap();
+
+        // Review of #714, S2: the same person and slug, another directory (a rule kept
+        // again first, so one exists): `always` is not offered there and the identical
+        // call is asked.
+        let place = manager
+            .lasting_scope(
+                Some("alice"),
+                Some("proj"),
+                &cwd.path().display().to_string(),
+            )
+            .await
+            .unwrap();
+        let call = crate::chat::session_grants::AskedCall {
+            asker: crate::chat::session_grants::Asker::Native,
+            tool: "mcp__nexus__Bash".into(),
+            canonical: Some("Bash".into()),
+            input: json!({"command": "cat README.md"}),
+        };
+        let grant = crate::chat::session_grants::lasting_grant_for(&call).unwrap();
+        place.keep(&call, &grant, "seed").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("README.md"), "secret").unwrap();
+        let sid4 = open_as(&manager, elsewhere.path(), "alice").await;
+        let handle = manager.agent_runtime.get(&sid4).await.unwrap();
+        assert!(
+            !handle
+                .offered_capabilities()
+                .permission_scopes
+                .contains(&nexus_claude::agent::PermissionScope::Always),
+            "not offered outside the project's root"
+        );
+        manager
+            .send_message(&sid4, "ALWAYS-ELSEWHERE")
+            .await
+            .unwrap();
+        let asked_there = asked(&graph, &sid4, "cat README.md", Duration::from_secs(10)).await;
+        assert!(asked_there.is_some(), "asked outside the project's root");
+        assert!(
+            decisions(&graph, &sid4, 1).await.is_empty(),
+            "never answered by a rule"
+        );
+        manager
+            .route_permission_response(
+                &sid4,
+                &asked_there.unwrap(),
+                false,
+                PermissionAnswerScope::Once,
+                true,
+            )
+            .await
+            .unwrap();
+        manager.close_session(&sid4).await.unwrap();
+    }
+
+    /// The id of the request holding `needle` asked after the first `skip` ones.
+    async fn asked_ids_after(
+        graph: &MockGraphStore,
+        sid: &str,
+        needle: &str,
+        skip: usize,
+    ) -> String {
+        for _ in 0..400 {
+            if let Some(id) = asked_ids(graph, sid, needle).await.into_iter().nth(skip) {
+                return id;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{needle} was not asked again");
+    }
+
+    /// No owner (the server's own run, the anonymous user) or no project: `always` is not
+    /// offered and is refused, typed, even with a store configured.
+    #[tokio::test]
+    async fn a_session_without_a_person_keeps_no_lasting_rule() {
+        let fake = FakeOpenAi::start(native_script());
+        let graph = stage(&fake).await;
+        let cwd = tempfile::tempdir().unwrap();
+        let rules = tempfile::tempdir().unwrap();
+        let manager = {
+            let mut m = native_manager(graph.clone()).await;
+            m.config.lasting_rules_dir = Some(rules.path().join("rules"));
+            m
+        };
+        let sid = open(&manager, cwd.path(), None).await;
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        assert!(!handle
+            .offered_capabilities()
+            .permission_scopes
+            .contains(&nexus_claude::agent::PermissionScope::Always));
+        manager.send_message(&sid, "ECHO-ONE").await.unwrap();
+        let id = asked(&graph, &sid, "first-echo", Duration::from_secs(10))
+            .await
+            .unwrap();
+        let refused = manager
+            .route_permission_response(&sid, &id, true, PermissionAnswerScope::Always, true)
+            .await;
+        assert!(
+            matches!(refused, Err(PermissionDeliveryError::ScopeUnsupported(_))),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(&sid, &id, false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        manager.close_session(&sid).await.unwrap();
+        assert!(!rules.path().join("rules").exists(), "nothing written");
+    }
+
+    #[tokio::test]
+    async fn read_only_access_wins_over_a_session_grant() {
+        let fake = FakeOpenAi::start(native_script());
+        let graph = stage(&fake).await;
+        let cwd = tempfile::tempdir().unwrap();
+        let manager = native_manager(graph.clone()).await;
+        let sid = open(
+            &manager,
+            cwd.path(),
+            Some(crate::chat::provider::policy::SessionAccess::ReadOnly),
+        )
+        .await;
+        // A grant that would cover `ls` (as if granted earlier in this session).
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        handle.seed_session_grant(
+            crate::chat::session_grants::grant_for(&crate::chat::session_grants::AskedCall {
+                asker: crate::chat::session_grants::Asker::Native,
+                tool: "mcp__nexus__Bash".into(),
+                canonical: Some("Bash".into()),
+                input: json!({"command": "ls"}),
+            })
+            .unwrap(),
+        );
+        manager.send_message(&sid, "BASH-LS").await.unwrap();
+        assert!(
+            ran(&fake, "BASH-LS").await,
+            "the model got the tool's answer"
+        );
+        let body = fake
+            .chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .filter(|b| b.contains("BASH-LS"))
+            .nth(1)
+            .unwrap_or_default();
+        // Read-only does not even offer the command tool: the call is refused before any
+        // question, whatever the grant.
+        assert!(
+            body.contains("unknown tool") || body.contains("denied"),
+            "read-only refused the command whatever the grant: {body}"
+        );
+        assert!(
+            asked_ids(&graph, &sid, "\"ls\"").await.is_empty(),
+            "never asked"
+        );
+        assert!(
+            decisions(&graph, &sid, 1).await.is_empty(),
+            "no decision made"
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P4 + P12 (parity): the background tasks of an agent-engine session reach the
+/// wire as on the Claude Code engine (`active_tasks_update`, keyed by the
+/// `tool_use` that started the task), `cancel_task` stops one through the
+/// provider — from this instance or from another one over NATS — and a provider
+/// that cannot stop it (Claude Code over SSH: no `tool_cancel`) is a typed
+/// refusal, never a success.
+mod background_tasks {
+    #[allow(unused_imports)]
+    use nexus_claude::agent::{
+        AgentEvent, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ProviderError,
+        ProviderKind,
+    };
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::{Script, ScriptedProvider, Step};
+
+    use super::parity::{caps, Tapped};
+    use super::*;
+    use crate::events::nats_broker_test::TestBroker;
+    use crate::events::NatsEmitter;
+
+    /// The probe, the catalogue, then one turn that starts `sleep 30` in the
+    /// background with the `Bash` of the real `nexus-tools`, and answers.
+    fn background_sleep_script() -> Value {
+        json!([
+            sse_route("Call the ping tool now", vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]),
+            {"method": "GET", "path": "/v1/models", "status": 200,
+             "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}},
+            sse_route("start the background sleep", vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "b1", "type": "function",
+                    "function": {"name": "mcp__nexus__Bash", "arguments": json!({
+                        "command": "sleep 30", "run_in_background": true,
+                        "description": "background sleep"}).to_string()}}]})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]),
+            sse_route("\"role\":\"tool\"", vec![
+                delta(json!({"content": "started in the background"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!("[DONE]"),
+            ]),
+        ])
+    }
+
+    /// A native session (fake_openai + fake_mcp + the real nexus-tools) in trust
+    /// mode, no opening turn; the manager on NATS when `nats` is given.
+    async fn native_session(
+        fake: &FakeOpenAi,
+        nats: Option<Arc<NatsEmitter>>,
+    ) -> (ChatManager, String, broadcast::Receiver<ChatEvent>) {
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: Some(fake_bin("nexus-tools")),
+            nexus_browser_path: None,
+            obscura_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let mut manager = ChatManager::new_without_memory(dyn_graph, state.meili, config);
+        if let Some(nats) = nats {
+            manager = manager.with_nats(nats);
+        }
+        let mut req = request(Some("local"), Some("proj"), "bypassPermissions");
+        req.message = String::new();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        let rx = manager.subscribe(&sid).await.unwrap();
+        (manager, sid, rx)
+    }
+
+    /// Starts the background sleep and waits for it on the wire: the
+    /// `active_tasks_update` naming it by its `tool_use` (`b1`), with its process.
+    async fn start_background_sleep(
+        manager: &ChatManager,
+        sid: &str,
+        rx: &mut broadcast::Receiver<ChatEvent>,
+    ) -> u32 {
+        manager
+            .send_message(sid, "start the background sleep")
+            .await
+            .unwrap();
+        let update = next_event(rx, |e| {
+            matches!(e, ChatEvent::ActiveTasksUpdate { tasks } if tasks.iter().any(|t| t.id == "b1"))
+        })
+        .await;
+        let ChatEvent::ActiveTasksUpdate { tasks } = update else {
+            unreachable!()
+        };
+        let task = tasks.iter().find(|t| t.id == "b1").unwrap();
+        assert_eq!(
+            task.kind,
+            crate::chat::types::BackgroundTaskKind::BashBackground
+        );
+        let pid = task.pid.expect("the task's process is reported");
+        assert!(alive(pid), "the background sleep runs");
+        next_event(rx, |e| {
+            matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            )
+        })
+        .await;
+        // The snapshot route answers the same list.
+        let listed = manager.get_active_background_tasks(sid).await;
+        assert!(listed.iter().any(|t| t.id == "b1"), "{listed:?}");
+        pid
+    }
+
+    fn alive(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    async fn gone_within(pid: u32, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline {
+            if !alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        !alive(pid)
+    }
+
+    /// After the stop: an `active_tasks_update` without the task.
+    async fn task_left_the_list(rx: &mut broadcast::Receiver<ChatEvent>) {
+        next_event(rx, |e| {
+            matches!(e, ChatEvent::ActiveTasksUpdate { tasks } if !tasks.iter().any(|t| t.id == "b1"))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_native_background_task_is_on_the_wire_and_cancel_task_ends_its_process() {
+        let fake = FakeOpenAi::start(background_sleep_script());
+        let (manager, sid, mut rx) = native_session(&fake, None).await;
+        let pid = start_background_sleep(&manager, &sid, &mut rx).await;
+
+        let stopped = manager.cancel_task(&sid, "b1").await.unwrap();
+        assert!(!stopped.capped);
+        assert_eq!(stopped.task_id, "b1");
+        assert!(stopped.killed_pids.contains(&pid), "{stopped:?}");
+        assert!(
+            gone_within(pid, Duration::from_secs(10)).await,
+            "the process is gone"
+        );
+        task_left_the_list(&mut rx).await;
+        assert!(manager.get_active_background_tasks(&sid).await.is_empty());
+
+        // Clicking Stop again on the ended task: the idempotent no-op.
+        let again = manager.cancel_task(&sid, "b1").await.unwrap();
+        assert!(again.killed_pids.is_empty() && !again.capped, "{again:?}");
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_task_from_another_instance_ends_the_native_task_here() {
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let fake = FakeOpenAi::start(background_sleep_script());
+        let (manager, sid, mut rx) = native_session(&fake, Some(owner)).await;
+        let pid = start_background_sleep(&manager, &sid, &mut rx).await;
+
+        // The other instance holds no session: its cancel_task goes over NATS and
+        // comes back with what the owner did.
+        let other = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let far = far_manager(other);
+        let stopped = far.cancel_task(&sid, "b1").await.unwrap();
+        assert!(stopped.killed_pids.contains(&pid), "{stopped:?}");
+        assert!(
+            gone_within(pid, Duration::from_secs(10)).await,
+            "the process is gone"
+        );
+        task_left_the_list(&mut rx).await;
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// A manager with no session of its own, on NATS.
+    fn far_manager(nats: Arc<NatsEmitter>) -> ChatManager {
+        let state = mock_app_state();
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        ChatManager::new_without_memory(graph, state.meili, config).with_nats(nats)
+    }
+
+    /// A Claude Code session that cannot stop a tool (over SSH: `tool_cancel`
+    /// absent, background tasks reported), its first turn reporting one task.
+    async fn remote_claude_code(
+        nats: Option<Arc<NatsEmitter>>,
+    ) -> (ChatManager, String, broadcast::Receiver<ChatEvent>) {
+        claude_code_session(false, false, nats).await
+    }
+
+    /// A Claude Code session (scripted) whose first turn reports the task `b7`;
+    /// `tool_cancel` as given; `stall`: its `cancel_tools(task { id: "stuck" })`
+    /// never returns (a provider that hangs).
+    async fn claude_code_session(
+        tool_cancel: bool,
+        stall: bool,
+        nats: Option<Arc<NatsEmitter>>,
+    ) -> (ChatManager, String, broadcast::Receiver<ChatEvent>) {
+        let mut capabilities = caps();
+        capabilities.tool_cancel = tool_cancel;
+        capabilities.background_tasks = true;
+        let task = BackgroundTask {
+            id: "bash-7".into(),
+            kind: BackgroundTaskKind::Shell,
+            description: "tail -F deploy.log".into(),
+            status: BackgroundTaskStatus::Running,
+            started_at_ms: None,
+            tool_call_id: Some("b7".into()),
+            parent: None,
+            pid: None,
+        };
+        let turn: Vec<Step> = vec![
+            Step::Emit(AgentEvent::BackgroundTasks { tasks: vec![task] }),
+            steps::text("watching"),
+            steps::done(&capabilities),
+        ];
+        let script = Script::builder()
+            .capabilities(capabilities)
+            .turn(turn)
+            .build();
+        let provider = Tapped {
+            inner: Arc::new(ScriptedProvider::new("claude-code", script)),
+            kind: ProviderKind::ClaudeCode,
+            answers: Arc::default(),
+        };
+        let state = mock_app_state();
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let source: Arc<dyn super::super::agent_runtime::ProviderSource> = if stall {
+            Arc::new(Stalling(provider))
+        } else {
+            Arc::new(provider)
+        };
+        let mut manager = ChatManager::new_without_memory(graph, state.meili, config)
+            .with_provider_source(source);
+        if let Some(nats) = nats {
+            manager = manager.with_nats(nats);
+        }
+        let mut req = request(None, None, "default");
+        req.message = String::new();
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        manager.send_message(&sid, "watch").await.unwrap();
+        next_event(&mut rx, |e| {
+            matches!(e, ChatEvent::ActiveTasksUpdate { tasks } if tasks.iter().any(|t| t.id == "b7"))
+        })
+        .await;
+        (manager, sid, rx)
+    }
+
+    /// The refusal as the HTTP layer answers it: 422 `unsupported`, naming the capability.
+    fn assert_typed_refusal(error: &anyhow::Error) {
+        let refusal = error
+            .chain()
+            .find_map(|c| c.downcast_ref::<ProviderError>())
+            .unwrap_or_else(|| panic!("a typed ProviderError: {error:#}"));
+        assert_eq!(
+            refusal,
+            &ProviderError::Unsupported {
+                capability: "tool_cancel".into()
+            }
+        );
+        // What `POST .../cancel-task/{id}` and `.../cancel-tools` answer (never a 500).
+        let failure = super::super::provider::errors::classify_open_error(error, None)
+            .expect("typed on the wire");
+        assert_eq!((failure.status, failure.code), (422, "unsupported"));
+        assert!(
+            failure.message.contains("tool_cancel"),
+            "{}",
+            failure.message
+        );
+        let answered = crate::api::handlers::AppError::from_open_error(
+            anyhow::Error::new(refusal.clone()).context("cancel"),
+            None,
+        );
+        assert!(
+            matches!(&answered, crate::api::handlers::AppError::Provider(f) if f.status == 422),
+            "the HTTP answer is the typed refusal"
+        );
+    }
+
+    async fn refusal_on_the_wire(rx: &mut broadcast::Receiver<ChatEvent>) {
+        let event = next_event(
+            rx,
+            |e| matches!(e, ChatEvent::Error { code: Some(code), .. } if code == "cancel_refused"),
+        )
+        .await;
+        let ChatEvent::Error { reason, .. } = event else {
+            unreachable!()
+        };
+        assert_eq!(reason.as_deref(), Some("tool_cancel"));
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_tool_cancel_refuses_cancel_task_and_cancel_tools_typed() {
+        let (manager, sid, mut rx) = remote_claude_code(None).await;
+
+        let error = manager
+            .cancel_task(&sid, "b7")
+            .await
+            .expect_err("never a success");
+        assert_typed_refusal(&error);
+        refusal_on_the_wire(&mut rx).await;
+
+        let error = manager
+            .cancel_running_tools(&sid)
+            .await
+            .expect_err("never a success");
+        assert_typed_refusal(&error);
+        refusal_on_the_wire(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn a_cancel_task_refused_by_the_owner_comes_back_typed_over_nats() {
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let (_manager, sid, mut rx) = remote_claude_code(Some(owner)).await;
+        let far = far_manager(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+
+        let error = far
+            .cancel_task(&sid, "b7")
+            .await
+            .expect_err("never a success");
+        assert_typed_refusal(&error);
+        refusal_on_the_wire(&mut rx).await;
+    }
+
+    // ------------------------------------------------------------------------
+    // Review of #663: never a success the owner did not report, across instances.
+    // ------------------------------------------------------------------------
+
+    use super::super::cancel_relay::{CancelKind, CancelRelayError};
+    use async_trait::async_trait;
+    use nexus_claude::agent::{
+        AgentProvider, AgentSession, CancelOutcome, CancelScope, Capabilities, EventStream,
+        InterruptOutcome, InterruptScope, ModelInfo, PermissionDecision, PolicyMode,
+        ProviderHealth, QuestionAnswer, ResumeToken, SessionSpec, TurnInput,
+    };
+
+    /// The scripted provider, its sessions hanging on `cancel_tools(task { id: "stuck" })`.
+    struct Stalling(Tapped);
+
+    struct StallingSession(Arc<dyn AgentSession>);
+
+    #[async_trait]
+    impl AgentSession for StallingSession {
+        fn capabilities(&self) -> &Capabilities {
+            self.0.capabilities()
+        }
+        fn resume_token(&self) -> Option<ResumeToken> {
+            self.0.resume_token()
+        }
+        async fn send_turn(&self, input: TurnInput) -> Result<EventStream, ProviderError> {
+            self.0.send_turn(input).await
+        }
+        async fn answer_permission(
+            &self,
+            request_id: &str,
+            decision: PermissionDecision,
+        ) -> Result<(), ProviderError> {
+            self.0.answer_permission(request_id, decision).await
+        }
+        async fn answer_question(
+            &self,
+            question_id: &str,
+            answer: QuestionAnswer,
+        ) -> Result<(), ProviderError> {
+            self.0.answer_question(question_id, answer).await
+        }
+        async fn interrupt(
+            &self,
+            scope: InterruptScope,
+        ) -> Result<InterruptOutcome, ProviderError> {
+            self.0.interrupt(scope).await
+        }
+        async fn cancel_tools(&self, scope: CancelScope) -> Result<CancelOutcome, ProviderError> {
+            if matches!(&scope, CancelScope::Task { id } if id == "stuck") {
+                std::future::pending::<()>().await;
+            }
+            // A provider that takes its time (an owner slower than a stale `gone`).
+            if matches!(&scope, CancelScope::Task { id } if id == "slow") {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            self.0.cancel_tools(scope).await
+        }
+        async fn set_model(&self, model: &str) -> Result<(), ProviderError> {
+            self.0.set_model(model).await
+        }
+        async fn set_policy_mode(
+            &self,
+            mode: PolicyMode,
+            native: Option<&str>,
+        ) -> Result<(), ProviderError> {
+            self.0.set_policy_mode(mode, native).await
+        }
+        fn out_of_band(&self) -> Option<EventStream> {
+            self.0.out_of_band()
+        }
+        async fn close(&self) -> Result<(), ProviderError> {
+            self.0.close().await
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for Stalling {
+        fn id(&self) -> &str {
+            self.0.id()
+        }
+        fn kind(&self) -> ProviderKind {
+            self.0.kind()
+        }
+        async fn health(&self) -> ProviderHealth {
+            self.0.health().await
+        }
+        async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            self.0.catalog().await
+        }
+        fn capabilities(&self, model: Option<&str>) -> Capabilities {
+            self.0.capabilities(model)
+        }
+        async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            Ok(Arc::new(StallingSession(self.0.open(spec).await?)))
+        }
+        async fn resume(
+            &self,
+            spec: SessionSpec,
+            token: ResumeToken,
+        ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            Ok(Arc::new(StallingSession(self.0.resume(spec, token).await?)))
+        }
+    }
+
+    impl super::super::agent_runtime::ProviderSource for Stalling {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+            (provider_id == "claude-code")
+                .then(|| Arc::new(Stalling(self.0.clone())) as Arc<dyn AgentProvider>)
+        }
+    }
+
+    fn relay_error(error: &anyhow::Error) -> Option<CancelRelayError> {
+        error.downcast_ref::<CancelRelayError>().cloned()
+    }
+
+    /// Asks again while the owner's listener may still be subscribing (the
+    /// broker answers "no responders" until it is).
+    async fn until_subscribed<T>(
+        mut ask: impl FnMut() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send>,
+        >,
+    ) -> anyhow::Result<T> {
+        for _ in 0..30 {
+            match ask().await {
+                Err(e) if relay_error(&e) == Some(CancelRelayError::OwnerUnreachable) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => return other,
+            }
+        }
+        ask().await
+    }
+
+    /// Point 1: nobody holds the session — real NATS (and the test broker) answer
+    /// "no responders" at once: a typed `owner_unreachable`, fast, for both cancels.
+    #[tokio::test]
+    async fn a_cancel_nobody_holds_is_owner_unreachable_at_once_not_a_success() {
+        let broker = TestBroker::start().await;
+        let far = far_manager(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let sid = Uuid::new_v4().to_string();
+        let started = std::time::Instant::now();
+        let task = far
+            .cancel_task(&sid, "b1")
+            .await
+            .expect_err("not a success");
+        assert_eq!(relay_error(&task), Some(CancelRelayError::OwnerUnreachable));
+        let tools = far
+            .cancel_running_tools(&sid)
+            .await
+            .expect_err("not a success");
+        assert_eq!(
+            relay_error(&tools),
+            Some(CancelRelayError::OwnerUnreachable)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Point 1: an owner that subscribes but never answers — `owner_timeout`.
+    #[tokio::test]
+    async fn a_silent_owner_is_owner_timeout_not_a_success() {
+        let broker = TestBroker::start().await;
+        let sid = Uuid::new_v4().to_string();
+        let silent = NatsEmitter::new(broker.client().await, "events");
+        let _task_sub = silent.subscribe_cancel_task(&sid).await.unwrap();
+        let _tools_sub = silent.subscribe_cancel_tools(&sid).await.unwrap();
+        silent.client().flush().await.unwrap();
+        let far = far_manager(Arc::new(
+            NatsEmitter::new(broker.client().await, "events")
+                .with_cancel_rpc_timeout(Duration::from_millis(400)),
+        ));
+        let task = far
+            .cancel_task(&sid, "b1")
+            .await
+            .expect_err("not a success");
+        assert_eq!(
+            relay_error(&task),
+            Some(CancelRelayError::OwnerTimeout {
+                kind: CancelKind::Task
+            })
+        );
+        let tools = far
+            .cancel_running_tools(&sid)
+            .await
+            .expect_err("not a success");
+        assert_eq!(
+            relay_error(&tools),
+            Some(CancelRelayError::OwnerTimeout {
+                kind: CancelKind::Tools
+            })
+        );
+    }
+
+    /// Point 1: an answer that is not one — `owner_protocol`.
+    #[tokio::test]
+    async fn an_unreadable_answer_is_owner_protocol_not_a_success() {
+        use futures::StreamExt;
+        let broker = TestBroker::start().await;
+        let sid = Uuid::new_v4().to_string();
+        let liar = NatsEmitter::new(broker.client().await, "events");
+        let mut sub = liar.subscribe_cancel_task(&sid).await.unwrap();
+        liar.client().flush().await.unwrap();
+        let client = liar.client().clone();
+        tokio::spawn(async move {
+            while let Some(msg) = sub.next().await {
+                if let Some(reply) = msg.reply {
+                    let _ = client
+                        .publish(reply.to_string(), "{\"ok\": true}".into())
+                        .await;
+                }
+            }
+        });
+        let far = far_manager(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let error = far
+            .cancel_task(&sid, "b1")
+            .await
+            .expect_err("not a success");
+        assert!(
+            matches!(
+                relay_error(&error),
+                Some(CancelRelayError::OwnerProtocol(_))
+            ),
+            "{error:#}"
+        );
+    }
+
+    /// Point 3: cancel-tools across instances is request/reply too: the owner's
+    /// refusal (`Unsupported { tool_cancel }`) comes back typed, not a 200.
+    #[tokio::test]
+    async fn a_cancel_tools_refused_by_the_owner_comes_back_typed_over_nats() {
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let (_manager, sid, mut rx) = remote_claude_code(Some(owner)).await;
+        let far = Arc::new(far_manager(Arc::new(NatsEmitter::new(
+            broker.client().await,
+            "events",
+        ))));
+        let error = until_subscribed(|| {
+            let (far, sid) = (Arc::clone(&far), sid.clone());
+            Box::pin(async move { far.cancel_running_tools(&sid).await })
+        })
+        .await
+        .expect_err("never a success");
+        assert_typed_refusal(&error);
+        refusal_on_the_wire(&mut rx).await;
+    }
+
+    /// Point 2: the owner bounds each cancel and answers every request in its own
+    /// task: a provider that hangs on one task answers `timeout` within the bound
+    /// (typed `owner_timeout`, before the asker's own 10 s), while a second request
+    /// sent meanwhile is answered at once.
+    #[tokio::test]
+    async fn a_hanging_cancel_on_the_owner_is_bounded_and_does_not_hold_the_next_one() {
+        use super::super::cancel_relay::OWNER_CANCEL_BOUND;
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let (_manager, sid, _rx) = claude_code_session(true, true, Some(owner)).await;
+        let far = Arc::new(far_manager(Arc::new(NatsEmitter::new(
+            broker.client().await,
+            "events",
+        ))));
+        // Subscribed: a first, quick cancel answers.
+        until_subscribed(|| {
+            let (far, sid) = (Arc::clone(&far), sid.clone());
+            Box::pin(async move { far.cancel_task(&sid, "nobody").await })
+        })
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let stuck = {
+            let (far, sid) = (Arc::clone(&far), sid.clone());
+            tokio::spawn(async move { far.cancel_task(&sid, "stuck").await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let quick = far.cancel_task(&sid, "b7").await.unwrap();
+        assert!(!quick.capped, "{quick:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the second request was not held by the first: {:?}",
+            started.elapsed()
+        );
+        let error = stuck.await.unwrap().expect_err("never a success");
+        assert_eq!(
+            relay_error(&error),
+            Some(CancelRelayError::OwnerTimeout {
+                kind: CancelKind::Task
+            })
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= OWNER_CANCEL_BOUND && took < OWNER_CANCEL_BOUND + Duration::from_millis(1500),
+            "the owner's bound answered, not the asker's timeout: {took:?}"
+        );
+    }
+
+    async fn post(addr: std::net::SocketAddr, path: &str) -> (u16, Value) {
+        let res = reqwest::Client::new()
+            .post(format!("http://{addr}{path}"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let status = res.status().as_u16();
+        (status, res.json().await.unwrap_or(Value::Null))
+    }
+
+    /// Point 5: through the real router — a refusal is 422 `unsupported` on both
+    /// routes, a session nobody holds is 409 `owner_unreachable`.
+    #[tokio::test]
+    async fn the_cancel_routes_answer_the_typed_refusals() {
+        let (manager, sid, _rx) = remote_claude_code(None).await;
+        let addr =
+            crate::test_helpers::serve_chat(Arc::new(manager), Arc::new(MockGraphStore::new()))
+                .await;
+        for path in [
+            format!("/api/chat/sessions/{sid}/cancel-task/b7"),
+            format!("/api/chat/sessions/{sid}/cancel-tools"),
+        ] {
+            let (status, body) = post(addr, &path).await;
+            assert_eq!(status, 422, "{path}: {body}");
+            assert_eq!(body["code"], "unsupported", "{path}: {body}");
+            assert!(
+                body["error"].as_str().unwrap_or("").contains("tool_cancel"),
+                "{body}"
+            );
+        }
+
+        let broker = TestBroker::start().await;
+        let far = far_manager(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let addr =
+            crate::test_helpers::serve_chat(Arc::new(far), Arc::new(MockGraphStore::new())).await;
+        let nobody = Uuid::new_v4();
+        for path in [
+            format!("/api/chat/sessions/{nobody}/cancel-task/b1"),
+            format!("/api/chat/sessions/{nobody}/cancel-tools"),
+        ] {
+            let (status, body) = post(addr, &path).await;
+            assert_eq!(status, 409, "{path}: {body}");
+            assert_eq!(body["code"], "owner_unreachable", "{path}: {body}");
+            assert_eq!(body["retryable"], false, "{body}");
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Review round 2 of #663.
+    // ------------------------------------------------------------------------
+
+    /// N1: an instance that no longer holds the session answers `gone` at once;
+    /// the instance that holds it answers later (its provider takes 500 ms). The
+    /// asker keeps the real answer, never the stale 410.
+    #[tokio::test]
+    async fn a_stale_gone_never_beats_the_real_owners_answer() {
+        use futures::StreamExt;
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let (_manager, sid, _rx) = claude_code_session(true, true, Some(owner)).await;
+        let far = Arc::new(far_manager(Arc::new(NatsEmitter::new(
+            broker.client().await,
+            "events",
+        ))));
+        until_subscribed(|| {
+            let (far, sid) = (Arc::clone(&far), sid.clone());
+            Box::pin(async move { far.cancel_task(&sid, "nobody").await })
+        })
+        .await
+        .unwrap();
+        // The stale instance: answers `gone` to every request, at once.
+        let stale = NatsEmitter::new(broker.client().await, "events");
+        let mut sub = stale.subscribe_cancel_task(&sid).await.unwrap();
+        stale.client().flush().await.unwrap();
+        let client = stale.client().clone();
+        tokio::spawn(async move {
+            while let Some(msg) = sub.next().await {
+                if let Some(reply) = msg.reply {
+                    let _ = client
+                        .publish(reply.to_string(), "{\"v\":2,\"gone\":true}".into())
+                        .await;
+                }
+            }
+        });
+        let answered = far.cancel_task(&sid, "slow").await.unwrap();
+        assert_eq!(answered.task_id, "slow");
+        assert!(!answered.capped, "{answered:?}");
+    }
+
+    /// N1 (the other half): only `gone` comes back — after the grace, `session_gone`,
+    /// now retryable (the session moved: asking again reaches its new owner).
+    #[tokio::test]
+    async fn only_a_gone_is_session_gone_and_retryable() {
+        use futures::StreamExt;
+        let broker = TestBroker::start().await;
+        let sid = Uuid::new_v4().to_string();
+        let stale = NatsEmitter::new(broker.client().await, "events");
+        let mut sub = stale.subscribe_cancel_task(&sid).await.unwrap();
+        stale.client().flush().await.unwrap();
+        let client = stale.client().clone();
+        tokio::spawn(async move {
+            while let Some(msg) = sub.next().await {
+                if let Some(reply) = msg.reply {
+                    let _ = client.publish(reply.to_string(), "\"gone\"".into()).await;
+                }
+            }
+        });
+        let far = far_manager(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let started = std::time::Instant::now();
+        let error = far.cancel_task(&sid, "b1").await.unwrap_err();
+        assert_eq!(
+            relay_error(&error),
+            Some(CancelRelayError::SessionGone {
+                kind: super::super::cancel_relay::CancelKind::Task
+            })
+        );
+        assert!(started.elapsed() >= super::super::cancel_relay::GONE_GRACE);
+        let failure = relay_error(&error).unwrap().failure();
+        assert_eq!((failure.status, failure.retryable), (410, true));
+    }
+
+    /// N2: a timed-out cancel_tools is NOT retryable (a late cancel may have
+    /// happened; a retry would stop tools started since); a timed-out cancel_task is.
+    #[tokio::test]
+    async fn a_timed_out_cancel_tools_is_not_retryable_through_the_router() {
+        let broker = TestBroker::start().await;
+        let sid = Uuid::new_v4();
+        let silent = NatsEmitter::new(broker.client().await, "events");
+        let _tools = silent
+            .subscribe_cancel_tools(&sid.to_string())
+            .await
+            .unwrap();
+        let _task = silent
+            .subscribe_cancel_task(&sid.to_string())
+            .await
+            .unwrap();
+        silent.client().flush().await.unwrap();
+        let far = far_manager(Arc::new(
+            NatsEmitter::new(broker.client().await, "events")
+                .with_cancel_rpc_timeout(Duration::from_millis(400)),
+        ));
+        let addr =
+            crate::test_helpers::serve_chat(Arc::new(far), Arc::new(MockGraphStore::new())).await;
+        let (status, body) = post(addr, &format!("/api/chat/sessions/{sid}/cancel-tools")).await;
+        assert_eq!(
+            (status, &body["code"]),
+            (504, &json!("owner_timeout")),
+            "{body}"
+        );
+        assert_eq!(body["retryable"], false, "{body}");
+        let (status, body) = post(addr, &format!("/api/chat/sessions/{sid}/cancel-task/b1")).await;
+        assert_eq!(
+            (status, &body["code"]),
+            (504, &json!("owner_timeout")),
+            "{body}"
+        );
+        assert_eq!(body["retryable"], true, "{body}");
+    }
+
+    /// N3: the WebSocket `cancel_tools` no longer holds the connection's loop while
+    /// the owner is asked (here a silent one): the next frame of the client is
+    /// answered at once, and the failure comes back as a typed `error` frame.
+    #[tokio::test]
+    async fn a_ws_cancel_tools_does_not_block_the_socket_and_reports_its_failure() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let broker = TestBroker::start().await;
+        // The session exists (the socket opens on it) but no instance holds it live.
+        let graph = Arc::new(MockGraphStore::new());
+        let node = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&node).await.unwrap();
+        let sid = node.id.to_string();
+        let silent = NatsEmitter::new(broker.client().await, "events");
+        let _tools = silent.subscribe_cancel_tools(&sid).await.unwrap();
+        silent.client().flush().await.unwrap();
+        let far = far_manager(Arc::new(
+            NatsEmitter::new(broker.client().await, "events")
+                .with_cancel_rpc_timeout(Duration::from_secs(3)),
+        ));
+        let addr = crate::test_helpers::serve_chat(Arc::new(far), graph).await;
+        let url = format!("ws://{addr}/ws/chat/{sid}?last_event=999999999999999");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        ws.send(WsMessage::text("ready")).await.unwrap();
+        ws.send(WsMessage::text(json!({"type": "cancel_tools"}).to_string()))
+            .await
+            .unwrap();
+        let sent = std::time::Instant::now();
+        ws.send(WsMessage::text(
+            json!({"type": "queue_op", "op": "snapshot"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut queue_seen = None;
+        let mut error = None;
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(Ok(msg)) = ws.next().await {
+                let WsMessage::Text(t) = msg else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(t.as_str()) else {
+                    continue;
+                };
+                if v["type"] == "pending_queue" && queue_seen.is_none() {
+                    queue_seen = Some(sent.elapsed());
+                }
+                if v["type"] == "error" && v["code"] == "cancel_failed" {
+                    error = Some(v);
+                    return;
+                }
+            }
+        })
+        .await;
+        let queue_seen = queue_seen.expect("the queue_op was answered");
+        assert!(
+            queue_seen < Duration::from_secs(2),
+            "the socket was not held by the cancel: {queue_seen:?}"
+        );
+        let error = error.expect("a typed error frame for the failed cancel");
+        assert_eq!(error["reason"], "owner_timeout", "{error}");
+        assert_eq!(error["seq"], 0, "a live frame like the others: {error}");
+    }
+
+    /// N4 (rolling upgrade): an older instance asks without `v` and reads only
+    /// `{"result"|"refused"|"failed"}`: it gets exactly that, never a bare string it
+    /// would take for a failure.
+    #[tokio::test]
+    async fn an_older_asker_gets_the_format_it_reads() {
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let (_manager, sid, _rx) = claude_code_session(true, false, Some(owner)).await;
+        let old = NatsEmitter::new(broker.client().await, "events");
+        let mut reply = None;
+        for _ in 0..30 {
+            match old
+                .client()
+                .request(
+                    old.cancel_task_subject(&sid),
+                    serde_json::to_vec(&json!({"task_id": "b7"}))
+                        .unwrap()
+                        .into(),
+                )
+                .await
+            {
+                Ok(msg) => {
+                    reply = Some(serde_json::from_slice::<Value>(&msg.payload).unwrap());
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let reply = reply.expect("the owner answered");
+        assert!(reply.get("v").is_none(), "{reply}");
+        assert_eq!(reply["result"]["task_id"], "b7", "{reply}");
+    }
+
+    /// N6: the local cancel is bounded like the relayed one: a provider that hangs
+    /// is `owner_timeout` after `OWNER_CANCEL_BOUND`, not a request that never ends.
+    #[tokio::test]
+    async fn a_hanging_local_cancel_is_bounded() {
+        use super::super::cancel_relay::OWNER_CANCEL_BOUND;
+        let (manager, sid, _rx) = claude_code_session(true, true, None).await;
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            OWNER_CANCEL_BOUND + Duration::from_secs(3),
+            manager.cancel_task(&sid, "stuck"),
+        )
+        .await
+        .expect("answered within the bound");
+        let error = outcome.expect_err("never a success");
+        assert_eq!(
+            relay_error(&error),
+            Some(CancelRelayError::OwnerTimeout {
+                kind: CancelKind::Task
+            })
+        );
+        assert!(started.elapsed() >= OWNER_CANCEL_BOUND);
+    }
+}
+
+/// P8 — the record of a native session (the agent engine) is kept as the legacy
+/// engine keeps its own (`chat::session_record`): before, it stayed at what the
+/// creation wrote (`message_count: 1`, no cost, no title) whatever the conversation did.
+mod native_session_record {
+    use super::*;
+    fn answer(key: &str) -> Value {
+        sse_route(
+            key,
+            vec![
+                delta(json!({"content": format!("answer to {key}")})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+                json!("[DONE]"),
+            ],
+        )
+    }
+
+    async fn record_until(
+        graph: &MockGraphStore,
+        sid: &str,
+        done: impl Fn(&crate::neo4j::models::ChatSessionNode) -> bool,
+    ) -> crate::neo4j::models::ChatSessionNode {
+        let id = Uuid::parse_str(sid).unwrap();
+        let mut last = None;
+        for _ in 0..400 {
+            if let Some(node) = graph.get_chat_session(id).await.unwrap() {
+                if done(&node) {
+                    return node;
+                }
+                last = Some(node);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the record of {sid} never got there: {last:?}");
+    }
+
+    async fn results(graph: &MockGraphStore, sid: &str) -> usize {
+        graph
+            .get_chat_events(Uuid::parse_str(sid).unwrap(), 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.event_type == "result")
+            .count()
+    }
+
+    async fn wait_results(graph: &MockGraphStore, sid: &str, count: usize) {
+        for _ in 0..400 {
+            if results(graph, sid).await >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{count} result event(s) never persisted");
+    }
+
+    #[tokio::test]
+    async fn a_native_session_keeps_its_title_its_message_count_and_its_cost_across_a_resume() {
+        let mut routes = vec![answer("AFTER-RESTART"), answer("SECOND-TURN")];
+        routes.extend(script().as_array().cloned().unwrap());
+        let fake = FakeOpenAi::start(Value::Array(routes));
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        let before = manager(graph.clone(), true).with_native_transcripts(&root);
+        let sid = before
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(before.agent_runtime.owns(&sid).await, "the agent engine");
+        wait_results(&graph, &sid, 1).await;
+        // A free endpoint: its turns cost a real 0, recorded.
+        let node = record_until(&graph, &sid, |n| n.total_cost_usd.is_some()).await;
+        assert_eq!(node.message_count, 1, "the opening message, once: {node:?}");
+        assert_eq!(node.total_cost_usd, Some(0.0), "{node:?}");
+        assert_eq!(node.title.as_deref(), Some("hi there"), "{node:?}");
+        assert_eq!(node.preview.as_deref(), Some("hi there"), "{node:?}");
+
+        before.send_message(&sid, "SECOND-TURN").await.unwrap();
+        wait_results(&graph, &sid, 2).await;
+        let node = record_until(&graph, &sid, |n| n.message_count >= 2).await;
+        assert_eq!(node.message_count, 2, "{node:?}");
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+
+        // The message that resumes the session after a restart counts too.
+        let after = manager(graph.clone(), true).with_native_transcripts(&root);
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        after
+            .resume_session(&sid, "AFTER-RESTART", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        wait_results(&graph, &sid, 3).await;
+        let node = record_until(&graph, &sid, |n| n.message_count >= 3).await;
+        assert_eq!(node.message_count, 3, "{node:?}");
+        assert_eq!(node.title.as_deref(), Some("hi there"), "the title stays");
+        assert_eq!(node.total_cost_usd, Some(0.0));
+        after.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P8 — the lifecycle of the agent engine's sessions follows the chat's
+/// configuration as the legacy engine's do: the idle cleanup closes them, they
+/// count in `max_sessions` / `active_session_count`, and their retries follow
+/// `RetryConfig`. Before, they were invisible to all three.
+mod agent_lifecycle {
+    use super::*;
+    fn configured(
+        graph: Arc<MockGraphStore>,
+        edit: impl FnOnce(&mut super::super::config::ChatConfig),
+    ) -> Arc<ChatManager> {
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph;
+        let mut config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            obscura_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        edit(&mut config);
+        Arc::new(ChatManager::new_without_memory(
+            dyn_graph,
+            state.meili,
+            config,
+        ))
+    }
+
+    async fn native_world() -> (FakeOpenAi, Arc<MockGraphStore>) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        (fake, graph)
+    }
+
+    async fn idle(manager: &ChatManager, sid: &str) {
+        for _ in 0..400 {
+            if !manager.is_session_streaming(sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the opening turn never ended");
+    }
+
+    #[tokio::test]
+    async fn an_idle_native_session_is_closed_by_the_cleanup() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |c| c.session_timeout = Duration::from_millis(300));
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        idle(&manager, &sid).await;
+        manager.start_cleanup_task();
+        for _ in 0..200 {
+            if !manager.agent_runtime.owns(&sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("an idle native session outlived the session timeout");
+    }
+
+    /// The segment state of a live session, once its tap has seeded the stored thread.
+    async fn segment_state_of(
+        manager: &ChatManager,
+        sid: &str,
+        now_ms: u64,
+        want: crate::chat::segment_state::SessionState,
+    ) -> crate::chat::segment_state::Verdict {
+        let id = Uuid::parse_str(sid).unwrap();
+        let mut last = None;
+        for _ in 0..200 {
+            let snap = manager.live_session_snapshot_at(now_ms).await;
+            last = snap.states.get(&id).cloned();
+            // A verdict on the tail before the stored thread was seeded proves nothing.
+            if last.as_ref().is_some_and(|v| {
+                v.state == want && v.reason.rule != crate::chat::segment_state::Rule::NoProvenEnd
+            }) {
+                return last.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("session {sid} never reached {want:?}: last verdict {last:?}");
+    }
+
+    fn spawned_request() -> ChatRequest {
+        let mut r = request(Some("local"), Some("proj"), "default");
+        r.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: Uuid::new_v4(),
+                tool_use_id: Some("toolu_seg".into()),
+            }
+            .to_json_string(),
+        );
+        r
+    }
+
+    /// SEG-1 step 3: a real native session of the mock carries its segment state in
+    /// `SessionActivity`, by name. Its opening turn answered a person: `reporting`, never
+    /// `done` — however late the clock is — and the session stays live.
+    #[tokio::test]
+    async fn a_native_session_reports_its_segment_state_and_a_report_stays_live() {
+        use crate::chat::segment_state::{Rule, SessionState};
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |_| {});
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let now = crate::chat::segment_tap::now_ms();
+        let verdict = segment_state_of(&manager, &sid, now, SessionState::Reporting).await;
+        assert_eq!(verdict.reason.rule, Rule::AnsweredHuman, "{verdict:?}");
+        let activity = manager
+            .session_activity_map()
+            .await
+            .remove(&Uuid::parse_str(&sid).unwrap())
+            .expect("live");
+        assert_eq!(activity.state, Some(SessionState::Reporting));
+        let json = serde_json::to_value(&activity).unwrap();
+        assert_eq!(json["state"], "reporting");
+        assert_eq!(json["state_reason"]["rule"], "answered_human");
+        assert_eq!(json["state_reason"]["event"], "result");
+
+        let a_day_later = now + 24 * 3_600_000;
+        assert!(manager
+            .release_done_sessions_at(a_day_later)
+            .await
+            .is_empty());
+        assert!(
+            manager.agent_runtime.owns(&sid).await,
+            "a report to a person is never released"
+        );
+    }
+
+    /// SEG-1 step 4: a spawned native session whose turn ended (its answer went to its
+    /// spawner) is `done` once the settle window has passed, and the release takes it out
+    /// of the live set through the ordinary close; its thread stays readable, and a new
+    /// message resumes it.
+    #[tokio::test]
+    async fn a_finished_spawned_native_session_is_done_and_released() {
+        use crate::chat::segment_state::{SessionState, SETTLE_MS};
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph.clone(), |_| {});
+        let sid = manager
+            .create_session(&spawned_request())
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let now = crate::chat::segment_tap::now_ms();
+        // Inside the settle window: still working (its end-of-turn work may plan a turn).
+        segment_state_of(&manager, &sid, now, SessionState::Working).await;
+        assert!(manager.release_done_sessions_at(now).await.is_empty());
+        assert!(manager.agent_runtime.owns(&sid).await);
+
+        let later = now + SETTLE_MS + 1_000;
+        segment_state_of(&manager, &sid, later, SessionState::Done).await;
+        assert_eq!(
+            manager.release_done_sessions_at(later).await,
+            vec![sid.clone()]
+        );
+        assert!(!manager.agent_runtime.owns(&sid).await, "no longer live");
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        assert!(
+            !manager.live_session_snapshot().await.live.contains(&uuid),
+            "out of the live set"
+        );
+        let node = graph.get_chat_session(uuid).await.unwrap();
+        assert!(node.is_some(), "the conversation is still there");
+        assert!(
+            graph.count_chat_events(uuid).await.unwrap() > 0,
+            "its thread stays readable"
+        );
+        // Done flips back the ordinary way: a new message resumes the session.
+        manager
+            .route_user_message(&sid, "hi there", None)
+            .await
+            .expect("a released session resumes on its next message");
+        assert!(manager.agent_runtime.owns(&sid).await, "live again");
+    }
+
+    /// SEG-1 step 4: a finished spawned session that WATCHES (a background task still
+    /// running) is never released, whatever the clock.
+    #[tokio::test]
+    async fn a_watching_native_session_is_not_released() {
+        use crate::chat::segment_state::{SessionState, SETTLE_MS};
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |_| {});
+        let sid = manager
+            .create_session(&spawned_request())
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        handle
+            .set_background_tasks(vec![nexus_claude::agent::BackgroundTask {
+                id: "w1".into(),
+                kind: nexus_claude::agent::BackgroundTaskKind::Shell,
+                description: "tail -F build.log".into(),
+                status: nexus_claude::agent::BackgroundTaskStatus::Running,
+                started_at_ms: Some(1_700_000_000_000),
+                tool_call_id: Some("tool-w1".into()),
+                parent: None,
+                pid: None,
+            }])
+            .await;
+        let later = crate::chat::segment_tap::now_ms() + SETTLE_MS + 3_600_000;
+        segment_state_of(&manager, &sid, later, SessionState::Watching).await;
+        assert!(manager.release_done_sessions_at(later).await.is_empty());
+        assert!(manager.agent_runtime.owns(&sid).await, "a watch stays live");
+    }
+
+    /// The release sweep runs on its own clock (`start_done_release_task`), and the
+    /// wrapper reads the real one: a watching session is kept by both.
+    #[tokio::test]
+    async fn the_release_sweep_runs_on_its_own_clock_and_keeps_a_watch() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |_| {});
+        let sid = manager
+            .create_session(&spawned_request())
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        handle
+            .set_background_tasks(vec![nexus_claude::agent::BackgroundTask {
+                id: "w2".into(),
+                kind: nexus_claude::agent::BackgroundTaskKind::Shell,
+                description: "tail -F build.log".into(),
+                status: nexus_claude::agent::BackgroundTaskStatus::Running,
+                started_at_ms: Some(1_700_000_000_000),
+                tool_call_id: Some("tool-w2".into()),
+                parent: None,
+                pid: None,
+            }])
+            .await;
+        manager.start_done_release_task();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(manager.release_done_sessions().await.is_empty());
+        assert!(manager.agent_runtime.owns(&sid).await, "a watch stays live");
+    }
+
+    #[tokio::test]
+    async fn a_full_table_frees_its_most_idle_session_instead_of_refusing() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |c| c.max_sessions = 1);
+        let first = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &first).await;
+        // Too recent for the default grace: still refused, typed.
+        assert!(!manager.reclaim_idle_slot(Duration::from_secs(3600)).await);
+        assert_eq!(manager.active_session_count().await, 1);
+        // Idle past the grace: its slot is freed for the next session.
+        assert!(manager.reclaim_idle_slot(Duration::ZERO).await);
+        assert_eq!(manager.active_session_count().await, 0);
+        assert!(!manager.agent_runtime.owns(&first).await);
+    }
+
+    #[tokio::test]
+    async fn native_sessions_count_toward_max_sessions_and_get_the_chat_retry_config() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |c| {
+            c.max_sessions = 1;
+            c.retry = super::super::config::RetryConfig {
+                max_attempts: 7,
+                initial_delay_ms: 5,
+                backoff_multiplier: 1.5,
+            };
+        });
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert_eq!(manager.active_session_count().await, 1);
+        let live = manager.live_session_snapshot().await;
+        assert!(
+            live.live.contains(&Uuid::parse_str(&sid).unwrap()),
+            "the cockpit sees the native session live"
+        );
+        let second = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await;
+        let err = second.expect_err("the limit refuses a second session");
+        assert!(
+            err.to_string()
+                .contains("Maximum number of active sessions"),
+            "{err:#}"
+        );
+        // Typed: a capacity limit is a 429 with a code, never a bare 500 (issue #876).
+        let failure = crate::chat::provider::errors::classify_open_error(&err, None)
+            .expect("the limit is a typed refusal");
+        assert_eq!(
+            (failure.status, failure.code),
+            (429, "session_limit_reached")
+        );
+        let retry = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .unwrap()
+            .retry_config();
+        assert_eq!(
+            (retry.max_attempts, retry.initial_delay_ms),
+            (7, 5),
+            "the chat's RetryConfig, not a constant"
+        );
+        manager.close_session(&sid).await.unwrap();
+        assert_eq!(manager.active_session_count().await, 0);
+    }
+}
+
+/// P8 (c) — the post-stream steps of the Claude Code engine run at the end of each
+/// turn of the agent engine, with the same functions (`post_stream`): the context
+/// re-injected after a compaction, the objective reminder, and `cancel_task`
+/// refused, typed, instead of a silent success.
+mod post_turn {
+    use super::parity::{caps, rig};
+    use super::*;
+    #[allow(unused_imports)]
+    use nexus_claude::agent::{AgentEvent, CompactionPhase, ProviderKind};
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::Step;
+
+    async fn seed_pending_tasks(graph: &MockGraphStore, project: Uuid) {
+        use crate::neo4j::models::{PlanNode, PlanStatus, TaskStatus};
+        let plan = PlanNode::new_for_project(
+            "Active Plan".into(),
+            "Plan with pending tasks".into(),
+            "test".into(),
+            50,
+            project,
+        );
+        graph.create_plan(&plan).await.unwrap();
+        graph
+            .update_plan_status(plan.id, PlanStatus::InProgress)
+            .await
+            .unwrap();
+        let mut task = crate::test_helpers::test_task_titled("Fix the parser bug");
+        task.status = TaskStatus::Pending;
+        graph.create_task(plan.id, &task).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn after_a_compaction_the_context_is_reinjected_and_the_objectives_recalled() {
+        let compacted = Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        });
+        let quiet = || vec![steps::done(&caps())];
+        let mut r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compacted, steps::done(&caps())],
+                quiet(),
+                quiet(),
+                quiet(),
+                quiet(),
+            ],
+        )
+        .await;
+        seed_pending_tasks(&r.graph, r.project.id).await;
+        r.manager.send_message(&r.sid, "go on").await.unwrap();
+        let recovery = next_event(&mut r.rx, |e| {
+            matches!(e, ChatEvent::CompactionRecovery { .. })
+        })
+        .await;
+        assert!(
+            matches!(
+                recovery,
+                ChatEvent::CompactionRecovery {
+                    recovery_success: true,
+                    ..
+                }
+            ),
+            "{recovery:?}"
+        );
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // No turn of its own for the context, nor any automated turn on the history
+        // just compacted: the run is the user's turn alone.
+        assert_eq!(r.sent().len(), 1, "{:#?}", r.sent());
+        // The next turn carries in front, once, the context and the reminder of the
+        // turn that compacted (it did no work: the objective is pending).
+        r.manager.send_message(&r.sid, "next").await.unwrap();
+        r.turn_end().await;
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert!(
+            sent[1].contains("Post-Compaction Context")
+                && sent[1].contains(&r.project.name)
+                && sent[1].contains("next"),
+            "the context of the project, in front of the next turn: {}",
+            sent[1]
+        );
+        assert!(
+            sent[2..]
+                .iter()
+                .all(|s| !s.contains("Post-Compaction Context")),
+            "re-injected once: {sent:#?}"
+        );
+        assert!(
+            sent[1].contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)
+                && sent[1].contains("Fix the parser bug"),
+            "the pending objective recalled with the context: {}",
+            sent[1]
+        );
+        assert!(
+            sent.len() <= 4,
+            "the reminders stop at their cap: {sent:#?}"
+        );
+    }
+
+    /// After a compaction, the context comes back BEFORE the model continues: the
+    /// continuation turn carries it in front of "Continue…" (the legacy engine queues
+    /// the re-injection before the auto-continue hint).
+    #[tokio::test]
+    async fn after_a_compaction_the_continuation_carries_the_context_first() {
+        let compacted = Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        });
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![
+                    compacted,
+                    Step::Emit(nexus_claude::testkit::done_event(
+                        &caps(),
+                        nexus_claude::agent::StopReason::MaxTurns,
+                        None,
+                    )),
+                ],
+                vec![steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        for _ in 0..400 {
+            if r.sent().len() >= 2 && !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "the turn, then its continuation: {sent:#?}");
+        let context = sent[1].find("Post-Compaction Context");
+        let cont = sent[1].find("Continue where you left off");
+        assert!(
+            matches!((context, cont), (Some(a), Some(b)) if a < b),
+            "the context first, then the continuation: {}",
+            sent[1]
+        );
+    }
+
+    /// A tool call announced before its input was complete (Claude Code, ACP) is
+    /// judged on its RESOLVED input: a `git commit` is conclusive, so a turn that
+    /// only committed still gets the objective reminder.
+    #[tokio::test]
+    async fn a_tool_is_judged_on_its_resolved_input() {
+        let r = rig(
+            ProviderKind::ClaudeCode,
+            vec![
+                vec![
+                    steps::tool_call_start("c1", "Bash"),
+                    steps::tool_call("c1", "Bash", json!({ "command": "git commit -m done" })),
+                    steps::tool_result("c1", "committed"),
+                    steps::done(&caps()),
+                ],
+                vec![steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        seed_pending_tasks(&r.graph, r.project.id).await;
+        r.manager.send_message(&r.sid, "commit it").await.unwrap();
+        for _ in 0..400 {
+            if r.sent().len() >= 2 && !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert!(
+            sent.iter()
+                .skip(1)
+                .any(|s| s.contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)),
+            "a commit alone is wrapping up, not working: the objectives are recalled: {sent:#?}"
+        );
+    }
+
+    /// A child of a conversation is a sub-agent: its objective is the prompt it was given,
+    /// never the project's backlog. The objective reminder reads the PROJECT's pending
+    /// tasks, so on a child it nags about work the child never took — and the child pays a
+    /// whole extra billed turn to answer it (measured 17/10/2026 on a throwaway child:
+    /// 9 413 cache-creation tokens, 600 output tokens, $0.0094).
+    #[tokio::test]
+    async fn a_child_of_a_conversation_is_not_reminded_of_the_project_objectives() {
+        let r = rig(
+            ProviderKind::ClaudeCode,
+            vec![vec![steps::done(&caps())], vec![steps::done(&caps())]],
+        )
+        .await;
+        seed_pending_tasks(&r.graph, r.project.id).await;
+        // The session is opened AS a child of a conversation (an `Agent` call), the way
+        // `subagents.rs` opens one — not converted after the fact: the objective counters
+        // are built when the agent session is adopted, which happens at open.
+        let mut req = request(None, Some(&r.project.slug), "default");
+        req.message = String::new();
+        req.cwd = r.project.root_path.clone();
+        req.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: Uuid::new_v4(),
+                tool_use_id: Some("toolu_child".into()),
+            }
+            .to_json_string(),
+        );
+        let child = r.manager.create_session(&req).await.unwrap();
+        r.manager
+            .send_message(&child.session_id, "do the thing")
+            .await
+            .unwrap();
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&child.session_id).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // A queued reminder becomes another turn: give it time to show up.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let sent = r.sent();
+        assert!(
+            !sent
+                .iter()
+                .any(|s| s.contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)),
+            "a sub-agent is not reminded of the project's backlog: {sent:#?}"
+        );
+    }
+
+    async fn idle(r: &super::parity::Rig) {
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the session never went idle");
+    }
+
+    async fn sent_count(r: &super::parity::Rig, n: usize) {
+        for _ in 0..400 {
+            if r.sent().len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{n} turns were never sent: {:#?}", r.sent());
+    }
+
+    fn compaction() -> Step {
+        Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        })
+    }
+
+    /// What the session keeps in the store for its next turn.
+    async fn stored(r: &super::parity::Rig) -> super::super::manager::HeldContext {
+        let graph: Arc<dyn GraphStore> = r.graph.clone();
+        super::super::manager::HeldContext::load(&graph, &r.sid)
+            .await
+            .unwrap()
+    }
+
+    /// Through the real `ManagerTurnServices`: a compaction, then the next turn hit
+    /// by a 429 (retried with the same text), the retry stopped by the user — the
+    /// provider ended it `done interrupted` and recorded it (nexus' native loop
+    /// keeps an interrupted turn in its history). The context rode that one turn:
+    /// the turn after it does not carry it again, and the store holds nothing.
+    #[tokio::test]
+    async fn the_held_context_rides_one_turn_across_a_429_and_a_stop() {
+        let limited = AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Error,
+            subtype: None,
+            is_error: true,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 0,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: Some(nexus_claude::agent::ProviderError::RateLimited {
+                retry_after_ms: Some(5),
+                resets_at_ms: None,
+            }),
+        };
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compaction(), steps::done(&caps())],
+                vec![Step::Emit(limited)],
+                vec![Step::AwaitInterrupt],
+                vec![steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        idle(&r).await;
+        assert!(
+            stored(&r).await.context.is_some(),
+            "held after the compaction"
+        );
+        r.manager.send_message(&r.sid, "next").await.unwrap();
+        // The turn, then its retry after the 429: stopped while it runs.
+        sent_count(&r, 3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        r.manager.interrupt(&r.sid).await.unwrap();
+        idle(&r).await;
+        r.manager.send_message(&r.sid, "then").await.unwrap();
+        sent_count(&r, 4).await;
+        idle(&r).await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 4, "{sent:#?}");
+        assert!(
+            sent[1].contains("Post-Compaction Context") && sent[1].contains("next"),
+            "{}",
+            sent[1]
+        );
+        assert_eq!(sent[1], sent[2], "the retry sends the same turn");
+        assert!(
+            !sent[3].contains("Post-Compaction Context"),
+            "injected once, not again after the Stop: {}",
+            sent[3]
+        );
+        assert!(stored(&r).await.is_empty(), "cleared from the store too");
+    }
+
+    /// A turn that carried the held context, was answered AND compacted again holds
+    /// the NEW context, in memory and in the store: the clear of the answered turn
+    /// and the store of its compaction are one ordered write, so a restart or an
+    /// idle close still finds it.
+    #[tokio::test]
+    async fn a_turn_that_compacts_again_keeps_its_new_context_stored() {
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compaction(), steps::done(&caps())],
+                vec![compaction(), steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "one").await.unwrap();
+        idle(&r).await;
+        r.manager.send_message(&r.sid, "two").await.unwrap();
+        idle(&r).await;
+        // The write is waited for in `after_turn`, before the session goes idle.
+        assert!(
+            stored(&r).await.context.is_some(),
+            "the context of the second compaction is stored"
+        );
+        r.manager.send_message(&r.sid, "three").await.unwrap();
+        sent_count(&r, 3).await;
+        idle(&r).await;
+        let sent = r.sent();
+        assert!(sent[1].contains("Post-Compaction Context"), "{}", sent[1]);
+        assert!(sent[2].contains("Post-Compaction Context"), "{}", sent[2]);
+    }
+
+    /// A turn carrying the held context compacts again, then the user stops it (the
+    /// provider ends it `done interrupted`: answered, the context delivered). The
+    /// compaction's own context is still built and held — the next turn carries a
+    /// context, and the store keeps one — instead of nothing at all.
+    #[tokio::test]
+    async fn a_stop_on_a_turn_that_compacts_again_keeps_a_context_for_the_next() {
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compaction(), steps::done(&caps())],
+                vec![compaction(), Step::AwaitInterrupt],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "one").await.unwrap();
+        idle(&r).await;
+        r.manager.send_message(&r.sid, "two").await.unwrap();
+        sent_count(&r, 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        r.manager.interrupt(&r.sid).await.unwrap();
+        idle(&r).await;
+        assert!(
+            stored(&r).await.context.is_some(),
+            "the stopped turn's compaction holds its context in the store"
+        );
+        r.manager.send_message(&r.sid, "three").await.unwrap();
+        sent_count(&r, 3).await;
+        idle(&r).await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 3, "{sent:#?}");
+        assert!(sent[1].contains("Post-Compaction Context"), "{}", sent[1]);
+        assert!(
+            sent[2].contains("Post-Compaction Context") && sent[2].contains("three"),
+            "the turn after the Stop carries a context: {}",
+            sent[2]
+        );
+    }
+}
+
+/// P8c — the context re-injected after a compaction never starts a turn of its
+/// own: such a turn is measured against the window right after the compaction and
+/// compacted again (measured on integ/p8: a second summarisation call whose history
+/// held the re-injected context). The context rides in front of the session's next
+/// turn instead. What is guaranteed: the re-injection itself never starts a turn,
+/// hence never a compaction; in this scenario (one model call per message) a user
+/// turn compacts at most once. Nexus may still compact between the tool steps of
+/// one turn: that is its own policy, not bounded here.
+mod compaction_loop {
+    use super::*;
+    const SUMMARY_PROMPT: &str = "You are compacting the history";
+    const TURNS: [&str; 5] = [
+        "turn two",
+        "turn three",
+        "turn four",
+        "turn five",
+        "turn six",
+    ];
+
+    fn answer(text: &str, prompt_tokens: u64) -> Vec<Value> {
+        vec![
+            delta(json!({ "content": text })),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 4, "total_tokens": prompt_tokens + 4}}),
+            json!("[DONE]"),
+        ]
+    }
+
+    /// A 32k window; every long turn reports a prompt near it (31k), so each turn
+    /// after enough history calls for a compaction before it.
+    fn script() -> Value {
+        let mut routes = vec![
+            sse_route(
+                "Call the ping tool now",
+                vec![
+                    delta(
+                        json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]}),
+                    ),
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                    json!("[DONE]"),
+                ],
+            ),
+            json!({"method": "GET", "path": "/v1/models", "status": 200,
+                   "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}}),
+            sse_route(SUMMARY_PROMPT, answer("a dense summary", 50)),
+        ];
+        for text in TURNS.iter().rev() {
+            routes.push(sse_route(text, answer("noted", 31_000)));
+        }
+        routes.push(sse_route("hi there", answer("hello", 10)));
+        Value::Array(routes)
+    }
+
+    fn bodies(fake: &FakeOpenAi) -> Vec<String> {
+        fake.chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .filter(|b| !b.contains("Call the ping tool now"))
+            .collect()
+    }
+
+    async fn idle(manager: &ChatManager, sid: &str) {
+        for _ in 0..600 {
+            if !manager.is_session_streaming(sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the session never went idle");
+    }
+
+    #[tokio::test]
+    async fn a_reinjected_context_never_triggers_a_compaction_and_a_user_turn_compacts_at_most_once(
+    ) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let manager = manager(graph.clone(), true);
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+
+        let mut recovered = 0;
+        for text in TURNS {
+            let before = bodies(&fake).len();
+            manager.send_message(&sid, text).await.unwrap();
+            // Its result, then the end of its run (hints included).
+            next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+            idle(&manager, &sid).await;
+            let run: Vec<String> = bodies(&fake)[before..].to_vec();
+            let compactions = run.iter().filter(|b| b.contains(SUMMARY_PROMPT)).count();
+            assert!(
+                compactions <= 1,
+                "{text}: {compactions} compactions in one user turn: {run:#?}"
+            );
+            for body in run.iter().filter(|b| b.contains(SUMMARY_PROMPT)) {
+                assert!(
+                    !body.contains("Post-Compaction Context"),
+                    "{text}: a compaction summarised the re-injected context: {body}"
+                );
+            }
+            let turns = run.iter().filter(|b| !b.contains(SUMMARY_PROMPT)).count();
+            assert_eq!(turns, 1, "{text}: one model turn per user turn: {run:#?}");
+            while let Ok(event) = rx.try_recv() {
+                recovered += usize::from(matches!(event, ChatEvent::CompactionRecovery { .. }));
+            }
+        }
+        assert!(recovered >= 1, "the scenario compacted at least once");
+        // The context of the last compaction reaches the model, in front of a turn.
+        let last = bodies(&fake)
+            .into_iter()
+            .filter(|b| !b.contains(SUMMARY_PROMPT))
+            .rfind(|b| b.contains("Post-Compaction Context"));
+        assert!(
+            last.is_some(),
+            "the re-injected context rode on a user turn"
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+/// OpenClaw delegated through its ACP bridge (`openclaw acp`), played by nexus'
+/// `fake_acp` (its `refuse_mcp_servers` mode answers as the bridge does). The bridge
+/// refuses MCP servers per session (`session/new`, `session/load` answered with an
+/// error, 2026.9.x; older versions ignored them): the session is opened WITHOUT the
+/// project-orchestrator server, and says so (`project_orchestrator_tools` among its
+/// `degraded_features`), as a remote Claude Code.
+///
+/// Each test has its own directory: the agent's script, its transcripts, what it
+/// recorded, and the agent's `HOME` (`with_acp_homes`). Nothing is declared in the
+/// process environment (`with_acp_commands`), nothing is written in the user's real
+/// data directory.
+mod openclaw_delegation {
+    use super::super::provider::settings::{process_origin, AcpCommand};
+    use super::*;
+    const INIT: &str = r#"{"op": "expect", "method": "initialize", "reply": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true}, "mcpCapabilities": {"http": false, "sse": false}}, "agentInfo": {"name": "openclaw-acp", "version": "2026.9.9"}, "authMethods": []}}"#;
+
+    fn turn() -> [Value; 3] {
+        [
+            json!({"op": "expect", "method": "session/prompt", "defer": "p"}),
+            json!({"op": "notify", "method": "session/update", "params": {"sessionId": "oc-1",
+                   "update": {"sessionUpdate": "agent_message_chunk",
+                              "content": {"type": "text", "text": "hello from openclaw"}}}}),
+            json!({"op": "reply", "to": "p", "result": {"stopReason": "end_turn"}}),
+        ]
+    }
+
+    /// One declared ACP agent played by `fake_acp`. The transcript it plays is the
+    /// one `mode` names (written by the test before a session starts): `new` (a
+    /// 2026.9.x bridge: `session/new` refused when it carries servers), `load` (same on
+    /// `session/load`), `ignoring` (an older bridge: servers ignored without a word).
+    struct Agent {
+        dir: tempfile::TempDir,
+        preset: &'static str,
+        command: AcpCommand,
+    }
+
+    impl Agent {
+        fn new(preset: &'static str, program: &str, per_session_mcp: Option<bool>) -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let d = dir.path();
+            let write = |name: &str, lines: Vec<Value>| {
+                let text: Vec<String> = lines.iter().map(Value::to_string).collect();
+                std::fs::write(d.join(format!("{name}.jsonl")), text.join("\n")).unwrap();
+            };
+            let init: Value = serde_json::from_str(INIT).unwrap();
+            let mut new = vec![
+                init.clone(),
+                json!({"op": "expect", "method": "session/new", "refuse_mcp_servers": true,
+                       "reply": {"sessionId": "oc-1"}}),
+            ];
+            new.extend(turn());
+            write("new", new);
+            let mut load = vec![
+                init.clone(),
+                json!({"op": "expect", "method": "session/load", "refuse_mcp_servers": true,
+                       "reply": null}),
+            ];
+            load.extend(turn());
+            write("load", load);
+            let mut ignoring = vec![
+                init,
+                json!({"op": "expect", "method": "session/new", "reply": {"sessionId": "oc-1"}}),
+            ];
+            ignoring.extend(turn());
+            write("ignoring", ignoring);
+            let script = d.join(program);
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nD='{dir}'\nFAKE_ACP_TRANSCRIPT=\"$D/$(cat \"$D/mode\").jsonl\" \
+                     FAKE_ACP_RECORD=\"$D/record.jsonl\" FAKE_ACP_MAX_RUNTIME_MS=120000 \
+                     exec '{fake}' \"$@\"\n",
+                    dir = d.display(),
+                    fake = fake_bin("fake_acp").display()
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let agent = Self {
+                command: AcpCommand {
+                    argv: vec![
+                        script.display().to_string(),
+                        "acp".into(),
+                        "--token-file".into(),
+                        "/dev/null".into(),
+                    ],
+                    per_session_mcp,
+                },
+                dir,
+                preset,
+            };
+            agent.mode("new");
+            agent
+        }
+
+        fn mode(&self, mode: &str) {
+            std::fs::write(self.dir.path().join("mode"), mode).unwrap();
+        }
+
+        fn recorded(&self) -> Vec<Value> {
+            std::fs::read_to_string(self.dir.path().join("record.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect()
+        }
+
+        /// The `mcpServers` of every `method` request the agent received (the health
+        /// probe sends none).
+        fn servers_sent(&self, method: &str) -> Vec<Value> {
+            self.recorded()
+                .into_iter()
+                .filter(|e| e["kind"] == "in" && e["method"] == method)
+                .map(|e| e["params"]["mcpServers"].clone())
+                .collect()
+        }
+
+        fn refusals(&self) -> usize {
+            self.recorded()
+                .iter()
+                .filter(|e| e["kind"] == "refused_mcp")
+                .count()
+        }
+
+        /// A manager that knows this agent only, keeps its `HOME` here, and a stored,
+        /// consented instance `id` of it.
+        async fn manager(&self, graph: &Arc<MockGraphStore>, id: &str) -> ChatManager {
+            let origin = process_origin("acp", Some(self.preset));
+            store_instance(
+                graph,
+                &InstanceRecord {
+                    id: id.into(),
+                    kind: "acp".into(),
+                    preset: Some(self.preset.into()),
+                    label: id.into(),
+                    base_url: String::new(),
+                    origin: origin.clone(),
+                    default_model: Some("openclaw".into()),
+                    cost_source: "unknown".into(),
+                    credential_ref: "none".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            consent(graph, "proj", id, &origin).await;
+            manager(graph.clone(), true)
+                .with_acp_commands(
+                    [(self.preset.to_string(), self.command.clone())]
+                        .into_iter()
+                        .collect(),
+                )
+                .with_acp_homes(self.dir.path().join("acp-homes"))
+        }
+
+        /// The instance's `HOME` is in this directory, and NOT in nexus' default under
+        /// the user's real data directory.
+        fn assert_home_here(&self, id: &str) {
+            let home = self.dir.path().join("acp-homes").join(id).join("home");
+            assert!(
+                home.is_dir(),
+                "the agent ran with its HOME at {}",
+                home.display()
+            );
+            let real = nexus_claude::providers::acp::default_acp_home(id);
+            assert!(
+                !real.exists(),
+                "nothing is written in the real data directory: {}",
+                real.display()
+            );
+        }
+    }
+
+    /// The persisted events of `sid` until one matches `found` (the out-of-turn pump
+    /// may persist after the Result).
+    async fn persisted<T>(
+        graph: &MockGraphStore,
+        sid: &str,
+        found: impl Fn(&ChatEvent) -> Option<T>,
+    ) -> Option<T> {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        for _ in 0..100 {
+            let hit = graph
+                .get_chat_events(uuid, 0, 200)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+                .find_map(|e| found(&e));
+            if hit.is_some() {
+                return hit;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    async fn lacks_po_tools(graph: &MockGraphStore, sid: &str) -> bool {
+        let degraded = persisted(graph, sid, |e| match e {
+            ChatEvent::SystemInit {
+                degraded_features, ..
+            } => degraded_features.clone(),
+            _ => None,
+        })
+        .await
+        .expect("a system_init with degraded_features");
+        degraded
+            .iter()
+            .any(|f| f == super::super::agent_runtime::PO_TOOLS_FEATURE)
+    }
+
+    async fn answered(manager: &ChatManager, sid: &str) {
+        let mut rx = manager.subscribe(sid).await.unwrap();
+        next_event(
+            &mut rx,
+            |e| matches!(e, ChatEvent::AssistantText { content, .. } if content.contains("hello from openclaw")),
+        )
+        .await;
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+    }
+
+    /// Opens a session on `id` and plays its turn; returns its id.
+    async fn open(manager: &ChatManager, id: &str) -> String {
+        let created = manager
+            .create_session(&request(Some(id), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the session on {id} must open: {e:#}"));
+        answered(manager, &created.session_id).await;
+        created.session_id
+    }
+
+    async fn resume(manager: &ChatManager, sid: &str) {
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        manager
+            .resume_session(sid, "again", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("the session must resume: {e:#}"));
+        answered(manager, sid).await;
+    }
+
+    #[tokio::test]
+    async fn an_openclaw_session_opens_without_the_po_server_and_says_so() {
+        let agent = Agent::new("openclaw", "openclaw", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "p19-openclaw").await;
+        let sid = open(&manager, "p19-openclaw").await;
+        // Never given a server: no refusal, no second request.
+        assert_eq!(agent.servers_sent("session/new"), vec![json!([])]);
+        assert_eq!(agent.refusals(), 0);
+        assert!(lacks_po_tools(&graph, &sid).await);
+        agent.assert_home_here("p19-openclaw");
+    }
+
+    /// An older OpenClaw IGNORES the servers without a word (nothing to learn), and a
+    /// wrapper hides its name: the declaration `per_session_mcp: false` says it.
+    #[tokio::test]
+    async fn a_declared_agent_without_per_session_mcp_is_never_given_a_server() {
+        let agent = Agent::new("wrapped", "my-bridge", Some(false));
+        agent.mode("ignoring");
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "p19-wrapped").await;
+        let sid = open(&manager, "p19-wrapped").await;
+        assert_eq!(agent.servers_sent("session/new"), vec![json!([])]);
+        assert!(lacks_po_tools(&graph, &sid).await);
+        agent.assert_home_here("p19-wrapped");
+    }
+
+    /// An agent of another name that refuses the servers: the first session is opened
+    /// again without them by nexus (and says so, on the thread too); the provider has
+    /// learned it, so the SECOND session is built without the PO server and opens at
+    /// once, with no refusal and no retry.
+    #[tokio::test]
+    async fn a_learned_refusal_opens_the_next_session_without_the_po_server_and_without_retry() {
+        let agent = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "p19-bridge").await;
+
+        let first = open(&manager, "p19-bridge").await;
+        let asked = agent.servers_sent("session/new");
+        assert_eq!(asked.len(), 2, "refused, then asked again: {asked:?}");
+        assert_eq!(asked[0][0]["name"], "project-orchestrator");
+        assert_eq!(asked[1], json!([]));
+        assert!(lacks_po_tools(&graph, &first).await);
+        // The user sees the refusal on the thread, not only in a log.
+        let notice = persisted(&graph, &first, |e| match e {
+            ChatEvent::BackgroundOutput { source, .. }
+                if source == "system:mcp_servers_refused" =>
+            {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        assert!(notice.is_some(), "mcp_servers_refused reaches the thread");
+
+        let second = open(&manager, "p19-bridge").await;
+        let asked = agent.servers_sent("session/new");
+        assert_eq!(asked.len(), 3, "one more session/new, no retry: {asked:?}");
+        assert_eq!(asked[2], json!([]));
+        assert_eq!(agent.refusals(), 1);
+        assert!(lacks_po_tools(&graph, &second).await);
+        agent.assert_home_here("p19-bridge");
+    }
+
+    /// ISO4: ACP has no system role, but the PO system prompt is not lost: the backend gives
+    /// it to the session (`SessionSpec::system_prompt`) and nexus delivers it as the leading
+    /// text block of the FIRST `session/prompt`, in front of the turn's own text (which is
+    /// the enriched message, `TurnServices::prepare`, the same for every engine).
+    #[tokio::test]
+    async fn an_acp_session_receives_the_po_system_prompt_as_the_leading_block_of_its_first_prompt()
+    {
+        let agent = Agent::new("bridge", "acp-bridge", Some(false));
+        agent.mode("ignoring");
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "iso4-acp").await;
+        open(&manager, "iso4-acp").await;
+        let prompts: Vec<Value> = agent
+            .recorded()
+            .into_iter()
+            .filter(|e| e["kind"] == "in" && e["method"] == "session/prompt")
+            .collect();
+        assert_eq!(prompts.len(), 1, "one prompt: {prompts:?}");
+        let blocks = prompts[0]["params"]["prompt"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a prompt array: {:?}", prompts[0]));
+        let texts: Vec<&str> = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
+        let at = texts
+            .iter()
+            .position(|t| t.contains("hi there"))
+            .unwrap_or_else(|| panic!("the turn text is in the prompt: {texts:?}"));
+        assert!(
+            at >= 1,
+            "the system prompt leads the first prompt, the turn follows: {texts:?}"
+        );
+        assert!(
+            texts[0].len() > 200 && !texts[0].contains("hi there"),
+            "the leading block is the PO system prompt, not the turn: {:?}",
+            texts[0]
+        );
+    }
+
+    /// A delegation carries a token and a spend cap (PYSR-3); an ACP agent refuses to open a
+    /// session with any limit (`unsupported("limits")`). Routed there by Auto, the delegation
+    /// must open anyway, without the caps it cannot hold (mono-harness rule).
+    #[tokio::test]
+    async fn a_session_with_caps_opens_on_an_acp_agent_that_cannot_enforce_them() {
+        let agent = Agent::new("bridge", "acp-bridge", Some(false));
+        agent.mode("ignoring");
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "iso4-acp").await;
+        let mut capped = request(Some("iso4-acp"), Some("proj"), "default");
+        capped.max_tokens = Some(1_000_000);
+        capped.max_cost_usd = Some(50.0);
+        let created = manager
+            .create_session(&capped)
+            .await
+            .unwrap_or_else(|e| panic!("a capped session must open on ACP: {e:#}"));
+        answered(&manager, &created.session_id).await;
+    }
+
+    /// A native instance (`local`, `fake_openai`) and an ACP agent (`fake_acp`) on one manager.
+    async fn native_and_acp(agent: &Agent) -> (ChatManager, Arc<MockGraphStore>, FakeOpenAi) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "iso4-acp").await;
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        (manager, graph, fake)
+    }
+
+    /// ISO4, switch in both directions on the fake binaries (native -> ACP here, ACP -> native
+    /// below): the thread keeps its id, the target gets the relay, and an ACP target gets the
+    /// PO system prompt in front of it like any other session.
+    #[tokio::test]
+    async fn a_conversation_moves_from_the_native_harness_to_acp_with_the_system_prompt() {
+        let agent = Agent::new("bridge", "acp-bridge", Some(false));
+        agent.mode("ignoring");
+        let (manager, graph, _fake) = native_and_acp(&agent).await;
+        let created = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the native session must open: {e:#}"));
+        let sid = created.session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+
+        let moved = manager
+            .switch_session_provider(&sid, "iso4-acp", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("the switch to ACP failed: {e:#}"));
+        assert_eq!(moved.session_id, sid, "the SAME thread continues");
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.provider_id.as_deref(), Some("iso4-acp"));
+        let said = persisted(&graph, &sid, |e| match e {
+            ChatEvent::AssistantText { content, .. } if content.contains("hello from openclaw") => {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        assert!(said.is_some(), "the ACP agent answered after the switch");
+        let prompts: Vec<Value> = agent
+            .recorded()
+            .into_iter()
+            .filter(|e| e["kind"] == "in" && e["method"] == "session/prompt")
+            .collect();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        let texts: Vec<&str> = prompts[0]["params"]["prompt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect();
+        assert!(texts.len() >= 2, "system prompt then the turn: {texts:?}");
+        assert!(texts[0].len() > 200, "the system prompt leads: {texts:?}");
+        assert!(
+            texts.iter().any(|t| t.contains("<conversation_relay")),
+            "the history is relayed: {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_moves_from_acp_to_the_native_harness() {
+        let agent = Agent::new("bridge", "acp-bridge", Some(false));
+        agent.mode("ignoring");
+        let (manager, graph, fake) = native_and_acp(&agent).await;
+        let sid = open(&manager, "iso4-acp").await;
+
+        let moved = manager
+            .switch_session_provider(&sid, "local", None, "hi there again", None)
+            .await
+            .unwrap_or_else(|e| panic!("the switch to the native harness failed: {e:#}"));
+        assert_eq!(moved.session_id, sid, "the SAME thread continues");
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.provider_id.as_deref(), Some("local"));
+        let said = persisted(&graph, &sid, |e| match e {
+            ChatEvent::AssistantText { content, .. } if content.contains("fake model") => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(said.is_some(), "the native model answered after the switch");
+        assert!(
+            fake.chat_requests()
+                .iter()
+                .any(|r| r.to_string().contains("<conversation_relay")),
+            "the native model received the relayed ACP history"
+        );
+    }
+
+    /// Two FIRST sessions opened at once on a refusing agent: whichever learns the
+    /// refusal first, the other one (built while the provider still said yes) is
+    /// opened too — by nexus' retry, or by the backend's when nexus answers
+    /// `Unsupported { per_session_mcp }` — and both say what they lack.
+    ///
+    /// What it proves is the OUTCOME only: it cannot tell which of the two retries
+    /// (nexus', the backend's) opened the late session, and nexus' alone would make it
+    /// pass. The backend's retry is proven by the unit test
+    /// `a_refusal_learned_meanwhile_reopens_the_session_without_its_mcp_servers`
+    /// (manager.rs), where the provider answers `Unsupported { per_session_mcp }`.
+    #[tokio::test]
+    async fn two_first_sessions_opened_at_once_on_a_refusing_agent_both_open() {
+        let agent = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "p19-race").await;
+        let (a, b) = tokio::join!(open(&manager, "p19-race"), open(&manager, "p19-race"));
+        assert!(lacks_po_tools(&graph, &a).await);
+        assert!(lacks_po_tools(&graph, &b).await);
+        assert_ne!(a, b);
+        // The two agent processes write one record file at once: its lines are not
+        // counted here. A session given the server was refused, never served with it.
+        let asked = agent.servers_sent("session/new");
+        assert!(asked.contains(&json!([])), "{asked:?}");
+    }
+
+    /// Resuming: an OpenClaw session is loaded without servers; a refusing agent's
+    /// session resumed after a RESTART (a new manager, the learned refusal forgotten
+    /// in memory) is loaded without servers too, from its frozen snapshot.
+    #[tokio::test]
+    async fn a_resumed_session_is_loaded_without_servers_even_after_a_restart() {
+        let openclaw = Agent::new("openclaw", "openclaw", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = openclaw.manager(&graph, "p19-oc-resume").await;
+        let sid = open(&manager, "p19-oc-resume").await;
+        manager.close_session(&sid).await.unwrap();
+        openclaw.mode("load");
+        resume(&manager, &sid).await;
+        assert_eq!(openclaw.servers_sent("session/load"), vec![json!([])]);
+        assert_eq!(openclaw.refusals(), 0);
+
+        let bridge = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let before = bridge.manager(&graph, "p19-br-resume").await;
+        let sid = open(&before, "p19-br-resume").await;
+        assert_eq!(bridge.refusals(), 1, "learned at the first session");
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+        let after = bridge.manager(&graph, "p19-br-resume").await;
+        bridge.mode("load");
+        resume(&after, &sid).await;
+        assert_eq!(bridge.servers_sent("session/load"), vec![json!([])]);
+        assert_eq!(bridge.refusals(), 1, "not refused again after the restart");
+        assert!(lacks_po_tools(&graph, &sid).await);
+        bridge.assert_home_here("p19-br-resume");
+    }
+
+    /// The frozen snapshot survives the resumes: a refusing agent's session resumed
+    /// after a restart, then after ANOTHER one, is loaded without servers both times.
+    /// The first resume must not rewrite the snapshot with what a fresh provider (which
+    /// has learned nothing yet) says, or the second restart sends the servers again, to
+    /// be refused again (a refused round-trip and a second `mcp_servers_refused`).
+    #[tokio::test]
+    async fn a_refused_session_stays_without_servers_across_two_restarts() {
+        let bridge = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let first = bridge.manager(&graph, "p19-br-twice").await;
+        let sid = open(&first, "p19-br-twice").await;
+        assert_eq!(bridge.refusals(), 1, "learned at the first session");
+        first.close_session(&sid).await.unwrap();
+        drop(first);
+        bridge.mode("load");
+        for restart in 1..=2 {
+            let manager = bridge.manager(&graph, "p19-br-twice").await;
+            resume(&manager, &sid).await;
+            manager.close_session(&sid).await.unwrap();
+            drop(manager);
+            assert_eq!(
+                bridge.servers_sent("session/load"),
+                vec![json!([]); restart],
+                "restart {restart}: loaded without servers"
+            );
+            assert_eq!(bridge.refusals(), 1, "restart {restart}: not refused again");
+        }
+        let notices = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+            .filter(|e| {
+                matches!(e, ChatEvent::BackgroundOutput { source, .. }
+                    if source == "system:mcp_servers_refused")
+            })
+            .count();
+        assert_eq!(notices, 1, "the refusal is told once, at the first opening");
+    }
+
+    /// PYSR-2: a session opened with a server the person attached (`docs`) and resumed
+    /// without it is refused, naming `mcp_servers`, BEFORE the provider is asked to load
+    /// the conversation, and nothing is written: no event, no process left behind.
+    #[tokio::test]
+    async fn a_resume_that_loses_a_server_the_person_attached_is_refused_and_writes_nothing() {
+        let bridge = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let first = bridge.manager(&graph, "pysr2-lost").await;
+        let sid = open(&first, "pysr2-lost").await;
+        first.close_session(&sid).await.unwrap();
+        drop(first);
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        // What the opening would have recorded had the person attached a `docs` server.
+        graph
+            .set_chat_session_fingerprint(
+                uuid,
+                &super::super::resume_guard::fingerprint_json(&["docs".to_string()]),
+            )
+            .await
+            .unwrap();
+        let events_before = graph.get_chat_events(uuid, 0, 500).await.unwrap().len();
+        bridge.mode("load");
+        let manager = bridge.manager(&graph, "pysr2-lost").await;
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        let error = manager
+            .resume_session(&sid, "again", Some(&claims))
+            .await
+            .expect_err("a resume that loses `docs` must be refused");
+        assert!(
+            format!("{error:#}").contains("mcp_servers"),
+            "the refusal names the field: {error:#}"
+        );
+        assert!(
+            bridge.servers_sent("session/load").is_empty(),
+            "the provider was never asked to load the conversation"
+        );
+        assert_eq!(
+            graph.get_chat_events(uuid, 0, 500).await.unwrap().len(),
+            events_before,
+            "a refused resume writes no event"
+        );
+    }
+
+    /// The same session with the fingerprint it was opened with resumes: the guard refuses
+    /// a LOSS, not a resume.
+    #[tokio::test]
+    async fn a_resume_that_keeps_its_servers_is_not_refused() {
+        let bridge = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let first = bridge.manager(&graph, "pysr2-kept").await;
+        let sid = open(&first, "pysr2-kept").await;
+        first.close_session(&sid).await.unwrap();
+        drop(first);
+        graph
+            .set_chat_session_fingerprint(
+                Uuid::parse_str(&sid).unwrap(),
+                &super::super::resume_guard::fingerprint_json(&[]),
+            )
+            .await
+            .unwrap();
+        bridge.mode("load");
+        let manager = bridge.manager(&graph, "pysr2-kept").await;
+        resume(&manager, &sid).await;
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+/// ISO4: `provider_switch.relay` on fake_codex (nexus src/bin/fake_codex.rs).
+/// Two symmetric switch tests — native ↔ Codex — using the existing `plain.jsonl`
+/// transcript (prelude + one text turn returning "Hello from codex").
+///
+/// These tests prove only the relay contract: the session thread keeps its id and the
+/// destination provider receives the conversation history.  They do NOT run the full
+/// parity scenario; every other Codex cell in the matrix that needs a dedicated
+/// transcript is declared `not_measured` in EXPECTED (ISO4).
+mod codex_switch {
+    use super::super::provider::settings::process_origin;
+    use super::*;
+    /// Shell wrapper around `fake_codex` that hard-codes `FAKE_CODEX_TRANSCRIPT`
+    /// so the backend never touches the test's process environment.
+    /// Also owns a `codex-homes/` directory with a fake `auth.json` so that
+    /// the health preflight (`logged_in()`) passes without a real Codex login.
+    struct FakeCodex {
+        _dir: tempfile::TempDir,
+        script: std::path::PathBuf,
+        /// Root passed to `with_codex_home`: each instance home is `<root>/<instance-id>`.
+        home_root: std::path::PathBuf,
+        /// Path where `fake_codex` records every incoming request (FAKE_CODEX_RECORD).
+        record: std::path::PathBuf,
+    }
+
+    impl FakeCodex {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            // Fake CODEX_HOME root: `home_root/<instance>/auth.json` must exist so
+            // `logged_in()` returns true and the health preflight passes.
+            let home_root = dir.path().join("codex-homes");
+            // Write a fully-inlined transcript so the test does not depend on
+            // the nexus source tree being at a fixed relative path (CARGO_MANIFEST_DIR
+            // differs between the main backend worktree and a git worktree under _wt/).
+            let transcript = dir.path().join("plain.jsonl");
+            std::fs::write(
+                &transcript,
+                concat!(
+                    // ── prelude ──────────────────────────────────────────────
+                    "{\"op\":\"expect\",\"method\":\"initialize\",\"reply\":{\"userAgent\":\"fake_codex/0.130.0\",\"codexHome\":\"/fake/codex-home\",\"platformFamily\":\"unix\",\"platformOs\":\"macos\"}}\n",
+                    "{\"op\":\"expect_notification\",\"method\":\"initialized\"}\n",
+                    "{\"op\":\"expect\",\"method\":\"thread/start\",\"reply\":{\"thread\":{\"id\":\"thr_fake1\",\"preview\":\"\",\"modelProvider\":\"openai\",\"createdAt\":1730910000},\"model\":\"gpt-fake\"}}\n",
+                    "{\"op\":\"notify\",\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"thr_fake1\",\"preview\":\"\",\"modelProvider\":\"openai\",\"createdAt\":1730910000}}}\n",
+                    // ── turn1_start ──────────────────────────────────────────
+                    "{\"op\":\"expect\",\"method\":\"turn/start\",\"reply\":{\"turn\":{\"id\":\"turn_1\",\"status\":\"inProgress\",\"items\":[],\"error\":null}}}\n",
+                    "{\"op\":\"notify\",\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_fake1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"inProgress\",\"items\":[],\"error\":null}}}\n",
+                    // ── turn1_text (delta → "Hello from codex") ─────────────
+                    "{\"op\":\"notify\",\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_fake1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_1\",\"text\":\"\"}}}\n",
+                    "{\"op\":\"notify\",\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_fake1\",\"turnId\":\"turn_1\",\"itemId\":\"msg_1\",\"delta\":\"Hello \"}}\n",
+                    "{\"op\":\"notify\",\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_fake1\",\"turnId\":\"turn_1\",\"itemId\":\"msg_1\",\"delta\":\"from codex\"}}\n",
+                    "{\"op\":\"notify\",\"method\":\"item/completed\",\"params\":{\"threadId\":\"thr_fake1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_1\",\"text\":\"Hello from codex\"}}}\n",
+                    // ── turn1_end ────────────────────────────────────────────
+                    "{\"op\":\"notify\",\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thr_fake1\",\"turnId\":\"turn_1\",\"tokenUsage\":{\"total\":{\"totalTokens\":180,\"inputTokens\":120,\"cachedInputTokens\":20,\"outputTokens\":60,\"reasoningOutputTokens\":10},\"last\":{\"totalTokens\":180,\"inputTokens\":120,\"cachedInputTokens\":20,\"outputTokens\":60,\"reasoningOutputTokens\":10},\"modelContextWindow\":272000}}}\n",
+                    "{\"op\":\"notify\",\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_fake1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\",\"items\":[],\"error\":null}}}\n",
+                ),
+            )
+            .unwrap();
+            // Create a fake `auth.json` under `home_root/iso4-codex/auth.json` so that
+            // `logged_in()` returns `true` and the health preflight (`create_session`
+            // calls `health()` before opening) does not fail with `auth_required`.
+            // The content is irrelevant — only its existence is checked.
+            let instance_home = home_root.join("iso4-codex");
+            std::fs::create_dir_all(&instance_home).unwrap();
+            std::fs::write(instance_home.join("auth.json"), b"{}").unwrap();
+            let record = dir.path().join("fake-codex-record.jsonl");
+            let fake = fake_bin("fake_codex");
+            let script = dir.path().join("fake-codex-wrapper.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nFAKE_CODEX_TRANSCRIPT='{}' FAKE_CODEX_RECORD='{}' \
+                     FAKE_CODEX_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                    transcript.display(),
+                    record.display(),
+                    fake.display(),
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            Self {
+                _dir: dir,
+                script,
+                home_root,
+                record,
+            }
+        }
+
+        fn script(&self) -> &std::path::Path {
+            &self.script
+        }
+
+        /// Root for `with_codex_home`: each instance's home is `<root>/<instance-id>`.
+        fn home_root(&self) -> &std::path::Path {
+            &self.home_root
+        }
+
+        /// Every request recorded by `fake_codex` (FAKE_CODEX_RECORD).
+        fn recorded(&self) -> Vec<Value> {
+            std::fs::read_to_string(&self.record)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect()
+        }
+    }
+
+    async fn store_codex_instance(graph: &MockGraphStore, id: &str) -> String {
+        let origin = process_origin("codex", None);
+        store_instance(
+            graph,
+            &InstanceRecord {
+                id: id.into(),
+                kind: "codex".into(),
+                label: "Codex ISO4".into(),
+                origin: origin.clone(),
+                default_model: Some("gpt-fake".into()),
+                cost_source: "unknown".into(),
+                credential_ref: "none".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        origin
+    }
+
+    /// Poll the graph until `found` returns `Some`, or return `None` after 5 s.
+    async fn persisted<T>(
+        graph: &MockGraphStore,
+        sid: &str,
+        found: impl Fn(&ChatEvent) -> Option<T>,
+    ) -> Option<T> {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        for _ in 0..100 {
+            let hit = graph
+                .get_chat_events(uuid, 0, 200)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+                .find_map(|e| found(&e));
+            if hit.is_some() {
+                return hit;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    /// A native (`fake_openai`) instance and a Codex instance on one manager.
+    async fn native_and_codex(
+        fake_codex: &FakeCodex,
+    ) -> (ChatManager, Arc<MockGraphStore>, FakeOpenAi) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let codex_origin = store_codex_instance(&graph, "iso4-codex").await;
+        consent(&graph, "proj", "iso4-codex", &codex_origin).await;
+        let mgr = manager(graph.clone(), true)
+            .with_codex_program(fake_codex.script())
+            .with_codex_home(fake_codex.home_root());
+        (mgr, graph, fake)
+    }
+
+    /// Opens a session on `id` and waits for the Codex answer; returns the session id.
+    async fn open_codex(manager: &ChatManager, id: &str) -> String {
+        let created = manager
+            .create_session(&request(Some(id), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the codex session on {id} must open: {e:#}"));
+        let sid = created.session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(
+            &mut rx,
+            |e| matches!(e, ChatEvent::AssistantText { content, .. } if content.contains("Hello from codex")),
+        )
+        .await;
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        sid
+    }
+
+    /// ISO4 — native → Codex: the thread keeps its id and the Codex side answers.
+    #[tokio::test]
+    async fn a_conversation_moves_from_the_native_harness_to_codex() {
+        let fake_codex = FakeCodex::new();
+        let (manager, graph, _fake) = native_and_codex(&fake_codex).await;
+
+        // Open on native first.
+        let created = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the native session must open: {e:#}"));
+        let sid = created.session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+
+        // Switch to Codex.
+        let moved = manager
+            .switch_session_provider(&sid, "iso4-codex", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("the switch to Codex failed: {e:#}"));
+        assert_eq!(moved.session_id, sid, "the SAME thread continues");
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.provider_id.as_deref(), Some("iso4-codex"));
+        let said = persisted(&graph, &sid, |e| match e {
+            ChatEvent::AssistantText { content, .. } if content.contains("Hello from codex") => {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        assert!(said.is_some(), "Codex answered after the switch");
+        // ISO4: verify that fake_codex received the relayed native history.
+        assert!(
+            fake_codex
+                .recorded()
+                .iter()
+                .any(|e| e["kind"] == "in"
+                    && e["params"].to_string().contains("<conversation_relay")),
+            "fake_codex received the relayed native history in the switch request"
+        );
+    }
+
+    /// ISO4 — Codex → native: the thread keeps its id and the native side receives the
+    /// relayed Codex history.
+    #[tokio::test]
+    async fn a_conversation_moves_from_codex_to_the_native_harness() {
+        let fake_codex = FakeCodex::new();
+        let (manager, graph, fake) = native_and_codex(&fake_codex).await;
+
+        // Open on Codex first.
+        let sid = open_codex(&manager, "iso4-codex").await;
+
+        // Switch to native.
+        let moved = manager
+            .switch_session_provider(&sid, "local", None, "hi there again", None)
+            .await
+            .unwrap_or_else(|e| panic!("the switch to the native harness failed: {e:#}"));
+        assert_eq!(moved.session_id, sid, "the SAME thread continues");
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.provider_id.as_deref(), Some("local"));
+        let said = persisted(&graph, &sid, |e| match e {
+            ChatEvent::AssistantText { content, .. } if content.contains("fake model") => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(said.is_some(), "the native model answered after the switch");
+        assert!(
+            fake.chat_requests()
+                .iter()
+                .any(|r| r.to_string().contains("<conversation_relay")),
+            "the native model received the relayed Codex history"
+        );
+    }
+}
+
+// ============================================================================
+// Sub-agents of a native session (P18): the child's ceiling, the cap of live children
+// under parallel calls, the child closed whatever the end. Scripted provider, no fakes.
+// ============================================================================
+mod native_subagents {
+    use super::parity::{caps, Tapped};
+    use super::*;
+    #[allow(unused_imports)]
+    use nexus_claude::agent::{
+        AgentEvent, AgentProvider, AgentSession, CancelOutcome, CancelScope, Capabilities,
+        EventStream, InterruptOutcome, InterruptScope, ModelInfo, PermissionDecision, PolicyMode,
+        ProviderError, ProviderHealth, ProviderKind, QuestionAnswer, ResumeToken, SessionSpec,
+        StopReason, SubagentRequest, TurnInput,
+    };
+    use nexus_claude::testkit::{steps, Script, ScriptedProvider, Step};
+
+    /// A session whose FIRST turn takes `ms` to be accepted by the provider. That is the
+    /// window INSIDE `create_session` where the child is already live — registered in the
+    /// runtime, its first message on the way — while its id is not yet known to the caller
+    /// of `run_subagent` (P18b, fix 2).
+    struct SlowFirstTurn {
+        inner: Arc<dyn AgentSession>,
+        ms: u64,
+        /// How long the provider takes to take a permission answer (the automatic answer
+        /// of a covered request included).
+        answer_ms: u64,
+        first: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentSession for SlowFirstTurn {
+        fn capabilities(&self) -> &Capabilities {
+            self.inner.capabilities()
+        }
+        fn resume_token(&self) -> Option<ResumeToken> {
+            self.inner.resume_token()
+        }
+        async fn send_turn(&self, input: TurnInput) -> Result<EventStream, ProviderError> {
+            if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(self.ms)).await;
+            }
+            self.inner.send_turn(input).await
+        }
+        async fn answer_permission(
+            &self,
+            request_id: &str,
+            decision: PermissionDecision,
+        ) -> Result<(), ProviderError> {
+            tokio::time::sleep(Duration::from_millis(self.answer_ms)).await;
+            self.inner.answer_permission(request_id, decision).await
+        }
+        async fn answer_question(
+            &self,
+            question_id: &str,
+            answer: QuestionAnswer,
+        ) -> Result<(), ProviderError> {
+            self.inner.answer_question(question_id, answer).await
+        }
+        async fn interrupt(
+            &self,
+            scope: InterruptScope,
+        ) -> Result<InterruptOutcome, ProviderError> {
+            self.inner.interrupt(scope).await
+        }
+        async fn cancel_tools(&self, scope: CancelScope) -> Result<CancelOutcome, ProviderError> {
+            self.inner.cancel_tools(scope).await
+        }
+        async fn set_model(&self, model: &str) -> Result<(), ProviderError> {
+            self.inner.set_model(model).await
+        }
+        async fn set_policy_mode(
+            &self,
+            mode: PolicyMode,
+            native: Option<&str>,
+        ) -> Result<(), ProviderError> {
+            self.inner.set_policy_mode(mode, native).await
+        }
+        fn out_of_band(&self) -> Option<EventStream> {
+            self.inner.out_of_band()
+        }
+        async fn close(&self) -> Result<(), ProviderError> {
+            self.inner.close().await
+        }
+    }
+
+    /// The scripted provider, each opening taking `open_ms`: the window between the count of
+    /// the live children and the registration of a new one that a real endpoint opens too.
+    /// `turn_ms` stretches the FIRST turn of every session it opens ([`SlowFirstTurn`]).
+    #[derive(Clone)]
+    struct SlowOpen {
+        inner: Tapped,
+        open_ms: u64,
+        turn_ms: u64,
+        answer_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentProvider for SlowOpen {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn kind(&self) -> ProviderKind {
+            self.inner.kind()
+        }
+        async fn health(&self) -> ProviderHealth {
+            self.inner.health().await
+        }
+        async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            self.inner.catalog().await
+        }
+        fn capabilities(&self, model: Option<&str>) -> Capabilities {
+            self.inner.capabilities(model)
+        }
+        async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            tokio::time::sleep(Duration::from_millis(self.open_ms)).await;
+            let session = self.inner.open(spec).await?;
+            if self.turn_ms == 0 && self.answer_ms == 0 {
+                return Ok(session);
+            }
+            Ok(Arc::new(SlowFirstTurn {
+                inner: session,
+                ms: self.turn_ms,
+                answer_ms: self.answer_ms,
+                first: std::sync::atomic::AtomicBool::new(true),
+            }))
+        }
+        async fn resume(
+            &self,
+            spec: SessionSpec,
+            token: ResumeToken,
+        ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.inner.resume(spec, token).await
+        }
+    }
+
+    impl crate::chat::agent_runtime::ProviderSource for SlowOpen {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+            (provider_id == "claude-code").then(|| Arc::new(self.clone()) as Arc<dyn AgentProvider>)
+        }
+    }
+
+    struct Rig {
+        manager: Arc<ChatManager>,
+        graph: Arc<MockGraphStore>,
+        parent: String,
+        /// The CRUD bus the manager emits on (session lists).
+        bus: Arc<crate::events::EventBus>,
+        /// The scripted provider itself: its journal (`calls()`) is what the tests read.
+        scripted: Arc<ScriptedProvider>,
+        _dir: tempfile::TempDir,
+        _rules: tempfile::TempDir,
+    }
+
+    /// A native parent session opened in `mode`; every child plays `child_turn`.
+    async fn rig(child_turn: Vec<Step>, mode: &str) -> Rig {
+        rig_with(child_turn, mode, 0, 0, None, 0).await
+    }
+
+    async fn rig_slow(child_turn: Vec<Step>, mode: &str, open_ms: u64) -> Rig {
+        rig_with(child_turn, mode, open_ms, 0, None, 0).await
+    }
+
+    /// [`rig`], the parent opened inside the workspace `ws` (its only project is the
+    /// parent's own, so its resolved `add_dirs` starts out empty — P18b, fix 1).
+    async fn rig_in_workspace(child_turn: Vec<Step>, mode: &str, ws: &str) -> Rig {
+        rig_with(child_turn, mode, 0, 0, Some(ws), 0).await
+    }
+
+    /// [`rig`], the provider taking `open_ms` to open a session, `turn_ms` to accept its
+    /// first turn and `answer_ms` to take each permission answer, and the parent opened
+    /// inside `workspace` when given. Lasting rules are kept (a person's session keeps
+    /// them; the parent has no owner unless a test gives it one).
+    async fn rig_with(
+        child_turn: Vec<Step>,
+        mode: &str,
+        open_ms: u64,
+        turn_ms: u64,
+        workspace: Option<&str>,
+        answer_ms: u64,
+    ) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let mut project = crate::test_helpers::test_project();
+        project.root_path = dir.path().display().to_string();
+        graph.create_project(&project).await.unwrap();
+        crate::skills::project_resolver::seed_resolve_cache_for_tests(std::slice::from_ref(
+            &project,
+        ));
+        if let Some(ws_slug) = workspace {
+            let mut ws = crate::test_helpers::test_workspace();
+            ws.slug = ws_slug.to_string();
+            graph.create_workspace(&ws).await.unwrap();
+            graph
+                .add_project_to_workspace(ws.id, project.id)
+                .await
+                .unwrap();
+        }
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 20,
+            lasting_rules_dir: Some(rules.path().join("rules")),
+            native_turn_timeout_secs: None,
+            native_session_max_tokens: None,
+            ..Default::default()
+        };
+        // A native harness asks its permissions of the user (and takes their answers).
+        let mut child_caps = caps();
+        child_caps.interactive_permissions = true;
+        child_caps.permission_scopes = vec![nexus_claude::agent::PermissionScope::Once];
+        let scripted = Arc::new(ScriptedProvider::new(
+            "claude-code",
+            Script::builder()
+                .capabilities(child_caps)
+                .turn(child_turn)
+                .build(),
+        ));
+        let provider = Tapped {
+            inner: scripted.clone(),
+            kind: ProviderKind::Native,
+            answers: Arc::default(),
+        };
+        let bus = Arc::new(crate::events::EventBus::new(1024));
+        let manager = Arc::new(
+            ChatManager::new_without_memory(dyn_graph, state.meili, config)
+                .with_provider_source(Arc::new(SlowOpen {
+                    inner: provider,
+                    open_ms,
+                    turn_ms,
+                    answer_ms,
+                }))
+                .with_event_emitter(bus.clone()),
+        );
+        manager.enable_subagents();
+        let mut req = request(None, Some(&project.slug), mode);
+        req.message = String::new();
+        req.cwd = project.root_path.clone();
+        req.workspace_slug = workspace.map(str::to_string);
+        let parent = manager.create_session(&req).await.unwrap().session_id;
+        Rig {
+            manager,
+            graph,
+            parent,
+            bus,
+            scripted,
+            _dir: dir,
+            _rules: rules,
+        }
+    }
+
+    impl Rig {
+        async fn children(&self) -> Vec<crate::neo4j::models::ChatSessionNode> {
+            self.graph
+                .get_session_children(Uuid::parse_str(&self.parent).unwrap())
+                .await
+                .unwrap_or_default()
+        }
+
+        async fn none_alive(&self) -> bool {
+            for child in self.children().await {
+                if self.manager.agent_runtime.owns(&child.id.to_string()).await {
+                    return false;
+                }
+            }
+            true
+        }
+
+        async fn run(&self, call: &str) -> Result<String, String> {
+            self.manager
+                .clone()
+                .run_subagent(&self.parent, None, &SubagentRequest::new(call, "do it"))
+                .await
+        }
+
+        fn parent_uuid(&self) -> Uuid {
+            Uuid::parse_str(&self.parent).unwrap()
+        }
+
+        async fn parent_node(&self) -> crate::neo4j::models::ChatSessionNode {
+            self.graph
+                .get_chat_session(self.parent_uuid())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        /// A child of the parent opened the way `chat(send_message)` opens one: `spawned_by`
+        /// says `conversation`, with NO `tool_use_id`.
+        async fn open_send_message_child(&self) -> String {
+            let parent = self.parent_node().await;
+            let mut req = request(None, parent.project_slug.as_deref(), "default");
+            req.message = "you too".into();
+            req.cwd = parent.cwd.clone();
+            req.spawned_by = Some(crate::chat::envelope::conversation_spawned_by(
+                self.parent_uuid(),
+            ));
+            self.manager.create_session(&req).await.unwrap().session_id
+        }
+
+        async fn events_of(&self, sid: &str) -> Vec<crate::neo4j::models::ChatEventRecord> {
+            self.graph
+                .get_chat_events(Uuid::parse_str(sid).unwrap(), 0, 500)
+                .await
+                .unwrap_or_default()
+        }
+    }
+
+    fn answer(text: &str) -> Vec<Step> {
+        vec![steps::text("working"), steps::done_with_text(&caps(), text)]
+    }
+
+    /// ISO2, criterion 1: an `Agent` call with `run_in_background: true` answers at once and
+    /// the child's end wakes the IDLE parent with a `<task-notification>` turn (`subagents.rs`,
+    /// `inject_hint`). Red without that `inject_hint`: the parent never gets a second turn.
+    #[tokio::test]
+    async fn a_background_agent_wakes_the_idle_parent_with_its_task_notification() {
+        // The first turn of every session takes 600 ms: the child is still running when the
+        // call returns.
+        let r = rig_with(answer("CHILD-ANSWER"), "bypassPermissions", 0, 600, None, 0).await;
+        let mut request = SubagentRequest::new("toolu_bg", "do it");
+        request.run_in_background = true;
+        let started = tokio::time::Instant::now();
+        let launched = r
+            .manager
+            .clone()
+            .run_subagent(&r.parent, None, &request)
+            .await;
+        let took = started.elapsed();
+        assert!(launched.is_ok(), "launch answered: {launched:?}");
+        assert!(
+            took < Duration::from_millis(400),
+            "the call blocked for {took:?}"
+        );
+        let turns_of = |r: &Rig| {
+            r.scripted
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    nexus_claude::testkit::RecordedCall::SendTurn(input) => {
+                        Some(format!("{:?}", input.blocks))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !turns_of(&r)
+                .iter()
+                .any(|t| t.contains("<task-notification")),
+            "no notification before the child ends"
+        );
+        // The parent is idle: the notification arrives as the input of a new turn.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let wake = loop {
+            if let Some(t) = turns_of(&r)
+                .into_iter()
+                .find(|t| t.contains("<task-notification"))
+            {
+                break t;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the parent never received the notification: {:?}",
+                turns_of(&r)
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert!(wake.contains("tool_use_id=\\\"toolu_bg\\\""), "{wake}");
+        assert!(wake.contains("status=\\\"completed\\\""), "{wake}");
+        assert!(
+            wake.contains("CHILD-ANSWER"),
+            "the child's answer is the summary: {wake}"
+        );
+    }
+
+    /// Lot review of #721, finding 1 (decision ed628dad): a child opened by the `Agent` tool
+    /// emits exactly ONE CRUD `created`, whose payload names its parent — the client then
+    /// refetches its `/children`, where the record's `tool_use_id` joins it to the call. Red
+    /// before: none at all (the agent engine's opening returned before the only emission,
+    /// and `run_subagent` is no HTTP handler), so the card never appeared live.
+    #[tokio::test]
+    async fn an_agent_child_emits_one_created_event_carrying_its_spawned_by() {
+        let r = rig(answer("CHILD-ANSWER"), "bypassPermissions").await;
+        let mut crud = r.bus.subscribe();
+        assert_eq!(r.run("toolu_live").await, Ok("CHILD-ANSWER".to_string()));
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        let child = children[0].id.to_string();
+        let mut created = Vec::new();
+        while let Ok(event) = crud.try_recv() {
+            if event.entity_type == crate::events::EntityType::ChatSession
+                && event.action == crate::events::CrudAction::Created
+            {
+                created.push(event);
+            }
+        }
+        assert_eq!(created.len(), 1, "exactly one, for the child: {created:?}");
+        assert_eq!(created[0].entity_id, child);
+        // Exactly the project and the parent (review nexus-41 of #727, finding 1): the
+        // `tool_use_id` join is read from the filtered `/children`, which holds the record.
+        let project_slug = created[0].payload["project_slug"].clone();
+        assert_eq!(
+            created[0].payload,
+            serde_json::json!({
+                "project_slug": project_slug,
+                "spawned_by": { "type": "conversation", "parent_session_id": r.parent.as_str() },
+            })
+        );
+        let stored: serde_json::Value =
+            serde_json::from_str(children[0].spawned_by.as_deref().unwrap()).unwrap();
+        assert_eq!(stored["tool_use_id"], "toolu_live");
+        assert!(r.none_alive().await);
+    }
+
+    /// B1: a native parent opened in bypassPermissions then put in plan: its child is capped
+    /// at plan (the CURRENT mode), not at the opening one. Red before the agent engine's mode
+    /// was kept live and persisted.
+    #[tokio::test]
+    async fn a_child_is_capped_at_the_parents_current_mode() {
+        let r = rig(answer("CHILD-ANSWER"), "bypassPermissions").await;
+        r.manager
+            .set_session_permission_mode(&r.parent, "plan")
+            .await
+            .unwrap();
+        assert_eq!(r.run("ca1").await, Ok("CHILD-ANSWER".to_string()));
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].permission_mode.as_deref(), Some("plan"));
+        // Persisted too: the envelope after a restart reads the same.
+        let parent = r
+            .graph
+            .get_chat_session(Uuid::parse_str(&r.parent).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.permission_mode.as_deref(), Some("plan"));
+        // The child is closed once it answered.
+        assert!(r.none_alive().await);
+    }
+
+    /// B2: six parallel calls on one parent: at most four children, the others refused with a
+    /// clear error; dropping the running calls (the parent's turn interrupted) closes their
+    /// children and gives the slots back.
+    #[tokio::test]
+    async fn parallel_calls_open_at_most_four_children_and_a_dropped_call_closes_its_child() {
+        let r = Arc::new(rig_slow(vec![Step::AwaitInterrupt], "default", 300).await);
+        let calls: Vec<_> = (0..6)
+            .map(|i| {
+                let r = r.clone();
+                tokio::spawn(async move { r.run(&format!("c{i}")).await })
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let finished = calls.iter().filter(|h| h.is_finished()).count();
+            if r.children().await.len() >= 4 && finished >= 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "children={}, finished={finished}",
+                r.children().await.len()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            r.children().await.len(),
+            4,
+            "the cap holds under parallel calls"
+        );
+        let mut refused = 0;
+        let mut running = Vec::new();
+        for handle in calls {
+            if handle.is_finished() {
+                let out = handle.await.unwrap();
+                assert!(
+                    out.as_ref()
+                        .is_err_and(|e| e.contains("envelope_too_many_children")),
+                    "{out:?}"
+                );
+                refused += 1;
+            } else {
+                running.push(handle);
+            }
+        }
+        assert_eq!(refused, 2);
+        assert!(!r.none_alive().await, "the four children run");
+        for handle in running {
+            handle.abort();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !r.none_alive().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a dropped call must close its child"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(r
+            .manager
+            .subagent_slots
+            .lock()
+            .unwrap()
+            .get(&r.parent)
+            .is_none());
+    }
+
+    /// B2b: the live-children cap is a runtime setting — a cap of N accepts N children and
+    /// refuses the N+1-th with the stable code and where to raise it in the message
+    /// (PLAFOND-4). Test with cap = 2 to keep the rig lightweight.
+    #[tokio::test]
+    async fn the_live_children_cap_is_set_at_runtime_and_names_where_to_raise_it() {
+        // Build a rig manually so we can set max_live_children = 2.
+        let cap: usize = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let mut project = crate::test_helpers::test_project();
+        project.root_path = dir.path().display().to_string();
+        graph.create_project(&project).await.unwrap();
+        crate::skills::project_resolver::seed_resolve_cache_for_tests(std::slice::from_ref(
+            &project,
+        ));
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 20,
+            ..Default::default()
+        };
+        let mut child_caps = caps();
+        child_caps.interactive_permissions = true;
+        child_caps.permission_scopes = vec![nexus_claude::agent::PermissionScope::Once];
+        let provider = Tapped {
+            inner: Arc::new(ScriptedProvider::new(
+                "claude-code",
+                Script::builder()
+                    .capabilities(child_caps)
+                    .turn(vec![Step::AwaitInterrupt])
+                    .build(),
+            )),
+            kind: ProviderKind::Native,
+            answers: Arc::default(),
+        };
+        let scripted_handle = provider.inner.clone();
+        let rules = tempfile::tempdir().unwrap();
+        let bus = Arc::new(crate::events::EventBus::new(1024));
+        let manager = Arc::new(
+            ChatManager::new_without_memory(dyn_graph, state.meili, config)
+                .with_provider_source(Arc::new(SlowOpen {
+                    inner: provider,
+                    open_ms: 300,
+                    turn_ms: 0,
+                    answer_ms: 0,
+                }))
+                .with_event_emitter(bus.clone()),
+        );
+        manager.enable_subagents();
+        manager
+            .set_max_live_children(cap)
+            .await
+            .expect("the cap is within bounds")
+            .expect("the cap is stored");
+        let mut req = request(None, Some(&project.slug), "default");
+        req.message = String::new();
+        req.cwd = project.root_path.clone();
+        let parent = manager.create_session(&req).await.unwrap().session_id;
+        let r = Arc::new(Rig {
+            manager,
+            graph,
+            parent,
+            bus,
+            scripted: scripted_handle,
+            _dir: dir,
+            _rules: rules,
+        });
+
+        // Spawn cap + 1 concurrent calls.
+        let calls: Vec<_> = (0..(cap + 1))
+            .map(|i| {
+                let r = r.clone();
+                tokio::spawn(async move { r.run(&format!("c{i}")).await })
+            })
+            .collect();
+        // Wait until cap children are live and 1 call has finished (refused).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let finished = calls.iter().filter(|h| h.is_finished()).count();
+            if r.children().await.len() >= cap && finished >= 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "children={}, finished={finished}",
+                r.children().await.len()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Exactly one call was refused with the stable code + env var name.
+        let mut refused = 0;
+        let mut running = Vec::new();
+        for handle in calls {
+            if handle.is_finished() {
+                let out = handle.await.unwrap();
+                assert!(
+                    out.as_ref().is_err_and(|e| {
+                        e.contains("envelope_too_many_children") && e.contains("delegation-limits")
+                    }),
+                    "unexpected: {out:?}"
+                );
+                refused += 1;
+            } else {
+                running.push(handle);
+            }
+        }
+        assert_eq!(refused, 1, "exactly one call past cap={cap} was refused");
+        for handle in running {
+            handle.abort();
+        }
+    }
+
+    /// P18-suite, point 6: the cap counts EVERY child of the parent, whichever path opened it.
+    /// Three children opened the way `chat(send_message)` opens one (the REST/MCP path, no
+    /// `Agent` slot) are working; two `Agent` calls then race. Only one may open: the fourth
+    /// child fills the cap of four, the fifth is refused.
+    ///
+    /// Red before the fix: the `Agent` slots counted only `Agent` calls (2 of 4) and the
+    /// envelope counted only children already live (3 of 4, the two openings still in
+    /// flight), so both calls passed and the parent had five children alive.
+    #[tokio::test]
+    async fn mcp_children_and_parallel_agent_calls_share_one_live_children_cap() {
+        let r = Arc::new(rig_slow(vec![Step::AwaitInterrupt], "default", 300).await);
+        for _ in 0..3 {
+            r.open_send_message_child().await;
+        }
+        assert_eq!(r.children().await.len(), 3);
+        let calls: Vec<_> = (0..2)
+            .map(|i| {
+                let r = r.clone();
+                tokio::spawn(async move { r.run(&format!("race{i}")).await })
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let finished = calls.iter().filter(|h| h.is_finished()).count();
+            if r.children().await.len() >= 4 && finished >= 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "children={}, finished={finished}",
+                r.children().await.len()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Past the opening time of a child that would have slipped through.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            r.children().await.len(),
+            crate::chat::envelope::MAX_LIVE_CHILDREN,
+            "3 MCP children + 1 Agent child: the cap of four holds"
+        );
+        let mut refused = 0;
+        let mut running = Vec::new();
+        for handle in calls {
+            if handle.is_finished() {
+                let out = handle.await.unwrap();
+                assert!(
+                    out.as_ref()
+                        .is_err_and(|e| e.contains("envelope_too_many_children")),
+                    "{out:?}"
+                );
+                refused += 1;
+            } else {
+                running.push(handle);
+            }
+        }
+        assert_eq!(refused, 1, "the fifth child is refused");
+        for handle in running {
+            handle.abort();
+        }
+    }
+
+    /// A child that fails: an error result for the parent, the child closed.
+    #[tokio::test]
+    async fn a_failed_child_is_an_error_and_is_closed() {
+        let failed = AgentEvent::Done {
+            stop_reason: StopReason::Error,
+            subtype: Some("error_during_execution".into()),
+            is_error: true,
+            result_text: Some("boom".into()),
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 0,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        let r = rig(vec![Step::Emit(failed)], "default").await;
+        let out = r.run("ca1").await;
+        assert!(out.as_ref().is_err_and(|e| e.contains("failed")), "{out:?}");
+        assert!(r.none_alive().await);
+    }
+
+    /// P18b, fix 2: the parent's turn is interrupted while the child is still OPENING — the
+    /// child is already live (registered, its first message on the way) but `run_subagent`
+    /// does not know its id yet. The child must not be left running with nobody awaiting it.
+    ///
+    /// Red before the fix: the whole `run_subagent` future, `create_session` included, was
+    /// dropped mid-open, and the `CloseOnDrop` guard was only armed on its return — the
+    /// child ran on for ever.
+    #[tokio::test]
+    async fn a_call_cancelled_while_the_child_opens_still_closes_it() {
+        let r = Arc::new(rig_with(vec![Step::AwaitInterrupt], "default", 0, 2_000, None, 0).await);
+        let call = {
+            let r = r.clone();
+            tokio::spawn(async move { r.run("c0").await })
+        };
+        // The window of the defect: the child is live, the call has not returned.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while r.none_alive().await || r.children().await.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!call.is_finished(), "the opening is still running");
+        let child = r.children().await[0].id.to_string();
+        call.abort();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !r.none_alive().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a call cancelled during the opening must still close its child"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(r.children().await.len(), 1, "one child, and it is closed");
+        assert!(
+            r.events_of(&child)
+                .await
+                .iter()
+                .any(|e| e.event_type == "session_closed"),
+            "the close is on the child's thread: {:?}",
+            r.events_of(&child)
+                .await
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(r
+            .manager
+            .subagent_slots
+            .lock()
+            .unwrap()
+            .get(&r.parent)
+            .is_none());
+    }
+
+    /// P18b round 2, fix 2: the slot must stay taken for as long as the child the spawned
+    /// `open_wait_close` task is still opening — not just for as long as `run_subagent`'s
+    /// own future, which the caller can abort well before the provider's `open` even
+    /// returns. `open_ms` (not `turn_ms`) delays specifically that path: the child's session
+    /// node is persisted but the provider has not even been asked to open it yet when the
+    /// call is aborted.
+    ///
+    /// Red before the fix: `_slot` lived in `run_subagent`'s own frame, so aborting it freed
+    /// the slot immediately, while the spawned task was still stuck inside `create_session`
+    /// with the child nowhere near closed — a concurrent call could then take a slot that,
+    /// for a little longer, was still really in use.
+    #[tokio::test]
+    async fn the_slot_stays_taken_until_the_cancelled_childs_task_actually_closes_it() {
+        let r = Arc::new(rig_slow(vec![Step::AwaitInterrupt], "default", 2_000).await);
+        let call = {
+            let r = r.clone();
+            tokio::spawn(async move { r.run("c0").await })
+        };
+        // The child's session node is persisted (`create_session_in_place`) well before the
+        // provider's `open` returns: catch the call here, node up but not yet live.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while r.children().await.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child's node never appeared"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let child_id = r.children().await[0].id.to_string();
+        assert!(
+            !r.manager.agent_runtime.owns(&child_id).await,
+            "the child must not be live yet: this is the window the slot now spans"
+        );
+        call.abort();
+        // Right after the abort: `run_subagent`'s own frame is gone, but the spawned task
+        // is still stuck inside `create_session`'s multi-second provider `open`.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            r.manager
+                .subagent_slots
+                .lock()
+                .unwrap()
+                .get(&r.parent)
+                .copied(),
+            Some(1),
+            "the slot must still be taken: the child this task owns is not yet even live"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while r
+            .manager
+            .subagent_slots
+            .lock()
+            .unwrap()
+            .get(&r.parent)
+            .is_some()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the slot was never freed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !r.manager.agent_runtime.owns(&child_id).await,
+            "the slot frees only once the child this task owns is actually closed"
+        );
+    }
+
+    /// P18b, fix 3: after a restart, the child of an `Agent` call is NOT resumed. Its
+    /// parent's own resume re-issues the call, so resuming the child too would run the same
+    /// work twice (two agents editing the same files), its answer would reach nobody, and it
+    /// would hold one of the parent's four slots. It is closed instead (it stays resumable
+    /// and visible). A child opened by `chat(send_message)` — `conversation` with no
+    /// `tool_use_id` — keeps its behaviour: it is resumed.
+    #[tokio::test]
+    async fn after_a_restart_the_child_of_an_agent_call_is_closed_not_resumed() {
+        let r = Arc::new(rig(vec![Step::AwaitInterrupt], "default").await);
+        let call = {
+            let r = r.clone();
+            tokio::spawn(async move { r.run("c0").await })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while r.children().await.is_empty() || r.none_alive().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sub-agent's child never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let agent_child = r.children().await[0].id.to_string();
+        let plain_child = r.open_send_message_child().await;
+        assert_ne!(agent_child, plain_child);
+
+        // The server after the restart, over the same graph: neither child is live for it.
+        let graph: Arc<dyn GraphStore> = r.graph.clone();
+        // The rig's fake provider answers as `claude-code`; since #726 such a session is
+        // closed at boot unless the server resumes Claude Code. This test is about the
+        // Agent-tool child vs a chat(send_message) child, not that policy.
+        let next =
+            ChatManager::new_without_memory(graph, mock_app_state().meili, Default::default())
+                .resuming_claude_code_at_boot();
+        let (pending, scan) = next.scan_interrupted_turns().await.unwrap();
+        let resumed: Vec<String> = pending.iter().map(|p| p.node.id.to_string()).collect();
+        assert!(
+            !resumed.contains(&agent_child),
+            "the child of an `Agent` call is not resumed: {resumed:?}"
+        );
+        assert!(
+            resumed.contains(&plain_child),
+            "a chat(send_message) child is still resumed: {resumed:?}"
+        );
+        assert!(scan.closed >= 1, "{scan:?}");
+        let closed = r.events_of(&agent_child).await;
+        assert!(
+            closed
+                .iter()
+                .any(|e| e.event_type == "error" && e.data.contains("restart_interrupted")),
+            "the child is closed on its thread: {:?}",
+            closed
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect::<Vec<_>>()
+        );
+
+        call.abort();
+        let _ = r.manager.close_session(&plain_child).await;
+    }
+
+    /// P18b, fix 4: the child's `result` was among the events the broadcast dropped. The
+    /// parent must read the thread back instead of waiting for its own 30-minute turn
+    /// timeout. Red before the fix: `Lagged` was a bare `continue`, so the call ended on the
+    /// stream closing ("ended before it answered") and, in production, on the timeout.
+    #[tokio::test]
+    async fn a_lagged_subscription_reads_the_answer_back_from_the_thread() {
+        let r = Arc::new(rig(answer("UNUSED"), "default").await);
+        // A child's id with nothing on its thread yet: only the thread is read here, so no
+        // session has to be opened for it.
+        let uuid = Uuid::new_v4();
+        let sid = uuid.to_string();
+
+        let said = |t: &str| ChatEvent::AssistantText {
+            content: t.into(),
+            parent_tool_use_id: None,
+        };
+        // Two slots: what the reader does not take in time is overwritten.
+        let (tx, rx) = broadcast::channel::<ChatEvent>(2);
+        tx.send(said("working")).unwrap();
+        let waiting = {
+            let manager = r.manager.clone();
+            let sid = sid.clone();
+            tokio::spawn(async move { manager.answer_from(&sid, rx, &|_| false).await })
+        };
+        // The reader took "working", found no `result` on the thread, and now waits.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished(), "it waits for the child's result");
+
+        // The child's turn ends: its `result` is stored...
+        r.graph
+            .store_chat_events(
+                uuid,
+                vec![crate::neo4j::models::ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: uuid,
+                    seq: 1,
+                    event_type: "result".into(),
+                    data: json!({
+                        "type": "result", "session_id": sid, "duration_ms": 1,
+                        "subtype": "success", "is_error": false, "result_text": "LATE-ANSWER",
+                    })
+                    .to_string(),
+                    created_at: Utc::now(),
+                }],
+            )
+            .await
+            .unwrap();
+        // ... and the stream loses it: eight events into two slots, sent without ever
+        // yielding to the waiting reader (a `#[tokio::test]` runtime is single-threaded, so
+        // the reader cannot be polled between two `send` calls) — it is overrun.
+        for i in 0..8 {
+            tx.send(said(&format!("chatter {i}"))).unwrap();
+        }
+        drop(tx);
+
+        let out = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the parent must not wait for its turn timeout")
+            .unwrap();
+        assert_eq!(out, Ok("LATE-ANSWER".to_string()));
+    }
+
+    /// P18b round 2, fix 1: the parent opens inside a workspace whose only project is its
+    /// own (so its resolved `add_dirs` is empty — nothing to freeze yet); project B then
+    /// joins the workspace. A sub-agent spawned afterwards does not get B's root, although
+    /// the envelope's `add_dirs` check alone would pass (the child's raw `add_dirs` is
+    /// still `None`, same as the parent's). The same clamp guards a `chat(send_message)`
+    /// child, not just the `Agent` tool. Red before the fix: `resolve_add_dirs` re-read the
+    /// workspace's CURRENT membership at child-creation time, which by then included B.
+    #[tokio::test]
+    async fn a_project_added_to_the_workspace_after_the_parent_opened_does_not_widen_its_child() {
+        let r = rig_in_workspace(answer("CHILD-ANSWER"), "default", "ws-widen").await;
+
+        // Project B joins the workspace only after the parent is already open.
+        let mut b = crate::test_helpers::test_project_named("project-b");
+        b.root_path = "/tmp/project-b-root".into();
+        r.graph.create_project(&b).await.unwrap();
+        let ws = r
+            .graph
+            .get_workspace_by_slug("ws-widen")
+            .await
+            .unwrap()
+            .unwrap();
+        r.graph.add_project_to_workspace(ws.id, b.id).await.unwrap();
+
+        assert_eq!(r.run("ca1").await, Ok("CHILD-ANSWER".to_string()));
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        // Not vacuous (P18b round 3, fix D): the Agent child DOES carry the parent's
+        // workspace (`ParentEnvelope::apply` inherits it, #720 fix 1), and its own `add_dirs`
+        // is `None` like the parent's, so `resolve_add_dirs` takes its workspace branch —
+        // the one that re-reads the CURRENT membership and would hand it project B.
+        assert_eq!(
+            children[0].workspace_slug.as_deref(),
+            Some("ws-widen"),
+            "the Agent child inherits the parent's workspace"
+        );
+        assert_eq!(
+            children[0].workspace_slug,
+            r.parent_node().await.workspace_slug
+        );
+        let agent_child_dirs = children[0].add_dirs.clone().unwrap_or_default();
+        assert!(
+            !agent_child_dirs.iter().any(|d| d.contains("project-b")),
+            "an Agent-tool child must not see project B, added after the parent opened: {agent_child_dirs:?}"
+        );
+
+        // The same clamp protects a `chat(send_message)` child: both paths end in
+        // `create_session_in_place`.
+        let parent = r.parent_node().await;
+        let mut req = request(None, parent.project_slug.as_deref(), "default");
+        req.message = "also widened?".into();
+        req.cwd = parent.cwd.clone();
+        req.workspace_slug = parent.workspace_slug.clone();
+        req.spawned_by = Some(crate::chat::envelope::conversation_spawned_by(
+            r.parent_uuid(),
+        ));
+        let plain_child = r.manager.create_session(&req).await.unwrap().session_id;
+        let plain_node = r
+            .graph
+            .get_chat_session(Uuid::parse_str(&plain_child).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let plain_dirs = plain_node.add_dirs.clone().unwrap_or_default();
+        assert!(
+            !plain_dirs.iter().any(|d| d.contains("project-b")),
+            "a chat(send_message) child must not see project B either: {plain_dirs:?}"
+        );
+        let _ = r.manager.close_session(&plain_child).await;
+    }
+
+    /// P18b round 3, fix A: after a restart the parent is reopened WITHOUT its owner's
+    /// claims (the recovery keeps none), so its `Agent` calls reach `run_subagent` with no
+    /// claims — exactly what `Rig::run` passes. The child still belongs to the parent's
+    /// person. Red before the fix: `session_owner(None)` gave the child no owner at all.
+    #[tokio::test]
+    async fn a_child_opened_without_claims_belongs_to_its_parents_owner() {
+        let r = rig(answer("CHILD-ANSWER"), "default").await;
+        let mut parent = r.parent_node().await;
+        parent.owner = Some("person-behind-the-parent".into());
+        r.graph.create_chat_session(&parent).await.unwrap();
+
+        assert_eq!(r.run("ca1").await, Ok("CHILD-ANSWER".to_string()));
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].owner.as_deref(),
+            Some("person-behind-the-parent")
+        );
+    }
+
+    /// P18b round 3, fix B: a child that asks for a permission — nobody watches its
+    /// session — fails the parent's call within seconds, not at the parent's 30-minute turn
+    /// timeout, and the child ends closed. Red before the fix: the call waited only for a
+    /// `result` or a `session_closed`, neither of which ever came.
+    #[tokio::test]
+    async fn a_child_that_asks_for_a_permission_fails_the_call_fast_and_is_closed() {
+        let r = rig(
+            vec![
+                steps::permission_ask("perm-1", "Bash", None, &[]),
+                steps::await_permission("perm-1", answer("ALLOWED"), answer("DENIED")),
+            ],
+            "default",
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let out = tokio::time::timeout(Duration::from_secs(60), r.run("ca1"))
+            .await
+            .expect("a child's permission request must not hold the parent");
+        assert!(
+            out.as_ref()
+                .is_err_and(|e| e.contains("permission") && e.contains("Bash")),
+            "{out:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        assert!(r.none_alive().await, "the child is closed");
+        let child = children[0].id.to_string();
+        let kinds: Vec<String> = r
+            .events_of(&child)
+            .await
+            .iter()
+            .map(|e| e.event_type.clone())
+            .collect();
+        assert!(
+            kinds.iter().any(|k| k == "permission_request"),
+            "the child did ask: {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "session_closed"),
+            "the close is on the child's thread: {kinds:?}"
+        );
+        // Review of #724, point 1: the request is answered `deny` before the close, so it
+        // is no orphan in the cockpit of the child's owner. Red before the fix: no
+        // `permission_decision`, and the attention derivation kept `perm-1` for 30 days.
+        let events = r.events_of(&child).await;
+        assert_eq!(
+            crate::chat::attention::permission_status(&events, "perm-1"),
+            crate::chat::attention::PermissionStatus::Decided,
+            "the child's request is answered: {kinds:?}"
+        );
+        let denied = events.iter().any(|e| {
+            matches!(
+                serde_json::from_str::<ChatEvent>(&e.data),
+                Ok(ChatEvent::PermissionDecision { ref id, allow: false, .. }) if id == "perm-1"
+            )
+        });
+        assert!(denied, "answered with a deny: {kinds:?}");
+        let attention = crate::chat::attention::derive_session_attention(
+            &crate::chat::attention::SessionAttentionInput {
+                session_id: children[0].id,
+                workspace: "w".into(),
+                thread_id: None,
+                alive: false,
+                pending_in_memory: Default::default(),
+            },
+            &events,
+            chrono::Utc::now(),
+        );
+        assert!(
+            attention.waiting.is_empty() && attention.orphans.is_empty(),
+            "nothing of the child is left in its owner's attention: {attention:?}"
+        );
+    }
+
+    /// Review of #724 (second review): a request of the child a lasting rule of its owner
+    /// covers never fails the call, even when its automatic answer reaches the provider
+    /// well after the old 3 s grace (here 4 s: the provider is slow to take it); the child
+    /// runs the call and answers. Red before: the call failed at 3 s and closed the child.
+    #[tokio::test]
+    async fn a_childs_request_a_lasting_rule_covers_never_fails_the_call_even_when_answered_late() {
+        let input = json!({"command": "cat README.md"});
+        let r = rig_with(
+            vec![
+                Step::Emit(AgentEvent::PermissionAsk {
+                    request_id: "perm-1".into(),
+                    tool_name: "mcp__nexus__Bash".into(),
+                    input: input.clone(),
+                    category: Default::default(),
+                    canonical: Some("Bash".into()),
+                    tool_call_id: None,
+                    scopes: Vec::new(),
+                    parent: None,
+                }),
+                steps::await_permission("perm-1", answer("ALLOWED"), answer("DENIED")),
+            ],
+            "default",
+            0,
+            0,
+            None,
+            4_000,
+        )
+        .await;
+        // The parent (so the child, fix A) belongs to alice, who approved this call for
+        // good on this project.
+        let mut parent = r.parent_node().await;
+        parent.owner = Some("alice".into());
+        r.graph.create_chat_session(&parent).await.unwrap();
+        let call = crate::chat::session_grants::AskedCall {
+            asker: crate::chat::session_grants::Asker::Native,
+            tool: "mcp__nexus__Bash".into(),
+            canonical: Some("Bash".into()),
+            input,
+        };
+        let grant = crate::chat::session_grants::lasting_grant_for(&call).unwrap();
+        r.manager
+            .lasting_scope(Some("alice"), parent.project_slug.as_deref(), &parent.cwd)
+            .await
+            .expect("alice keeps lasting rules on this project")
+            .keep(&call, &grant, "seed")
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let out = tokio::time::timeout(Duration::from_secs(60), r.run("ca1"))
+            .await
+            .expect("the call ends");
+        assert_eq!(out, Ok("ALLOWED".to_string()));
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "the answer was late: {:?}",
+            started.elapsed()
+        );
+        let child = r.children().await[0].id.to_string();
+        let events = r.events_of(&child).await;
+        let allowed = events.iter().any(|e| {
+            matches!(
+                serde_json::from_str::<ChatEvent>(&e.data),
+                Ok(ChatEvent::PermissionDecision { ref id, allow: true, .. }) if id == "perm-1"
+            )
+        });
+        assert!(allowed, "the backend answered it itself");
+    }
+
+    /// The other side, at once: a request no grant and no rule covers fails the call
+    /// immediately — no grace (review of #724, second review). Red before: the call failed
+    /// only after 3 s.
+    #[tokio::test]
+    async fn a_childs_request_nothing_covers_fails_the_call_at_once() {
+        let r = rig(
+            vec![
+                steps::permission_ask("perm-1", "Bash", None, &[]),
+                steps::await_permission("perm-1", answer("ALLOWED"), answer("DENIED")),
+            ],
+            "default",
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let out = tokio::time::timeout(Duration::from_secs(60), r.run("ca1"))
+            .await
+            .expect("the call ends");
+        assert!(out.is_err_and(|e| e.contains("Bash")));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "no grace: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// P18b round 3, fix E: a panic in `open_wait_close` between the child's answer and its
+    /// explicit close — the point where the guard used to be already disarmed — still
+    /// closes the child, and the slot is given back only AFTER that close (the guard owns
+    /// it). The injection runs in the real task: this proves the guard is wired in, not
+    /// just that the struct works. Red before the fix: the guard was disarmed there, so the
+    /// child stayed live and the slot was freed at once by the unwind.
+    #[tokio::test]
+    async fn a_panic_before_the_close_still_closes_the_child_then_frees_the_slot() {
+        let r = rig(answer("CHILD-ANSWER"), "default").await;
+        crate::chat::subagents::panic_injection::before_close(&r.parent);
+        let out = r.run("ca1").await;
+        assert!(
+            out.as_ref().is_err_and(|e| e.contains("opening ended")),
+            "the panic reaches the caller as an error: {out:?}"
+        );
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        let child = children[0].id.to_string();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while r
+            .manager
+            .subagent_slots
+            .lock()
+            .unwrap()
+            .get(&r.parent)
+            .is_some()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the slot was never freed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !r.manager.agent_runtime.owns(&child).await,
+            "the slot is freed only once the child is closed"
+        );
+        assert!(
+            r.events_of(&child)
+                .await
+                .iter()
+                .any(|e| e.event_type == "session_closed"),
+            "the backstop closed the child"
+        );
+    }
+
+    /// AUTO-SUB, end to end: a native parent in Auto routes its `Agent` call over the pool
+    /// (a fake decider picks a second native provider), and the child opens on that pair —
+    /// its own provider and model, not the parent's. Red before: the child always inherited
+    /// the parent's provider and model.
+    #[tokio::test]
+    async fn an_auto_parent_routes_its_subagent_to_the_deciders_pick() {
+        // The parent (a pilot) stays on the native built-in; the child (an executor) is
+        // routed to a second native provider.
+        struct RoleAwareDecider;
+        #[async_trait::async_trait]
+        impl crate::chat::provider::cognitive::decision::Decider for RoleAwareDecider {
+            async fn decide(
+                &self,
+                request: &crate::chat::provider::cognitive::decision::DecideRequest,
+            ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision>
+            {
+                use crate::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
+                let pick = match request.signature.role {
+                    crate::chat::provider::resolver::Role::Pilot => Pick::new("claude-code", "m"),
+                    crate::chat::provider::resolver::Role::Executor => Pick::new("deepseek", "d1"),
+                };
+                Ok(CognitiveDecision {
+                    snapshot: None,
+                    arms_snapshot: Vec::new(),
+                    id: Uuid::new_v4(),
+                    at: Utc::now(),
+                    signature: request.signature.clone(),
+                    chosen: Some(pick),
+                    score: Some(0.9),
+                    explored: false,
+                    exploration_epsilon: 0.0,
+                    confidence: None,
+                    reason: "role-aware: fake".into(),
+                    alternatives: Vec::new(),
+                    applied: true,
+                    mode: request.settings.mode,
+                    stage: request.settings.stage,
+                    session_id: request.session_id,
+                    task_id: None,
+                    run_id: None,
+                    turn_index: request.turn_index,
+                    outcome: None,
+                    used: None,
+                })
+            }
+        }
+
+        // Two in-memory native providers: the parent's and the routed child's.
+        struct TwoProviders {
+            claude_code: Arc<ScriptedProvider>,
+            deepseek: Arc<ScriptedProvider>,
+        }
+        impl crate::chat::agent_runtime::ProviderSource for TwoProviders {
+            fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+                match provider_id {
+                    "claude-code" => Some(self.claude_code.clone()),
+                    "deepseek" => Some(self.deepseek.clone()),
+                    _ => None,
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let rules = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let mut project = crate::test_helpers::test_project();
+        project.root_path = dir.path().display().to_string();
+        graph.create_project(&project).await.unwrap();
+        crate::skills::project_resolver::seed_resolve_cache_for_tests(std::slice::from_ref(
+            &project,
+        ));
+        // The second native provider is stored and consented, so the resolver accepts it.
+        store_instance(
+            &graph,
+            &InstanceRecord {
+                id: "deepseek".into(),
+                kind: "openai_compatible".into(),
+                preset: None,
+                label: "DeepSeek".into(),
+                base_url: "http://127.0.0.1:9/v1".into(),
+                origin: "http://127.0.0.1:9".into(),
+                default_model: Some("d1".into()),
+                cost_source: "free".into(),
+                credential_ref: "none".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        consent(&graph, &project.slug, "deepseek", "http://127.0.0.1:9").await;
+
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 20,
+            lasting_rules_dir: Some(rules.path().join("rules")),
+            native_turn_timeout_secs: None,
+            native_session_max_tokens: None,
+            // The child opens on a third-party instance: the security gate (A32) needs a
+            // signing key, as any other test that leaves Claude Code does.
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            ..Default::default()
+        };
+        let child_turn = answer("CHILD-ANSWER");
+        let make = |id: &str| {
+            Arc::new(ScriptedProvider::new(
+                id,
+                Script::builder()
+                    .capabilities(caps())
+                    .turn(child_turn.clone())
+                    .build(),
+            ))
+        };
+        let provider_source = Arc::new(TwoProviders {
+            claude_code: make("claude-code"),
+            deepseek: make("deepseek"),
+        });
+        let manager = Arc::new(
+            ChatManager::new_without_memory(dyn_graph, state.meili, config)
+                .with_provider_source(provider_source)
+                .with_cognitive_routing(
+                    crate::chat::provider::cognitive::decider::CognitiveRouting::with_decider(
+                        Arc::new(RoleAwareDecider),
+                    ),
+                ),
+        );
+        manager.enable_subagents();
+        // The parent: a native session in Auto (`full`), not pinned.
+        let mut req = request(None, Some(&project.slug), "default");
+        req.message = String::new();
+        req.cwd = project.root_path.clone();
+        req.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
+        let parent = manager.create_session(&req).await.unwrap().session_id;
+        // The parent stays on its own pair (the decider's `Pilot` pick); what the child
+        // opens is read below, so an inherited provider would be visible here.
+        let pnode = graph
+            .get_chat_session(Uuid::parse_str(&parent).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (pnode.provider_id.as_deref(), pnode.model.as_str()),
+            (Some("claude-code"), "m"),
+            "the parent stays on the native built-in"
+        );
+        let out = manager
+            .clone()
+            .run_subagent(&parent, None, &SubagentRequest::new("toolu_auto", "do it"))
+            .await;
+        assert_eq!(out, Ok("CHILD-ANSWER".to_string()));
+        let children = graph
+            .get_session_children(Uuid::parse_str(&parent).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].provider_id.as_deref(),
+            Some("deepseek"),
+            "the child opens on the router's pair, not the parent's"
+        );
+        assert_eq!(children[0].model, "d1");
+    }
+
+    /// AUTO-SUB (review point 4): a model pinned BY HAND on an Auto parent is never moved,
+    /// so its `Agent` calls inherit like any other pinned parent's. `set_session_model` is
+    /// the manual path (the API's model change): it pins WITHOUT touching `routed_by` or
+    /// `routing_mode`, the two signals `pinned` used to read — so this parent used to be
+    /// routed even though the human had taken its model over.
+    #[tokio::test]
+    async fn a_hand_pinned_model_on_an_auto_parent_keeps_its_children() {
+        // The parent (a pilot) keeps `local`; every child (an executor) would be routed to
+        // `other` — a pair a routed child opens on and an inheriting one does not.
+        struct RoutesChildren;
+        #[async_trait::async_trait]
+        impl crate::chat::provider::cognitive::decision::Decider for RoutesChildren {
+            async fn decide(
+                &self,
+                request: &crate::chat::provider::cognitive::decision::DecideRequest,
+            ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision>
+            {
+                use crate::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
+                let pick = match request.signature.role {
+                    crate::chat::provider::resolver::Role::Pilot => Pick::new("local", "m"),
+                    crate::chat::provider::resolver::Role::Executor => Pick::new("other", "o1"),
+                };
+                Ok(CognitiveDecision {
+                    snapshot: None,
+                    arms_snapshot: Vec::new(),
+                    id: Uuid::new_v4(),
+                    at: Utc::now(),
+                    signature: request.signature.clone(),
+                    chosen: Some(pick),
+                    score: Some(0.9),
+                    explored: false,
+                    exploration_epsilon: 0.0,
+                    confidence: None,
+                    reason: "routes children: fake".into(),
+                    alternatives: Vec::new(),
+                    applied: true,
+                    mode: request.settings.mode,
+                    stage: request.settings.stage,
+                    session_id: request.session_id,
+                    task_id: None,
+                    run_id: None,
+                    turn_index: request.turn_index,
+                    outcome: None,
+                    used: None,
+                })
+            }
+        }
+
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let mut other = instance(&fake, "none");
+        other.id = "other".into();
+        other.label = "Other".into();
+        other.default_model = Some("o1".into());
+        store_instance(&graph, &other).await;
+        consent(&graph, "proj", "other", &fake.origin()).await;
+        let manager = Arc::new(manager(graph.clone(), true).with_cognitive_routing(
+            crate::chat::provider::cognitive::decider::CognitiveRouting::with_decider(Arc::new(
+                RoutesChildren,
+            )),
+        ));
+        manager.enable_subagents();
+        let mut req = request(None, Some("proj"), "default");
+        req.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
+        let parent = manager.create_session(&req).await.unwrap().session_id;
+        let parent_uuid = Uuid::parse_str(&parent).unwrap();
+        let pnode = graph.get_chat_session(parent_uuid).await.unwrap().unwrap();
+        assert_eq!(
+            (pnode.provider_id.as_deref(), pnode.model.as_str()),
+            (Some("local"), "m"),
+            "the parent runs on the pilot's pair"
+        );
+        assert_eq!(
+            pnode.routed_by.as_deref(),
+            Some("auto"),
+            "and it is an Auto parent"
+        );
+        // The human takes the model over, by hand (the API's model change). The pin is what
+        // matters here; the model itself is left alone.
+        let _ = manager.set_session_model(&parent, "m").await;
+        assert!(
+            manager.model_is_pinned(&parent).await,
+            "the model is pinned by hand"
+        );
+        let out = manager
+            .clone()
+            .run_subagent(
+                &parent,
+                None,
+                &SubagentRequest::new("t-pin", "hi there: the child's task"),
+            )
+            .await;
+        out.as_ref()
+            .unwrap_or_else(|e| panic!("the Agent call ran: {e}"));
+        let children = graph.get_session_children(parent_uuid).await.unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            (
+                children[0].provider_id.as_deref(),
+                children[0].model.as_str()
+            ),
+            (Some("local"), "m"),
+            "a hand-pinned parent's child inherits: it is not routed to `other`"
+        );
+    }
+}
+
+/// What a session of the Claude CLI leaves on its thread, read back by the restart
+/// recovery of the next boot (review of #711, findings 1 and 4): a turn that ENDED must
+/// not look cut, or the recovery closes an idle session with a false "the server
+/// restarted".
+mod legacy_turn_end_at_boot {
+    use super::*;
+    fn emit(v: Value) -> Value {
+        json!({"op": "emit_json", "json": v})
+    }
+
+    fn text(t: &str, id: &str) -> Value {
+        emit(json!({"type": "assistant", "message": {
+            "id": id, "type": "message", "role": "assistant",
+            "model": "fake-claude", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": t}]}}))
+    }
+
+    fn result(subtype: &str, t: &str, is_error: bool) -> Value {
+        emit(json!({"type": "result", "subtype": subtype,
+            "duration_ms": 1, "duration_api_ms": 1, "is_error": is_error, "num_turns": 1,
+            "session_id": "fake-cli-session", "total_cost_usd": 0.0, "result": t}))
+    }
+
+    fn init() -> Value {
+        emit(json!({"type": "system", "subtype": "init",
+            "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+            "permissionMode": "default", "apiKeySource": "none"}))
+    }
+
+    struct Cli {
+        _dir: tempfile::TempDir,
+        graph: Arc<MockGraphStore>,
+        manager: ChatManager,
+        sid: String,
+    }
+
+    /// A legacy session on the fake CLI playing `transcript`, opened with "FIRST-MESSAGE".
+    async fn open(transcript: Vec<Value>) -> Cli {
+        open_with(transcript, |_| {}).await
+    }
+
+    /// [`open`], the chat configured by `tweak`.
+    async fn open_with(
+        transcript: Vec<Value>,
+        tweak: impl FnOnce(&mut super::super::config::ChatConfig),
+    ) -> Cli {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("transcript.jsonl");
+        let lines: String = transcript.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&script, lines).unwrap();
+        let wrapper = dir.path().join("claude");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                 FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                script.display(),
+                dir.path().join("stdin.jsonl").display(),
+                fake_bin("fake_claude").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let mut config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Legacy,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            obscura_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        tweak(&mut config);
+        let manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config);
+        manager
+            .update_claude_cli_path(Some(wrapper.display().to_string()))
+            .await;
+        let mut req = request(None, None, "default");
+        req.message = "FIRST-MESSAGE".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
+        Cli {
+            _dir: dir,
+            graph,
+            manager,
+            sid,
+        }
+    }
+
+    impl Cli {
+        fn id(&self) -> Uuid {
+            Uuid::parse_str(&self.sid).unwrap()
+        }
+
+        async fn events(&self) -> Vec<crate::neo4j::models::ChatEventRecord> {
+            self.graph.get_chat_events(self.id(), 0, 500).await.unwrap()
+        }
+
+        /// Waits until a stored event satisfies `pred` (at most 15 s).
+        async fn stored(
+            &self,
+            pred: impl Fn(&crate::neo4j::models::ChatEventRecord) -> bool,
+        ) -> bool {
+            for _ in 0..600 {
+                if self.events().await.iter().any(&pred) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            false
+        }
+
+        async fn idle(&self) {
+            for _ in 0..600 {
+                if !self.manager.is_session_streaming(&self.sid).await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the turn never ended");
+        }
+
+        /// The boot after a restart, over the same graph: what its scan closes.
+        async fn closed_at_next_boot(&self) -> usize {
+            let dyn_graph: Arc<dyn GraphStore> = self.graph.clone();
+            let next = ChatManager::new_without_memory(
+                dyn_graph,
+                mock_app_state().meili,
+                Default::default(),
+            );
+            next.scan_interrupted_turns().await.unwrap().1.closed
+        }
+    }
+
+    /// Finding 1: a background command that prints after the turn's `result` stores a
+    /// `background_output` on the idle session; the turn stays ended for the next boot.
+    #[tokio::test]
+    async fn output_of_a_background_command_after_the_turn_closes_nothing_at_boot() {
+        let cli = open(vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            init(),
+            text("started it in the background", "msg_1"),
+            result("success", "started it in the background", false),
+            json!({"op": "sleep", "ms": 600}),
+            text("BACKGROUND-LINE", "msg_bg"),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ])
+        .await;
+        assert!(
+            cli.stored(
+                |e| e.event_type == "background_output" && e.data.contains("BACKGROUND-LINE")
+            )
+            .await,
+            "the output after the turn is stored: {:?}",
+            cli.events().await
+        );
+        assert_eq!(cli.closed_at_next_boot().await, 0);
+        assert!(!cli.events().await.iter().any(|e| e.event_type == "error"));
+        cli.manager.close_session(&cli.sid).await.unwrap();
+    }
+
+    /// Finding 4: a turn stopped by a person ends on the thread with a `result`
+    /// (`stop_reason: interrupted`), whether the CLI answers the interrupt or not.
+    async fn a_stopped_turn_is_stored_with_its_end(cli_answers: bool) {
+        let marks = tempfile::tempdir().unwrap();
+        let mid_turn = marks.path().join("mid-turn");
+        let mut transcript = vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            init(),
+            text("working on it", "msg_1"),
+            // The readiness signal: the fake CLI touches `mid_turn` once it has written
+            // "working on it" (a child process, reaped at once). A complete assistant
+            // message shows in neither part of the streaming snapshot on this engine,
+            // and the fixed pause this replaces was too short under Code Coverage.
+            json!({"op": "spawn_child", "program": "touch", "args": [mid_turn.display().to_string()]}),
+            json!({"op": "wait_children_exit", "timeout_ms": 30000}),
+            json!({"op": "await_stdin", "contains": "\"interrupt\"", "timeout_ms": 60000, "optional": true}),
+        ];
+        if cli_answers {
+            transcript.push(result("error_during_execution", "", true));
+        }
+        transcript.push(json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}));
+        let cli = open(transcript).await;
+        // The Stop lands mid-turn: the turn runs and the CLI is in it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !(mid_turn.exists() && cli.manager.is_session_streaming(&cli.sid).await) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fake CLI never reached the middle of its turn (marker={}, streaming={})",
+                mid_turn.exists(),
+                cli.manager.is_session_streaming(&cli.sid).await
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        cli.manager.interrupt(&cli.sid).await.unwrap();
+        cli.idle().await;
+        assert!(
+            cli.stored(|e| e.event_type == "result" && e.data.contains("\"interrupted\""))
+                .await,
+            "the stopped turn ends on the thread: {:?}",
+            cli.events()
+                .await
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect::<Vec<_>>()
+        );
+        // Follow-up review of #711, finding 2: the end is neutral — the reloaded thread
+        // shows no `result_error` block under the stopped turn (the frontend keys it on
+        // `error_during_execution`) — and carries a real duration, never "0 ms".
+        let ended: Value = cli
+            .events()
+            .await
+            .iter()
+            .find(|e| e.event_type == "result")
+            .map(|e| serde_json::from_str(&e.data).unwrap())
+            .unwrap();
+        assert_eq!(ended["subtype"], "interrupted", "{ended}");
+        assert_eq!(ended["is_error"], false, "{ended}");
+        assert_eq!(ended["stop_reason"], "interrupted", "{ended}");
+        assert!(ended.get("result_text").is_none(), "{ended}");
+        assert!(ended["duration_ms"].as_u64().unwrap() > 0, "{ended}");
+        assert_eq!(cli.closed_at_next_boot().await, 0);
+        cli.manager.close_session(&cli.sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stopped_turn_the_cli_answers_is_stored_with_its_end() {
+        a_stopped_turn_is_stored_with_its_end(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_stopped_turn_the_cli_never_answers_is_stored_with_its_end() {
+        a_stopped_turn_is_stored_with_its_end(false).await;
+    }
+
+    /// Follow-up review of #711, finding 3: a turn stopped during the pause before a retry
+    /// (a retryable API error, no output yet) ends on the thread too: it used to end with
+    /// `retrying` alone, a cut turn for the next boot.
+    #[tokio::test]
+    async fn a_turn_stopped_during_the_pause_before_a_retry_is_stored_with_its_end() {
+        let cli = open_with(
+            vec![
+                json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+                init(),
+                result(
+                    "error_during_execution",
+                    r#"API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+                    true,
+                ),
+                json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+            ],
+            |config| config.retry.initial_delay_ms = 30_000,
+        )
+        .await;
+        assert!(
+            cli.stored(|e| e.event_type == "retrying").await,
+            "the turn waits to retry: {:?}",
+            cli.events().await
+        );
+        cli.manager.interrupt(&cli.sid).await.unwrap();
+        cli.idle().await;
+        assert!(
+            cli.stored(|e| e.event_type == "result" && e.data.contains("\"interrupted\""))
+                .await,
+            "the stopped turn ends on the thread: {:?}",
+            cli.events()
+                .await
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(cli.closed_at_next_boot().await, 0);
+        cli.manager.close_session(&cli.sid).await.unwrap();
+    }
+}
+
+/// Decision fce98b8a end to end: the launch line `attach` builds for a session whose trust a
+/// person lifted (`--unscoped`, the signed `unscoped` claim, `--deny-path`) is accepted by the
+/// REAL `nexus-tools` at the pinned revision, which then reaches outside the session's
+/// directories but never into a denied place; the launch line of a session nobody lifted
+/// stays scoped.
+mod file_scope_lift {
+    use super::*;
+    use crate::chat::provider::nexus_tools as nt;
+    #[allow(unused_imports)]
+    use nexus_claude::agent::{McpServerSpec, PolicyMode, ToolPolicy};
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    /// `initialize`, then one `Read` per path; the text of each answer and whether it is an error.
+    fn read_through(server: &McpServerSpec, paths: &[&std::path::Path]) -> Vec<(String, bool)> {
+        let McpServerSpec::Stdio { command, args, env } = server else {
+            panic!("nexus-tools is a stdio server");
+        };
+        let mut child = std::process::Command::new(command)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .envs(env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26"}})
+        )
+        .unwrap();
+        for (index, path) in paths.iter().enumerate() {
+            writeln!(
+                stdin,
+                "{}",
+                serde_json::json!({"jsonrpc":"2.0","id":index + 1,"method":"tools/call","params":{"name":"Read","arguments":{"file_path": path.display().to_string()}}})
+            )
+            .unwrap();
+        }
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut answers: Vec<serde_json::Value> = Vec::new();
+        while answers.len() < paths.len() + 1 {
+            let mut line = String::new();
+            if stdout.read_line(&mut line).unwrap() == 0 {
+                let mut stderr = String::new();
+                std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).ok();
+                panic!("nexus-tools stopped early (refused its launch line?): {stderr}");
+            }
+            answers.push(serde_json::from_str(&line).unwrap());
+        }
+        drop(stdin);
+        child.wait().unwrap();
+        answers.sort_by_key(|a| a["id"].as_u64());
+        answers
+            .iter()
+            .skip(1)
+            .map(|a| {
+                (
+                    a["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    a["result"]["isError"] == true,
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_real_server_accepts_a_lifted_launch_line_and_keeps_its_deny_list() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(worktree.path().join("w.txt"), "worktree\n").unwrap();
+        let ssh = home.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("id_ed25519"), "PRIVATE KEY\n").unwrap();
+        let config = nt::NexusToolsConfig {
+            program: fake_bin("nexus-tools"),
+            browser: None,
+            obscura: None,
+            embedded_obscura: false,
+            deny_paths: vec![ssh.clone()],
+            host_home: None,
+        };
+        let consents = nt::GraphConsents(Arc::new(crate::neo4j::mock::MockGraphStore::new()));
+        let policy =
+            ToolPolicy::from_patterns(PolicyMode::Trust, &["Read"], &[] as &[&str]).unwrap();
+        let outside = worktree.path().join("w.txt");
+        let key = ssh.join("id_ed25519");
+        for (sid, lifted) in [("lift-e2e-yes", true), ("lift-e2e-no", false)] {
+            let attachment = nt::attach(
+                &config,
+                &consents,
+                None,
+                nt::AttachInput {
+                    session_id: sid,
+                    cwd: root.path(),
+                    extra_dirs: &[],
+                    access: crate::chat::provider::policy::SessionAccess::Normal,
+                    lifted_by_person: lifted,
+                    policy: &policy,
+                    ceiling: None,
+                    project: None,
+                    ttl_secs: 600,
+                    now: chrono::Utc::now(),
+                },
+            )
+            .await;
+            assert_eq!(attachment.unscoped, lifted, "{sid}");
+            let answers = read_through(&attachment.servers["nexus"], &[&outside, &key]);
+            let (text, is_error) = &answers[0];
+            if lifted {
+                assert!(!is_error && text.contains("worktree"), "{sid}: {text}");
+            } else {
+                assert!(
+                    *is_error && text.contains("outside the directories"),
+                    "{sid}: {text}"
+                );
+            }
+            let (text, is_error) = &answers[1];
+            assert!(*is_error && !text.contains("PRIVATE KEY"), "{sid}: {text}");
+            crate::auth::agent_tokens::revoke_session(sid);
+        }
+    }
+}
+
+// ============================================================================
+// P18c: the sub-agents of Claude Code get read-only mirror children
+// ============================================================================
+
+/// A sub-agent launched by Claude Code's own `Task`/`Agent` tool runs inside the CLI; its
+/// activity reaches the parent with `parent_tool_use_id`. Each engine mirrors it into ONE
+/// read-only child (`chat::mirror`), the parent's thread left as it was; a native session
+/// (whose sub-agents are real children) gets no mirror; nothing can be sent to a mirror.
+mod claude_code_mirror {
+    #[allow(unused_imports)]
+    use nexus_claude::agent::{AgentEvent, ProviderKind};
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::Step;
+
+    use super::parity::{caps, rig, rig_tweaked};
+    use super::*;
+    use crate::chat::manager::MessageDeliveryError;
+    use crate::chat::mirror::test_support::{closed_mirrors, mirrors_of, thread, RecordingEmitter};
+    use crate::chat::mirror::{MIRROR_OF_CLAUDE_CODE, MIRROR_READ_ONLY};
+    use crate::chat::types::SpawnedBy;
+    use crate::events::CrudAction;
+
+    const CALL: &str = "t-agent";
+
+    /// `step`, as the sub-agent of the call `parent` emits it.
+    fn nested(step: Step, parent: &str) -> Step {
+        match step {
+            Step::Emit(mut event) => {
+                match &mut event {
+                    AgentEvent::Text { parent: p, .. }
+                    | AgentEvent::ToolCall { parent: p, .. }
+                    | AgentEvent::ToolResult { parent: p, .. } => *p = Some(parent.to_string()),
+                    _ => {}
+                }
+                Step::Emit(event)
+            }
+            other => other,
+        }
+    }
+
+    fn task_turn() -> Vec<Step> {
+        vec![
+            steps::tool_call(
+                CALL,
+                "Task",
+                json!({"description": "find the spec", "prompt": "Look for the spec"}),
+            ),
+            nested(steps::text("looking"), CALL),
+            nested(
+                steps::tool_call("t-read", "Read", json!({"file_path": "a.md"})),
+                CALL,
+            ),
+            nested(steps::tool_result("t-read", "the spec"), CALL),
+            nested(steps::text("found it"), CALL),
+            steps::tool_result(CALL, "The spec is in a.md"),
+            steps::text("answered agent"),
+            steps::done(&caps()),
+        ]
+    }
+
+    /// Asserts the mirror of a turn that ran [`task_turn`] (or the CLI's equivalent): one
+    /// child linked to the call, its thread the prompt then the sub-agent's events at top
+    /// level, closed with the call's result; a message to it refused before any turn.
+    async fn assert_one_closed_mirror(
+        manager: &ChatManager,
+        graph: &MockGraphStore,
+        parent: Uuid,
+        said: &[&str],
+        answer: &str,
+    ) -> crate::neo4j::models::ChatSessionNode {
+        let mirrors = closed_mirrors(graph, parent, 1).await;
+        assert_eq!(mirrors.len(), 1, "exactly one mirror");
+        let mirror = mirrors[0].clone();
+        assert_eq!(mirror.mirror_of.as_deref(), Some(MIRROR_OF_CLAUDE_CODE));
+        assert_eq!(mirror.title.as_deref(), Some("find the spec"));
+        assert_eq!(
+            SpawnedBy::from_json_str(mirror.spawned_by.as_deref().unwrap()),
+            Some(SpawnedBy::Conversation {
+                parent_session_id: parent,
+                tool_use_id: Some(CALL.into()),
+            })
+        );
+        let events = thread(graph, mirror.id).await;
+        assert!(
+            matches!(&events[0], ChatEvent::UserMessage { content } if content.contains("Look for the spec")),
+            "{events:?}"
+        );
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::AssistantText {
+                    content,
+                    parent_tool_use_id: None,
+                } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, said, "the sub-agent's words, top level: {events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            ChatEvent::ToolUse { tool, parent_tool_use_id: None, .. } if tool == "Read")));
+        assert!(
+            matches!(events.last(), Some(ChatEvent::Result { result_text: Some(t), is_error: false, .. }) if t.contains(answer)),
+            "{events:?}"
+        );
+        // The listing carries the marker (the frontend reads `mirror_of`).
+        let children = graph.get_session_children(parent).await.unwrap();
+        assert_eq!(children.len(), 1);
+
+        // Read-only: refused, typed, before any send or resume.
+        let sid = mirror.id.to_string();
+        assert!(matches!(
+            manager.route_user_message(&sid, "hello", None).await,
+            Err(MessageDeliveryError::MirrorReadOnly)
+        ));
+        assert!(matches!(
+            manager.route_queued_user_message(&sid, "hello", None).await,
+            Err(MessageDeliveryError::MirrorReadOnly)
+        ));
+        let err = manager
+            .resume_session(&sid, "hello", None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::chat::provider::errors::classify_open_error(&err, None)
+                .map(|f| (f.status, f.code)),
+            Some((409, MIRROR_READ_ONLY))
+        );
+        assert!(
+            !manager.is_session_active(&sid).await,
+            "no process was started"
+        );
+        // Nor moved to another provider, nor given another model or mode (M1, M7).
+        let refused = |r: anyhow::Result<()>| {
+            crate::chat::provider::errors::classify_open_error(&r.unwrap_err(), None)
+                .map(|f| (f.status, f.code))
+        };
+        assert_eq!(
+            refused(
+                manager
+                    .switch_session_provider(&sid, "claude-code", None, "go on", None)
+                    .await
+                    .map(|_| ())
+            ),
+            Some((409, MIRROR_READ_ONLY))
+        );
+        assert_eq!(
+            refused(manager.set_session_model(&sid, "other").await.map(|_| ())),
+            Some((409, MIRROR_READ_ONLY))
+        );
+        assert_eq!(
+            refused(manager.set_session_permission_mode(&sid, "plan").await),
+            Some((409, MIRROR_READ_ONLY))
+        );
+        assert_eq!(
+            graph.get_session_children(parent).await.unwrap().len(),
+            1,
+            "no second child holds the call"
+        );
+        mirror
+    }
+
+    /// Agent engine (the default for Claude Code): the mirror is written from the events
+    /// the runtime emits; the parent keeps its nested events exactly as before.
+    #[tokio::test]
+    async fn a_claude_code_task_call_gets_a_mirror_on_the_agent_engine() {
+        let mut r = rig(ProviderKind::ClaudeCode, vec![task_turn()]).await;
+        r.manager.send_message(&r.sid, "find it").await.unwrap();
+        r.turn_end().await;
+        let parent = Uuid::parse_str(&r.sid).unwrap();
+        assert_one_closed_mirror(
+            &r.manager,
+            &r.graph,
+            parent,
+            &["looking", "found it"],
+            "The spec is in a.md",
+        )
+        .await;
+        // The parent's own thread is untouched: the sub-agent still nested under its call.
+        let own = thread(r.graph.as_ref(), parent).await;
+        assert!(
+            own.iter().any(|e| matches!(e,
+            ChatEvent::AssistantText { content, parent_tool_use_id: Some(p) }
+                if content == "looking" && p == CALL)),
+            "{own:?}"
+        );
+        assert!(own.iter().any(|e| matches!(e,
+            ChatEvent::ToolResult { id, parent_tool_use_id: None, .. } if id == CALL)));
+        assert_eq!(r.sent().len(), 1, "the mirror sent nothing to the provider");
+    }
+
+    /// A native session's sub-agents are real children (`chat::subagents`): the same
+    /// stream gets no mirror.
+    #[tokio::test]
+    async fn a_native_session_gets_no_mirror() {
+        let mut r = rig(ProviderKind::Native, vec![task_turn()]).await;
+        r.manager.send_message(&r.sid, "find it").await.unwrap();
+        r.turn_end().await;
+        // No tap at all on a native session: nothing can still be on its way.
+        let parent = Uuid::parse_str(&r.sid).unwrap();
+        assert!(mirrors_of(r.graph.as_ref(), parent).await.is_empty());
+    }
+
+    /// Historical engine: the same, from the CLI itself (`fake_claude`): a Task call whose
+    /// sub-agent speaks with `parent_tool_use_id`, then its `tool_result`. The CRUD bus
+    /// sees the mirror created once, then streaming true / false.
+    #[tokio::test]
+    async fn a_claude_code_task_call_gets_a_mirror_on_the_historical_engine() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let assistant = |content: Value, parent: Option<&str>| {
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude", "content": content,
+                "stop_reason": "end_turn"}, "parent_tool_use_id": parent}})
+        };
+        let tool_result = |id: &str, text: &str, parent: Option<&str>| {
+            json!({"op": "emit_json", "json": {
+                "type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": id, "content": text, "is_error": false}
+                ]}, "parent_tool_use_id": parent}})
+        };
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            json!({"op": "emit_json", "json": {
+                "type": "system", "subtype": "init", "session_id": "cli-mirror-1",
+                "model": "fake-claude", "cwd": ".", "tools": ["Read", "Task"],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+            assistant(
+                json!([{"type": "tool_use", "id": CALL, "name": "Task",
+                    "input": {"description": "find the spec", "prompt": "Look for the spec"}}]),
+                None,
+            ),
+            assistant(json!([{"type": "text", "text": "looking"}]), Some(CALL)),
+            assistant(
+                json!([{"type": "tool_use", "id": "t-read", "name": "Read",
+                    "input": {"file_path": "a.md"}}]),
+                Some(CALL),
+            ),
+            tool_result("t-read", "the spec", Some(CALL)),
+            assistant(json!([{"type": "text", "text": "found it"}]), Some(CALL)),
+            tool_result(CALL, "The spec is in a.md", None),
+            assistant(json!([{"type": "text", "text": "answered agent"}]), None),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": "cli-mirror-1", "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": "answered agent"}}),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let fake = fake_bin("fake_claude");
+        let cli = dir.path().join("claude");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do if [ \"$a\" = \"--version\" ]; then exec \"{fake}\" \"$@\"; fi; done\n\
+                 FAKE_CLAUDE_TRANSCRIPT=\"{t}\" FAKE_CLAUDE_MAX_RUNTIME_MS=60000 exec \"{fake}\" \"$@\"\n",
+                fake = fake.display(),
+                t = transcript.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let emitter = Arc::new(RecordingEmitter::default());
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Legacy,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            claude_cli_path: Some(cli.display().to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+            .with_event_emitter(emitter.clone());
+        let mut req = request(None, None, "default");
+        req.message = "find it".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        assert!(
+            !manager.agent_runtime.owns(&sid).await,
+            "the historical engine"
+        );
+        let parent = Uuid::parse_str(&sid).unwrap();
+        let mirror = assert_one_closed_mirror(
+            &manager,
+            &graph,
+            parent,
+            &["looking", "found it"],
+            "The spec is in a.md",
+        )
+        .await;
+
+        let crud = emitter.of(&mirror.id.to_string());
+        assert_eq!(crud.len(), 3, "{crud:?}");
+        assert_eq!(crud[0].0, CrudAction::Created);
+        // Exactly the payload of every session (decision ed628dad).
+        assert_eq!(
+            crud[0].1,
+            json!({"project_slug": null, "spawned_by": {"type": "conversation", "parent_session_id": sid}})
+        );
+        assert_eq!(
+            crud[1],
+            (CrudAction::Updated, json!({"is_streaming": true}))
+        );
+        assert_eq!(
+            crud[2],
+            (CrudAction::Updated, json!({"is_streaming": false}))
+        );
+
+        // The parent's thread keeps the sub-agent nested under its call.
+        let mut own = Vec::new();
+        for _ in 0..200 {
+            own = thread(graph.as_ref(), parent).await;
+            if own.iter().any(|e| matches!(e, ChatEvent::Result { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            own.iter().any(|e| matches!(e,
+            ChatEvent::AssistantText { content, parent_tool_use_id: Some(p) }
+                if content == "looking" && p == CALL)),
+            "{own:?}"
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// The parent's events without what differs from one run to another (its own id, the
+    /// durations, the clock of its tool calls).
+    fn normalized(events: &[ChatEvent]) -> Vec<Value> {
+        events
+            .iter()
+            .filter(|e| !matches!(e, ChatEvent::ToolTiming { .. }))
+            .map(|e| {
+                let mut v = serde_json::to_value(e).unwrap();
+                if let Some(o) = v.as_object_mut() {
+                    for k in [
+                        "session_id",
+                        "duration_ms",
+                        "duration_api_ms",
+                        "cli_session_id",
+                    ] {
+                        o.remove(k);
+                    }
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// One parent turn running [`task_turn`] on the agent engine: what its clients saw live,
+    /// what its thread holds, and the parent's id and store.
+    async fn parent_run(
+        mirrors: bool,
+        store_down: bool,
+    ) -> (Vec<Value>, Vec<Value>, Uuid, Arc<MockGraphStore>) {
+        let mut r = rig_tweaked(
+            ProviderKind::ClaudeCode,
+            vec![task_turn()],
+            None,
+            None,
+            false,
+            |m| {
+                if mirrors {
+                    m
+                } else {
+                    m.without_subagent_mirrors()
+                }
+            },
+        )
+        .await;
+        if store_down {
+            r.graph
+                .fail_session_writes
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        r.manager.send_message(&r.sid, "find it").await.unwrap();
+        let mut live = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), r.rx.recv())
+                .await
+                .expect("the turn ends")
+                .unwrap();
+            let end = matches!(
+                event,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            );
+            live.push(event);
+            if end {
+                break;
+            }
+        }
+        let parent = Uuid::parse_str(&r.sid).unwrap();
+        let stored = thread(r.graph.as_ref(), parent).await;
+        (
+            normalized(&live),
+            normalized(&stored),
+            parent,
+            r.graph.clone(),
+        )
+    }
+
+    /// Strictly passive: the parent's live stream and stored thread are the SAME, event for
+    /// event, with the tap and without it.
+    #[tokio::test]
+    async fn the_parents_stream_is_the_same_with_and_without_the_tap() {
+        let (live_off, stored_off, parent_off, graph_off) = parent_run(false, false).await;
+        let (live_on, stored_on, parent_on, graph_on) = parent_run(true, false).await;
+        assert!(mirrors_of(graph_off.as_ref(), parent_off).await.is_empty());
+        closed_mirrors(graph_on.as_ref(), parent_on, 1).await;
+        assert_eq!(live_on, live_off, "the live stream");
+        assert_eq!(stored_on, stored_off, "the stored thread");
+        assert!(
+            live_on.iter().any(|e| e["parent_tool_use_id"] == CALL),
+            "the sub-agent, nested"
+        );
+    }
+
+    /// The store refuses the mirror (a failed write): no mirror, and the parent's stream and
+    /// thread are untouched — the same as without the tap.
+    #[tokio::test]
+    async fn a_failed_mirror_write_leaves_the_parents_events_untouched() {
+        let (live_off, stored_off, _, _) = parent_run(false, false).await;
+        let (live_down, stored_down, parent, graph) = parent_run(true, true).await;
+        assert_eq!(live_down, live_off, "the live stream");
+        assert_eq!(stored_down, stored_off, "the stored thread");
+        assert!(mirrors_of(graph.as_ref(), parent).await.is_empty());
+    }
+
+    /// A BACKGROUND sub-agent on the agent engine, from the CLI itself (`fake_claude`, the
+    /// real nexus façade), as Claude Code 2.1.296 prints it: the `Agent` call with
+    /// `run_in_background`, its `task_started`, the immediate "launched" result, the end of
+    /// the parent's turn; THEN, out of turn, the sub-agent's tool call and words (with
+    /// `parent_tool_use_id`) and the `task_notification` that names the call. The mirror
+    /// follows it past the turn (in the form a turn shows it) and is closed by the
+    /// notification, with its summary; the parent keeps showing the out-of-turn activity
+    /// flattened, as before. Before P18c-suite the mirror ended at the turn's end on "runs in
+    /// the background", without anything the sub-agent did after it.
+    #[tokio::test]
+    async fn a_background_sub_agent_is_mirrored_out_of_turn_until_its_notification() {
+        use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+        const BG: &str = "toolu_bg_agent";
+        let dir = tempfile::tempdir().unwrap();
+        let assistant = |content: Value, parent: Option<&str>| {
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude", "content": content,
+                "stop_reason": "end_turn"}, "parent_tool_use_id": parent}})
+        };
+        let tool_result = |id: &str, text: &str, parent: Option<&str>| {
+            json!({"op": "emit_json", "json": {
+                "type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": id, "content": text, "is_error": false}
+                ]}, "parent_tool_use_id": parent}})
+        };
+        let system = |subtype: &str, uuid: &str, mut data: Value| {
+            data["type"] = json!("system");
+            data["subtype"] = json!(subtype);
+            data["uuid"] = json!(uuid);
+            data["session_id"] = json!("cli-bg-1");
+            json!({"op": "emit_json", "json": data})
+        };
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            system(
+                "init",
+                "u-init",
+                json!({"model": "fake-claude", "cwd": ".", "tools": ["Agent", "Bash"],
+                    "permissionMode": "default", "apiKeySource": "none"}),
+            ),
+            assistant(
+                json!([{"type": "tool_use", "id": BG, "name": "Agent", "input": {
+                    "description": "probe in the background", "prompt": "Run the probe",
+                    "subagent_type": "general-purpose", "run_in_background": true}}]),
+                None,
+            ),
+            system(
+                "task_started",
+                "u-started",
+                json!({"task_id": "a0bg", "tool_use_id": BG, "description": "probe in the background",
+                    "is_backgrounded": true, "task_type": "local_agent"}),
+            ),
+            tool_result(BG, "Async agent launched successfully.", None),
+            assistant(json!([{"type": "text", "text": "launched"}]), None),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": "cli-bg-1", "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": "launched"}}),
+            // The parent's turn is over: what follows is printed out of turn.
+            json!({"op": "sleep", "ms": 400}),
+            assistant(
+                json!([{"type": "tool_use", "id": "t-bg-bash", "name": "Bash",
+                    "input": {"command": "echo hello-from-bg"}}]),
+                Some(BG),
+            ),
+            system(
+                "task_progress",
+                "u-progress",
+                json!({"task_id": "a0bg", "tool_use_id": BG, "description": "Running echo",
+                    "last_tool_name": "Bash"}),
+            ),
+            tool_result("t-bg-bash", "hello-from-bg", Some(BG)),
+            assistant(
+                json!([{"type": "text", "text": "it printed hello-from-bg"}]),
+                Some(BG),
+            ),
+            system(
+                "task_notification",
+                "u-notified",
+                json!({"task_id": "a0bg", "tool_use_id": BG, "status": "completed",
+                    "output_file": "/nonexistent/a0bg.output",
+                    "summary": "The probe printed hello-from-bg."}),
+            ),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let mut config = ClaudeCodeConfig::default();
+        config.cli_path = Some(fake_bin("fake_claude"));
+        let provider = super::claude_code_resume_token::FakeCli {
+            inner: Arc::new(ClaudeCodeProvider::new(config)),
+            env: vec![
+                (
+                    "FAKE_CLAUDE_TRANSCRIPT".into(),
+                    transcript.display().to_string(),
+                ),
+                ("FAKE_CLAUDE_MAX_RUNTIME_MS".into(), "60000".into()),
+            ],
+        };
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let emitter = Arc::new(RecordingEmitter::default());
+        let chat_config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager =
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, chat_config)
+                .with_provider_source(Arc::new(provider))
+                .with_event_emitter(emitter.clone());
+        let mut req = request(None, None, "default");
+        req.message = "probe it in the background".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        let parent = Uuid::parse_str(&sid).unwrap();
+
+        let mirror = closed_mirrors(graph.as_ref(), parent, 1).await[0].clone();
+        assert_eq!(mirror.title.as_deref(), Some("probe in the background"));
+        let events = thread(graph.as_ref(), mirror.id).await;
+        assert!(
+            matches!(&events[0], ChatEvent::UserMessage { content } if content == "Run the probe"),
+            "{events:?}"
+        );
+        // What the sub-agent did after the parent's turn, at the mirror's top level.
+        assert!(
+            events.iter().any(|e| matches!(e,
+                ChatEvent::ToolUse { id, tool, parent_tool_use_id: None, .. }
+                    if id == "t-bg-bash" && tool == "Bash")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e,
+                ChatEvent::ToolResult { id, parent_tool_use_id: None, .. } if id == "t-bg-bash")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e,
+                ChatEvent::AssistantText { content, parent_tool_use_id: None }
+                    if content == "it printed hello-from-bg")),
+            "{events:?}"
+        );
+        // Closed by the notification, with its summary, as a success.
+        assert!(
+            matches!(events.last(), Some(ChatEvent::Result {
+                is_error: false, result_text: Some(t), stop_reason: Some(r), .. })
+                if t == "The probe printed hello-from-bg." && r == "completed"),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ChatEvent::Result { .. }))
+                .count(),
+            1,
+            "one end: {events:?}"
+        );
+        // The CRUD bus: created, streaming, then not streaming once — at the notification.
+        let crud = emitter.of(&mirror.id.to_string());
+        assert_eq!(
+            crud.iter()
+                .filter(|(_, p)| *p == json!({"is_streaming": false}))
+                .count(),
+            1,
+            "{crud:?}"
+        );
+        let node = graph.get_chat_session(mirror.id).await.unwrap().unwrap();
+        assert!(node.updated_at > node.created_at, "the end is stamped");
+
+        // The parent: its turn as before, the out-of-turn activity flattened under the call.
+        let own = thread(graph.as_ref(), parent).await;
+        assert!(
+            own.iter().any(|e| matches!(e,
+                ChatEvent::BackgroundOutput { correlation_id: Some(c), content, .. }
+                    if c == BG && content.contains("hello-from-bg"))),
+            "{own:?}"
+        );
+        assert!(
+            !own.iter().any(|e| matches!(e,
+                ChatEvent::ToolUse { id, .. } if id == "t-bg-bash")),
+            "the parent's own thread is unchanged: {own:?}"
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P20-suite-2: a Claude Code turn cut by a restart is resumed ONCE at boot through the
+/// CLI's own `--resume`, on either engine, when its CLI asks before each tool; past the cap,
+/// or when the CLI is gone or refuses the conversation, it is closed with an `error` event.
+/// The CLI is nexus' `fake_claude`; the restart is a second manager over the same graph.
+mod claude_code_recovery_at_boot {
+    use super::claude_code_resume_token::FakeCli;
+    use super::*;
+    #[allow(unused_imports)]
+    use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+
+    const CLI_SESSION: &str = "cli-session-recovered";
+    /// `recovery::RESUME_MARKER` (the module is private to the manager).
+    const MARKER: &str = "[PO restart recovery]";
+
+    /// One turn as the CLI plays it, every spawn: reads the user's message, names its
+    /// session, answers, ends with a `result`, stays up until stdin closes.
+    fn cli_turn() -> String {
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            json!({"op": "emit_json", "json": {
+                "type": "system", "subtype": "init", "session_id": CLI_SESSION,
+                "model": "fake-claude", "cwd": ".", "tools": ["Read"],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude",
+                "content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn"}}}),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": CLI_SESSION, "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": "done"}}),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    fn argv_of(path: &std::path::Path) -> Vec<String> {
+        let recorded: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("argv recorded")).unwrap();
+        recorded["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str().map(str::to_string))
+            .collect()
+    }
+
+    async fn wait_for_file(path: &std::path::Path) -> bool {
+        for _ in 0..400 {
+            if path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    async fn events(
+        graph: &MockGraphStore,
+        sid: &str,
+    ) -> Vec<crate::neo4j::models::ChatEventRecord> {
+        graph
+            .get_chat_events(Uuid::parse_str(sid).unwrap(), 0, 500)
+            .await
+            .unwrap()
+    }
+
+    async fn results(graph: &MockGraphStore, sid: &str, at_least: usize) -> usize {
+        let mut n = 0;
+        for _ in 0..400 {
+            n = events(graph, sid)
+                .await
+                .iter()
+                .filter(|e| e.event_type == "result")
+                .count();
+            if n >= at_least {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        n
+    }
+
+    /// Appends `tail` (type, data) after the last stored event: the turn the restart cut.
+    async fn cut_turn(graph: &MockGraphStore, sid: &str, tail: &[(&str, String)]) {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        let last = graph.get_latest_chat_event_seq(uuid).await.unwrap();
+        for (i, (event_type, data)) in tail.iter().enumerate() {
+            graph
+                .store_chat_events(
+                    uuid,
+                    vec![crate::neo4j::models::ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: uuid,
+                        seq: last + 1 + i as i64,
+                        event_type: event_type.to_string(),
+                        data: data.clone(),
+                        created_at: Utc::now(),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    fn user(content: &str) -> (&'static str, String) {
+        (
+            "user_message",
+            json!({"type": "user_message", "content": content}).to_string(),
+        )
+    }
+
+    fn text(content: &str) -> (&'static str, String) {
+        (
+            "assistant_text",
+            json!({"type": "assistant_text", "content": content}).to_string(),
+        )
+    }
+
+    fn assert_closed_by_recovery(events: &[crate::neo4j::models::ChatEventRecord]) {
+        let last = events.last().expect("events");
+        assert_eq!(last.event_type, "error", "{events:?}");
+        assert!(last.data.contains("restart_interrupted"), "{}", last.data);
+    }
+
+    // ── the agent engine ───────────────────────────────────────────────────────────────
+
+    struct Agent {
+        dir: tempfile::TempDir,
+        graph: Arc<MockGraphStore>,
+        sid: String,
+    }
+
+    impl Agent {
+        fn argv_out(&self) -> PathBuf {
+            self.dir.path().join("argv.json")
+        }
+
+        /// The Claude Code provider of nexus on `cli`, recording its argv.
+        fn provider(&self, cli: PathBuf) -> FakeCli {
+            let mut config = ClaudeCodeConfig::default();
+            config.cli_path = Some(cli);
+            FakeCli {
+                inner: Arc::new(ClaudeCodeProvider::new(config)),
+                env: vec![
+                    (
+                        "FAKE_CLAUDE_TRANSCRIPT".into(),
+                        self.dir
+                            .path()
+                            .join("transcript.jsonl")
+                            .display()
+                            .to_string(),
+                    ),
+                    (
+                        "FAKE_CLAUDE_ARGS_OUT".into(),
+                        self.argv_out().display().to_string(),
+                    ),
+                ],
+            }
+        }
+
+        /// A server over the graph, its Claude Code CLI `cli`: the one after the restart
+        /// is a production one (no `resuming_claude_code_at_boot`).
+        fn server(&self, cli: PathBuf) -> ChatManager {
+            let dyn_graph: Arc<dyn GraphStore> = self.graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Agent,
+                mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+                .with_provider_source(Arc::new(self.provider(cli)))
+        }
+    }
+
+    /// A Claude Code session of the agent engine in `mode` whose first turn ended (the CLI
+    /// named its conversation), then a turn the restart cut after `tail`.
+    async fn agent_session_cut(mode: &str, tail: &[(&str, String)]) -> Agent {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("transcript.jsonl"), cli_turn()).unwrap();
+        let agent = Agent {
+            dir,
+            graph: Arc::new(MockGraphStore::new()),
+            sid: String::new(),
+        };
+        let before = agent.server(fake_bin("fake_claude"));
+        let mut req = request(None, None, mode);
+        req.message = "first".into();
+        req.cwd = agent.dir.path().display().to_string();
+        let sid = before.create_session(&req).await.unwrap().session_id;
+        assert!(before.agent_runtime.owns(&sid).await, "the agent engine");
+        assert_eq!(results(&agent.graph, &sid, 1).await, 1, "the first turn");
+        for _ in 0..200 {
+            let node = agent
+                .graph
+                .get_chat_session(Uuid::parse_str(&sid).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            if node.resume_token.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+        cut_turn(&agent.graph, &sid, tail).await;
+        std::fs::remove_file(agent.argv_out()).unwrap();
+        Agent { sid, ..agent }
+    }
+
+    #[tokio::test]
+    async fn a_claude_code_turn_cut_by_a_restart_is_resumed_once_with_the_cli_resume() {
+        let agent = agent_session_cut("default", &[user("go on"), text("working on it")]).await;
+        let after = agent.server(fake_bin("fake_claude"));
+        let (pending, scan) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (1, 0), "{scan:?}");
+        let report = after
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(5))
+            .await;
+        assert_eq!((report.resumed, report.failed), (1, 0), "{report:?}");
+        assert!(wait_for_file(&agent.argv_out()).await, "the CLI respawned");
+        let argv = argv_of(&agent.argv_out());
+        let at = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .unwrap_or_else(|| panic!("the CLI resumes its conversation: {argv:?}"));
+        assert_eq!(argv.get(at + 1).map(String::as_str), Some(CLI_SESSION));
+        assert_eq!(
+            results(&agent.graph, &agent.sid, 2).await,
+            2,
+            "the resumed turn"
+        );
+        let stored = events(&agent.graph, &agent.sid).await;
+        let resume = stored
+            .iter()
+            .find(|e| e.event_type == "user_message" && e.data.contains(MARKER))
+            .expect("the resume message is on the thread");
+        assert!(resume.data.contains("User: go on"), "{}", resume.data);
+        assert!(
+            resume.data.contains("queued") && resume.data.contains("lost"),
+            "the queued messages are said lost: {}",
+            resume.data
+        );
+        after.close_session(&agent.sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_claude_code_turn_cut_again_past_the_cap_is_closed() {
+        let marker = format!("{MARKER} The server restarted while you were working.");
+        let agent = agent_session_cut(
+            "default",
+            &[
+                user("go on"),
+                user(&marker),
+                text("again"),
+                user(&marker),
+                text("and again"),
+            ],
+        )
+        .await;
+        let after = agent.server(fake_bin("fake_claude"));
+        let (pending, scan) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 1), "{scan:?}");
+        assert_closed_by_recovery(&events(&agent.graph, &agent.sid).await);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!agent.argv_out().exists(), "no CLI was started");
+    }
+
+    #[tokio::test]
+    async fn a_claude_code_turn_whose_cli_is_gone_is_closed_with_an_error() {
+        let agent = agent_session_cut("default", &[user("go on"), text("working")]).await;
+        let after = agent.server(PathBuf::from("/nonexistent/claude"));
+        let (pending, _) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let report = after
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(5))
+            .await;
+        assert_eq!((report.resumed, report.failed), (0, 1), "{report:?}");
+        assert!(!after.is_session_active(&agent.sid).await);
+        assert_closed_by_recovery(&events(&agent.graph, &agent.sid).await);
+    }
+
+    /// The rule of the review of #726 (point 3) still holds: a CLI that runs tools without
+    /// asking is not resumed with nobody there.
+    #[tokio::test]
+    async fn a_claude_code_turn_that_runs_tools_without_asking_is_still_closed() {
+        let agent = agent_session_cut("bypassPermissions", &[user("go on"), text("working")]).await;
+        let after = agent.server(fake_bin("fake_claude"));
+        let (pending, scan) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 1), "{scan:?}");
+        let stored = events(&agent.graph, &agent.sid).await;
+        assert_closed_by_recovery(&stored);
+        assert!(
+            stored.last().unwrap().data.contains("without asking"),
+            "{}",
+            stored.last().unwrap().data
+        );
+    }
+
+    // ── the historical engine ──────────────────────────────────────────────────────────
+
+    /// `fake_claude` behind a wrapper: `--version` probes pass through; spawn `n` plays
+    /// `transcript.<n>.jsonl` and records its argv in `args.<n>.json`.
+    fn legacy_wrapper(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = fake_bin("fake_claude");
+        let path = dir.join("claude");
+        let script = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do if [ \"$a\" = \"--version\" ]; then exec \"{fake}\" \"$@\"; fi; done\n\
+             n=$(cat \"{dir}/count\" 2>/dev/null || echo 0)\n\
+             echo $((n+1)) > \"{dir}/count\"\n\
+             FAKE_CLAUDE_TRANSCRIPT=\"{dir}/transcript.$n.jsonl\" \
+             FAKE_CLAUDE_ARGS_OUT=\"{dir}/args.$n.json\" \
+             FAKE_CLAUDE_MAX_RUNTIME_MS=60000 \
+             exec \"{fake}\" \"$@\"\n",
+            fake = fake.display(),
+            dir = dir.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn legacy_server(graph: &Arc<MockGraphStore>, cli: &std::path::Path) -> ChatManager {
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Legacy,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            claude_cli_path: Some(cli.display().to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+    }
+
+    /// A session of the historical engine whose first turn ended, then a cut turn; the
+    /// second spawn of the CLI plays `second`.
+    async fn legacy_session_cut(second: &str) -> (tempfile::TempDir, Arc<MockGraphStore>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("transcript.0.jsonl"), cli_turn()).unwrap();
+        std::fs::write(dir.path().join("transcript.1.jsonl"), second).unwrap();
+        std::fs::write(dir.path().join("transcript.2.jsonl"), cli_turn()).unwrap();
+        let cli = legacy_wrapper(dir.path());
+        let graph = Arc::new(MockGraphStore::new());
+        let before = legacy_server(&graph, &cli);
+        let mut req = request(None, None, "default");
+        req.message = "first".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = before.create_session(&req).await.unwrap().session_id;
+        assert!(
+            !before.agent_runtime.owns(&sid).await,
+            "the historical engine"
+        );
+        assert_eq!(results(&graph, &sid, 1).await, 1, "the first turn");
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.cli_session_id.as_deref(), Some(CLI_SESSION));
+        cut_turn(&graph, &sid, &[user("go on"), text("working")]).await;
+        (dir, graph, sid)
+    }
+
+    #[tokio::test]
+    async fn a_legacy_claude_code_turn_cut_by_a_restart_is_resumed_with_the_cli_resume() {
+        let (dir, graph, sid) = legacy_session_cut(&cli_turn()).await;
+        let after = legacy_server(&graph, &dir.path().join("claude"));
+        let (pending, scan) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (1, 0), "{scan:?}");
+        let report = after
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(5))
+            .await;
+        assert_eq!((report.resumed, report.failed), (1, 0), "{report:?}");
+        let args = dir.path().join("args.1.json");
+        assert!(wait_for_file(&args).await, "the CLI respawned");
+        let argv = argv_of(&args);
+        let at = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .unwrap_or_else(|| panic!("the CLI resumes its conversation: {argv:?}"));
+        assert_eq!(argv.get(at + 1).map(String::as_str), Some(CLI_SESSION));
+        assert_eq!(results(&graph, &sid, 2).await, 2, "the resumed turn");
+        assert!(events(&graph, &sid)
+            .await
+            .iter()
+            .any(|e| e.event_type == "user_message" && e.data.contains(MARKER)));
+        after.close_session(&sid).await.unwrap();
+    }
+
+    /// A `--resume` the CLI refuses (here: it exits at once) closes the turn; the recovery
+    /// never falls back to a fresh CLI that would continue blind.
+    #[tokio::test]
+    async fn a_legacy_claude_code_turn_whose_resume_is_refused_is_closed_not_started_fresh() {
+        // The CLI given `--resume` exits at once, as one whose conversation expired.
+        let refuse = format!("{}\n", json!({"op": "exit", "code": 1}));
+        let (dir, graph, sid) = legacy_session_cut(&refuse).await;
+        let after = legacy_server(&graph, &dir.path().join("claude"));
+        let (pending, _) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let report = after
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(10))
+            .await;
+        assert_eq!((report.resumed, report.failed), (0, 1), "{report:?}");
+        assert!(
+            !dir.path().join("args.2.json").exists(),
+            "no fresh CLI after the refused --resume"
+        );
+        assert!(!after.is_session_active(&sid).await);
+        assert_closed_by_recovery(&events(&graph, &sid).await);
+    }
+
+    /// The CLI that accepts the handshake but dies before the grace of a resume is out (a
+    /// conversation it only finds missing afterwards) is the same refusal: the turn is closed,
+    /// no fresh CLI takes its place.
+    #[tokio::test]
+    async fn a_legacy_claude_code_turn_whose_cli_dies_after_its_handshake_is_closed_not_started_fresh(
+    ) {
+        let dies_late = [
+            json!({"op": "sleep", "ms": 400}),
+            json!({"op": "exit", "code": 1}),
+        ]
+        .iter()
+        .map(|l| format!("{l}\n"))
+        .collect::<String>();
+        let (dir, graph, sid) = legacy_session_cut(&dies_late).await;
+        let after = legacy_server(&graph, &dir.path().join("claude"));
+        let (pending, _) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let report = after
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(10))
+            .await;
+        assert_eq!((report.resumed, report.failed), (0, 1), "{report:?}");
+        assert!(
+            wait_for_file(&dir.path().join("args.1.json")).await,
+            "the resumed CLI was started"
+        );
+        assert!(
+            !dir.path().join("args.2.json").exists(),
+            "no fresh CLI after the refused --resume"
+        );
+        assert!(!after.is_session_active(&sid).await);
+        assert_closed_by_recovery(&events(&graph, &sid).await);
+    }
+
+    // ── several instances ──────────────────────────────────────────────────────────────
+
+    /// A session live on instance A whose thread looks cut (its turn is running there) is
+    /// neither resumed nor closed by instance B's boot scan: B asks on NATS first.
+    #[tokio::test]
+    async fn a_session_live_on_another_instance_is_left_alone_by_the_scan() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+        let broker = TestBroker::start().await;
+        let graph = Arc::new(MockGraphStore::new());
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        let instance = |nats: Arc<NatsEmitter>| {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Agent,
+                mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+                .with_provider_source(Arc::new(fake.clone()))
+                .with_nats(nats)
+                // The fake answers as `claude-code` but is no CLI.
+                .resuming_claude_code_at_boot()
+        };
+        let a_nats = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let a = instance(a_nats.clone());
+        let sid = a
+            .create_session(&request(None, None, "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(a.agent_runtime.owns(&sid).await);
+        // A's turn is running: its thread ends mid-turn.
+        cut_turn(&graph, &sid, &[user("go on"), text("working")]).await;
+        // A answers for its session on the bus (its listener subscribes in the background).
+        let mut answered = false;
+        for _ in 0..100 {
+            if a_nats.request_streaming_snapshot(&sid).await.is_some() {
+                answered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(answered, "instance A answers for its live session");
+
+        let b = instance(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let (pending, scan) = b.scan_interrupted_turns().await.unwrap();
+        assert_eq!(
+            (pending.len(), scan.closed, scan.live_elsewhere),
+            (0, 0, 1),
+            "{scan:?}"
+        );
+        assert!(!events(&graph, &sid)
+            .await
+            .iter()
+            .any(|e| e.event_type == "error"));
+        a.close_session(&sid).await.unwrap();
+    }
+}
+
+/// ZOMBIE-CLI, for real: a real `fake_claude` process on the AGENT engine (the default) is
+/// SIGKILLed while the session is idle. Nothing here fakes the death: the provider's own
+/// stream reports it out of turn, and the manager's watchdog (started as in production)
+/// closes the session with `process_died`; the killed process must then be REAPED (no
+/// `<defunct>` left: `kill(pid, 0)` answers ESRCH), within 30 seconds.
+mod zombie_cli_real_kill {
+    #[allow(unused_imports)]
+    use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+
+    use super::claude_code_resume_token::FakeCli;
+    use super::*;
+    use crate::documents::store::DocumentStore;
+
+    /// The `fake_claude` children of this process right now (the CLI is spawned by us).
+    fn fake_claude_children() -> Vec<i32> {
+        let out = Command::new("pgrep")
+            .args(["-P", &std::process::id().to_string(), "-f", "fake_claude"])
+            .output()
+            .expect("pgrep");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<i32>().ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_real_cli_killed_while_idle_closes_its_session_and_is_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let stdin_out = dir.path().join("stdin.jsonl");
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            json!({"op": "emit_json", "json": {
+                "type": "system", "subtype": "init", "session_id": "cli-kill",
+                "model": "fake-claude", "cwd": ".", "tools": ["Read"],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_kill", "type": "message",
+                "role": "assistant", "model": "fake-claude",
+                "content": [{"type": "text", "text": "ready"}], "stop_reason": "end_turn"}}}),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 1,
+                "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                "session_id": "cli-kill", "total_cost_usd": 0.0,
+                "usage": {"input_tokens": 1, "output_tokens": 1}, "result": "ready"}}),
+            // Stays alive, idle, until it is killed (or its stdin closes).
+            json!({"op": "wait_eof", "timeout_ms": 120000, "optional": true}),
+        ];
+        std::fs::write(
+            &transcript,
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let mut config = ClaudeCodeConfig::default();
+        config.cli_path = Some(fake_bin("fake_claude"));
+        let provider = FakeCli {
+            inner: Arc::new(ClaudeCodeProvider::new(config)),
+            env: vec![
+                (
+                    "FAKE_CLAUDE_TRANSCRIPT".into(),
+                    transcript.display().to_string(),
+                ),
+                (
+                    "FAKE_CLAUDE_STDIN_OUT".into(),
+                    stdin_out.display().to_string(),
+                ),
+            ],
+        };
+        let graph = Arc::new(MockGraphStore::new());
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let chat_config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            ChatManager::new_without_memory(dyn_graph, state.meili, chat_config)
+                .with_provider_source(Arc::new(provider))
+                .with_document_store(DocumentStore::new(dir.path().join("blobs"))),
+        );
+
+        let before = fake_claude_children();
+        let mut req = request(None, None, "default");
+        req.message = "hello".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        let uuid = Uuid::parse_str(&sid).unwrap();
+
+        // The turn answered: the CLI is now IDLE, waiting for its next message.
+        let mut answered = false;
+        for _ in 0..200 {
+            answered = graph
+                .get_chat_events(uuid, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.event_type == "result");
+            if answered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(answered, "the first turn must be answered");
+        assert!(
+            manager.is_session_active(&sid).await,
+            "live before the kill"
+        );
+
+        // The one CLI this session started: the child that did not exist before it.
+        // Other tests run in parallel and spawn their own `fake_claude` under this process: the
+        // new child is not enough. Ours is the one whose environment names OUR transcript
+        // (the tempdir path is unique to this test).
+        let marker = transcript.display().to_string();
+        let cli: Vec<i32> = fake_claude_children()
+            .into_iter()
+            .filter(|p| !before.contains(p))
+            .filter(|p| {
+                Command::new("ps")
+                    .args(["eww", "-o", "command=", "-p", &p.to_string()])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).contains(&marker))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(cli.len(), 1, "exactly one CLI for this session: {cli:?}");
+        let pid = cli[0];
+
+        // Production timing: the same watchdog the server starts.
+        manager.start_dead_cli_watchdog();
+        let started = std::time::Instant::now();
+        // SAFETY: a plain signal to the child pid we just found, not a group.
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGKILL) },
+            0,
+            "SIGKILL delivered"
+        );
+
+        let deadline = started + Duration::from_secs(30);
+        while manager.is_session_active(&sid).await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session of a killed CLI must close within 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let closed_in = started.elapsed();
+
+        // Reaped: a zombie would still answer kill(pid, 0); a reaped pid answers ESRCH.
+        let mut reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                reaped = std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            reaped,
+            "the killed CLI ({pid}) must be reaped, not left <defunct>"
+        );
+        assert!(
+            !manager.is_session_working(&sid).await,
+            "a closed session holds no envelope slot"
+        );
+        eprintln!("ZOMBIE-CLI real kill: session closed in {closed_in:?}, pid {pid} reaped");
+    }
+}

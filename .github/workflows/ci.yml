@@ -1,0 +1,1105 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "integ/**"]
+  pull_request:
+    # integ/<lot>: integration branches. A lot's PRs merge there after review on the FAST tier
+    # (lint, security, unit, integration); the lot reaches main through ONE PR integ/<lot> -> main,
+    # which runs everything (build, API, coverage and the parity matrix). See the FULL-tier `if`.
+    # ready_for_review: marking a draft PR into main as ready is what starts its FULL tier.
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main, "integ/**"]
+  # Cold run: nothing restored from any cache (see "Cache policy" below).
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      fresh:
+        description: "Cold run: ignore every cache (what a fresh clone costs, and proof nothing depends on a stale one)"
+        type: boolean
+        default: false
+
+# A new push to a PR cancels the run it supersedes: iterating on a branch must not
+# queue 30 minutes of runners behind results nobody will read. `main` is never
+# cancelled (each push to it must finish: it is what fills the caches).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Toolchain: every job pins dtolnay/rust-toolchain@1.95.0, the same version as
+# rust-toolchain.toml (keep the two in sync when bumping). "@stable" was
+# ambiguous: the action installs stable, then rustup's rust-toolchain.toml
+# override silently wins for cargo, so the action input was dead. cargo-audit /
+# cargo-deny are installed with --locked under 1.95 on purpose: an unlocked
+# install resolves deps needing rustc >= 1.96 (kstring 2.0.5) and fails to build
+# (see security.yml).
+# Cache policy
+# - One cache per PROFILE, because a profile's dependencies are not another's:
+#   release (Build), clippy/check (Lint), dev test (Unit/Integration/API), and
+#   instrumented (Coverage) each compile the same ~600 crates differently. They used
+#   to share one key written by the release Build only, so every other job restored
+#   artefacts it could not use and recompiled everything.
+# - Written ONLY by pushes to main; PRs restore main's. A PR that saved its own would
+#   evict main's entries (GitHub keeps 10 GB per repo, least recently used first).
+# - Invalidated by itself when Cargo.lock or the compiler changes (rust-cache hashes
+#   both). Bump CACHE_VERSION to drop every cache at once (suspected poisoning).
+# - Cold run: nightly (schedule) and on demand (workflow_dispatch, fresh=true) use a
+#   key nobody has, so they compile from scratch and save nothing. That is the
+#   truth about a fresh clone, and the check that warm runs do not hide a problem.
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CACHE_VERSION: v2
+  CACHE_FRESH: ${{ (github.event_name == 'schedule' || inputs.fresh) && format('-fresh-{0}', github.run_id) || '' }}
+  CACHE_SAVE: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+
+jobs:
+
+  # ==========================================================================
+  # Resolve runner - can each heavy job take a self-hosted runner RIGHT NOW?
+  # ==========================================================================
+  # The three heavy jobs (Build, Unit Tests, Code Coverage) pin to a self-hosted
+  # runner by the repository variable CI_SELF_HOSTED_LABEL (<label>-build,
+  # -unit, -cov). GitHub does NOT fall back when that machine is offline or when
+  # its single instance is busy: the job then queues forever, and nothing in the
+  # UI says so beyond a grey "queued".
+  #
+  # MEASURED FAILURE, 01/11/2026. Four runs sat `queued` for an hour doing
+  # nothing while TWO of the three ffs-n2 runners were IDLE: every one of them
+  # was waiting for the same bucket, `ffs-unit`, which has a single instance.
+  # The previous probe answered a different question - "is ANY runner whose
+  # label starts with `ffs-` online?" - and six such labels were online, so it
+  # said `self_hosted=true` and the queue never drained. It also required
+  # RUNNERS_READ_TOKEN, a secret that has never existed, so it answered
+  # `self_hosted=true` unconditionally and silently: the fallback could not fire.
+  #
+  # The decision is now per BUCKET (`build`, `unit`, `cov`), so a saturated
+  # bucket no longer drags the two healthy ones to ubuntu-latest, and it uses a
+  # GITHUB_TOKEN: `/actions/runners` needs admin, but `/actions/runs/{id}/jobs`
+  # only needs `actions: read`, and every job carries its `labels`, its
+  # `status`, the `runner_name` that executed it and its `created_at` - which is
+  # everything the decision needs. No PAT, no secret to forget.
+  #
+  # A bucket falls back to ubuntu-latest when ANY of these holds:
+  #   * no job has ever run on such a runner (an empty or renamed fleet);
+  #   * a job of this bucket has been waiting longer than QUEUE_LIMIT seconds -
+  #     the bucket is not draining, whether the instance is offline or stuck;
+  #   * every known instance is busy AND at least one job is already waiting.
+  # Otherwise the job stays on self-hosted, where the warm target/ makes it ~3x
+  # faster. If the API cannot be read at all, the job falls back to ubuntu-latest
+  # and says so: a slow run beats a silent hour of nothing.
+  resolve-runner:
+    name: Resolve runner
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      unit: ${{ steps.check.outputs.unit }}
+      cov: ${{ steps.check.outputs.cov }}
+    steps:
+      - name: Can each bucket take a job right now?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ vars.CI_SELF_HOSTED_LABEL }}
+          # 10 minutes: longer than a cold unit run takes to start, short enough
+          # that nobody waits an hour in front of a grey "queued".
+          QUEUE_LIMIT: "600"
+        run: |
+          label="$LABEL"
+          limit="$QUEUE_LIMIT"
+          now=$(date -u +%s)
+
+          # No label -> every heavy job already routes to ubuntu-latest.
+          jobs=""
+          if [ -n "$label" ]; then
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?per_page=20" \
+              --jq '.workflow_runs[].id') || jobs=""
+            if [ -n "$runs" ]; then
+              jobs=$(for r in $runs; do
+                gh api "repos/$GITHUB_REPOSITORY/actions/runs/$r/jobs?per_page=100" \
+                  --jq '[.jobs[] | {l: .labels, s: .status, r: (.runner_name // ""), c: .created_at}]'
+              done | jq -s 'add // []') || jobs=""
+            fi
+          fi
+
+          for bucket in build unit cov; do
+            if [ -z "$label" ]; then
+              echo "$bucket=false" >> "$GITHUB_OUTPUT"
+              continue
+            fi
+            if [ -z "$jobs" ]; then
+              echo "::warning::cannot read this repository's jobs; ${label}-${bucket} falls back to ubuntu-latest"
+              echo "$bucket=false" >> "$GITHUB_OUTPUT"
+              continue
+            fi
+            sel=$(jq --arg L "${label}-${bucket}" '[.[] | select(.l | index($L))]' <<<"$jobs")
+            instances=$(jq '[.[] | select(.r != "") | .r] | unique | length' <<<"$sel")
+            busy=$(jq '[.[] | select(.s == "in_progress") | .r] | unique | length' <<<"$sel")
+            queued=$(jq '[.[] | select(.s == "queued")] | length' <<<"$sel")
+            oldest=$(jq -r '[.[] | select(.s == "queued") | .c] | min // empty' <<<"$sel")
+            waited=0
+            if [ -n "$oldest" ]; then
+              # jq does the arithmetic: Apple's `date` has no `-d`.
+              waited=$(jq -n --arg o "$oldest" --argjson n "$now" '$n - ($o|fromdateiso8601)')
+            fi
+
+            verdict=true
+            why="free capacity (${busy}/${instances} busy, ${queued} waiting)"
+            if [ "$instances" -eq 0 ]; then
+              verdict=false
+              why="no runner has ever served this bucket"
+            elif [ "$waited" -gt "$limit" ]; then
+              verdict=false
+              why="this bucket is not draining: a job has been waiting ${waited}s (limit ${limit}s)"
+            elif [ "$busy" -ge "$instances" ] && [ "$queued" -ge 1 ]; then
+              verdict=false
+              why="saturated: ${busy}/${instances} busy, ${queued} waiting"
+            fi
+            # The numbers are printed either way: a fallback nobody can explain
+            # is how the old probe stayed broken for months.
+            if [ "$verdict" = "true" ]; then
+              echo "::notice::${label}-${bucket}: self-hosted - ${why}"
+            else
+              echo "::warning::${label}-${bucket}: ubuntu-latest - ${why}"
+            fi
+            echo "$bucket=$verdict" >> "$GITHUB_OUTPUT"
+          done
+  # ==========================================================================
+  # Build - Compile once, share artifacts and cache
+  # ==========================================================================
+  build:
+    name: Build
+    needs: [resolve-runner]
+    # FULL tier only: a READY (non-draft) PR into main, pushes to main, nightly and manual runs.
+    # A DRAFT PR into main (an integration branch accumulating its lot) runs the fast tier only;
+    # "Ready for review" starts the full tier once.
+    if: (github.base_ref == 'main' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main'
+    # On the self-hosted runner (ffs-n2, label in the repository variable CI_SELF_HOSTED_LABEL)
+    # when that variable is set, for pushes and for PRs from THIS repository only: the repository
+    # is public, a fork's code never runs on that machine. Nightly and `fresh` runs stay on a
+    # hosted runner, where a cold start is the point. Empty the variable to send every job back.
+    # One runner instance per job (<label>-build, -unit, -cov): cargo fingerprints the
+    # workspace crates by their absolute path, and each instance has its own work dir, so a
+    # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
+    # on an empty commit, 19/10/2026).
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && needs.resolve-runner.outputs.build == 'true' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-build', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Outside the workspace (`checkout` cleans it) and kept between runs: the point of the
+      # self-hosted runner is a warm, incremental target/ (measured on ffs-n2: the crate in
+      # 45 s incremental against 6 min 45 s from the cache on a hosted runner).
+      - name: Persistent target dir (self-hosted runner)
+        if: runner.environment == 'self-hosted'
+        run: echo "CARGO_TARGET_DIR=${RUNNER_TARGETS:?RUNNER_TARGETS missing, see the runner .env}/build" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/pinned-toolchain-only
+
+      # rust-toolchain sets CARGO_INCREMENTAL=0. These binaries only serve API Tests (release.yml
+      # builds what ships): on the self-hosted runner, keep the crate's incremental state, which
+      # build.rs invalidates at every commit anyway (it embeds `git describe`).
+      - name: Incremental release build (self-hosted runner)
+        if: runner.environment == 'self-hosted'
+        run: echo "CARGO_INCREMENTAL=1" >> "$GITHUB_ENV"
+
+      - name: Cache cargo registry
+        if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-release-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
+          cache-workspace-crates: true
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      # CARGO_TARGET_DIR on the self-hosted runner, target/ otherwise; dist/ keeps the artifact's
+      # flat layout, which API Tests downloads into target/release/.
+      - name: Collect the binaries
+        run: |
+          mkdir -p dist
+          cp "${CARGO_TARGET_DIR:-target}"/release/{orchestrator,orch,mcp_server} dist/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-artifacts
+          path: |
+            dist/orchestrator
+            dist/orch
+            dist/mcp_server
+          retention-days: 1
+
+  # ==========================================================================
+  # Security Audit - Detect known vulnerabilities and license issues
+  # ==========================================================================
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/pinned-toolchain-only
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-build"
+          save-if: false
+
+      # Prebuilt binaries: `cargo install` compiled both tools from source on every run
+      # (200-280 s). Being prebuilt also removes the rustc-version trap noted at the top of
+      # this file (an unlocked install resolving a dependency that needs a newer rustc).
+      - name: Install cargo-audit and cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      # The committed Cargo.lock is audited as-is: it is what we ship. This step
+      # used to run `cargo generate-lockfile` ("Clean stale lockfile entries"),
+      # which re-resolves the whole dependency graph - impossible since the whole
+      # zip 8.x line was yanked (office_oxide pulls zip ^8.6, via pdf_oxide; see
+      # Cargo.toml). Audit the pinned set; restore a re-resolve once pdf_oxide
+      # ships a build against office_oxide 0.1.15 (zip ^9).
+      - name: Run cargo audit (fails on known vulnerabilities)
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2026-0049 \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099 \
+            --ignore RUSTSEC-2026-0104
+        # Ignored advisories (transitive, no fix available):
+        #   RUSTSEC-2023-0071: rsa — via jsonwebtoken 10.3.0 (upstream must bump)
+        #   RUSTSEC-2026-0049: rustls-webpki 0.101.7 URI name constraints — via nexus-claude pinned reqwest 0.11
+        #   RUSTSEC-2026-0098: rustls-webpki 0.101.7 wildcard name constraints — same transitive dep
+        #   RUSTSEC-2026-0099: rustls-webpki 0.101.7 — same transitive dep
+        #   RUSTSEC-2026-0104: rustls-webpki 0.101.7 reachable panic in CRL parsing — same transitive dep
+
+      - name: Run cargo deny (license + advisory check)
+        run: cargo deny check advisories licenses
+        continue-on-error: true  # advisory until deny.toml is fully tuned
+
+  # ==========================================================================
+  # Lint & Format - Fast feedback on code quality
+  # ==========================================================================
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The diagram index gate checks that each `verified_sha` is an
+          # ancestor of HEAD (`git merge-base --is-ancestor`): a depth-1 clone
+          # has only HEAD, and the check would downgrade to a warning. The
+          # history comes without file contents (partial clone): commits and
+          # trees are all the check reads.
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Embedded frontend carries the frames the backend uses
+        run: scripts/check-dist-contract.sh dist
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy, rustfmt
+
+      - uses: ./.github/actions/pinned-toolchain-only
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-clippy-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
+          cache-workspace-crates: true
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        # --workspace so EVERY member crate is linted (neural-routing-*,
+        # tree-sitter-*), not just the root package. Without it, member crates
+        # only compile as path-dependencies and their own targets/tests are
+        # never linted. project-orchestrator-desktop is excluded here: it needs
+        # Tauri system deps + a frontend dist; the "Desktop (Tauri)" job below
+        # compiles and tests it.
+        run: cargo clippy --workspace --exclude project-orchestrator-desktop --all-targets --all-features -- -D warnings
+
+      # xtask/ (`cargo xtask in-service|pins`, the after-merge checks) is
+      # OUTSIDE the workspace, so the three commands above never see it.
+      # Std-only: a few seconds, no cache. The last line is a smoke test of
+      # the alias and of the whole path (HEAD against HEAD, offline): the
+      # verdict must be « identiques : oui », exit 0.
+      - name: xtask (after-merge checks) — format, clippy, tests, smoke
+        run: |
+          cargo fmt --manifest-path xtask/Cargo.toml --check
+          cargo clippy --manifest-path xtask/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path xtask/Cargo.toml
+          cargo xtask in-service --no-fetch --ref HEAD --service-sha "$(git rev-parse HEAD)"
+      # Garde-fou de la frontière de stockage : signale et BLOQUE toute
+      # référence directe à un pilote hors de son adaptateur (fichiers *.rs et
+      # Cargo.toml des crates du workspace). `--strict` sort 1 dès qu une
+      # référence hors adaptateur n est pas déclarée dans
+      # xtask/storage-boundary-exceptions.txt : la liste de départ est gelée,
+      # elle ne peut que décroître (cf. docs/storage/README.md).
+      - name: storage-boundary — pilote hors adaptateur
+        run: cargo xtask storage-boundary --strict
+
+      # Index des diagrammes (docs/diagrams/INDEX.yml). Node est deja sur les
+      # runners ubuntu-latest : pas de setup-node, pas de package.json, pas de
+      # nouvelle chaine d'outils dans un depot Rust.
+      #
+      # CE QUI EST VERIFIE ICI, et c'est tout : la structure de l'index, les
+      # globs `backend:` qui ne matchent plus rien, un fichier revendique par
+      # deux diagrammes, une entree `verified` sans son `.mmd`, un en-tete
+      # invalide.
+      #
+      # Et le CLIQUET D'ORPHELINS DU BACKEND : son plafond par depot
+      # (<!-- orphan-ceiling-backend: N -->) porte sur le meme perimetre que ce
+      # checkout, donc ajouter un fichier source que nul diagramme verifie ne
+      # revendique fait echouer cette etape.
+      #
+      # CE QUI NE L'EST PAS : les depots voisins (frontend, nexus, website) ne
+      # sont pas dans ce checkout, donc leurs globs ne sont pas resolus, leurs
+      # plafonds ne sont pas appliques, et ni le plafond TOTAL ni la fraicheur
+      # de ORPHANS.md ne sont verifies — le script le dit en avertissement
+      # plutot que de passer vert en silence. Ce vert ne prouve donc PAS
+      # l'absence de derive : c'est la tache 1.1 qui branchera le gate complet
+      # (checkout multi-depots ou artefact publie). Ne pas le citer comme
+      # preuve de non-derive.
+      - name: Check diagram index (partial — see comment)
+        run: node scripts/diagrams/check-index.mjs
+
+      - name: Test the diagram index checker
+        run: node --test scripts/diagrams/check-index.test.mjs
+
+      # Forbidden tokens. This repository is public, and a few identifiers (a
+      # private service host and its API paths) must never appear in it. The
+      # gate stores SHA-256 digests of the normalized forms, never the strings,
+      # so it cannot publish what it forbids — the cost of that choice is that a
+      # failure gives you file:line and not the token. Offline, ~2 s on this tree.
+      #
+      # SCOPE: the tracked tree. Commit messages are NOT checked (that needs
+      # full history, which this checkout does not fetch). The script's header
+      # lists the other blind spots. Do not cite this step as proof that a
+      # branch is free of them.
+      - name: Check forbidden tokens (tree only — see the script header)
+        run: node scripts/forbidden/check-forbidden-tokens.mjs
+
+      - name: Test the forbidden-token checker
+        run: node --test scripts/forbidden/check-forbidden-tokens.test.mjs
+
+  # ==========================================================================
+  # Desktop - the Tauri crate compiles and its tests pass
+  # ==========================================================================
+  # Every other job excludes project-orchestrator-desktop (it needs the WebKitGTK
+  # headers and a frontend dist/). Without this job a change of the library's API,
+  # or of desktop/src-tauri itself, broke the desktop with no signal until a release.
+  # `cargo test` compiles every target of the crate (what `cargo check --all-targets`
+  # checks, plus the link) and runs its tests (setup wizard config, Docker, network).
+  # FULL tier only, like Build: it compiles the library once more.
+  desktop:
+    name: Desktop (Tauri)
+    if: (github.base_ref == 'main' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/pinned-toolchain-only
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-desktop-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
+          cache-workspace-crates: true
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libssl-dev
+
+      # build.rs refuses to build without desktop/dist/index.html, and tauri-build checks
+      # that every bundle resource exists (target/release/mcp_server). Placeholders: this
+      # job checks the Rust code, it bundles nothing.
+      - name: Placeholder frontend dist and mcp_server resource
+        run: |
+          mkdir -p desktop/dist target/release
+          echo '<!doctype html><title>ci</title>' > desktop/dist/index.html
+          [ -e target/release/mcp_server ] || { printf '#!/bin/sh\n' > target/release/mcp_server; chmod +x target/release/mcp_server; }
+
+      - name: Compile and test the desktop crate
+        run: cargo test -p project-orchestrator-desktop
+
+  # ==========================================================================
+  # Unit Tests - Library and parser tests without external services
+  # ==========================================================================
+  unit-tests:
+    name: Unit Tests
+    needs: [resolve-runner]
+    # On the self-hosted runner (ffs-n2, label in the repository variable CI_SELF_HOSTED_LABEL)
+    # when that variable is set, for pushes and for PRs from THIS repository only: the repository
+    # is public, a fork's code never runs on that machine. Nightly and `fresh` runs stay on a
+    # hosted runner, where a cold start is the point. Empty the variable to send every job back.
+    # One runner instance per job (<label>-build, -unit, -cov): cargo fingerprints the
+    # workspace crates by their absolute path, and each instance has its own work dir, so a
+    # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
+    # on an empty commit, 19/10/2026).
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && needs.resolve-runner.outputs.unit == 'true' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-unit', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
+    # A hung test used to hold a job for 1-2 hours; nextest kills it after 5 min (see
+    # .config/nextest.toml), this is the backstop.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      # Outside the workspace (`checkout` cleans it) and kept between runs: the point of the
+      # self-hosted runner is a warm, incremental target/ (measured on ffs-n2: the crate in
+      # 45 s incremental against 6 min 45 s from the cache on a hosted runner).
+      - name: Persistent target dir (self-hosted runner)
+        if: runner.environment == 'self-hosted'
+        run: echo "CARGO_TARGET_DIR=${RUNNER_TARGETS:?RUNNER_TARGETS missing, see the runner .env}/unit-tests" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/test-profile
+
+      - uses: ./.github/actions/pinned-toolchain-only
+
+      - name: Cache cargo registry
+        if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
+          # Not the workspace's own crates: their debug test binaries made this entry 4.45 GB
+          # (19/10/2026), and a PR recompiles the top crate anyway. With them, two entries of this
+          # profile plus coverage passed GitHub's 10 GB per repo and evicted ci-release, ci-clippy
+          # and ci-desktop: Build recompiled from scratch (10-15 min), API Tests found no cache and
+          # spent 14 min compiling for 29 s of tests.
+          cache-workspace-crates: false
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # src/chat/agent_e2e_tests.rs needs the nexus fake servers (see the action).
+      - name: Build the nexus fake servers used by the agent e2e tests
+        uses: ./.github/actions/nexus-fakes
+
+      - name: Run unit tests (lib)
+        # --workspace so member crates' unit tests actually run in CI (the
+        # neural-routing-* crates carry their own #[cfg(test)] suites that the
+        # root-only `cargo test --lib` never executed). Desktop excluded — see
+        # the clippy step.
+        # nextest: one process per test (no shared globals between tests), all cores, and a
+        # per-test timeout that NAMES a hung test instead of letting it hold the job.
+        # parser_tests and the service-free integration targets (see below) are in the SAME
+        # invocation: as separate `cargo test --test ...` steps they compiled the non-test lib in a
+        # second, serial pass (2 min 50 s measured 19/10/2026); here cargo builds both in parallel.
+        run: >-
+          cargo nextest run --profile ci --workspace --exclude project-orchestrator-desktop
+          --lib --test parser_tests --test p2p_integration --test p2p_http_exchange
+          --test prompt_completeness --test routing_metamorphic
+        env:
+          # T9: the offline transverse evaluation (src/chat/eval_transverse.rs) runs in
+          # this step and fails it on any leak; its report is kept below.
+          PO_EVAL_REPORT: ${{ github.workspace }}/target/eval-transverse/report.json
+
+      - name: Keep the T9 evaluation report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: eval-transverse-report
+          path: target/eval-transverse/report.json
+          if-no-files-found: ignore
+
+      # Integration targets that need no external service (in-process axum on
+      # random ports, pure logic), run by the nextest step above with the lib and parser_tests.
+      #   p2p_integration, p2p_http_exchange: P2P pipeline + two local axum servers
+      #   prompt_completeness: tool-reference/group coverage guard
+      #   routing_metamorphic: RoutingProvider invariance harness
+      # Deliberately NOT run here (all #[ignore]d, need live resources):
+      #   mcp_federation_integration: real remote MCP servers over the network
+      # (cancel-tools / cancel-task end to end run in the lib step above: src/chat/cancel_e2e_tests.rs,
+      # against fake_claude, on both engines; no CLI, no key.)
+
+  # ==========================================================================
+  # Integration Tests - Requires Neo4j and Meilisearch
+  # ==========================================================================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    services:
+      neo4j:
+        image: ghcr.io/this-rs/ci-mirror/neo4j:5.26.31@sha256:c7d25c0eeebfe125718d58b72ed5d663c85d0479047733845eb2237c67ce8069
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          NEO4J_AUTH: neo4j/testpassword
+          NEO4J_PLUGINS: '["apoc"]'
+        ports:
+          - 7687
+          - 7474
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 10
+          --health-start-period 30s
+
+      meilisearch:
+        image: ghcr.io/this-rs/ci-mirror/meilisearch:v1.34.3@sha256:82767d2afc4fb6c3e4ebadb134ca6ef5687c894ae9e152928619393b1f331681
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          MEILI_MASTER_KEY: test-master-key
+          MEILI_NO_ANALYTICS: true
+        ports:
+          - 7700
+        options: >-
+          --health-cmd "curl -sf http://localhost:7700/health || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/test-profile
+
+      - uses: ./.github/actions/pinned-toolchain-only
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: false
+          cache-workspace-crates: true
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for Neo4j..."
+          timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.neo4j.ports['7474'] }} > /dev/null 2>&1; do sleep 2; done'
+          echo "Waiting for Meilisearch..."
+          timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.meilisearch.ports['7700'] }}/health > /dev/null 2>&1; do sleep 2; done'
+          echo "All services are ready!"
+
+      - name: Run integration tests
+        env:
+          NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
+          NEO4J_USER: neo4j
+          NEO4J_PASSWORD: testpassword
+          MEILISEARCH_URL: http://localhost:${{ job.services.meilisearch.ports['7700'] }}
+          MEILISEARCH_KEY: test-master-key
+        run: |
+          # harness_neo4j: the Cypher of the provider settings; REQUIRED here, so a
+          # missing Neo4j fails instead of passing silently.
+          # neural_routing_indexes: the offline guard that the startup path creates the
+          # vector index the NN router queries, plus the behavioural half against a real
+          # Neo4j (a stored trajectory is found above the 0.7 threshold). The offline half
+          # is the one that keeps the fix from being undone — it must run somewhere.
+          # neural_routing_sampler: the sampler that drives the graph for GNN training. Its
+          # pure half is tested in the domain crate; here is the half that only exists
+          # because something answers Cypher — hops, cache, unknown centre, stratified pick.
+          # store_conformance: the one GraphStore conformance suite, instantiated per backend
+          # (mock AND this Neo4j); REQUIRED, so its neo4j:: half never skips silently.
+          HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
+            --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
+            --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes \
+            --test neo4j_synapse_shadow --test store_conformance --test code_graph_stable_key \
+            --test file_paths --test neural_routing_sampler --test note_sweep
+
+  # ==========================================================================
+  # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
+  # ==========================================================================
+  api-tests:
+    name: API Tests
+    # FULL tier only: a READY (non-draft) PR into main, pushes to main, nightly and manual runs.
+    # A DRAFT PR into main (an integration branch accumulating its lot) runs the fast tier only;
+    # "Ready for review" starts the full tier once.
+    if: (github.base_ref == 'main' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [build, lint]
+    permissions:
+      contents: read
+      packages: read
+    services:
+      neo4j:
+        image: ghcr.io/this-rs/ci-mirror/neo4j:5.26.31@sha256:c7d25c0eeebfe125718d58b72ed5d663c85d0479047733845eb2237c67ce8069
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          NEO4J_AUTH: neo4j/testpassword
+          NEO4J_PLUGINS: '["apoc"]'
+        ports:
+          - 7687:7687
+          - 7474:7474
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 10
+          --health-start-period 30s
+
+      meilisearch:
+        image: ghcr.io/this-rs/ci-mirror/meilisearch:v1.34.3@sha256:82767d2afc4fb6c3e4ebadb134ca6ef5687c894ae9e152928619393b1f331681
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          MEILI_MASTER_KEY: test-master-key
+          MEILI_NO_ANALYTICS: true
+        ports:
+          - 7700:7700
+        options: >-
+          --health-cmd "curl -sf http://localhost:7700/health || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/test-profile
+
+      - uses: ./.github/actions/pinned-toolchain-only
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: false
+          cache-workspace-crates: true
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build-artifacts
+          path: target/release/
+
+      - name: Make binaries executable
+        run: chmod +x target/release/orchestrator target/release/orch target/release/mcp_server
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for Neo4j..."
+          timeout 60 bash -c 'until curl -sf http://localhost:7474 > /dev/null 2>&1; do sleep 2; done'
+          echo "Waiting for Meilisearch..."
+          timeout 60 bash -c 'until curl -sf http://localhost:7700/health > /dev/null 2>&1; do sleep 2; done'
+          echo "All services are ready!"
+
+      - name: Write CI config.yaml
+        run: |
+          printf '%s\n' \
+            'setup_completed: true' \
+            'server:' \
+            '  port: 8080' \
+            '  serve_frontend: false' \
+            'neo4j:' \
+            '  uri: "bolt://localhost:7687"' \
+            '  user: "neo4j"' \
+            '  password: "testpassword"' \
+            'meilisearch:' \
+            '  url: "http://localhost:7700"' \
+            '  key: "test-master-key"' \
+            > config.yaml
+
+      - name: Start server in background
+        env:
+          RUST_LOG: info
+        run: |
+          ./target/release/orchestrator serve --port 8080 &
+          echo "Waiting for server to start..."
+          timeout 60 bash -c 'until curl -sf http://localhost:8080/health > /dev/null 2>&1; do sleep 1; done'
+          echo "Server is ready!"
+
+      - name: Run API tests
+        run: cargo test --test api_tests
+
+  # ==========================================================================
+  # Code Coverage - Generate and upload coverage report
+  # ==========================================================================
+  coverage:
+    name: Code Coverage
+    needs: [resolve-runner]
+    # FULL tier only: a READY (non-draft) PR into main, pushes to main, nightly and manual runs.
+    # A DRAFT PR into main (an integration branch accumulating its lot) runs the fast tier only;
+    # "Ready for review" starts the full tier once.
+    if: (github.base_ref == 'main' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main'
+    # On the self-hosted runner (ffs-n2, label in the repository variable CI_SELF_HOSTED_LABEL)
+    # when that variable is set, for pushes and for PRs from THIS repository only: the repository
+    # is public, a fork's code never runs on that machine. Nightly and `fresh` runs stay on a
+    # hosted runner, where a cold start is the point. Empty the variable to send every job back.
+    # One runner instance per job (<label>-build, -unit, -cov): cargo fingerprints the
+    # workspace crates by their absolute path, and each instance has its own work dir, so a
+    # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
+    # on an empty commit, 19/10/2026).
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && needs.resolve-runner.outputs.cov == 'true' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-cov', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
+    # Backstop: a hung test used to keep this job alive for 1-2 hours.
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      packages: read
+    services:
+      neo4j:
+        image: ghcr.io/this-rs/ci-mirror/neo4j:5.26.31@sha256:c7d25c0eeebfe125718d58b72ed5d663c85d0479047733845eb2237c67ce8069
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          NEO4J_AUTH: neo4j/testpassword
+          NEO4J_PLUGINS: '["apoc"]'
+        ports:
+          - 7687
+          - 7474
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 10
+          --health-start-period 30s
+      meilisearch:
+        image: ghcr.io/this-rs/ci-mirror/meilisearch:v1.34.3@sha256:82767d2afc4fb6c3e4ebadb134ca6ef5687c894ae9e152928619393b1f331681
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          MEILI_MASTER_KEY: test-master-key
+          MEILI_NO_ANALYTICS: true
+        ports:
+          - 7700
+        options: >-
+          --health-cmd "curl -sf http://localhost:7700/health || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # Outside the workspace (`checkout` cleans it) and kept between runs: the point of the
+      # self-hosted runner is a warm, incremental target/ (measured on ffs-n2: the crate in
+      # 45 s incremental against 6 min 45 s from the cache on a hosted runner).
+      - name: Persistent target dir (self-hosted runner)
+        if: runner.environment == 'self-hosted'
+        run: echo "CARGO_TARGET_DIR=${RUNNER_TARGETS:?RUNNER_TARGETS missing, see the runner .env}/coverage" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: llvm-tools-preview
+
+      - uses: ./.github/actions/test-profile
+
+      # Instrumented builds are never incremental: test-profile turns incremental on for the
+      # self-hosted runner, and an incremental build under coverage keeps the mapping of
+      # superseded copies of each function, which count as missed lines (see the reset step).
+      - name: No incremental compilation under coverage
+        run: echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+
+      - uses: ./.github/actions/pinned-toolchain-only
+
+      - name: Cache cargo registry
+        if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-cov-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
+          cache-workspace-crates: true
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Wait for services to be ready
+        run: |
+          timeout 90 bash -c 'until curl -sf http://localhost:${{ job.services.neo4j.ports['7474'] }} > /dev/null 2>&1; do sleep 2; done'
+          timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.meilisearch.ports['7700'] }}/health > /dev/null 2>&1; do sleep 2; done'
+          echo "Neo4j + Meilisearch ready"
+
+      # Coverage is collected in SEVERAL runs whose profraw data is then MERGED
+      # into a single lcov (`--no-report` accumulates, `llvm-cov report` merges).
+      # One run cannot do it: the unit tests span the whole workspace while the
+      # Neo4j/Meilisearch suites are per-test-target, and a single invocation
+      # would hide one behind the other.
+      #
+      # `clean --workspace` first, so stale profraw from the cargo cache cannot
+      # inflate the numbers.
+      # `--workspace` on EVERY runner. The self-hosted runner used to remove only the profiles and
+      # keep the instrumented build for the incremental state (#893): since then main's report
+      # counts the same hits over many more lines (src/chat/manager.rs 23 840 -> 32 711 coverable
+      # lines, 92 % -> 63 %), and every patch touching that file reads as uncovered. An
+      # incremental build under instrumentation keeps the coverage mapping of superseded copies
+      # of the functions; they are never executed, so they count as missed lines. `--workspace`
+      # removes the workspace crates' artifacts (the dependencies stay warm).
+      - name: Reset coverage profile data
+        run: cargo llvm-cov clean --workspace
+
+      # (1) Unit tests, whole workspace (member crates carry their own suites).
+      # `test_large_index_performance` is a wall-clock assertion that does not
+      # hold under llvm-cov instrumentation — skipped here, still run by the
+      # Unit Tests job. See docs/COVERAGE.md. `the_same_scenario_on_both_engines_
+      # gives_the_parity_matrix` (multi-engine scenario, Codex column stalls ~90s
+      # under instrumentation — documented FLAKY-PARITE) is skipped here too.
+      - name: Build the nexus fake servers used by the agent e2e tests
+        uses: ./.github/actions/nexus-fakes
+
+      # PARITY_NEO4J_URI here (this job has the Neo4j service) is what makes the
+      # one lib test that needs a real Neo4j, neo4j::mock::cross_project_parity,
+      # actually run; HARNESS_NEO4J_REQUIRED turns a missing Neo4j into a
+      # failure. Its own variable, not NEO4J_URI: the config tests of lib.rs
+      # clear NEO4J_* in the same process while tests run in parallel.
+      # AGENT_IDENTITY_NEO4J_URI does the same for neo4j::chat::agent_identity_neo4j
+      # (the durable self, its model facet and the facet→self migration): without
+      # it, HARNESS_NEO4J_REQUIRED turns that suite's skip into a failure.
+      # The Unit Tests job has no Neo4j and neither variable: it skips.
+      - name: Collect coverage — unit tests (workspace)
+        env:
+          PARITY_NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
+          PARITY_NEO4J_USER: neo4j
+          PARITY_NEO4J_PASSWORD: testpassword
+          AGENT_IDENTITY_NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
+          HARNESS_NEO4J_REQUIRED: "1"
+        run: |
+          cargo llvm-cov --no-report --no-fail-fast \
+            --workspace --exclude project-orchestrator-desktop --lib \
+            -- --skip test_large_index_performance \
+               --skip the_same_scenario_on_both_engines_gives_the_parity_matrix
+
+      # (2) Parser tests — no service needed.
+      - name: Collect coverage — parser tests
+        run: cargo llvm-cov --no-report --no-fail-fast --test parser_tests
+
+      # (3) The suites that talk to the REAL Neo4j provisioned above. This is
+      # what makes src/neo4j/* measurable instead of excluded: every GraphStore
+      # method here runs against Neo4j, so its lines count.
+      - name: Collect coverage — Neo4j integration suites
+        env:
+          NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
+          NEO4J_USER: neo4j
+          NEO4J_PASSWORD: testpassword
+          MEILISEARCH_URL: http://localhost:${{ job.services.meilisearch.ports['7700'] }}
+          MEILISEARCH_KEY: test-master-key
+        # harness_neo4j: the anchors, provider settings and lineage of src/neo4j/chat.rs
+        # (with neo4j_store_tests for the rest of the file). REQUIRED, so a missing
+        # Neo4j fails instead of uploading a 0 %.
+        run: |
+          HARNESS_NEO4J_REQUIRED=1 cargo llvm-cov --no-report --no-fail-fast \
+            --test integration_tests \
+            --test data_migrations \
+            --test workspace_tests \
+            --test neo4j_store_tests \
+            --test harness_neo4j \
+            --test neo4j_decision_project \
+            --test self_graph \
+            --test code_graph_stable_key \
+            --test file_paths \
+            --test neural_routing_sampler \
+            --test store_conformance \
+            --test note_sweep
+
+      # (4) Merge every run above into one lcov.
+      - name: Merge coverage runs into a single lcov
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+
+      # Blocking gate for src/refs (see scripts/lcov_gate.rs): Codecov is advisory
+      # here, and a file no test binary compiles never shows up in the report, so
+      # this reads the directory from disk. Fails the job - and the PR - when a
+      # file is absent from the report or under its threshold. No `ignore` entry.
+      - name: Blocking coverage gate - src/refs
+        run: |
+          rustc --test scripts/lcov_gate.rs -o "$RUNNER_TEMP/lcov_gate_test"
+          "$RUNNER_TEMP/lcov_gate_test"
+          rustc -O scripts/lcov_gate.rs -o "$RUNNER_TEMP/lcov_gate"
+          "$RUNNER_TEMP/lcov_gate" lcov.info --dir src/refs --min 90 \
+            --exact src/refs/access.rs \
+            --exact src/refs/validate.rs \
+            --exact src/refs/registry.rs
+
+      # Same blocking contract for the rate-limit decision (RL2/RL3). The three
+      # files named `--exact` are the DECISION — the counters, the classifier and
+      # the provider table — and a line of them that no test executes is a rule
+      # nobody proved. `store.rs` writes a file and `mod.rs` only re-exports, so
+      # the directory minimum covers them. No `ignore` entry.
+      - name: Blocking coverage gate - src/chat/provider/limits
+        run: |
+          rustc -O scripts/lcov_gate.rs -o "$RUNNER_TEMP/lcov_gate_limits"
+          "$RUNNER_TEMP/lcov_gate_limits" lcov.info --dir src/chat/provider/limits --min 90 \
+            --exact src/chat/provider/limits/ledger.rs \
+            --exact src/chat/provider/limits/classify.rs \
+            --exact src/chat/provider/limits/profiles.rs \
+            --exact src/chat/provider/limits/breaker.rs \
+            --exact src/chat/provider/limits/admission.rs
+
+      # Guard: the merged report must actually contain the Neo4j lines. Without
+      # it, a silently skipped integration suite (backends_available() returning
+      # false) would upload a report that looks fine while covering nothing.
+      - name: Assert the merged lcov covers src/neo4j
+        run: |
+          python3 scripts/assert_lcov_covers.py lcov.info \
+            src/neo4j/workspace.rs \
+            src/neo4j/milestone.rs \
+            src/neo4j/constraint.rs \
+            src/neo4j/release.rs \
+            src/neo4j/commit.rs \
+            src/neo4j/decision.rs \
+            src/neo4j/user.rs \
+            src/neo4j/traits.rs \
+            src/neo4j/client.rs \
+            src/neo4j/chat.rs
+
+      # Codecov's `patch` status is ADVISORY here (`require_ci_to_pass: false`,
+      # `fail_ci_if_error: false`) and it reports ONE percentage, never the lines
+      # behind it. This applies the SAME bar before the upload — the target read
+      # from `codecov.yml` (95 %, threshold 0 %) — and NAMES every uncovered line
+      # of the diff, so a red patch status stops being an unexplained number.
+      # Calibration: on PR #1048 the gate measured 29/32 instrumented lines, i.e.
+      # 90.62 %, the exact figure codecov printed for that commit.
+      - name: Patch coverage of this PR's diff (the bar codecov applies)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          # The gate diffs the PR against its base, which needs the merge base: a
+          # depth-1 checkout has no history at all (`--unshallow` on a complete
+          # clone is an error, hence the test).
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --no-tags --unshallow origin "+refs/heads/${BASE}:refs/remotes/origin/${BASE}"
+          else
+            git fetch --no-tags origin "+refs/heads/${BASE}:refs/remotes/origin/${BASE}"
+          fi
+          rustc --test scripts/patch_coverage.rs -o "$RUNNER_TEMP/patch_coverage_test"
+          "$RUNNER_TEMP/patch_coverage_test"
+          rustc -O scripts/patch_coverage.rs -o "$RUNNER_TEMP/patch_coverage"
+          "$RUNNER_TEMP/patch_coverage" lcov.info \
+            --base "origin/${BASE}" --min 95 --repo .
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
+          verbose: true
+
+  # ==========================================================================
+  # Test timing - which tests make the suite slow (nightly / on demand only)
+  # ==========================================================================
+  # The lib suite is ~6,600 tests and ~16 minutes of EXECUTION (compilation is
+  # the smaller part), and `cargo test` prints no per-test time on stable. This
+  # runs it once with the timing report (RUSTC_BOOTSTRAP enables the libtest flag
+  # on the pinned stable toolchain) and writes the slowest tests to the job
+  # summary, so the next speed-up is chosen from a measure, not from a guess.
+  test-timing:
+    name: Test timing
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/test-profile
+
+      - uses: ./.github/actions/pinned-toolchain-only
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: false
+          cache-workspace-crates: true
+
+      - name: Build the nexus fake servers used by the agent e2e tests
+        uses: ./.github/actions/nexus-fakes
+
+      - name: Run the lib suite with per-test times
+        env:
+          RUSTC_BOOTSTRAP: "1"
+        run: |
+          cargo test --workspace --exclude project-orchestrator-desktop --lib -- \
+            -Z unstable-options --report-time 2>&1 | tee timing.log
+
+      - name: Slowest tests
+        if: always()
+        run: |
+          {
+            echo "### Slowest 40 tests"
+            echo '```'
+            grep -aE '^test .* <[0-9.]+s>' timing.log \
+              | sed -E 's/^test (.*) \.\.\. [a-z]+ <([0-9.]+)s>$/\2 \1/' \
+              | sort -rn | head -40
+            echo '```'
+            echo "### Total time by module (top 15)"
+            echo '```'
+            grep -aE '^test .* <[0-9.]+s>' timing.log \
+              | sed -E 's/^test ([^ ]+) \.\.\. [a-z]+ <([0-9.]+)s>$/\2 \1/' \
+              | awk '{ n=split($2,p,"::"); m=p[1]"::"p[2]; t[m]+=$1 } END { for (k in t) printf "%.1f %s\n", t[k], k }' \
+              | sort -rn | head -15
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
+  # Cache prune - one entry per profile, so the profiles stop evicting each other
+  # ==========================================================================
+  # GitHub keeps 10 GB of cache per repository and evicts the least recently used entries.
+  # Every push to main whose Cargo.lock/Cargo.toml hash differs writes NEW entries next to the
+  # old ones; measured 19/10/2026: 11.7 GB in 4 entries (three of them ci-test/ci-cov), every
+  # ci-release, ci-clippy and ci-desktop entry evicted. After the jobs that save, keep only the
+  # newest entry of each profile written by main. PRs never save, so they have nothing to prune.
+  cache-prune:
+    name: Cache prune
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build, lint, desktop, unit-tests, coverage]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete superseded cache entries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh cache list --repo "$REPO" --ref refs/heads/main --limit 100 \
+              --sort created_at --order desc --json id,key,createdAt,sizeInBytes > caches.json
+          # The family of an entry: the cargo profile (v0-rust-ci-<profile>-...) or the nexus fake
+          # servers (nexus-fakes-..., one entry per pinned nexus revision, see
+          # .github/actions/nexus-fakes). The newest entry of each family is kept.
+          FAMILY='def family: if test("^v0-rust-ci-[a-z]+-") then capture("^v0-rust-(?<p>ci-[a-z]+)-").p
+                               elif test("^nexus-fakes-") then "nexus-fakes" else empty end;
+                  [.[] | select(.key | family) ] | group_by(.key | family)'
+          jq -r "$FAMILY"' | map(max_by(.createdAt)) | .[] | "  \(.key) \(.sizeInBytes)"' caches.json \
+            | sed '1i\
+          Keeping:' || true
+          jq -r "$FAMILY"' | map(sort_by(.createdAt) | reverse | .[1:][]) | .[]
+                 | "\(.id) \(.key) \(.sizeInBytes)"' caches.json > stale.txt
+          echo "Deleting:"; cat stale.txt
+          while read -r id key size; do
+            gh cache delete "$id" --repo "$REPO" || echo "::warning::could not delete $key"
+          done < stale.txt

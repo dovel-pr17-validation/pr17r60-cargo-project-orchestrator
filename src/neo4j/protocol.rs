@@ -1,0 +1,1647 @@
+//! Neo4j Protocol operations (Pattern Federation)
+//!
+//! Implements CRUD operations for Protocol, ProtocolState, and ProtocolTransition
+//! entities on the Neo4j graph.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use super::client::Neo4jClient;
+use crate::protocol::{
+    Protocol, ProtocolCategory, ProtocolRun, ProtocolState, ProtocolTransition, RunStatus,
+    RuntimeState, StateVisit,
+};
+use anyhow::{Context, Result};
+use neo4rs::query;
+use tracing::warn;
+use uuid::Uuid;
+
+impl Neo4jClient {
+    // ========================================================================
+    // Conversion helpers
+    // ========================================================================
+
+    /// Convert a Neo4j node to a [`Protocol`].
+    pub(crate) fn node_to_protocol(node: &neo4rs::Node) -> Result<Protocol> {
+        let terminal_states_json: String = node
+            .get("terminal_states_json")
+            .unwrap_or_else(|_| "[]".to_string());
+        let terminal_states: Vec<Uuid> =
+            serde_json::from_str(&terminal_states_json).unwrap_or_default();
+
+        Ok(Protocol {
+            id: node.get::<String>("id")?.parse()?,
+            name: node.get("name")?,
+            description: node.get("description").unwrap_or_default(),
+            project_id: node.get::<String>("project_id").ok().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse().ok()
+                }
+            }),
+            skill_id: node
+                .get::<String>("skill_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            entry_state: node.get::<String>("entry_state")?.parse()?,
+            terminal_states,
+            protocol_category: node
+                .get::<String>("protocol_category")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
+            trigger_mode: node
+                .get::<String>("trigger_mode")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
+            trigger_config: node
+                .get::<String>("trigger_config_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            relevance_vector: node
+                .get::<String>("relevance_vector_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            last_triggered_at: node
+                .get::<String>("last_triggered_at")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            created_at: {
+                let raw = node.get::<String>("created_at")?;
+                raw.parse().unwrap_or_else(|_| chrono::Utc::now())
+            },
+            updated_at: {
+                let raw = node.get::<String>("updated_at")?;
+                raw.parse().unwrap_or_else(|_| chrono::Utc::now())
+            },
+        })
+    }
+
+    /// Convert a Neo4j node to a [`ProtocolState`].
+    pub(crate) fn node_to_protocol_state(node: &neo4rs::Node) -> Result<ProtocolState> {
+        Ok(ProtocolState {
+            id: node.get::<String>("id")?.parse()?,
+            protocol_id: node.get::<String>("protocol_id")?.parse()?,
+            name: node.get("name")?,
+            description: node.get("description").unwrap_or_default(),
+            action: node.get::<String>("action").ok().filter(|s| !s.is_empty()),
+            state_type: node
+                .get::<String>("state_type")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
+            sub_protocol_id: node
+                .get::<String>("sub_protocol_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            completion_strategy: node
+                .get::<String>("completion_strategy")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            on_failure_strategy: node
+                .get::<String>("on_failure_strategy")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            generator_config: node
+                .get::<String>("generator_config_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            prompt_fragment: node
+                .get::<String>("prompt_fragment")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            available_tools: node
+                .get::<String>("available_tools_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            forbidden_actions: node
+                .get::<String>("forbidden_actions_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            state_timeout_secs: node.get::<i64>("state_timeout_secs").ok().map(|v| v as u64),
+        })
+    }
+
+    /// Convert a Neo4j node to a [`ProtocolTransition`].
+    pub(crate) fn node_to_protocol_transition(node: &neo4rs::Node) -> Result<ProtocolTransition> {
+        Ok(ProtocolTransition {
+            id: node.get::<String>("id")?.parse()?,
+            protocol_id: node.get::<String>("protocol_id")?.parse()?,
+            from_state: node.get::<String>("from_state")?.parse()?,
+            to_state: node.get::<String>("to_state")?.parse()?,
+            trigger: node.get("trigger")?,
+            guard: node.get::<String>("guard").ok().filter(|s| !s.is_empty()),
+            // Fail closed: a stored guard that no longer parses must surface as an error,
+            // never be dropped (that would turn a guarded transition into an open one).
+            guard_expr: node
+                .get::<String>("guard_expr")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| serde_json::from_str(&s))
+                .transpose()
+                .context("Stored guard_expr is not a valid guard")?,
+        })
+    }
+
+    // ========================================================================
+    // Protocol CRUD
+    // ========================================================================
+
+    /// Check if a protocol with the given name already exists in the project.
+    /// Returns the existing protocol's ID if found.
+    pub async fn get_protocol_by_name_and_project(
+        &self,
+        name: &str,
+        project_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let q = query(
+            r#"
+            MATCH (proto:Protocol {name: $name, project_id: $project_id})
+            RETURN proto.id AS id
+            LIMIT 1
+            "#,
+        )
+        .param("name", name.to_string())
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let id_str: String = row.get("id")?;
+            Ok(Some(id_str.parse()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Create or update a protocol node and link it to its project.
+    ///
+    /// A protocol with no project is one of the transverse library: it is written
+    /// without a `BELONGS_TO` edge, like a skill of the transverse set. The `MATCH` used
+    /// to be mandatory, so `project_id = None` matched no project and the whole write did
+    /// NOTHING — silently: the transverse protocol never existed, while the in-memory
+    /// store created it (measured 28/10/2026 by `check_protocol_scope_rule`, the
+    /// conformance check that pins this rule for both backends). A protocol naming a
+    /// project that does not exist still writes nothing, as before.
+    pub async fn upsert_protocol(&self, protocol: &Protocol) -> Result<()> {
+        let terminal_states_json = serde_json::to_string(&protocol.terminal_states)?;
+
+        let q = query(
+            r#"
+            OPTIONAL MATCH (p:Project {id: $project_id})
+            WITH p WHERE $project_id IS NULL OR p IS NOT NULL
+            MERGE (proto:Protocol {id: $id})
+            ON CREATE SET proto.created_at = $created_at
+            SET proto.name = $name,
+                proto.description = $description,
+                proto.project_id = $project_id,
+                proto.skill_id = $skill_id,
+                proto.entry_state = $entry_state,
+                proto.terminal_states_json = $terminal_states_json,
+                proto.protocol_category = $protocol_category,
+                proto.trigger_mode = $trigger_mode,
+                proto.trigger_config_json = $trigger_config_json,
+                proto.relevance_vector_json = $relevance_vector_json,
+                proto.last_triggered_at = $last_triggered_at,
+                proto.updated_at = $updated_at
+            FOREACH (_ IN CASE WHEN p IS NULL THEN [] ELSE [1] END |
+                MERGE (proto)-[:BELONGS_TO]->(p)
+            )
+            "#,
+        )
+        .param("id", protocol.id.to_string())
+        .param("project_id", protocol.project_id.map(|id| id.to_string()))
+        .param("name", protocol.name.clone())
+        .param("description", protocol.description.clone())
+        .param(
+            "skill_id",
+            protocol.skill_id.map(|u| u.to_string()).unwrap_or_default(),
+        )
+        .param("entry_state", protocol.entry_state.to_string())
+        .param("terminal_states_json", terminal_states_json)
+        .param("protocol_category", protocol.protocol_category.to_string())
+        .param("trigger_mode", protocol.trigger_mode.to_string())
+        .param(
+            "trigger_config_json",
+            protocol
+                .trigger_config
+                .as_ref()
+                .map(|c| serde_json::to_string(c).unwrap_or_default())
+                .unwrap_or_default(),
+        )
+        .param(
+            "relevance_vector_json",
+            protocol
+                .relevance_vector
+                .as_ref()
+                .map(|rv| serde_json::to_string(rv).unwrap_or_default())
+                .unwrap_or_default(),
+        )
+        .param(
+            "last_triggered_at",
+            protocol
+                .last_triggered_at
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
+        )
+        .param("created_at", protocol.created_at.to_rfc3339())
+        .param("updated_at", protocol.updated_at.to_rfc3339());
+
+        self.graph
+            .run(q)
+            .await
+            .context("Failed to upsert protocol")?;
+
+        // Link to skill if present
+        if let Some(skill_id) = &protocol.skill_id {
+            let link_q = query(
+                r#"
+                MATCH (proto:Protocol {id: $protocol_id})
+                MATCH (s:Skill {id: $skill_id})
+                MERGE (proto)-[:BELONGS_TO_SKILL]->(s)
+                "#,
+            )
+            .param("protocol_id", protocol.id.to_string())
+            .param("skill_id", skill_id.to_string());
+
+            // Best-effort: don't fail if skill doesn't exist
+            let _ = self.graph.run(link_q).await;
+        }
+
+        Ok(())
+    }
+
+    /// Get a protocol by ID.
+    pub async fn get_protocol(&self, id: Uuid) -> Result<Option<Protocol>> {
+        let q = query(
+            r#"
+            MATCH (proto:Protocol {id: $id})
+            RETURN proto
+            "#,
+        )
+        .param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("proto")?;
+            Ok(Some(Self::node_to_protocol(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List protocols for a project with optional category filter and pagination.
+    pub async fn list_protocols(
+        &self,
+        project_id: Option<Uuid>,
+        category: Option<ProtocolCategory>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Protocol>, usize)> {
+        // Count query
+        let count_cypher = if category.is_some() {
+            r#"
+            MATCH (proto:Protocol {protocol_category: $category})
+            WHERE (proto.project_id = $project_id
+               OR ($project_id IS NOT NULL AND proto.project_id IS NULL)
+               OR ($project_id IS NULL AND proto.project_id IS NULL))
+            RETURN count(proto) AS total
+            "#
+        } else {
+            r#"
+            MATCH (proto:Protocol)
+            WHERE (proto.project_id = $project_id
+               OR ($project_id IS NOT NULL AND proto.project_id IS NULL)
+               OR ($project_id IS NULL AND proto.project_id IS NULL))
+            RETURN count(proto) AS total
+            "#
+        };
+
+        let mut count_q =
+            query(count_cypher).param("project_id", project_id.map(|id| id.to_string()));
+        if let Some(ref cat) = category {
+            count_q = count_q.param("category", cat.to_string());
+        }
+
+        let mut count_result = self.graph.execute(count_q).await?;
+        let total: usize = if let Some(row) = count_result.next().await? {
+            row.get::<i64>("total").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        if total == 0 {
+            return Ok((vec![], 0));
+        }
+
+        // List query
+        let list_cypher = if category.is_some() {
+            r#"
+            MATCH (proto:Protocol {protocol_category: $category})
+            WHERE (proto.project_id = $project_id
+               OR ($project_id IS NOT NULL AND proto.project_id IS NULL)
+               OR ($project_id IS NULL AND proto.project_id IS NULL))
+            RETURN proto
+            ORDER BY proto.updated_at DESC, proto.id DESC
+            SKIP $offset LIMIT $limit
+            "#
+        } else {
+            r#"
+            MATCH (proto:Protocol)
+            WHERE (proto.project_id = $project_id
+               OR ($project_id IS NOT NULL AND proto.project_id IS NULL)
+               OR ($project_id IS NULL AND proto.project_id IS NULL))
+            RETURN proto
+            ORDER BY proto.updated_at DESC, proto.id DESC
+            SKIP $offset LIMIT $limit
+            "#
+        };
+
+        let mut list_q = query(list_cypher)
+            .param("project_id", project_id.map(|id| id.to_string()))
+            .param("offset", offset as i64)
+            .param("limit", limit as i64);
+        if let Some(ref cat) = category {
+            list_q = list_q.param("category", cat.to_string());
+        }
+
+        let mut result = self.graph.execute(list_q).await?;
+        let mut protocols = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("proto")?;
+            match Self::node_to_protocol(&node) {
+                Ok(protocol) => protocols.push(protocol),
+                Err(e) => {
+                    let id_hint = node.get::<String>("id").unwrap_or_default();
+                    warn!("Skipping corrupted Protocol node (id={}): {}", id_hint, e);
+                }
+            }
+        }
+
+        Ok((protocols, total))
+    }
+
+    /// Delete a protocol and all its states, transitions, and relationships.
+    pub async fn delete_protocol(&self, id: Uuid) -> Result<bool> {
+        // First check if it exists
+        let check_q = query(
+            r#"
+            MATCH (proto:Protocol {id: $id})
+            RETURN proto.id AS found_id
+            "#,
+        )
+        .param("id", id.to_string());
+
+        let mut check_result = self.graph.execute(check_q).await?;
+        let exists = check_result.next().await?.is_some();
+
+        if !exists {
+            return Ok(false);
+        }
+
+        // Delete runs, states, transitions, then the protocol
+        let delete_q = query(
+            r#"
+            MATCH (proto:Protocol {id: $id})
+            OPTIONAL MATCH (proto)-[:HAS_STATE]->(s:ProtocolState)
+            OPTIONAL MATCH (proto)-[:HAS_TRANSITION]->(t:ProtocolTransition)
+            OPTIONAL MATCH (proto)<-[:INSTANCE_OF]-(r:ProtocolRun)
+            DETACH DELETE s, t, r, proto
+            "#,
+        )
+        .param("id", id.to_string());
+
+        self.graph
+            .run(delete_q)
+            .await
+            .context("Failed to delete protocol")?;
+
+        Ok(true)
+    }
+
+    // ========================================================================
+    // ProtocolState CRUD
+    // ========================================================================
+
+    /// Upsert a protocol state and create its HAS_STATE relationship.
+    pub async fn upsert_protocol_state(&self, state: &ProtocolState) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (proto:Protocol {id: $protocol_id})
+            MERGE (s:ProtocolState {id: $id})
+            SET s.protocol_id = $protocol_id,
+                s.name = $name,
+                s.description = $description,
+                s.action = $action,
+                s.state_type = $state_type,
+                s.sub_protocol_id = $sub_protocol_id,
+                s.completion_strategy = $completion_strategy,
+                s.on_failure_strategy = $on_failure_strategy,
+                s.generator_config_json = $generator_config_json,
+                s.prompt_fragment = $prompt_fragment,
+                s.available_tools_json = $available_tools_json,
+                s.forbidden_actions_json = $forbidden_actions_json,
+                s.state_timeout_secs = $state_timeout_secs
+            MERGE (proto)-[:HAS_STATE]->(s)
+            "#,
+        )
+        .param("id", state.id.to_string())
+        .param("protocol_id", state.protocol_id.to_string())
+        .param("name", state.name.clone())
+        .param("description", state.description.clone())
+        .param("action", state.action.clone().unwrap_or_default())
+        .param("state_type", state.state_type.to_string())
+        .param(
+            "sub_protocol_id",
+            state
+                .sub_protocol_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+        )
+        .param(
+            "completion_strategy",
+            state
+                .completion_strategy
+                .map(|c| c.to_string())
+                .unwrap_or_default(),
+        )
+        .param(
+            "on_failure_strategy",
+            state
+                .on_failure_strategy
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+        )
+        .param(
+            "generator_config_json",
+            state
+                .generator_config
+                .as_ref()
+                .map(|c| serde_json::to_string(c).unwrap_or_default())
+                .unwrap_or_default(),
+        )
+        .param(
+            "prompt_fragment",
+            state.prompt_fragment.clone().unwrap_or_default(),
+        )
+        .param(
+            "available_tools_json",
+            state
+                .available_tools
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_default())
+                .unwrap_or_default(),
+        )
+        .param(
+            "forbidden_actions_json",
+            state
+                .forbidden_actions
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_default())
+                .unwrap_or_default(),
+        )
+        .param(
+            "state_timeout_secs",
+            state.state_timeout_secs.map(|v| v as i64).unwrap_or(-1),
+        );
+
+        self.graph
+            .run(q)
+            .await
+            .context("Failed to upsert protocol state")?;
+
+        Ok(())
+    }
+
+    /// Get all states for a protocol.
+    pub async fn get_protocol_states(&self, protocol_id: Uuid) -> Result<Vec<ProtocolState>> {
+        let q = query(
+            r#"
+            MATCH (s:ProtocolState {protocol_id: $protocol_id})
+            RETURN s
+            ORDER BY s.state_type, s.name
+            "#,
+        )
+        .param("protocol_id", protocol_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut states = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            states.push(Self::node_to_protocol_state(&node)?);
+        }
+
+        Ok(states)
+    }
+
+    /// Count total ProtocolState and ProtocolTransition nodes across all
+    /// protocols of a project, in a single query.
+    ///
+    /// Replaces the previous per-protocol N+1 in the project overview, which
+    /// looped over every protocol and fired two queries each. States and
+    /// transitions are matched by their `protocol_id` property (the same access
+    /// pattern as [`Self::get_protocol_states`]).
+    pub async fn count_protocol_states_transitions(&self, project_id: Uuid) -> Result<(i64, i64)> {
+        let q = query(
+            r#"
+            MATCH (proto:Protocol)
+            WHERE (proto.project_id = $project_id
+               OR ($project_id IS NOT NULL AND proto.project_id IS NULL)
+               OR ($project_id IS NULL AND proto.project_id IS NULL))
+            WITH collect(proto.id) AS pids
+            OPTIONAL MATCH (s:ProtocolState) WHERE s.protocol_id IN pids
+            WITH pids, count(s) AS states
+            OPTIONAL MATCH (t:ProtocolTransition) WHERE t.protocol_id IN pids
+            RETURN states, count(t) AS transitions
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let states: i64 = row.get("states").unwrap_or(0);
+            let transitions: i64 = row.get("transitions").unwrap_or(0);
+            Ok((states, transitions))
+        } else {
+            Ok((0, 0))
+        }
+    }
+
+    /// Delete a protocol state and its relationships.
+    pub async fn delete_protocol_state(&self, state_id: Uuid) -> Result<bool> {
+        let check_q = query(
+            r#"
+            MATCH (s:ProtocolState {id: $id})
+            RETURN s.id AS found_id
+            "#,
+        )
+        .param("id", state_id.to_string());
+
+        let mut check_result = self.graph.execute(check_q).await?;
+        let exists = check_result.next().await?.is_some();
+
+        if !exists {
+            return Ok(false);
+        }
+
+        let delete_q = query(
+            r#"
+            MATCH (s:ProtocolState {id: $id})
+            DETACH DELETE s
+            "#,
+        )
+        .param("id", state_id.to_string());
+
+        self.graph
+            .run(delete_q)
+            .await
+            .context("Failed to delete protocol state")?;
+
+        Ok(true)
+    }
+
+    // ========================================================================
+    // ProtocolTransition CRUD
+    // ========================================================================
+
+    /// Upsert a protocol transition and create its HAS_TRANSITION relationship.
+    pub async fn upsert_protocol_transition(&self, transition: &ProtocolTransition) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (proto:Protocol {id: $protocol_id})
+            MERGE (t:ProtocolTransition {id: $id})
+            SET t.protocol_id = $protocol_id,
+                t.from_state = $from_state,
+                t.to_state = $to_state,
+                t.trigger = $trigger,
+                t.guard = $guard,
+                t.guard_expr = $guard_expr
+            MERGE (proto)-[:HAS_TRANSITION]->(t)
+            "#,
+        )
+        .param("id", transition.id.to_string())
+        .param("protocol_id", transition.protocol_id.to_string())
+        .param("from_state", transition.from_state.to_string())
+        .param("to_state", transition.to_state.to_string())
+        .param("trigger", transition.trigger.clone())
+        .param("guard", transition.guard.clone().unwrap_or_default())
+        .param(
+            "guard_expr",
+            transition
+                .guard_expr
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .context("Failed to serialize the transition guard_expr")?
+                .unwrap_or_default(),
+        );
+
+        self.graph
+            .run(q)
+            .await
+            .context("Failed to upsert protocol transition")?;
+
+        Ok(())
+    }
+
+    /// Get all transitions for a protocol.
+    pub async fn get_protocol_transitions(
+        &self,
+        protocol_id: Uuid,
+    ) -> Result<Vec<ProtocolTransition>> {
+        let q = query(
+            r#"
+            MATCH (t:ProtocolTransition {protocol_id: $protocol_id})
+            RETURN t
+            ORDER BY t.trigger, t.id
+            "#,
+        )
+        .param("protocol_id", protocol_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut transitions = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("t")?;
+            transitions.push(Self::node_to_protocol_transition(&node)?);
+        }
+
+        Ok(transitions)
+    }
+
+    /// Delete a protocol transition.
+    pub async fn delete_protocol_transition(&self, transition_id: Uuid) -> Result<bool> {
+        let check_q = query(
+            r#"
+            MATCH (t:ProtocolTransition {id: $id})
+            RETURN t.id AS found_id
+            "#,
+        )
+        .param("id", transition_id.to_string());
+
+        let mut check_result = self.graph.execute(check_q).await?;
+        let exists = check_result.next().await?.is_some();
+
+        if !exists {
+            return Ok(false);
+        }
+
+        let delete_q = query(
+            r#"
+            MATCH (t:ProtocolTransition {id: $id})
+            DETACH DELETE t
+            "#,
+        )
+        .param("id", transition_id.to_string());
+
+        self.graph
+            .run(delete_q)
+            .await
+            .context("Failed to delete protocol transition")?;
+
+        Ok(true)
+    }
+
+    // ========================================================================
+    // ProtocolRun CRUD (FSM Runtime)
+    // ========================================================================
+
+    /// Convert a Neo4j node to a [`ProtocolRun`].
+    pub(crate) fn node_to_protocol_run(node: &neo4rs::Node) -> Result<ProtocolRun> {
+        let states_visited_json: String = node
+            .get("states_visited_json")
+            .unwrap_or_else(|_| "[]".to_string());
+        let states_visited: Vec<StateVisit> =
+            serde_json::from_str(&states_visited_json).unwrap_or_default();
+
+        Ok(ProtocolRun {
+            id: node.get::<String>("id")?.parse()?,
+            protocol_id: node.get::<String>("protocol_id")?.parse()?,
+            project_id: node.get::<String>("project_id").ok().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse().ok()
+                }
+            }),
+            plan_id: node
+                .get::<String>("plan_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            task_id: node
+                .get::<String>("task_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            parent_run_id: node
+                .get::<String>("parent_run_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            current_state: node.get::<String>("current_state")?.parse()?,
+            states_visited,
+            status: node
+                .get::<String>("status")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
+            started_at: {
+                let raw = node.get::<String>("started_at")?;
+                raw.parse().unwrap_or_else(|_| chrono::Utc::now())
+            },
+            completed_at: node
+                .get::<String>("completed_at")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            error: node.get::<String>("error").ok().filter(|s| !s.is_empty()),
+            triggered_by: node
+                .get::<String>("triggered_by")
+                .unwrap_or_else(|_| "manual".to_string()),
+            depth: node.get::<i64>("depth").unwrap_or(0) as u32,
+            version: node.get::<i64>("version").unwrap_or(0) as u64,
+            runner_managed: node.get::<bool>("runner_managed").unwrap_or(false),
+        })
+    }
+
+    /// Create a new protocol run node with INSTANCE_OF relationship to its protocol.
+    ///
+    /// # Atomic concurrency guard
+    ///
+    /// The Cypher uses a conditional pattern: the CREATE only executes when no
+    /// existing `ProtocolRun` with `status = 'running'` exists for the same
+    /// protocol. If a concurrent run is already running, the query returns no
+    /// rows and this method returns an error.
+    pub async fn create_protocol_run(&self, run: &ProtocolRun) -> Result<()> {
+        let states_visited_json = serde_json::to_string(&run.states_visited)?;
+
+        let q = query(
+            r#"
+            MATCH (proto:Protocol {id: $protocol_id})
+            WHERE $is_child = true OR NOT EXISTS {
+                MATCH (existing:ProtocolRun {protocol_id: $protocol_id, status: 'running'})
+                WHERE existing.parent_run_id IS NULL OR existing.parent_run_id = ''
+            }
+            CREATE (r:ProtocolRun {
+                id: $id,
+                protocol_id: $protocol_id,
+                project_id: $project_id,
+                plan_id: $plan_id,
+                task_id: $task_id,
+                parent_run_id: $parent_run_id,
+                current_state: $current_state,
+                states_visited_json: $states_visited_json,
+                status: $status,
+                started_at: $started_at,
+                completed_at: $completed_at,
+                error: $error,
+                triggered_by: $triggered_by,
+                depth: $depth,
+                version: $version,
+                runner_managed: $runner_managed
+            })
+            CREATE (r)-[:INSTANCE_OF]->(proto)
+            RETURN r.id AS created_id
+            "#,
+        )
+        .param("id", run.id.to_string())
+        .param("protocol_id", run.protocol_id.to_string())
+        .param("project_id", run.project_id.map(|u| u.to_string()))
+        .param(
+            "plan_id",
+            run.plan_id.map(|u| u.to_string()).unwrap_or_default(),
+        )
+        .param(
+            "task_id",
+            run.task_id.map(|u| u.to_string()).unwrap_or_default(),
+        )
+        .param(
+            "parent_run_id",
+            run.parent_run_id.map(|u| u.to_string()).unwrap_or_default(),
+        )
+        .param("current_state", run.current_state.to_string())
+        .param("states_visited_json", states_visited_json)
+        .param("status", run.status.to_string())
+        .param("started_at", run.started_at.to_rfc3339())
+        .param(
+            "completed_at",
+            run.completed_at
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
+        )
+        .param("error", run.error.clone().unwrap_or_default())
+        .param("triggered_by", run.triggered_by.clone())
+        .param("depth", run.depth as i64)
+        .param("version", run.version as i64)
+        .param("is_child", run.parent_run_id.is_some())
+        .param("runner_managed", run.runner_managed);
+
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("Failed to create protocol run")?;
+
+        // If no rows returned, the WHERE NOT EXISTS clause prevented creation
+        // (a running run already exists for this protocol).
+        let row = result
+            .next()
+            .await
+            .context("Failed to read create_protocol_run result")?;
+        if row.is_none() {
+            anyhow::bail!(
+                "Skipped: concurrent run already running for protocol {}",
+                run.protocol_id
+            );
+        }
+
+        // Link to parent run if present (hierarchical)
+        if let Some(parent_id) = &run.parent_run_id {
+            let link_q = query(
+                r#"
+                MATCH (child:ProtocolRun {id: $child_id})
+                MATCH (parent:ProtocolRun {id: $parent_id})
+                MERGE (child)-[:CHILD_OF]->(parent)
+                "#,
+            )
+            .param("child_id", run.id.to_string())
+            .param("parent_id", parent_id.to_string());
+            let _ = self.graph.run(link_q).await;
+        }
+
+        // Link to plan if present
+        if let Some(plan_id) = &run.plan_id {
+            let link_q = query(
+                r#"
+                MATCH (r:ProtocolRun {id: $run_id})
+                MATCH (p:Plan {id: $plan_id})
+                MERGE (r)-[:LINKED_TO_PLAN]->(p)
+                "#,
+            )
+            .param("run_id", run.id.to_string())
+            .param("plan_id", plan_id.to_string());
+            let _ = self.graph.run(link_q).await;
+        }
+
+        // Link to task if present
+        if let Some(task_id) = &run.task_id {
+            let link_q = query(
+                r#"
+                MATCH (r:ProtocolRun {id: $run_id})
+                MATCH (t:Task {id: $task_id})
+                MERGE (r)-[:LINKED_TO_TASK]->(t)
+                "#,
+            )
+            .param("run_id", run.id.to_string())
+            .param("task_id", task_id.to_string());
+            let _ = self.graph.run(link_q).await;
+        }
+
+        Ok(())
+    }
+
+    /// Get a protocol run by ID.
+    pub async fn get_protocol_run(&self, run_id: Uuid) -> Result<Option<ProtocolRun>> {
+        let q = query(
+            r#"
+            MATCH (r:ProtocolRun {id: $id})
+            RETURN r
+            "#,
+        )
+        .param("id", run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            Ok(Some(Self::node_to_protocol_run(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update an existing protocol run with optimistic locking (compare-and-swap).
+    ///
+    /// The update only succeeds if `r.version` in Neo4j matches `run.version`.
+    /// On success, `version` is incremented both in Neo4j and on the passed `run`.
+    /// If another caller updated the run concurrently (version mismatch), returns
+    /// an `OptimisticLockError`.
+    pub async fn update_protocol_run(&self, run: &mut ProtocolRun) -> Result<()> {
+        let states_visited_json = serde_json::to_string(&run.states_visited)?;
+        let new_version = run.version + 1;
+
+        let q = query(
+            r#"
+            MATCH (r:ProtocolRun {id: $id})
+            WHERE coalesce(r.version, 0) = $expected_version
+            SET r.current_state = $current_state,
+                r.states_visited_json = $states_visited_json,
+                r.status = $status,
+                r.completed_at = $completed_at,
+                r.error = $error,
+                r.version = $new_version,
+                r.runner_managed = $runner_managed
+            RETURN r.id AS updated_id
+            "#,
+        )
+        .param("id", run.id.to_string())
+        .param("expected_version", run.version as i64)
+        .param("new_version", new_version as i64)
+        .param("current_state", run.current_state.to_string())
+        .param("states_visited_json", states_visited_json)
+        .param("status", run.status.to_string())
+        .param(
+            "completed_at",
+            run.completed_at
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
+        )
+        .param("error", run.error.clone().unwrap_or_default())
+        .param("runner_managed", run.runner_managed);
+
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("Failed to update protocol run")?;
+
+        let row = result
+            .next()
+            .await
+            .context("Failed to read update_protocol_run result")?;
+
+        if row.is_none() {
+            anyhow::bail!(
+                "OptimisticLockError: protocol run {} was modified concurrently (expected version {}, stale)",
+                run.id,
+                run.version
+            );
+        }
+
+        // Bump version in-place so the caller's struct stays in sync with Neo4j
+        run.version = new_version;
+
+        Ok(())
+    }
+
+    /// List protocol runs across all protocols, newest first.
+    ///
+    /// The scope is resolved through the owning protocol's `project_id`
+    /// (`project_id` wins over `workspace_slug`). Values are bound
+    /// parameters; the status equality uses the `protocol_run_status` index;
+    /// the page is bounded by `LIMIT`.
+    pub async fn list_all_protocol_runs(
+        &self,
+        status: Option<RunStatus>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ProtocolRun>, usize)> {
+        let head = if status.is_some() {
+            "MATCH (r:ProtocolRun {status: $status})"
+        } else {
+            "MATCH (r:ProtocolRun)"
+        };
+        let join = if project_id.is_some() {
+            "MATCH (proto:Protocol {id: r.protocol_id}) WHERE proto.project_id = $project_id"
+        } else if workspace_slug.is_some() {
+            "MATCH (proto:Protocol {id: r.protocol_id}) WHERE proto.project_id IN [(w:Workspace {slug: $workspace_slug})<-[:BELONGS_TO_WORKSPACE]-(p:Project) | p.id]"
+        } else {
+            ""
+        };
+        let bind = |q: neo4rs::Query| -> neo4rs::Query {
+            let q = match status {
+                Some(ref s) => q.param("status", s.to_string()),
+                None => q,
+            };
+            if let Some(pid) = project_id {
+                q.param("project_id", pid.to_string())
+            } else if let Some(ws) = workspace_slug {
+                q.param("workspace_slug", ws.to_string())
+            } else {
+                q
+            }
+        };
+
+        let count_cypher = format!("{} {} RETURN count(r) AS total", head, join);
+        let mut count_result = self.graph.execute(bind(query(&count_cypher))).await?;
+        let total: usize = if let Some(row) = count_result.next().await? {
+            row.get::<i64>("total").unwrap_or(0) as usize
+        } else {
+            0
+        };
+        if total == 0 {
+            return Ok((vec![], 0));
+        }
+
+        let list_cypher = format!(
+            "{} {} RETURN r ORDER BY r.started_at DESC, r.id DESC SKIP $offset LIMIT $limit",
+            head, join
+        );
+        let list_q = bind(
+            query(&list_cypher)
+                .param("offset", offset as i64)
+                .param("limit", limit as i64),
+        );
+        let mut result = self.graph.execute(list_q).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            runs.push(Self::node_to_protocol_run(&node)?);
+        }
+        Ok((runs, total))
+    }
+
+    /// List protocol runs for a protocol with optional status filter and pagination.
+    pub async fn list_protocol_runs(
+        &self,
+        protocol_id: Uuid,
+        status: Option<RunStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ProtocolRun>, usize)> {
+        // Count query
+        let count_cypher = if status.is_some() {
+            r#"
+            MATCH (r:ProtocolRun {protocol_id: $protocol_id, status: $status})
+            RETURN count(r) AS total
+            "#
+        } else {
+            r#"
+            MATCH (r:ProtocolRun {protocol_id: $protocol_id})
+            RETURN count(r) AS total
+            "#
+        };
+
+        let mut count_q = query(count_cypher).param("protocol_id", protocol_id.to_string());
+        if let Some(ref s) = status {
+            count_q = count_q.param("status", s.to_string());
+        }
+
+        let mut count_result = self.graph.execute(count_q).await?;
+        let total: usize = if let Some(row) = count_result.next().await? {
+            row.get::<i64>("total").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        if total == 0 {
+            return Ok((vec![], 0));
+        }
+
+        // List query
+        let list_cypher = if status.is_some() {
+            r#"
+            MATCH (r:ProtocolRun {protocol_id: $protocol_id, status: $status})
+            RETURN r
+            ORDER BY r.started_at DESC, r.id DESC
+            SKIP $offset LIMIT $limit
+            "#
+        } else {
+            r#"
+            MATCH (r:ProtocolRun {protocol_id: $protocol_id})
+            RETURN r
+            ORDER BY r.started_at DESC, r.id DESC
+            SKIP $offset LIMIT $limit
+            "#
+        };
+
+        let mut list_q = query(list_cypher)
+            .param("protocol_id", protocol_id.to_string())
+            .param("offset", offset as i64)
+            .param("limit", limit as i64);
+        if let Some(ref s) = status {
+            list_q = list_q.param("status", s.to_string());
+        }
+
+        let mut result = self.graph.execute(list_q).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            runs.push(Self::node_to_protocol_run(&node)?);
+        }
+
+        Ok((runs, total))
+    }
+
+    /// List child runs for a given parent run, ordered by started_at.
+    pub async fn list_child_runs(&self, parent_run_id: Uuid) -> Result<Vec<ProtocolRun>> {
+        let q = query(
+            r#"
+            MATCH (child:ProtocolRun)-[:CHILD_OF]->(parent:ProtocolRun {id: $parent_id})
+            RETURN child
+            ORDER BY child.started_at ASC
+            "#,
+        )
+        .param("parent_id", parent_run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("child")?;
+            runs.push(Self::node_to_protocol_run(&node)?);
+        }
+        Ok(runs)
+    }
+
+    /// Count children for a given run.
+    pub async fn count_child_runs(&self, parent_run_id: Uuid) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (child:ProtocolRun)-[:CHILD_OF]->(parent:ProtocolRun {id: $parent_id})
+            RETURN count(child) AS cnt
+            "#,
+        )
+        .param("parent_id", parent_run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("cnt").unwrap_or(0) as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get the full run tree rooted at a given run (recursive, depth limit 5).
+    ///
+    /// Returns a flat list of all runs in the tree (root + all descendants),
+    /// ordered by depth then started_at.
+    pub async fn get_run_tree(&self, root_run_id: Uuid) -> Result<Vec<ProtocolRun>> {
+        let q = query(
+            r#"
+            MATCH (root:ProtocolRun {id: $root_id})
+            OPTIONAL MATCH path = (descendant:ProtocolRun)-[:CHILD_OF*1..5]->(root)
+            WITH root, collect(DISTINCT descendant) AS descendants
+            UNWIND ([root] + descendants) AS r
+            RETURN DISTINCT r
+            ORDER BY r.depth ASC, r.started_at ASC
+            "#,
+        )
+        .param("root_id", root_run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            match Self::node_to_protocol_run(&node) {
+                Ok(run) => runs.push(run),
+                Err(e) => {
+                    warn!("Skipping corrupted ProtocolRun in tree: {}", e);
+                }
+            }
+        }
+        Ok(runs)
+    }
+
+    /// Delete a protocol run and its associated runtime states.
+    pub async fn delete_protocol_run(&self, run_id: Uuid) -> Result<bool> {
+        let check_q = query(
+            r#"
+            MATCH (r:ProtocolRun {id: $id})
+            RETURN r.id AS found_id
+            "#,
+        )
+        .param("id", run_id.to_string());
+
+        let mut check_result = self.graph.execute(check_q).await?;
+        let exists = check_result.next().await?.is_some();
+
+        if !exists {
+            return Ok(false);
+        }
+
+        // Cascade delete runtime states first
+        let delete_rs_q = query(
+            r#"
+            MATCH (rs:RuntimeState {run_id: $run_id})
+            DETACH DELETE rs
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+        let _ = self.graph.run(delete_rs_q).await;
+
+        let delete_q = query(
+            r#"
+            MATCH (r:ProtocolRun {id: $id})
+            DETACH DELETE r
+            "#,
+        )
+        .param("id", run_id.to_string());
+
+        self.graph
+            .run(delete_q)
+            .await
+            .context("Failed to delete protocol run")?;
+
+        Ok(true)
+    }
+
+    // ========================================================================
+    // RuntimeState CRUD (Generator-produced dynamic states)
+    // ========================================================================
+
+    /// Convert a Neo4j node to a [`RuntimeState`].
+    pub(crate) fn node_to_runtime_state(node: &neo4rs::Node) -> Result<RuntimeState> {
+        Ok(RuntimeState {
+            id: node.get::<String>("id")?.parse()?,
+            run_id: node.get::<String>("run_id")?.parse()?,
+            generated_by: node.get::<String>("generated_by")?.parse()?,
+            name: node.get("name")?,
+            index: node.get::<i64>("index").unwrap_or(0) as u32,
+            sub_protocol_id: node
+                .get::<String>("sub_protocol_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            action: node.get::<String>("action").ok().filter(|s| !s.is_empty()),
+            status: node
+                .get::<String>("status")
+                .unwrap_or_else(|_| "pending".to_string()),
+            next_runtime_state_id: node
+                .get::<String>("next_runtime_state_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            linking_strategy: node
+                .get::<String>("linking_strategy")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Create a new RuntimeState node with HAS_RUNTIME_STATE and GENERATED_BY relationships.
+    pub async fn create_runtime_state(&self, state: &RuntimeState) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (r:ProtocolRun {id: $run_id})
+            MATCH (ps:ProtocolState {id: $generated_by})
+            CREATE (rs:RuntimeState {
+                id: $id,
+                run_id: $run_id,
+                generated_by: $generated_by,
+                name: $name,
+                index: $index,
+                sub_protocol_id: $sub_protocol_id,
+                action: $action,
+                status: $status,
+                next_runtime_state_id: $next_runtime_state_id,
+                linking_strategy: $linking_strategy
+            })
+            CREATE (r)-[:HAS_RUNTIME_STATE]->(rs)
+            CREATE (rs)-[:GENERATED_BY]->(ps)
+            "#,
+        )
+        .param("id", state.id.to_string())
+        .param("run_id", state.run_id.to_string())
+        .param("generated_by", state.generated_by.to_string())
+        .param("name", state.name.clone())
+        .param("index", state.index as i64)
+        .param(
+            "sub_protocol_id",
+            state
+                .sub_protocol_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+        )
+        .param("action", state.action.clone().unwrap_or_default())
+        .param("status", state.status.clone())
+        .param(
+            "next_runtime_state_id",
+            state
+                .next_runtime_state_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+        )
+        .param("linking_strategy", state.linking_strategy.to_string());
+
+        self.graph
+            .run(q)
+            .await
+            .context("Failed to create runtime state")?;
+
+        Ok(())
+    }
+
+    /// Get all RuntimeStates for a protocol run, ordered by index.
+    pub async fn get_runtime_states(&self, run_id: Uuid) -> Result<Vec<RuntimeState>> {
+        let q = query(
+            r#"
+            MATCH (rs:RuntimeState {run_id: $run_id})
+            RETURN rs
+            ORDER BY rs.index ASC
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut states = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("rs")?;
+            states.push(Self::node_to_runtime_state(&node)?);
+        }
+        Ok(states)
+    }
+
+    /// Delete all RuntimeStates for a protocol run.
+    pub async fn delete_runtime_states(&self, run_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (rs:RuntimeState {run_id: $run_id})
+            DETACH DELETE rs
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        self.graph
+            .run(q)
+            .await
+            .context("Failed to delete runtime states")?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // PRODUCED_DURING — link artefacts to the run that produced them
+    // ========================================================================
+
+    /// Create a PRODUCED_DURING relationship from a Note or Decision to a ProtocolRun.
+    ///
+    /// Direction: `(artefact)-[:PRODUCED_DURING {produced_at}]->(run)`
+    /// The artefact (Note or Decision) points to the run that produced it.
+    pub async fn create_produced_during(
+        &self,
+        entity_type: &str,
+        entity_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<bool> {
+        let node_label = match entity_type {
+            "note" | "Note" => "Note",
+            "decision" | "Decision" => "Decision",
+            other => anyhow::bail!("PRODUCED_DURING only supports Note and Decision, got: {other}"),
+        };
+
+        let cypher = format!(
+            r#"
+            MATCH (e:{} {{id: $entity_id}})
+            MATCH (r:ProtocolRun {{id: $run_id}})
+            MERGE (e)-[rel:PRODUCED_DURING]->(r)
+            ON CREATE SET rel.produced_at = datetime()
+            RETURN rel IS NOT NULL AS created
+            "#,
+            node_label
+        );
+
+        let q = query(&cypher)
+            .param("entity_id", entity_id.to_string())
+            .param("run_id", run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<bool>("created").unwrap_or(false))
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Get all artefacts (notes + decisions) produced during a protocol run.
+    ///
+    /// Returns a list of `(entity_type, entity_id, produced_at)` tuples.
+    pub async fn get_run_outcomes(&self, run_id: Uuid) -> Result<Vec<ProducedArtefact>> {
+        let q = query(
+            r#"
+            MATCH (e)-[rel:PRODUCED_DURING]->(r:ProtocolRun {id: $run_id})
+            WHERE e:Note OR e:Decision
+            RETURN
+                CASE WHEN e:Note THEN 'note' ELSE 'decision' END AS entity_type,
+                e.id AS entity_id,
+                rel.produced_at AS produced_at,
+                CASE WHEN e:Note THEN coalesce(e.content, '') ELSE coalesce(e.description, '') END AS summary
+            ORDER BY rel.produced_at ASC
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut artefacts = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let entity_type: String = row.get("entity_type")?;
+            let entity_id: String = row.get("entity_id")?;
+            let produced_at: Option<String> = row.get::<String>("produced_at").ok();
+            let summary: String = row.get("summary").unwrap_or_default();
+
+            artefacts.push(ProducedArtefact {
+                entity_type,
+                entity_id: entity_id.parse()?,
+                produced_at: produced_at
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(chrono::Utc::now),
+                summary: if summary.len() > 200 {
+                    format!("{}...", &summary[..200])
+                } else {
+                    summary
+                },
+            });
+        }
+
+        Ok(artefacts)
+    }
+
+    /// Re-scope a protocol: `None` makes it transverse, `Some(pid)` attaches it.
+    ///
+    /// Same contract as [`Self::rescope_skill`]: the edge moves, it is never
+    /// duplicated, and the property follows in the same statement.
+    pub async fn rescope_protocol(
+        &self,
+        protocol_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Protocol {id: $id})
+            OPTIONAL MATCH (p)-[old:BELONGS_TO]->(:Project)
+            DELETE old
+            WITH p
+            OPTIONAL MATCH (proj:Project {id: $project_id})
+            FOREACH (_ IN CASE WHEN proj IS NULL THEN [] ELSE [1] END |
+                CREATE (p)-[:BELONGS_TO]->(proj)
+            )
+            SET p.project_id = $project_id
+            RETURN p.id AS id
+            "#,
+        )
+        .param("id", protocol_id.to_string())
+        .param("project_id", project_id.map(|p| p.to_string()));
+
+        let mut result = self.graph.execute(q).await?;
+        result.next().await?;
+        Ok(())
+    }
+
+    /// Find the most recently started active (running) protocol run for a project.
+    ///
+    /// Traverses: ProtocolRun -[:INSTANCE_OF]-> Protocol {project_id}.
+    /// Returns the run_id if found, None otherwise.
+    pub async fn find_active_run_for_project(&self, project_id: Uuid) -> Result<Option<Uuid>> {
+        let q = query(
+            r#"
+            MATCH (r:ProtocolRun {status: 'running'})-[:INSTANCE_OF]->(p:Protocol)
+            WHERE r.project_id = $project_id
+               OR (r.project_id IS NULL AND p.project_id = $project_id)
+            RETURN r.id AS run_id
+            ORDER BY r.started_at DESC
+            LIMIT 1
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let run_id_str: String = row.get("run_id")?;
+            Ok(Some(run_id_str.parse()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get the ID of a persisted reasoning tree linked to a protocol run.
+    /// Returns the tree UUID if found, None otherwise.
+    pub async fn get_run_reasoning_tree_id(&self, run_id: Uuid) -> Result<Option<Uuid>> {
+        let q = query(
+            r#"
+            MATCH (t:PersistedReasoningTree)-[:REASONING_FOR]->(r:ProtocolRun {id: $run_id})
+            RETURN t.id AS tree_id
+            ORDER BY t.persisted_at DESC
+            LIMIT 1
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let tree_id_str: String = row.get("tree_id")?;
+            Ok(Some(tree_id_str.parse()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List completed protocol runs for a project (most recent first).
+    pub async fn list_completed_runs_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ProtocolRun>> {
+        let q = query(
+            r#"
+            MATCH (r:ProtocolRun {status: 'completed'})-[:INSTANCE_OF]->(p:Protocol)
+            WHERE r.project_id = $project_id
+               OR (r.project_id IS NULL AND p.project_id = $project_id)
+            RETURN r
+            ORDER BY r.completed_at DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            if let Ok(run) = Self::node_to_protocol_run(&node) {
+                runs.push(run);
+            }
+        }
+        Ok(runs)
+    }
+
+    /// Backfill PRODUCED_DURING relations for completed runs.
+    ///
+    /// Uses a heuristic: notes/decisions created between run.started_at and
+    /// run.completed_at with the same project_id are assumed to have been
+    /// produced during that run.
+    ///
+    /// Returns the number of relations created.
+    pub async fn backfill_produced_during(&self, project_id: Uuid) -> Result<usize> {
+        let q = query(
+            &r#"
+            MATCH (r:ProtocolRun {status: 'completed'})
+            MATCH (p:Protocol {id: r.protocol_id})
+            WHERE (r.project_id = $project_id
+                   OR (r.project_id IS NULL AND p.project_id = $project_id))
+              AND r.completed_at IS NOT NULL
+
+            // Find notes created during the run window
+            OPTIONAL MATCH (n:Note)
+            WHERE n.project_id = $project_id
+              AND n.created_at >= r.started_at
+              AND n.created_at <= r.completed_at
+              AND NOT (n)-[:PRODUCED_DURING]->(r)
+            WITH r, collect(DISTINCT n) AS notes
+
+            // Find decisions of the same project created during the run
+            // window (one decision→project traversal, DECISION_PROJECT_PATH;
+            // the former check was a separate OPTIONAL MATCH on a
+            // Plan-[:BELONGS_TO]->Project edge that is never written, so it
+            // filtered nothing and linked decisions of every project).
+            OPTIONAL MATCH (d:Decision)
+            WHERE d.decided_at >= r.started_at
+              AND d.decided_at <= r.completed_at
+              AND NOT (d)-[:PRODUCED_DURING]->(r)
+              AND EXISTS { MATCH __PATH__ WHERE proj.id = $project_id }
+            WITH r, notes, collect(DISTINCT d) AS decisions
+
+            // Create PRODUCED_DURING for notes
+            UNWIND notes AS n
+            WITH r, decisions, n
+            WHERE n IS NOT NULL
+            MERGE (n)-[rel:PRODUCED_DURING]->(r)
+            ON CREATE SET rel.produced_at = n.created_at, rel.backfilled = true
+            WITH r, decisions, count(rel) AS note_count
+
+            // Create PRODUCED_DURING for decisions
+            UNWIND decisions AS d
+            WITH r, note_count, d
+            WHERE d IS NOT NULL
+            MERGE (d)-[rel:PRODUCED_DURING]->(r)
+            ON CREATE SET rel.produced_at = d.decided_at, rel.backfilled = true
+
+            RETURN sum(note_count) + count(rel) AS total_created
+            "#
+            .replace("__PATH__", super::decision::DECISION_PROJECT_PATH),
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("total_created").unwrap_or(0) as usize)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+/// An artefact produced during a protocol run (returned by `get_run_outcomes`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProducedArtefact {
+    /// "note" or "decision"
+    pub entity_type: String,
+    /// UUID of the note or decision
+    pub entity_id: Uuid,
+    /// When the artefact was produced
+    pub produced_at: chrono::DateTime<chrono::Utc>,
+    /// Content preview (first 200 chars)
+    pub summary: String,
+}

@@ -1,0 +1,702 @@
+//! Episodic Memory data model
+//!
+//! Defines the core types for episodic knowledge capture:
+//!
+//! - [`Episode`]: A complete cognitive episode assembled from a ProtocolRun
+//! - [`PortableEpisode`]: Anonymized, portable version for cross-instance exchange
+//! - Sub-structs: [`Stimulus`], [`Process`], [`Outcome`], [`Validation`], [`Lesson`]
+//!
+//! An Episode captures the full lifecycle of a knowledge-producing event:
+//! 1. **Stimulus**: What triggered the episode (request, event, context)
+//! 2. **Process**: How it was handled (reasoning tree, FSM states visited)
+//! 3. **Outcome**: What it produced (notes, decisions, commits)
+//! 4. **Validation**: How the outcome was evaluated (feedback, evidence)
+//! 5. **Lesson**: The abstract, portable pattern extracted (optional)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Comment une session s'est terminée, dit une fois.
+///
+/// `close_reason` valait `"closed"` partout : une fermeture par une personne, une
+/// éviction et l'arrêt normal d'un sous-agent étaient indiscernables dans le journal.
+/// Or c'est précisément ce champ qui, avec `files_modified`, décide si un épisode peut
+/// servir de leçon — un épisode dont on ne sait pas comment il s'est fini ne dit rien.
+///
+/// Ces valeurs sont écrites telles quelles dans `outcome.session.close_reason`, et un
+/// test vérifie qu'il y en a au moins trois réellement produites.
+pub mod close_reason {
+    /// A person (or the API on their behalf) closed the session.
+    pub const USER_CLOSED: &str = "user_closed";
+    /// The child process vanished: the provider reported it gone, out of a turn.
+    pub const PROCESS_DIED: &str = "process_died";
+    /// The session was a sub-agent's, and its call returned.
+    pub const SUBAGENT_FINISHED: &str = "subagent_finished";
+    /// The session was torn down for an in-place provider switch. It writes no episode:
+    /// the same thread must see only `provider_switched`.
+    pub const SWITCHED: &str = "switched";
+    /// Not a close. The episode was taken on demand (`POST /api/episodes/collect` with a
+    /// `session_id`) while the session was still running on this instance: it is in
+    /// progress, and the snapshot says so instead of inventing an ending.
+    pub const OPEN: &str = "open";
+    /// Not a close either. The episode was taken on demand for a session this instance
+    /// does not run: it may have closed (its stored episode, listed by
+    /// `GET /api/episodes?source=session`, carries the real reason), died without a close,
+    /// or run elsewhere. The snapshot does not pretend to know.
+    pub const UNKNOWN: &str = "unknown";
+
+    /// Every reason this instance can write or report, for the test that counts them.
+    pub const ALL: &[&str] = &[
+        USER_CLOSED,
+        PROCESS_DIED,
+        SUBAGENT_FINISHED,
+        SWITCHED,
+        OPEN,
+        UNKNOWN,
+    ];
+}
+
+// ============================================================================
+// Episode — local, fully-resolved version
+// ============================================================================
+
+/// A complete cognitive episode assembled from a ProtocolRun and its outcomes.
+///
+/// Episodes are the bridge between ephemeral execution (protocol runs,
+/// reasoning trees) and persistent knowledge (notes, decisions). They answer
+/// "what happened, why, and what did we learn?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Episode {
+    /// Unique identifier
+    pub id: Uuid,
+
+    /// The project this episode belongs to
+    pub project_id: Uuid,
+
+    /// What triggered this episode
+    pub stimulus: Stimulus,
+
+    /// How the episode was processed (reasoning + FSM trace)
+    pub process: Process,
+
+    /// What the episode produced (notes, decisions, commits)
+    pub outcome: Outcome,
+
+    /// How the outcome was validated (feedback, evidence)
+    pub validation: Validation,
+
+    /// The abstract lesson extracted (optional — may be added later)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson: Option<Lesson>,
+
+    /// When this episode was assembled
+    pub collected_at: DateTime<Utc>,
+
+    /// The ProtocolRun that generated this episode (if any)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<Uuid>,
+
+    /// The chat session that generated this episode, when it was taken at a session's
+    /// close rather than from a protocol run. Absent on every run episode, and on every
+    /// episode serialized before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionTrace>,
+
+    /// Embedding vector for semantic similarity search (ReflexEngine).
+    /// Computed from the stimulus request + lesson abstract_pattern during collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+}
+
+/// The chat session an episode was taken from, at its close.
+///
+/// What a session leaves that a protocol run does not: how much was exchanged and
+/// why it ended. Read from the session node at close time, never computed later.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionTrace {
+    /// The session closed.
+    pub session_id: Uuid,
+    /// Messages exchanged when it closed.
+    pub message_count: i64,
+    /// Why it closed (`closed`, `process_died`, ...), as announced on `session_closed`.
+    pub close_reason: String,
+    /// Its cost in USD when it closed, if the provider reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    /// The agent that ran it (`crate::notes::provenance`), from its model when it closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<Uuid>,
+}
+
+/// What triggered the episode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stimulus {
+    /// The original request or event that started the episode
+    pub request: String,
+
+    /// How the episode was triggered
+    pub trigger: StimulusTrigger,
+
+    /// When the stimulus occurred
+    pub timestamp: DateTime<Utc>,
+
+    /// Hash of the context at trigger time (for dedup and correlation)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_hash: Option<String>,
+}
+
+/// How an episode was triggered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StimulusTrigger {
+    /// Triggered by a user request via chat/MCP
+    UserRequest,
+    /// Triggered by a protocol FSM transition
+    ProtocolTransition,
+    /// Triggered by a reasoning tree feedback (outcome=success)
+    ReasoningFeedback,
+    /// Triggered by a system event (webhook, schedule)
+    SystemEvent,
+    /// Triggered manually by the agent
+    Manual,
+}
+
+/// A detailed record of a single state visit within an episode's process.
+///
+/// Captures timestamps, duration, and the trigger that caused entry.
+/// This is the enriched version of the plain state name string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateVisitRecord {
+    /// Name of the FSM state
+    pub state_name: String,
+
+    /// When this state was entered
+    pub entered_at: DateTime<Utc>,
+
+    /// When this state was exited (None for the last/current state)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exited_at: Option<DateTime<Utc>>,
+
+    /// Time spent in this state in milliseconds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+
+    /// The trigger that caused entry into this state (None for initial state)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+}
+
+/// How the episode was processed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Process {
+    /// ID of the PersistedReasoningTree used (if any)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tree_id: Option<Uuid>,
+
+    /// Ordered list of FSM states visited during the protocol run (names only, deprecated)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub states_visited: Vec<String>,
+
+    /// Enriched state visit records with timestamps and triggers
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_visits: Vec<StateVisitRecord>,
+
+    /// Duration of the processing phase
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+}
+
+/// What the episode produced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Outcome {
+    /// IDs of notes created during this episode (via PRODUCED_DURING)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub note_ids: Vec<Uuid>,
+
+    /// IDs of decisions made during this episode (via PRODUCED_DURING)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_ids: Vec<Uuid>,
+
+    /// SHAs of commits made during this episode
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_shas: Vec<String>,
+
+    /// Number of files modified
+    #[serde(default)]
+    pub files_modified: usize,
+}
+
+/// How the outcome was validated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Validation {
+    /// Type of feedback received
+    pub feedback_type: FeedbackType,
+
+    /// Validation score (0.0 - 1.0), if available
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+
+    /// Number of evidence items supporting the validation
+    #[serde(default)]
+    pub evidence_count: usize,
+}
+
+/// Type of feedback for an episode.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackType {
+    /// Explicit positive feedback (reason_feedback outcome=success)
+    ExplicitPositive,
+    /// Explicit negative feedback
+    ExplicitNegative,
+    /// Implicit positive (note created, task completed)
+    ImplicitPositive,
+    /// No feedback received
+    #[default]
+    None,
+}
+
+/// The abstract lesson extracted from an episode.
+///
+/// Lessons are the portable knowledge — they capture the "why" without
+/// the "what" (no UUIDs, no absolute paths, no project-specific context).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Lesson {
+    /// The abstract pattern (human-readable, context-independent)
+    pub abstract_pattern: String,
+
+    /// Domain tags for routing (e.g., ["rust", "neo4j", "api-design"])
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_tags: Vec<String>,
+
+    /// Portability layer: how universal is this lesson?
+    /// 1 = project-specific, 2 = language-specific, 3 = universal
+    #[serde(default = "default_portability")]
+    pub portability_layer: u8,
+
+    /// Confidence in the lesson extraction (0.0 - 1.0)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+}
+
+fn default_portability() -> u8 {
+    2
+}
+
+// ============================================================================
+// PortableEpisode — anonymized, cross-instance version
+// ============================================================================
+
+/// Anonymized, portable version of an Episode for cross-instance exchange.
+///
+/// All UUIDs are replaced with symbolic references (note_0, decision_0),
+/// absolute paths are replaced with patterns, and timestamps are converted
+/// to relative durations. A reader can understand the lesson without access
+/// to the source graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableEpisode {
+    /// Schema version for backward compatibility
+    #[serde(default = "default_episode_schema_version")]
+    pub schema_version: u32,
+
+    /// Anonymized stimulus
+    pub stimulus: PortableStimulus,
+
+    /// Anonymized process trace
+    pub process: PortableProcess,
+
+    /// Anonymized outcomes
+    pub outcome: PortableOutcome,
+
+    /// Anonymized validation
+    pub validation: PortableValidation,
+
+    /// The lesson (already portable by nature)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson: Option<PortableLesson>,
+}
+
+fn default_episode_schema_version() -> u32 {
+    1
+}
+
+/// Anonymized stimulus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableStimulus {
+    /// The original request (may be sanitized)
+    pub request: String,
+
+    /// How it was triggered
+    pub trigger: StimulusTrigger,
+}
+
+/// A portable state visit record (no absolute timestamps).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableStateVisitRecord {
+    /// Name of the FSM state
+    pub state_name: String,
+
+    /// Time spent in this state in milliseconds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+
+    /// The trigger that caused entry into this state
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+}
+
+/// Anonymized process trace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableProcess {
+    /// Whether a reasoning tree was used
+    pub had_reasoning_tree: bool,
+
+    /// Ordered FSM states visited (names, not IDs) — deprecated, kept for compat
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub states_visited: Vec<String>,
+
+    /// Enriched state visit records with durations (no absolute timestamps)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_visits: Vec<PortableStateVisitRecord>,
+
+    /// Relative duration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+}
+
+/// Anonymized outcomes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableOutcome {
+    /// Number of notes produced (not their IDs)
+    pub notes_produced: usize,
+
+    /// Number of decisions made
+    pub decisions_made: usize,
+
+    /// Number of commits
+    pub commits_made: usize,
+
+    /// Number of files modified
+    pub files_modified: usize,
+
+    /// Symbolic references: "note_0" → summary of the note content
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub note_summaries: Vec<String>,
+
+    /// Symbolic references: "decision_0" → summary of the decision
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_summaries: Vec<String>,
+}
+
+/// Anonymized validation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableValidation {
+    pub feedback_type: FeedbackType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(default)]
+    pub evidence_count: usize,
+}
+
+/// Portable lesson (same as Lesson — already context-independent).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableLesson {
+    pub abstract_pattern: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_tags: Vec<String>,
+    #[serde(default = "default_portability")]
+    pub portability_layer: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+}
+
+// ============================================================================
+// Conversion: Episode → PortableEpisode
+// ============================================================================
+
+impl Episode {
+    /// Convert to a portable, anonymized episode.
+    ///
+    /// Strips all UUIDs, replaces absolute paths with patterns,
+    /// and converts timestamps to relative durations.
+    pub fn to_portable(&self) -> PortableEpisode {
+        PortableEpisode {
+            schema_version: 1,
+            stimulus: PortableStimulus {
+                request: self.stimulus.request.clone(),
+                trigger: self.stimulus.trigger.clone(),
+            },
+            process: PortableProcess {
+                had_reasoning_tree: self.process.reasoning_tree_id.is_some(),
+                states_visited: self.process.states_visited.clone(),
+                state_visits: self
+                    .process
+                    .state_visits
+                    .iter()
+                    .map(|sv| PortableStateVisitRecord {
+                        state_name: sv.state_name.clone(),
+                        duration_ms: sv.duration_ms,
+                        trigger: sv.trigger.clone(),
+                    })
+                    .collect(),
+                duration_ms: self.process.duration_ms,
+            },
+            outcome: PortableOutcome {
+                notes_produced: self.outcome.note_ids.len(),
+                decisions_made: self.outcome.decision_ids.len(),
+                commits_made: self.outcome.commit_shas.len(),
+                files_modified: self.outcome.files_modified,
+                // Summaries are populated later by the collector (requires graph access)
+                note_summaries: Vec::new(),
+                decision_summaries: Vec::new(),
+            },
+            validation: PortableValidation {
+                feedback_type: self.validation.feedback_type.clone(),
+                score: self.validation.score,
+                evidence_count: self.validation.evidence_count,
+            },
+            lesson: self.lesson.as_ref().map(|l| PortableLesson {
+                abstract_pattern: l.abstract_pattern.clone(),
+                domain_tags: l.domain_tags.clone(),
+                portability_layer: l.portability_layer,
+                confidence: l.confidence,
+            }),
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    fn sample_episode() -> Episode {
+        Episode {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            stimulus: Stimulus {
+                request: "How to implement PRODUCED_DURING relation?".to_string(),
+                trigger: StimulusTrigger::UserRequest,
+                timestamp: Utc::now(),
+                context_hash: Some("abc123".to_string()),
+            },
+            process: Process {
+                reasoning_tree_id: Some(Uuid::new_v4()),
+                states_visited: vec![
+                    "analyze".to_string(),
+                    "implement".to_string(),
+                    "done".to_string(),
+                ],
+                state_visits: vec![
+                    StateVisitRecord {
+                        state_name: "analyze".to_string(),
+                        entered_at: Utc::now() - chrono::Duration::seconds(15),
+                        exited_at: Some(Utc::now() - chrono::Duration::seconds(10)),
+                        duration_ms: Some(5000),
+                        trigger: None,
+                    },
+                    StateVisitRecord {
+                        state_name: "implement".to_string(),
+                        entered_at: Utc::now() - chrono::Duration::seconds(10),
+                        exited_at: Some(Utc::now() - chrono::Duration::seconds(2)),
+                        duration_ms: Some(8000),
+                        trigger: Some("analysis_complete".to_string()),
+                    },
+                    StateVisitRecord {
+                        state_name: "done".to_string(),
+                        entered_at: Utc::now() - chrono::Duration::seconds(2),
+                        exited_at: Some(Utc::now()),
+                        duration_ms: Some(2000),
+                        trigger: Some("implemented".to_string()),
+                    },
+                ],
+                duration_ms: Some(15000),
+            },
+            outcome: Outcome {
+                note_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+                decision_ids: vec![Uuid::new_v4()],
+                commit_shas: vec!["abc1234".to_string()],
+                files_modified: 3,
+            },
+            validation: Validation {
+                feedback_type: FeedbackType::ExplicitPositive,
+                score: Some(0.85),
+                evidence_count: 2,
+            },
+            lesson: Some(Lesson {
+                abstract_pattern: "When adding a new graph relation, always create an index and a backfill script for existing data.".to_string(),
+                domain_tags: vec!["neo4j".to_string(), "schema-migration".to_string()],
+                portability_layer: 2,
+                confidence: Some(0.9),
+            }),
+            collected_at: Utc::now(),
+            source_run_id: Some(Uuid::new_v4()),
+            session: None,
+            embedding: None,
+        }
+    }
+
+    #[test]
+    fn test_episode_to_portable() {
+        let episode = sample_episode();
+        let portable = episode.to_portable();
+
+        assert_eq!(portable.schema_version, 1);
+        assert_eq!(portable.stimulus.request, episode.stimulus.request);
+        assert_eq!(portable.stimulus.trigger, StimulusTrigger::UserRequest);
+        assert!(portable.process.had_reasoning_tree);
+        assert_eq!(portable.process.states_visited.len(), 3);
+        assert_eq!(portable.process.state_visits.len(), 3);
+        // Portable state visits have durations but no absolute timestamps
+        assert_eq!(portable.process.state_visits[0].state_name, "analyze");
+        assert_eq!(portable.process.state_visits[0].duration_ms, Some(5000));
+        assert!(portable.process.state_visits[0].trigger.is_none());
+        assert_eq!(
+            portable.process.state_visits[1].trigger.as_deref(),
+            Some("analysis_complete")
+        );
+        assert_eq!(portable.outcome.notes_produced, 2);
+        assert_eq!(portable.outcome.decisions_made, 1);
+        assert_eq!(portable.outcome.commits_made, 1);
+        assert_eq!(portable.outcome.files_modified, 3);
+        assert_eq!(
+            portable.validation.feedback_type,
+            FeedbackType::ExplicitPositive
+        );
+        assert!(portable.lesson.is_some());
+        let lesson = portable.lesson.unwrap();
+        assert_eq!(lesson.portability_layer, 2);
+        assert!(lesson.abstract_pattern.contains("graph relation"));
+    }
+
+    #[test]
+    fn test_episode_without_lesson() {
+        let mut episode = sample_episode();
+        episode.lesson = None;
+        let portable = episode.to_portable();
+        assert!(portable.lesson.is_none());
+    }
+
+    #[test]
+    fn test_portable_no_uuids() {
+        let episode = sample_episode();
+        let portable = episode.to_portable();
+        let json = serde_json::to_string(&portable).unwrap();
+
+        // Portable should not contain any UUID pattern (8-4-4-4-12 hex)
+        let uuid_regex =
+            regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+                .unwrap();
+        assert!(
+            !uuid_regex.is_match(&json),
+            "PortableEpisode JSON should not contain UUIDs: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_serde_round_trip() {
+        let episode = sample_episode();
+        let json = serde_json::to_string_pretty(&episode).unwrap();
+        let restored: Episode = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.id, episode.id);
+        assert_eq!(restored.stimulus.request, episode.stimulus.request);
+        assert_eq!(restored.outcome.note_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_portable_serde_round_trip() {
+        let episode = sample_episode();
+        let portable = episode.to_portable();
+        let json = serde_json::to_string_pretty(&portable).unwrap();
+        let restored: PortableEpisode = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.outcome.notes_produced, 2);
+        assert_eq!(restored.process.states_visited.len(), 3);
+    }
+
+    #[test]
+    fn test_feedback_type_default() {
+        let ft: FeedbackType = Default::default();
+        assert_eq!(ft, FeedbackType::None);
+    }
+
+    #[test]
+    fn test_portability_layer_default() {
+        let lesson = PortableLesson {
+            abstract_pattern: "test".to_string(),
+            domain_tags: vec![],
+            portability_layer: default_portability(),
+            confidence: None,
+        };
+        assert_eq!(lesson.portability_layer, 2);
+    }
+
+    #[test]
+    fn test_state_visit_record_serde_roundtrip() {
+        let record = StateVisitRecord {
+            state_name: "implement".to_string(),
+            entered_at: chrono::Utc::now(),
+            exited_at: Some(chrono::Utc::now()),
+            duration_ms: Some(5000),
+            trigger: Some("plan_approved".to_string()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: StateVisitRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.state_name, "implement");
+        assert_eq!(deserialized.duration_ms, Some(5000));
+        assert_eq!(deserialized.trigger, Some("plan_approved".to_string()));
+    }
+
+    #[test]
+    fn test_portable_state_visit_record_strips_timestamps() {
+        let record = PortableStateVisitRecord {
+            state_name: "review".to_string(),
+            duration_ms: Some(3000),
+            trigger: Some("code_ready".to_string()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: PortableStateVisitRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.state_name, "review");
+        assert_eq!(deserialized.duration_ms, Some(3000));
+        // No timestamp fields in portable version
+        assert!(!json.contains("entered_at"));
+        assert!(!json.contains("exited_at"));
+    }
+
+    #[test]
+    fn test_process_state_visits_field() {
+        let process = Process {
+            reasoning_tree_id: None,
+            states_visited: vec!["A".to_string(), "B".to_string()],
+            state_visits: vec![
+                StateVisitRecord {
+                    state_name: "A".to_string(),
+                    entered_at: chrono::Utc::now(),
+                    exited_at: Some(chrono::Utc::now()),
+                    duration_ms: Some(100),
+                    trigger: None,
+                },
+                StateVisitRecord {
+                    state_name: "B".to_string(),
+                    entered_at: chrono::Utc::now(),
+                    exited_at: None,
+                    duration_ms: None,
+                    trigger: Some("go".to_string()),
+                },
+            ],
+            duration_ms: Some(200),
+        };
+        assert_eq!(process.state_visits.len(), 2);
+        assert_eq!(process.state_visits[0].state_name, "A");
+        assert!(process.state_visits[0].duration_ms.is_some());
+        assert_eq!(process.state_visits[1].trigger, Some("go".to_string()));
+    }
+}

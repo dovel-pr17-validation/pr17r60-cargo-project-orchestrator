@@ -1,0 +1,1207 @@
+//! Builds the native harness (nexus `NativeProvider` on an OpenAI-compatible
+//! endpoint) for a STORED instance.
+//!
+//! Nothing secret is read here: the endpoint receives a credential REFERENCE
+//! and a resolver; the key is read per request (`read_for_provider` under a
+//! grant for that instance) and never kept. No fallback exists: a locked vault
+//! is `credentials_locked`, a missing grant `auth_required`.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use std::str::FromStr;
+use std::sync::Arc;
+
+use nexus_claude::agent::{
+    AgentProvider, CostBasis, CredentialRef, CredentialResolver, EnvCredentialResolver,
+    KnownSecrets, ProviderError, SessionLimits,
+};
+use nexus_claude::model::{
+    AnthropicAuth, AnthropicEndpoint, AnthropicEndpointConfig, EndpointQuirks, ModelEndpoint,
+    OpenAiEndpoint, OpenAiEndpointConfig,
+};
+use nexus_claude::providers::native::{NativeConfig, NativeProvider};
+
+use super::credentials::VaultCredentialResolver;
+use super::settings::InstanceRecord;
+use crate::vault::VaultService;
+
+/// How the native harness reads a policy's `allow` list. The server's list
+/// (`PermissionConfig::allowed_tools`, `mcp__project-orchestrator__*` by
+/// default) has Claude Code's meaning — what runs WITHOUT asking — not nexus's
+/// strict one — the ONLY tools offered. Strict, the default list would hide
+/// every `nexus` tool (Bash, Read, Edit...) from every native session (B40).
+pub(crate) const STRICT_TOOL_EXPOSURE: bool = false;
+
+/// `program` as `nexus-tools` (or the browser it may come with) can be launched:
+/// its absolute, resolved path, when it is an executable file. Checked at every opening (the file may have gone
+/// since the server started). Absolute because the server is launched in the
+/// session's directory: a relative path (`./nexus-tools`, a `.` or empty entry of
+/// the PATH) would name a file of the project, which the model can write.
+pub(crate) fn runnable_nexus_tools(program: &std::path::Path) -> Option<std::path::PathBuf> {
+    let path = std::fs::canonicalize(program).ok()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    Some(path)
+}
+
+/// What a connection test found out about an instance (A30): can it be
+/// reached, which models it lists, can the chosen model call a tool, and how
+/// large its context window is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeReport {
+    /// Health as nexus reports it.
+    pub health: nexus_claude::agent::ProviderHealth,
+    /// Models the endpoint lists.
+    pub models: Vec<String>,
+    /// Model that was probed, if any.
+    pub model: Option<String>,
+    /// Whether that model called a tool.
+    pub tools: Option<bool>,
+    /// Its context window, when known.
+    pub context_window: Option<u64>,
+    /// Why the tool probe failed (typed), when it did.
+    pub probe_error: Option<ProviderError>,
+}
+
+/// Connection test of an instance, run BEFORE it is saved or used: health, the
+/// model listing, and a real tool-call probe of one model. Reads nothing but
+/// the credential reference's secret, per request, through the resolver.
+pub async fn probe_instance(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+    model: Option<&str>,
+) -> Result<ProbeReport, ProviderError> {
+    let provider = build_native(record, vault, &[])?;
+    let health = provider.health().await;
+    if health.status == nexus_claude::agent::HealthStatus::Unavailable {
+        return Ok(ProbeReport {
+            health,
+            models: Vec::new(),
+            model: None,
+            tools: None,
+            context_window: None,
+            probe_error: None,
+        });
+    }
+    let models: Vec<String> = provider
+        .catalog()
+        .await
+        .map(|c| c.into_iter().map(|m| m.id).collect())
+        .unwrap_or_default();
+    let chosen = model
+        .map(str::to_string)
+        .or_else(|| record.default_model.clone())
+        .or_else(|| models.first().cloned());
+    let (mut tools, mut context_window, mut probe_error) = (None, None, None);
+    if let Some(m) = chosen.as_deref() {
+        match provider.refresh_capabilities(m).await {
+            Ok(caps) => {
+                tools = Some(caps.tools);
+                context_window = caps.context_window.map(|w| w.value);
+            }
+            Err(e) => probe_error = Some(e),
+        }
+    }
+    Ok(ProbeReport {
+        health,
+        models,
+        model: chosen,
+        tools,
+        context_window,
+        probe_error,
+    })
+}
+
+/// Models an OpenAI-compatible instance lists (`GET /models`), in the order the
+/// endpoint gives them. Nothing is stored; the key is read for this request only.
+pub async fn list_models(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+) -> Result<Vec<String>, ProviderError> {
+    let provider = build_native(record, vault, &[])?;
+    Ok(provider
+        .catalog()
+        .await?
+        .into_iter()
+        .map(|m| m.id)
+        .collect())
+}
+
+/// Capabilities an instance declares without touching the network: its provider
+/// is built from the stored record and asked (`capabilities` is static, and
+/// `tools` stays false until a probe has run). A remote Claude Code, or a record
+/// that does not build, declares none.
+pub fn declared_capabilities(record: &InstanceRecord) -> nexus_claude::agent::Capabilities {
+    if record.kind == super::settings::KIND_CLAUDE_CODE_REMOTE {
+        return nexus_claude::agent::Capabilities::none();
+    }
+    build_native_provider(record, None)
+        .map(|p| p.capabilities(record.default_model.as_deref()))
+        .unwrap_or_else(|_| nexus_claude::agent::Capabilities::none())
+}
+
+fn build_native(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+    deferred_tools: &[String],
+) -> Result<Arc<NativeProvider>, ProviderError> {
+    native_provider(record, vault, deferred_tools).map(Arc::new)
+}
+
+fn native_provider(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+    deferred_tools: &[String],
+) -> Result<NativeProvider, ProviderError> {
+    native_provider_with(record, sessions_resolver(vault, None), deferred_tools)
+}
+
+/// The resolver of an instance: the vault's (per request, under a grant) or the
+/// process environment. With `known`, every key it resolves is also registered
+/// there, so that the instance's transcript store masks that VALUE (CTX6).
+fn sessions_resolver(
+    vault: Option<Arc<VaultService>>,
+    known: Option<&KnownSecrets>,
+) -> Arc<dyn CredentialResolver> {
+    let resolver: Arc<dyn CredentialResolver> = match vault {
+        Some(vault) => Arc::new(VaultCredentialResolver::new(vault)),
+        None => Arc::new(EnvCredentialResolver),
+    };
+    match known {
+        Some(known) => Arc::new(known.recording(resolver)),
+        None => resolver,
+    }
+}
+
+fn native_provider_with(
+    record: &InstanceRecord,
+    resolver: Arc<dyn CredentialResolver>,
+    deferred_tools: &[String],
+) -> Result<NativeProvider, ProviderError> {
+    // A stored record is checked again here: an `env:` reference must name a
+    // variable declared for provider credentials, whenever it was stored.
+    super::settings::parse_credential_ref(
+        &record.credential_ref,
+        &super::settings::env_credential_allowlist(),
+    )
+    .map_err(|_| ProviderError::invalid("credential reference not allowed"))?;
+    let credential = CredentialRef::from_str(&record.credential_ref)?;
+    // A private-range endpoint needs an operator decision that this API does
+    // not offer: the strict default stays (both protocols).
+    let model_endpoint: Arc<dyn ModelEndpoint> = if record.kind == super::settings::KIND_ANTHROPIC {
+        Arc::new(AnthropicEndpoint::new(
+            anthropic_endpoint(record, credential)?,
+            resolver,
+        ))
+    } else {
+        let mut endpoint = OpenAiEndpointConfig::new(record.id.clone(), record.base_url.clone());
+        endpoint.credential = credential;
+        endpoint.quirks = record
+            .preset
+            .as_deref()
+            .and_then(EndpointQuirks::preset)
+            .unwrap_or_else(EndpointQuirks::generic);
+        endpoint.allow_private_network = false;
+        Arc::new(OpenAiEndpoint::new(endpoint, resolver))
+    };
+
+    let mut config = NativeConfig::new(record.id.clone());
+    config.default_model = record.default_model.clone();
+    // The window the operator declared for this instance. nexus prefers it to
+    // the catalogue's and to the probe's, and reports its source as
+    // `Configured`, so a declared number is never mistaken for a measured one.
+    // Absent = unknown, exactly as before this field existed.
+    config.context_window = record.context_window;
+    config.strict_tool_exposure = STRICT_TOOL_EXPOSURE;
+    // The tools whose definitions are withheld behind `ToolSearch` (CTX2,
+    // `chat::deferred_tools`): the list in force when this provider is built. Empty =
+    // every definition is sent, as before.
+    config.deferred_tools = deferred_tools.to_vec();
+    // The harness's own `AskUserQuestion` (P18): its `question { reply: turn }` becomes the
+    // `ask_user_question` card (synthetic, A45) and the user's answer is the next turn.
+    config.ask_user_question = true;
+    // No turn wall-clock cap and no session budget at the harness level, whatever the
+    // nexus defaults (ISO5: a 30 min cap and a 10 M-token budget, cache reads included,
+    // were nexus' defaults and cut working sessions). The operator's limits, when set,
+    // come per session (`chat.native_turn_timeout_secs`, `chat.native_session_max_tokens`).
+    config.limits = SessionLimits::default();
+    // Only "free" is known without a price table; the rest stays `unknown`
+    // (no amount) until a price is configured (A21: never an invented price).
+    if record.cost_source == "free" {
+        config.cost_basis = CostBasis::Free;
+    }
+    Ok(NativeProvider::new(config, model_endpoint))
+}
+
+/// The endpoint of an `anthropic` instance (CTX5): the native harness speaks the Messages
+/// API itself, with its three `cache_control` points (tools, system, last turn). The key
+/// is a VAULT reference, checked again here whenever the record was stored: an `env:`
+/// variable or nothing is refused. Anthropic's own origin gets the key as `x-api-key`;
+/// any other origin is a gateway, which gets it as `Authorization: Bearer` (what Claude
+/// Code sends a gateway too).
+fn anthropic_endpoint(
+    record: &InstanceRecord,
+    credential: CredentialRef,
+) -> Result<AnthropicEndpointConfig, ProviderError> {
+    if !matches!(credential, CredentialRef::Vault(_)) {
+        return Err(ProviderError::invalid(
+            "an anthropic instance needs a vault reference for its key",
+        ));
+    }
+    let mut endpoint = if record.base_url.trim().is_empty() {
+        AnthropicEndpointConfig::new(record.id.clone())
+    } else {
+        AnthropicEndpointConfig::gateway(record.id.clone(), record.base_url.clone())
+    };
+    if record.origin == super::settings::ANTHROPIC_API_BASE || record.base_url.trim().is_empty() {
+        endpoint.auth = AnthropicAuth::ApiKey;
+    }
+    endpoint.credential = credential;
+    endpoint.allow_private_network = false;
+    Ok(endpoint)
+}
+
+/// The native harness of a record that runs SESSIONS: its transcripts are kept in
+/// `<transcripts>/<instance id>/` (owner-only files) so a session resumes after a
+/// restart (P14). The files are the conversation, byte for byte (CTX6): the only
+/// text masked is the VALUE of a key this instance's resolver handed out. Without a root they stay in memory (nexus' default): the probes,
+/// listings and tests build that way.
+fn build_native_for_sessions(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+    transcripts: Option<&std::path::Path>,
+    deferred_tools: &[String],
+) -> Result<Arc<NativeProvider>, ProviderError> {
+    let Some(root) = transcripts else {
+        return build_native(record, vault, deferred_tools);
+    };
+    if super::transcripts::inside_git_worktree(root) {
+        // The files hold the conversation in clear: never where a `git add -A` would
+        // publish them. Memory instead: the sessions do not resume after a restart.
+        tracing::warn!(
+            instance = %record.id,
+            "native transcripts kept in memory: their directory is inside a git work tree"
+        );
+        return build_native(record, vault, deferred_tools);
+    }
+    let known = KnownSecrets::new();
+    let store = super::transcripts::store_for(root, &record.id, known.clone()).map_err(|e| {
+        // The path may name a user; keep only the kind of failure.
+        ProviderError::protocol(format!("transcript store unavailable: {:?}", e.kind()))
+    })?;
+    Ok(Arc::new(
+        native_provider_with(
+            record,
+            sessions_resolver(vault, Some(&known)),
+            deferred_tools,
+        )?
+        .with_transcript_store(store),
+    ))
+}
+
+/// The provider of a stored instance, by kind: the native harness over an
+/// OpenAI-compatible endpoint, Codex (`app-server`) or a declared ACP agent.
+pub fn build_native_provider(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+) -> Result<Arc<dyn AgentProvider>, ProviderError> {
+    // A one-shot or a probe has no conversation to load tools into: nothing deferred.
+    build_provider_with_handle(
+        record,
+        vault,
+        None,
+        &AcpSetup::default(),
+        &CodexSetup::default(),
+        &[],
+    )
+    .map(|(provider, _)| provider)
+}
+
+/// Where the ACP instances of a server come from: the declared commands and the root
+/// of their dedicated `HOME`s. The default reads the declaration from
+/// `CHAT_PROVIDER_ACP_COMMANDS` and keeps nexus' default `HOME`
+/// (`<user data dir>/nexus/acp/<instance>/home`); a test gives both, so that it neither
+/// mutates the process environment nor writes in the user's real data directory.
+#[derive(Debug, Clone, Default)]
+pub struct AcpSetup {
+    /// Root of the `HOME` of each instance: `<root>/<instance>/home`.
+    pub homes: Option<std::path::PathBuf>,
+    /// The declared agents, instead of `CHAT_PROVIDER_ACP_COMMANDS`.
+    pub commands: Option<std::collections::BTreeMap<String, super::settings::AcpCommand>>,
+}
+
+/// How Codex instances are built for tests: the default uses the `codex` binary
+/// found on `PATH` and nexus' default `CODEX_HOME`; a test supplies its own program
+/// path (`fake_codex`) and a temporary home, so that it neither mutates `PATH` nor
+/// writes in the user's real Codex data directory.
+#[derive(Debug, Clone, Default)]
+pub struct CodexSetup {
+    /// The `codex` binary to run. `None` = look up `codex` on `PATH` (production).
+    pub program: Option<std::path::PathBuf>,
+    /// Root of `CODEX_HOME` for each instance: `<root>/<instance>`. `None` = nexus default.
+    pub home: Option<std::path::PathBuf>,
+}
+
+/// A provider and, for a native record, its concrete harness.
+pub type BuiltProvider = (Arc<dyn AgentProvider>, Option<Arc<NativeProvider>>);
+
+/// Same, also returning the concrete native harness when the record is one: only
+/// it can run a capability probe (the trait has no such method).
+/// `transcripts`: where the native sessions keep their conversations
+/// ([`build_native_for_sessions`]). `acp`: the declared ACP agents and where their
+/// `HOME`s live ([`AcpSetup`]). `codex`: program override for tests ([`CodexSetup`]).
+/// `deferred_tools`: what the native harness withholds behind `ToolSearch` (CTX2).
+pub fn build_provider_with_handle(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+    transcripts: Option<&std::path::Path>,
+    acp: &AcpSetup,
+    codex: &CodexSetup,
+    deferred_tools: &[String],
+) -> Result<BuiltProvider, ProviderError> {
+    match record.kind.as_str() {
+        "codex" => build_codex(record, vault, codex).map(|p| (p, None)),
+        "acp" => build_acp(record, acp).map(|p| (p, None)),
+        super::settings::KIND_CLAUDE_CODE_REMOTE => {
+            build_remote_claude(record, vault).map(|p| (p, None))
+        }
+        _ => {
+            let native = build_native_for_sessions(record, vault, transcripts, deferred_tools)?;
+            Ok((Arc::clone(&native) as Arc<dyn AgentProvider>, Some(native)))
+        }
+    }
+}
+
+fn cost_basis_of(record: &InstanceRecord) -> CostBasis {
+    // Only "free" is known without a price table; the rest stays `unknown`.
+    if record.cost_source == "free" {
+        CostBasis::Free
+    } else {
+        CostBasis::Unknown
+    }
+}
+
+/// Codex: the program is `codex` found on the server's PATH (never a path from an
+/// API body), with its own persistent home per instance.
+/// Tests may override `program` (to `fake_codex`) and `home` via [`CodexSetup`].
+fn build_codex(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+    setup: &CodexSetup,
+) -> Result<Arc<dyn AgentProvider>, ProviderError> {
+    use nexus_claude::providers::codex::{CodexConfig, CodexProvider};
+    super::settings::parse_credential_ref(
+        &record.credential_ref,
+        &super::settings::env_credential_allowlist(),
+    )
+    .map_err(|_| ProviderError::invalid("credential reference not allowed"))?;
+    let mut config = CodexConfig::new(record.id.clone());
+    config.default_model = record.default_model.clone();
+    config.cost_basis = cost_basis_of(record);
+    config.credential = CredentialRef::from_str(&record.credential_ref)?;
+    if let Some(program) = &setup.program {
+        config.program = program.clone();
+    }
+    if let Some(home_root) = &setup.home {
+        config.codex_home = home_root.join(&record.id);
+    }
+    let resolver: Arc<dyn CredentialResolver> = match vault {
+        Some(vault) => Arc::new(VaultCredentialResolver::new(vault)),
+        None => Arc::new(EnvCredentialResolver),
+    };
+    Ok(Arc::new(CodexProvider::with_resolver(config, resolver)))
+}
+
+/// ACP: the command is the one DECLARED on the server under the instance's
+/// preset; the agent holds its own login (no credential).
+fn build_acp(
+    record: &InstanceRecord,
+    acp: &AcpSetup,
+) -> Result<Arc<dyn AgentProvider>, ProviderError> {
+    use nexus_claude::providers::acp::{AcpConfig, AcpProvider};
+    let name = record
+        .preset
+        .as_deref()
+        .ok_or_else(|| ProviderError::invalid("an ACP instance names a declared agent"))?;
+    let command = acp
+        .commands
+        .clone()
+        .unwrap_or_else(super::settings::acp_commands)
+        .remove(name)
+        .ok_or_else(|| ProviderError::invalid("that ACP agent is not declared on this server"))?;
+    // An agent that takes no MCP server per session (declared so, or OpenClaw's ACP
+    // bridge by name): the provider says `per_session_mcp: false` and is given none.
+    let per_session_mcp = command.carries_mcp();
+    let mut config = AcpConfig::new(record.id.clone(), command.argv);
+    config.per_session_mcp = per_session_mcp;
+    if let Some(root) = &acp.homes {
+        config.home = root.join(&record.id).join("home");
+    }
+    config.default_model = record.default_model.clone();
+    config.cost_basis = cost_basis_of(record);
+    config.validate()?;
+    Ok(Arc::new(AcpProvider::new(config)))
+}
+
+/// Claude Code on another machine over SSH (nexus `ClaudeCodeConfig::remote`).
+///
+/// The record names a vault entry holding the SSH PRIVATE key. Nothing is read
+/// here: the key is read, and written to an owner-only file, when a session (or a
+/// health probe) needs it. See [`RemoteClaudeProvider`] for the lifetime.
+fn build_remote_claude(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+) -> Result<Arc<dyn AgentProvider>, ProviderError> {
+    use nexus_claude::providers::claude_code::ClaudeCodeConfig;
+    use nexus_claude::transport::RemoteHost;
+    // The stored record is checked again: `vault:<name>` only, whenever it was stored.
+    let key_name = match super::settings::parse_credential_ref(&record.credential_ref, &[]) {
+        Ok(super::settings::CredentialSource::Vault(name)) => name,
+        _ => {
+            return Err(ProviderError::invalid(
+                "a remote instance needs a vault credential",
+            ))
+        }
+    };
+    let (Some(host), Some(host_key)) = (record.host.clone(), record.host_key.clone()) else {
+        return Err(ProviderError::invalid(
+            "a remote instance needs a host and a host key",
+        ));
+    };
+    let mut remote = RemoteHost::new(host, host_key);
+    remote.user = record.ssh_user.clone();
+    remote.port = record.ssh_port;
+    remote.cwd = record.remote_cwd.clone();
+    remote.allow_trust = record.allow_trust;
+    remote
+        .validate()
+        .map_err(|e| ProviderError::invalid(e.to_string()))?;
+    let mut config = ClaudeCodeConfig::default();
+    config.id = record.id.clone();
+    config.default_model = record.default_model.clone();
+    config.cost_basis = match record.cost_source.as_str() {
+        "free" => CostBasis::Free,
+        "subscription" => CostBasis::Subscription,
+        "reported" => CostBasis::Reported,
+        _ => CostBasis::Unknown,
+    };
+    config.remote = Some(remote);
+    Ok(Arc::new(RemoteClaudeProvider {
+        config,
+        key_name,
+        vault,
+    }))
+}
+
+/// A Claude Code instance on another machine.
+///
+/// Lifetime of the SSH key, chosen on purpose: the provider is cached per record
+/// (`ChatManager::provider_for`) for as long as the server runs, so a key file
+/// owned by the provider would sit on disk for the whole uptime, and survive a
+/// vault lock. Instead the key is read from the vault, under the grant
+/// `Provider(<instance id>)`, at the moment it is needed (`health`, `open`,
+/// `resume`), written to an owner-only `0600` file in a fresh `0700` directory
+/// (nexus `SecretFile`), and the file is owned by what uses it: the probe, or
+/// the session ([`KeyedSession`]). It is removed when that is dropped. A locked
+/// vault or a missing grant is a typed error at that moment; there is no
+/// fallback to another provider or to the local CLI.
+struct RemoteClaudeProvider {
+    /// Config of the instance; `remote.identity_file` is always `None` here.
+    config: nexus_claude::providers::claude_code::ClaudeCodeConfig,
+    /// Name of the vault entry holding the private key.
+    key_name: String,
+    vault: Option<Arc<VaultService>>,
+}
+
+impl RemoteClaudeProvider {
+    /// A provider whose `remote.identity_file` points at a fresh file holding the
+    /// key, and the file itself (keep it alive as long as the connection needs it).
+    fn with_key(
+        &self,
+    ) -> Result<
+        (
+            nexus_claude::providers::claude_code::ClaudeCodeProvider,
+            nexus_claude::transport::SecretFile,
+        ),
+        ProviderError,
+    > {
+        use nexus_claude::providers::claude_code::ClaudeCodeProvider;
+        let vault = self.vault.clone().ok_or_else(|| {
+            ProviderError::invalid("the vault is not available: the SSH key lives there")
+        })?;
+        let secret = VaultCredentialResolver::new(vault)
+            .read_vault(&self.config.id, &self.key_name)?
+            .ok_or(ProviderError::CredentialsLocked)?;
+        let mut pem = secret.expose().to_string();
+        // OpenSSH refuses a private key file without its final newline.
+        if !pem.ends_with('\n') {
+            pem.push('\n');
+        }
+        let file = nexus_claude::transport::SecretFile::create("id_ssh", pem.as_bytes())
+            .map_err(|_| ProviderError::invalid("the SSH key file could not be prepared"))?;
+        let mut config = self.config.clone();
+        if let Some(remote) = config.remote.as_mut() {
+            remote.identity_file = Some(file.path().to_path_buf());
+        }
+        Ok((ClaudeCodeProvider::new(config), file))
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentProvider for RemoteClaudeProvider {
+    fn id(&self) -> &str {
+        &self.config.id
+    }
+    fn kind(&self) -> nexus_claude::agent::ProviderKind {
+        nexus_claude::agent::ProviderKind::ClaudeCode
+    }
+    async fn health(&self) -> nexus_claude::agent::ProviderHealth {
+        match self.with_key() {
+            Ok((provider, _key)) => provider.health().await,
+            Err(e) => nexus_claude::agent::ProviderHealth::unavailable(e),
+        }
+    }
+    async fn catalog(&self) -> Result<Vec<nexus_claude::agent::ModelInfo>, ProviderError> {
+        Ok(self.config.models.clone())
+    }
+    fn capabilities(&self, model: Option<&str>) -> nexus_claude::agent::Capabilities {
+        self.config.capabilities(model)
+    }
+    async fn open(
+        &self,
+        spec: nexus_claude::agent::SessionSpec,
+    ) -> Result<Arc<dyn nexus_claude::agent::AgentSession>, ProviderError> {
+        let (provider, key) = self.with_key()?;
+        let inner = provider.open(spec).await?;
+        Ok(Arc::new(KeyedSession { inner, _key: key }))
+    }
+    async fn resume(
+        &self,
+        spec: nexus_claude::agent::SessionSpec,
+        token: nexus_claude::agent::ResumeToken,
+    ) -> Result<Arc<dyn nexus_claude::agent::AgentSession>, ProviderError> {
+        let (provider, key) = self.with_key()?;
+        let inner = provider.resume(spec, token).await?;
+        Ok(Arc::new(KeyedSession { inner, _key: key }))
+    }
+}
+
+/// A session that owns the key file its connection was made with: the file goes
+/// when the session is dropped, never earlier (a reconnection would need it).
+struct KeyedSession {
+    inner: Arc<dyn nexus_claude::agent::AgentSession>,
+    _key: nexus_claude::transport::SecretFile,
+}
+
+#[async_trait::async_trait]
+impl nexus_claude::agent::AgentSession for KeyedSession {
+    fn capabilities(&self) -> &nexus_claude::agent::Capabilities {
+        self.inner.capabilities()
+    }
+    fn resume_token(&self) -> Option<nexus_claude::agent::ResumeToken> {
+        self.inner.resume_token()
+    }
+    async fn send_turn(
+        &self,
+        input: nexus_claude::agent::TurnInput,
+    ) -> Result<nexus_claude::agent::EventStream, ProviderError> {
+        self.inner.send_turn(input).await
+    }
+    async fn answer_permission(
+        &self,
+        request_id: &str,
+        decision: nexus_claude::agent::PermissionDecision,
+    ) -> Result<(), ProviderError> {
+        self.inner.answer_permission(request_id, decision).await
+    }
+    async fn answer_question(
+        &self,
+        question_id: &str,
+        answer: nexus_claude::agent::QuestionAnswer,
+    ) -> Result<(), ProviderError> {
+        self.inner.answer_question(question_id, answer).await
+    }
+    async fn interrupt(
+        &self,
+        scope: nexus_claude::agent::InterruptScope,
+    ) -> Result<nexus_claude::agent::InterruptOutcome, ProviderError> {
+        self.inner.interrupt(scope).await
+    }
+    async fn cancel_tools(
+        &self,
+        scope: nexus_claude::agent::CancelScope,
+    ) -> Result<nexus_claude::agent::CancelOutcome, ProviderError> {
+        self.inner.cancel_tools(scope).await
+    }
+    async fn set_model(&self, model: &str) -> Result<(), ProviderError> {
+        self.inner.set_model(model).await
+    }
+    async fn set_policy_mode(
+        &self,
+        mode: nexus_claude::agent::PolicyMode,
+        native: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        self.inner.set_policy_mode(mode, native).await
+    }
+    fn out_of_band(&self) -> Option<nexus_claude::agent::EventStream> {
+        self.inner.out_of_band()
+    }
+    async fn close(&self) -> Result<(), ProviderError> {
+        self.inner.close().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    /// CTX6: a transcript root inside a git work tree is never written: the instance
+    /// still builds, with its transcripts in memory.
+    #[test]
+    fn a_transcript_root_inside_a_git_work_tree_keeps_the_transcripts_in_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let root = tmp.path().join("native-transcripts");
+        let built = build_native_for_sessions(
+            &record("none", Some("llama_server")),
+            None,
+            Some(&root),
+            &[],
+        );
+        assert!(built.is_ok());
+        assert!(!root.exists(), "nothing is created inside the work tree");
+    }
+
+    /// CTX6: the resolver of a session-running instance registers the key it reads
+    /// from the vault, so the transcript store of that instance masks its VALUE.
+    #[tokio::test]
+    async fn a_sessions_resolver_teaches_the_store_the_key_it_resolves() {
+        use crate::vault::grants::{GrantScope, SecretSelector};
+        let vault = VaultService::ephemeral();
+        vault
+            .init(
+                "correct horse battery staple".into(),
+                chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        vault
+            .put("endpoint-key", "sk-ctx6-resolved-9f2a", None, now)
+            .unwrap();
+        vault
+            .grant(
+                SecretSelector::Names(["endpoint-key".to_string()].into()),
+                GrantScope::Provider("local".to_string()),
+                chrono::Duration::hours(1),
+                None,
+                now,
+            )
+            .unwrap();
+        let known = KnownSecrets::new();
+        let resolver = sessions_resolver(Some(vault), Some(&known));
+        assert!(known.is_empty());
+        let resolved = resolver
+            .resolve("local", &CredentialRef::Vault("endpoint-key".into()))
+            .await
+            .unwrap()
+            .is_some();
+        assert!(resolved);
+        assert_eq!(known.mask("key sk-ctx6-resolved-9f2a"), "key <redacted>");
+        // Without a store to feed, nothing is recorded.
+        assert!(sessions_resolver(None, None)
+            .resolve("local", &CredentialRef::None)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    fn record(credential_ref: &str, preset: Option<&str>) -> InstanceRecord {
+        InstanceRecord {
+            id: "local".into(),
+            kind: "openai_compatible".into(),
+            preset: preset.map(str::to_string),
+            label: "Local".into(),
+            base_url: "http://127.0.0.1:9/v1".into(),
+            origin: "http://127.0.0.1:9".into(),
+            default_model: Some("m".into()),
+            cost_source: "free".into(),
+            credential_ref: credential_ref.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_stored_instance_becomes_a_native_provider() {
+        let p = build_native_provider(&record("none", Some("llama_server")), None).unwrap();
+        assert_eq!(p.id(), "local");
+        assert_eq!(p.kind(), nexus_claude::agent::ProviderKind::Native);
+    }
+
+    #[test]
+    fn a_declared_window_reaches_the_provider_as_a_configured_capability() {
+        use nexus_claude::agent::ContextWindowSource;
+        let mut declared = record("none", Some("nim"));
+        declared.context_window = Some(131_072);
+        let p = build_native_provider(&declared, None).unwrap();
+        let window = p
+            .capabilities(Some("m"))
+            .context_window
+            .expect("the declared window is reported");
+        assert_eq!(window.value, 131_072);
+        // A number the operator declared is never mistaken for one a probe measured.
+        assert_eq!(window.source, ContextWindowSource::Configured);
+        // And an instance that declares nothing claims nothing.
+        let plain = build_native_provider(&record("none", Some("nim")), None).unwrap();
+        assert_eq!(plain.capabilities(Some("m")).context_window, None);
+    }
+
+    #[test]
+    fn a_native_instance_sets_no_turn_time_limit_and_no_session_budget() {
+        let p = native_provider(&record("none", Some("deepseek")), None, &[]).unwrap();
+        assert_eq!(p.config().limits, SessionLimits::default());
+        assert_eq!(p.config().limits.turn_timeout_ms, None);
+        assert_eq!(p.config().limits.max_tokens, None);
+    }
+
+    #[test]
+    fn a_native_instance_declares_permission_prompts_and_no_sandbox_before_any_session() {
+        // Listed with EMPTY capabilities, the interface said such an instance
+        // "cannot pause a tool call to ask you" (policy only) before the first message.
+        let caps = declared_capabilities(&record("none", Some("deepseek")));
+        assert!(caps.interactive_permissions);
+        assert!(caps.set_model_live);
+        assert_eq!(caps.sandbox, nexus_claude::agent::SandboxLevel::None);
+        // Nothing is claimed about tools before a probe has run.
+        assert!(!caps.tools);
+    }
+
+    #[test]
+    fn a_record_that_does_not_build_declares_nothing() {
+        let caps = declared_capabilities(&record("sk-live-abcdef", None));
+        assert_eq!(caps, nexus_claude::agent::Capabilities::none());
+    }
+
+    #[test]
+    fn a_pasted_key_is_refused_without_being_echoed() {
+        let err = build_native_provider(&record("sk-live-abcdef", None), None)
+            .err()
+            .expect("refused");
+        assert!(!format!("{err:?}{err}").contains("sk-live"));
+    }
+
+    #[test]
+    fn codex_and_acp_instances_are_built_without_any_command_from_the_record() {
+        let mut codex = record("none", None);
+        codex.kind = "codex".into();
+        codex.base_url = String::new();
+        codex.origin = "process:codex".into();
+        let p = build_native_provider(&codex, None).unwrap();
+        assert_eq!(p.kind(), nexus_claude::agent::ProviderKind::Codex);
+        // ACP with nothing declared on the server: refused, there is no command to run.
+        let mut acp = record("none", Some("opencode"));
+        acp.kind = "acp".into();
+        let err = build_native_provider(&acp, None).err().expect("refused");
+        assert_eq!(err.kind(), "invalid_request");
+    }
+
+    // ── list_models ───────────────────────────────────────────────────────
+
+    async fn endpoint_listing(body: serde_json::Value, status: u16) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_the_ids_the_endpoint_gives_in_its_order() {
+        let server = endpoint_listing(
+            serde_json::json!({"object": "list", "data": [{"id": "zeta"}, {"id": "alpha"}]}),
+            200,
+        )
+        .await;
+        let mut r = record("none", Some("llama_server"));
+        r.base_url = format!("{}/v1", server.uri());
+        let ids = list_models(&r, None).await.expect("a listing");
+        assert_eq!(ids, ["zeta", "alpha"]);
+    }
+
+    #[tokio::test]
+    async fn list_models_reports_an_endpoint_that_refuses() {
+        let server = endpoint_listing(serde_json::json!({"error": "no"}), 500).await;
+        let mut r = record("none", Some("llama_server"));
+        r.base_url = format!("{}/v1", server.uri());
+        assert!(list_models(&r, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_models_refuses_an_instance_it_cannot_build_without_echoing_a_pasted_key() {
+        let err = list_models(&record("sk-live-abcdef", None), None)
+            .await
+            .expect_err("refused");
+        assert!(!format!("{err:?}{err}").contains("sk-live"));
+    }
+
+    // ── claude_code_remote ────────────────────────────────────────────────
+
+    const KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXTCY3J636nEyMNqNrVj6HXnIXUnXL8sk4c5J6tek3N";
+    const PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA-test-only\n-----END OPENSSH PRIVATE KEY-----";
+
+    fn remote_record(host: &str, port: u16) -> InstanceRecord {
+        InstanceRecord {
+            id: "claude-code@box".into(),
+            kind: "claude_code_remote".into(),
+            label: "Box".into(),
+            origin: format!("ssh:{host}:{port}"),
+            cost_source: "subscription".into(),
+            credential_ref: "vault:ssh-box".into(),
+            host: Some(host.into()),
+            ssh_port: Some(port),
+            host_key: Some(KEY.into()),
+            remote_cwd: Some("/srv/work".into()),
+            ..Default::default()
+        }
+    }
+
+    async fn vault_with_key(grant_to: Option<&str>) -> Arc<VaultService> {
+        use crate::vault::grants::{GrantScope, SecretSelector};
+        let vault = VaultService::ephemeral();
+        vault
+            .init(
+                "correct horse battery staple".into(),
+                chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        vault.put("ssh-box", PEM, None, now).unwrap();
+        if let Some(instance) = grant_to {
+            vault
+                .grant(
+                    SecretSelector::Names(["ssh-box".to_string()].into()),
+                    GrantScope::Provider(instance.to_string()),
+                    chrono::Duration::hours(1),
+                    None,
+                    now,
+                )
+                .unwrap();
+        }
+        vault
+    }
+
+    fn remote_provider(vault: Option<Arc<VaultService>>) -> Arc<dyn AgentProvider> {
+        build_native_provider(&remote_record("127.0.0.1", 1), vault).unwrap()
+    }
+
+    #[test]
+    fn a_remote_instance_is_a_claude_code_provider_without_per_session_mcp() {
+        let p = remote_provider(None);
+        assert_eq!(p.id(), "claude-code@box");
+        assert_eq!(p.kind(), nexus_claude::agent::ProviderKind::ClaudeCode);
+        let caps = p.capabilities(None);
+        assert!(!caps.per_session_mcp && !caps.tool_cancel);
+    }
+
+    #[test]
+    fn a_remote_record_without_a_vault_credential_is_refused() {
+        for bad in ["none", "env:HOME", "sk-pasted-secret"] {
+            let mut r = remote_record("127.0.0.1", 1);
+            r.credential_ref = bad.into();
+            let err = build_native_provider(&r, None).err().expect("refused");
+            assert_eq!(err.kind(), "invalid_request", "{bad}");
+            assert!(!format!("{err:?}").contains("sk-pasted"));
+        }
+        let mut r = remote_record("-oProxyCommand=evil", 1);
+        r.host = Some("-oProxyCommand=evil".into());
+        assert!(build_native_provider(&r, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_key_file_is_owner_only_and_gone_with_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let vault = vault_with_key(Some("claude-code@box")).await;
+        let provider = RemoteClaudeProvider {
+            config: {
+                let mut c = nexus_claude::providers::claude_code::ClaudeCodeConfig::default();
+                c.id = "claude-code@box".into();
+                c.remote = Some(nexus_claude::transport::RemoteHost::new("127.0.0.1", KEY));
+                c
+            },
+            key_name: "ssh-box".into(),
+            vault: Some(vault),
+        };
+        let (_p, file) = provider.with_key().unwrap();
+        let path = file.path().to_path_buf();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("-----BEGIN") && text.ends_with('\n'));
+        drop(file);
+        assert!(!path.exists(), "the key file outlived its owner");
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn the_key_is_read_under_a_grant_and_a_missing_one_is_typed_never_a_fallback() {
+        // No grant: auth_required, naming the instance.
+        let health = remote_provider(Some(vault_with_key(None).await))
+            .health()
+            .await;
+        assert_eq!(
+            health.status,
+            nexus_claude::agent::HealthStatus::Unavailable
+        );
+        assert_eq!(
+            health.error.as_ref().map(|e| e.kind()),
+            Some("auth_required")
+        );
+        // Granted to ANOTHER instance: same.
+        let health = remote_provider(Some(vault_with_key(Some("claude-code@other")).await))
+            .health()
+            .await;
+        assert_eq!(
+            health.error.as_ref().map(|e| e.kind()),
+            Some("auth_required")
+        );
+        // Locked vault.
+        let vault = vault_with_key(Some("claude-code@box")).await;
+        vault.lock_now();
+        let health = remote_provider(Some(vault)).health().await;
+        assert_eq!(
+            health.error.as_ref().map(|e| e.kind()),
+            Some("credentials_locked")
+        );
+        // No vault service at all: refused, not "no key".
+        let err = remote_provider(None)
+            .open(nexus_claude::agent::SessionSpec::new("/srv/work"))
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(err.kind(), "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_machine_is_unavailable_with_a_readable_reason_and_no_path() {
+        // Port 1 on loopback: refused at once (or no ssh client: also unavailable).
+        let vault = vault_with_key(Some("claude-code@box")).await;
+        let health = remote_provider(Some(vault)).health().await;
+        assert_eq!(
+            health.status,
+            nexus_claude::agent::HealthStatus::Unavailable
+        );
+        let entry = crate::chat::provider::listing::HealthEntry::from_nexus(&health)
+            .with_remote_reason(&health);
+        let body = serde_json::to_string(&entry).unwrap();
+        assert!(entry.reason.is_some(), "{body}");
+        for leak in [
+            "nexus-",
+            "id_ssh",
+            "/tmp",
+            "/var/",
+            "PRIVATE KEY",
+            "known_hosts",
+        ] {
+            assert!(!body.contains(leak), "{leak} in {body}");
+        }
+        let failure = crate::chat::provider::errors::open_failure(
+            health.error.as_ref().unwrap(),
+            Some("claude-code@box"),
+        );
+        let body = format!("{failure:?}");
+        for leak in ["nexus-", "id_ssh", "PRIVATE KEY", "known_hosts"] {
+            assert!(!body.contains(leak), "{leak} in {body}");
+        }
+    }
+
+    // ── anthropic (CTX5) ──────────────────────────────────────────────────
+
+    const ANTHROPIC_KEY: &str = "sk-ant-ctx5-test-0123456789";
+
+    fn anthropic_record(base_url: &str, origin: &str, credential_ref: &str) -> InstanceRecord {
+        InstanceRecord {
+            id: "claude-api".into(),
+            kind: super::super::settings::KIND_ANTHROPIC.into(),
+            label: "Claude API".into(),
+            base_url: base_url.into(),
+            origin: origin.into(),
+            default_model: Some("m".into()),
+            cost_source: "unknown".into(),
+            credential_ref: credential_ref.into(),
+            ..Default::default()
+        }
+    }
+
+    async fn vault_with_api_key() -> Arc<VaultService> {
+        use crate::vault::grants::{GrantScope, SecretSelector};
+        let vault = VaultService::ephemeral();
+        vault
+            .init(
+                "correct horse battery staple".into(),
+                chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        vault
+            .put("anthropic-key", ANTHROPIC_KEY, None, now)
+            .unwrap();
+        vault
+            .grant(
+                SecretSelector::Names(["anthropic-key".to_string()].into()),
+                GrantScope::Provider("claude-api".to_string()),
+                chrono::Duration::hours(1),
+                None,
+                now,
+            )
+            .unwrap();
+        vault
+    }
+
+    /// The SSE body of a Messages API answer: `text`, then the end of the message.
+    fn messages_sse(text: &str) -> String {
+        let events = [
+            serde_json::json!({"type": "message_start", "message": {"id": "msg_1", "type": "message",
+                "role": "assistant", "content": [], "model": "m",
+                "usage": {"input_tokens": 12, "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 30, "output_tokens": 1}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": text}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 4}}),
+            serde_json::json!({"type": "message_stop"}),
+        ];
+        events
+            .iter()
+            .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+            .collect()
+    }
+
+    /// An `anthropic` instance runs the native harness over the Messages API: the turn
+    /// reaches `/v1/messages` with the version header, the key read from the VAULT under
+    /// the instance's grant (a gateway origin: `Bearer`), and the three cache points —
+    /// tools, system, last turn — in the request itself.
+    #[tokio::test]
+    async fn an_anthropic_instance_speaks_the_messages_api_with_three_cache_points() {
+        use futures::StreamExt;
+        use nexus_claude::agent::{SessionSpec, SystemPromptMode, SystemPromptSpec, TurnInput};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "m", "max_input_tokens": 200000,
+                    "capabilities": {"image_input": {"supported": true}}}],
+                "has_more": false})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(messages_sse("hello from claude")),
+            )
+            .mount(&server)
+            .await;
+
+        let record = anthropic_record(&server.uri(), &server.uri(), "vault:anthropic-key");
+        let provider = build_native_provider(&record, Some(vault_with_api_key().await)).unwrap();
+        assert_eq!(provider.kind(), nexus_claude::agent::ProviderKind::Native);
+        let cwd = tempfile::tempdir().unwrap();
+        let mut spec = SessionSpec::new(cwd.path());
+        spec.model = Some("m".into());
+        spec.system_prompt = Some(SystemPromptSpec {
+            text: "stable system prompt".into(),
+            mode: SystemPromptMode::Replace,
+        });
+        let session = provider.open(spec).await.expect("the session opens");
+        let mut stream = session.send_turn(TurnInput::text("hi")).await.unwrap();
+        let mut texts = String::new();
+        while let Some(event) = stream.next().await {
+            if let nexus_claude::agent::AgentEvent::Text { text, .. } = &event {
+                texts.push_str(text);
+            }
+        }
+        assert_eq!(texts, "hello from claude");
+
+        let received = server.received_requests().await.unwrap();
+        let post = received
+            .iter()
+            .find(|r| r.url.path() == "/v1/messages")
+            .expect("the turn reached the Messages API");
+        let header = |name: &str| {
+            post.headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(header("anthropic-version").as_deref(), Some("2023-06-01"));
+        assert_eq!(
+            header("authorization"),
+            Some(format!("Bearer {ANTHROPIC_KEY}")),
+            "the key from the vault, as a gateway takes it"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+        let ephemeral = serde_json::json!({"type": "ephemeral"});
+        let tools = body["tools"].as_array().expect("tools are offered");
+        assert_eq!(tools.last().unwrap()["cache_control"], ephemeral);
+        assert_eq!(body["system"][0]["cache_control"], ephemeral);
+        let last = body["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(
+            last["content"].as_array().unwrap().last().unwrap()["cache_control"],
+            ephemeral
+        );
+        assert_eq!(body.to_string().matches("cache_control").count(), 3);
+    }
+
+    /// The key of an `anthropic` instance is a vault reference: anything else is refused
+    /// by the factory too, whatever was stored, and never echoed.
+    #[test]
+    fn an_anthropic_instance_without_a_vault_reference_is_refused() {
+        for bad in ["none", "env:ANTHROPIC_API_KEY", "sk-ant-pasted-value"] {
+            let record = anthropic_record(
+                "https://api.anthropic.com",
+                "https://api.anthropic.com",
+                bad,
+            );
+            let err = build_native_provider(&record, None).err().expect("refused");
+            assert_eq!(err.kind(), "invalid_request", "{bad}");
+            assert!(!format!("{err:?}{err}").contains("sk-ant"), "{bad}");
+        }
+        let ok = anthropic_record(
+            "https://api.anthropic.com",
+            "https://api.anthropic.com",
+            "vault:anthropic-key",
+        );
+        assert!(build_native_provider(&ok, None).is_ok());
+    }
+}

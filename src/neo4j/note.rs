@@ -1,0 +1,4437 @@
+//! Neo4j Knowledge Note operations
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use super::client::{Neo4jClient, WhereBuilder, WhereParam};
+use super::models::DecisionNode;
+use crate::neurons::forgetting::{DecayPolicy, PassReport};
+use crate::notes::{
+    EntityType, MemoryHorizon, Note, NoteAnchor, NoteAuthorKind, NoteChange, NoteFilters,
+    NoteImportance, NoteScope, NoteStatus, NoteType, PropagatedNote,
+};
+use anyhow::{Context, Result};
+use neo4rs::query;
+use uuid::Uuid;
+
+/// How much of a scar heals per forgetting pass.
+///
+/// Twenty times slower than the amount a synapse used to lose per pass
+/// (0.02 × 0.05): the memory of a failure must outlive the links it scarred.
+const SCAR_DECAY_PER_PASS: f64 = 0.02 * 0.05;
+
+/// The `project_id` Cypher parameter of a note write.
+///
+/// `None` must reach the database as a NULL, never as an empty string: an empty
+/// string is a third state the read path decodes back to `None`, yet every
+/// predicate that tests `IS NULL` misses it. 3 319 notes were stranded that way
+/// until this write was fixed. One spelling only.
+fn note_project_param(project_id: Option<Uuid>) -> Option<String> {
+    project_id.map(|id| id.to_string())
+}
+
+/// Note properties a client may sort on. Anything else falls back to
+/// `created_at` (the field name is spliced into the Cypher, so it must come
+/// from this whitelist, never straight from the request).
+/// Candidates read by `get_propagated_notes` in `CrossProject`, where the pairwise
+/// coupling weights the score after the query: the final cut to 20 happens only
+/// once weighted.
+const CROSS_PROJECT_DIRECT_CANDIDATES: i64 = 200;
+const CROSS_PROJECT_TRANSITIVE_CANDIDATES: i64 = 100;
+
+const NOTE_SORT_FIELDS: &[&str] = &[
+    "created_at",
+    "updated_at",
+    "importance",
+    "status",
+    "note_type",
+    "staleness_score",
+    "energy",
+    "last_confirmed_at",
+    "last_activated",
+    "scar_intensity",
+];
+
+fn note_order_field(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|r| NOTE_SORT_FIELDS.iter().find(|f| **f == r))
+        .copied()
+        .unwrap_or("created_at")
+}
+
+fn note_order_dir(requested: Option<&str>) -> &'static str {
+    match requested.map(|d| d.trim().to_ascii_lowercase()) {
+        Some(d) if d == "asc" => "ASC",
+        _ => "DESC",
+    }
+}
+
+/// Split synapse neighbors into the parallel `$ids` / `$weights` lists bound
+/// to the UNWIND queries. A non-finite weight (NaN/inf) is rejected up front:
+/// it used to be spliced into the Cypher text and produced an invalid query.
+pub(crate) fn synapse_bind_params(neighbors: &[(Uuid, f64)]) -> Result<(Vec<String>, Vec<f64>)> {
+    if let Some((nid, w)) = neighbors.iter().find(|(_, w)| !w.is_finite()) {
+        anyhow::bail!("non-finite synapse weight {} for neighbor {}", w, nid);
+    }
+    Ok((
+        neighbors.iter().map(|(n, _)| n.to_string()).collect(),
+        neighbors.iter().map(|(_, w)| *w).collect(),
+    ))
+}
+
+/// Build the WHERE conditions of `list_notes`. Every client-supplied value
+/// (project id, workspace slug, enum lists, tags, search text) is carried as
+/// a bound `$wb_N` parameter; nothing is spliced into the Cypher text.
+pub(crate) fn build_note_where(
+    project_id: Option<Uuid>,
+    workspace_slug: Option<&str>,
+    filters: &NoteFilters,
+) -> WhereBuilder {
+    let mut wb = WhereBuilder::new();
+
+    if filters.global_only == Some(true) {
+        wb.add_static("(n.project_id IS NULL OR n.project_id = '')");
+    } else if let Some(pid) = project_id {
+        wb.add_bound("n.project_id = {}", WhereParam::Str(pid.to_string()));
+    } else if let Some(ws) = workspace_slug {
+        wb.add_bound(
+            "n.project_id IN [(w:Workspace {slug: {}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]",
+            WhereParam::Str(ws.to_string()),
+        );
+    }
+
+    if let Some(ref statuses) = filters.status {
+        let list: Vec<String> = statuses.iter().map(|s| s.to_string()).collect();
+        wb.add_bound("n.status IN {}", WhereParam::StrList(list));
+    }
+    if let Some(ref types) = filters.note_type {
+        let list: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        wb.add_bound("n.note_type IN {}", WhereParam::StrList(list));
+    }
+    if let Some(ref importance) = filters.importance {
+        let list: Vec<String> = importance.iter().map(|i| i.to_string()).collect();
+        wb.add_bound("n.importance IN {}", WhereParam::StrList(list));
+    }
+    if let Some(ref tags) = filters.tags {
+        for tag in tags {
+            wb.add_bound("{} IN n.tags", WhereParam::Str(tag.clone()));
+        }
+    }
+    // f64 values: not injectable, but NaN/inf would render as invalid Cypher
+    if let Some(min) = filters.min_staleness.filter(|v| v.is_finite()) {
+        wb.add_static(&format!("n.staleness_score >= {}", min));
+    }
+    if let Some(max) = filters.max_staleness.filter(|v| v.is_finite()) {
+        wb.add_static(&format!("n.staleness_score <= {}", max));
+    }
+    if let Some(ref search) = filters.search {
+        if !search.trim().is_empty() {
+            wb.add_bound(
+                "toLower(n.content) CONTAINS {}",
+                WhereParam::Str(search.to_lowercase()),
+            );
+        }
+    }
+    wb
+}
+
+/// SET clauses of `update_note`. Values are bound as `$content`, `$importance`,
+/// `$status` and `$tags` by the caller; only constant text appears here.
+pub(crate) fn note_update_set_clauses(
+    has_content: bool,
+    has_importance: bool,
+    has_status: bool,
+    has_tags: bool,
+    staleness_score: Option<f64>,
+) -> Vec<String> {
+    let mut set_clauses = vec!["n.updated_at = datetime()".to_string()];
+    if has_content {
+        set_clauses.push("n.content = $content".to_string());
+    }
+    if has_importance {
+        set_clauses.push("n.importance = $importance".to_string());
+    }
+    if has_status {
+        set_clauses.push("n.status = $status".to_string());
+    }
+    if has_tags {
+        set_clauses.push("n.tags = $tags".to_string());
+    }
+    if let Some(s) = staleness_score.filter(|v| v.is_finite()) {
+        set_clauses.push(format!("n.staleness_score = {}", s));
+    }
+    set_clauses
+}
+
+impl Neo4jClient {
+    // ========================================================================
+    // Knowledge Note operations
+    // ========================================================================
+
+    /// Create a new note
+    pub async fn create_note(&self, note: &Note) -> Result<()> {
+        let q = query(
+            r#"
+            CREATE (n:Note {
+                id: $id,
+                project_id: $project_id,
+                note_type: $note_type,
+                status: $status,
+                importance: $importance,
+                scope_type: $scope_type,
+                scope_path: $scope_path,
+                content: $content,
+                tags: $tags,
+                created_at: datetime($created_at),
+                created_by: $created_by,
+                author_kind: $author_kind,
+                confidence: $confidence,
+                human_confirmed_at: CASE WHEN $human_confirmed_at = '' THEN null ELSE datetime($human_confirmed_at) END,
+                human_confirmed_by: $human_confirmed_by,
+                last_confirmed_at: datetime($last_confirmed_at),
+                last_confirmed_by: $last_confirmed_by,
+                staleness_score: $staleness_score,
+                energy: $energy,
+                last_activated: datetime($last_activated),
+                changes_json: $changes_json,
+                assertion_rule_json: $assertion_rule_json,
+                scar_intensity: $scar_intensity,
+                memory_horizon: $memory_horizon,
+                activation_count: $activation_count,
+                valid_from: CASE WHEN $valid_from = '' THEN null ELSE datetime($valid_from) END,
+                valid_until: CASE WHEN $valid_until = '' THEN null ELSE datetime($valid_until) END,
+                revision_json: $revision_json,
+                sharing_consent: $sharing_consent
+            })
+            "#,
+        )
+        .param("id", note.id.to_string())
+        .param("project_id", note_project_param(note.project_id))
+        .param("note_type", note.note_type.to_string())
+        .param("status", note.status.to_string())
+        .param("importance", note.importance.to_string())
+        .param("scope_type", self.scope_type_string(&note.scope))
+        .param("scope_path", self.scope_path_string(&note.scope))
+        .param("content", note.content.clone())
+        .param("tags", note.tags.clone())
+        .param("created_at", note.created_at.to_rfc3339())
+        .param("created_by", note.created_by.clone())
+        .param("author_kind", note.author_kind.as_str())
+        .param("confidence", note.confidence)
+        .param(
+            "human_confirmed_at",
+            note.human_confirmed_at
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default(),
+        )
+        .param(
+            "human_confirmed_by",
+            note.human_confirmed_by.clone().unwrap_or_default(),
+        )
+        .param(
+            "last_confirmed_at",
+            note.last_confirmed_at
+                .unwrap_or(note.created_at)
+                .to_rfc3339(),
+        )
+        .param(
+            "last_confirmed_by",
+            note.last_confirmed_by.clone().unwrap_or_default(),
+        )
+        .param("staleness_score", note.staleness_score)
+        .param("energy", note.energy)
+        .param(
+            "last_activated",
+            note.last_activated.unwrap_or(note.created_at).to_rfc3339(),
+        )
+        .param("changes_json", serde_json::to_string(&note.changes)?)
+        .param(
+            "assertion_rule_json",
+            note.assertion_rule
+                .as_ref()
+                .map(|r| serde_json::to_string(r).unwrap_or_default())
+                .unwrap_or_default(),
+        )
+        .param("scar_intensity", note.scar_intensity)
+        .param("memory_horizon", note.memory_horizon.to_string())
+        .param("activation_count", note.activation_count)
+        .param(
+            "valid_from",
+            note.valid_from.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        )
+        .param(
+            "valid_until",
+            note.valid_until.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        )
+        .param(
+            "revision_json",
+            note.revision
+                .as_ref()
+                .map(|r| serde_json::to_string(r).unwrap_or_default())
+                .unwrap_or_default(),
+        )
+        .param("sharing_consent", note.sharing_consent.as_db_str());
+
+        self.graph.run(q).await?;
+
+        // Link to project (only if project_id is present)
+        if let Some(pid) = note.project_id {
+            let link_q = query(
+                r#"
+                MATCH (n:Note {id: $note_id})
+                MATCH (p:Project {id: $project_id})
+                MERGE (p)-[:HAS_NOTE]->(n)
+                "#,
+            )
+            .param("note_id", note.id.to_string())
+            .param("project_id", pid.to_string());
+
+            self.graph.run(link_q).await?;
+        }
+
+        // The author is a node, and this note is one of its own. Drawn at the write, so
+        // the edge never waits for a backfill to exist — and never a reason to refuse the
+        // note: an author that cannot be stamped is logged, not fatal.
+        if let Some(agent) = crate::notes::provenance::parse_actor(&note.created_by) {
+            if let Err(e) = self.ensure_agent(agent, None).await {
+                tracing::warn!(error = %e, "the node of the author of a note could not be made");
+            }
+            if let Err(e) = self.link_agent_authored(agent, note.id).await {
+                tracing::warn!(error = %e, "the note could not be given to its author");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get a note by ID
+    pub async fn get_note(&self, id: Uuid) -> Result<Option<Note>> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            RETURN n
+            "#,
+        )
+        .param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            Ok(Some(self.node_to_note(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update a note
+    pub async fn update_note(
+        &self,
+        id: Uuid,
+        content: Option<String>,
+        importance: Option<NoteImportance>,
+        status: Option<NoteStatus>,
+        tags: Option<Vec<String>>,
+        staleness_score: Option<f64>,
+    ) -> Result<Option<Note>> {
+        let set_clauses = note_update_set_clauses(
+            content.is_some(),
+            importance.is_some(),
+            status.is_some(),
+            tags.is_some(),
+            staleness_score,
+        );
+
+        let cypher = format!(
+            r#"
+            MATCH (n:Note {{id: $id}})
+            SET {}
+            RETURN n
+            "#,
+            set_clauses.join(", ")
+        );
+
+        let mut q = query(&cypher).param("id", id.to_string());
+        if let Some(c) = content {
+            q = q.param("content", c);
+        }
+        if let Some(i) = importance {
+            q = q.param("importance", i.to_string());
+        }
+        if let Some(s) = status {
+            q = q.param("status", s.to_string());
+        }
+        if let Some(t) = tags {
+            q = q.param("tags", t);
+        }
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            Ok(Some(self.node_to_note(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Delete a note
+    /// Move a note between the global level and a project, updating BOTH
+    /// representations. See `GraphStore::rescope_note` for why both matter.
+    pub async fn rescope_note(&self, note_id: Uuid, project_id: Option<Uuid>) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            OPTIONAL MATCH (:Project)-[old:HAS_NOTE]->(n)
+            DELETE old
+            WITH n
+            OPTIONAL MATCH (p:Project {id: $project_id})
+            FOREACH (_ IN CASE WHEN p IS NULL THEN [] ELSE [1] END |
+                MERGE (p)-[:HAS_NOTE]->(n)
+            )
+            SET n.project_id = $project_id
+            RETURN n.id AS id
+            "#,
+        )
+        .param("id", note_id.to_string())
+        .param("project_id", project_id.map(|p| p.to_string()));
+
+        let mut result = self.graph.execute(q).await?;
+        result.next().await?;
+        Ok(())
+    }
+
+    pub async fn delete_note(&self, id: Uuid) -> Result<bool> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            DETACH DELETE n
+            RETURN count(n) AS deleted
+            "#,
+        )
+        .param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let deleted: i64 = row.get("deleted")?;
+            Ok(deleted > 0)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// List notes with filters and pagination
+    pub async fn list_notes(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        filters: &NoteFilters,
+    ) -> Result<(Vec<Note>, usize)> {
+        let wb = build_note_where(project_id, workspace_slug, filters);
+        let where_clause = wb.build();
+
+        let order_field = note_order_field(filters.sort_by.as_deref());
+        let order_dir = note_order_dir(filters.sort_order.as_deref());
+        let limit = filters.limit.unwrap_or(50);
+        let offset = filters.offset.unwrap_or(0);
+
+        // Count total
+        let count_cypher = format!(
+            r#"
+            MATCH (n:Note)
+            {}
+            RETURN count(n) AS total
+            "#,
+            where_clause
+        );
+
+        let mut count_result = self.graph.execute(wb.bind(query(&count_cypher))).await?;
+        let total: i64 = if let Some(row) = count_result.next().await? {
+            row.get("total")?
+        } else {
+            0
+        };
+
+        // Get notes
+        let cypher = format!(
+            r#"
+            MATCH (n:Note)
+            {}
+            RETURN n
+            ORDER BY n.{} {}, n.id {}
+            SKIP {}
+            LIMIT {}
+            "#,
+            where_clause, order_field, order_dir, order_dir, offset, limit
+        );
+
+        let mut result = self.graph.execute(wb.bind(query(&cypher))).await?;
+        let mut notes = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            notes.push(self.node_to_note(&node)?);
+        }
+
+        Ok((notes, total as usize))
+    }
+
+    /// Link a note to an entity (File, Function, Task, etc.)
+    pub async fn link_note_to_entity(
+        &self,
+        note_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+        signature_hash: Option<&str>,
+        body_hash: Option<&str>,
+    ) -> Result<()> {
+        let node_label = match entity_type {
+            EntityType::Project => "Project",
+            EntityType::File => "File",
+            EntityType::Module => "Module",
+            EntityType::Function => "Function",
+            EntityType::Struct => "Struct",
+            EntityType::Trait => "Trait",
+            EntityType::Enum => "Enum",
+            EntityType::Impl => "Impl",
+            EntityType::Task => "Task",
+            EntityType::Plan => "Plan",
+            EntityType::Commit => "Commit",
+            EntityType::Decision => "Decision",
+            EntityType::Workspace => "Workspace",
+            EntityType::WorkspaceMilestone => "WorkspaceMilestone",
+            EntityType::Resource => "Resource",
+            EntityType::Component => "Component",
+            EntityType::Step => "Step",
+            EntityType::Constraint => "Constraint",
+            EntityType::Milestone => "Milestone",
+            EntityType::Release => "Release",
+            EntityType::FeatureGraph => "FeatureGraph",
+            EntityType::Protocol => "Protocol",
+            EntityType::ProtocolState => "ProtocolState",
+            EntityType::ProtocolRun => "ProtocolRun",
+            EntityType::PlanRun => "PlanRun",
+            EntityType::Skill => "Skill",
+            EntityType::Note => "Note",
+            EntityType::ChatSession => "ChatSession",
+            EntityType::Process => "Process",
+            EntityType::Document => "Document",
+        };
+
+        // Determine the match field based on entity type.
+        // For File entities with relative paths, use ENDS WITH matching
+        // since Neo4j stores absolute paths.
+        let (match_field, match_value, use_suffix_match) = match entity_type {
+            EntityType::File => {
+                if entity_id.starts_with('/') {
+                    ("path", entity_id.to_string(), false)
+                } else {
+                    ("path", format!("/{}", entity_id), true)
+                }
+            }
+            EntityType::Commit => ("hash", entity_id.to_string(), false),
+            _ => ("id", entity_id.to_string(), false),
+        };
+
+        let cypher = if use_suffix_match {
+            format!(
+                r#"
+                MATCH (n:Note {{id: $note_id}})
+                MATCH (e:{})
+                WHERE e.{} ENDS WITH $entity_id
+                MERGE (n)-[r:LINKED_TO]->(e)
+                SET r.signature_hash = $sig_hash,
+                    r.body_hash = $body_hash,
+                    r.last_verified = datetime()
+                "#,
+                node_label, match_field
+            )
+        } else {
+            format!(
+                r#"
+                MATCH (n:Note {{id: $note_id}})
+                MATCH (e:{} {{{}: $entity_id}})
+                MERGE (n)-[r:LINKED_TO]->(e)
+                SET r.signature_hash = $sig_hash,
+                    r.body_hash = $body_hash,
+                    r.last_verified = datetime()
+                "#,
+                node_label, match_field
+            )
+        };
+
+        let q = query(&cypher)
+            .param("note_id", note_id.to_string())
+            .param("entity_id", match_value)
+            .param("sig_hash", signature_hash.unwrap_or(""))
+            .param("body_hash", body_hash.unwrap_or(""));
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Unlink a note from an entity
+    pub async fn unlink_note_from_entity(
+        &self,
+        note_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<()> {
+        let node_label = match entity_type {
+            EntityType::Project => "Project",
+            EntityType::File => "File",
+            EntityType::Module => "Module",
+            EntityType::Function => "Function",
+            EntityType::Struct => "Struct",
+            EntityType::Trait => "Trait",
+            EntityType::Enum => "Enum",
+            EntityType::Impl => "Impl",
+            EntityType::Task => "Task",
+            EntityType::Plan => "Plan",
+            EntityType::Commit => "Commit",
+            EntityType::Decision => "Decision",
+            EntityType::Workspace => "Workspace",
+            EntityType::WorkspaceMilestone => "WorkspaceMilestone",
+            EntityType::Resource => "Resource",
+            EntityType::Component => "Component",
+            EntityType::Step => "Step",
+            EntityType::Constraint => "Constraint",
+            EntityType::Milestone => "Milestone",
+            EntityType::Release => "Release",
+            EntityType::FeatureGraph => "FeatureGraph",
+            EntityType::Protocol => "Protocol",
+            EntityType::ProtocolState => "ProtocolState",
+            EntityType::ProtocolRun => "ProtocolRun",
+            EntityType::PlanRun => "PlanRun",
+            EntityType::Skill => "Skill",
+            EntityType::Note => "Note",
+            EntityType::ChatSession => "ChatSession",
+            EntityType::Process => "Process",
+            EntityType::Document => "Document",
+        };
+
+        let (match_field, match_value, use_suffix_match) = match entity_type {
+            EntityType::File => {
+                if entity_id.starts_with('/') {
+                    ("path", entity_id.to_string(), false)
+                } else {
+                    ("path", format!("/{}", entity_id), true)
+                }
+            }
+            EntityType::Commit => ("hash", entity_id.to_string(), false),
+            _ => ("id", entity_id.to_string(), false),
+        };
+
+        let cypher = if use_suffix_match {
+            format!(
+                r#"
+                MATCH (n:Note {{id: $note_id}})-[r:LINKED_TO]->(e:{})
+                WHERE e.{} ENDS WITH $entity_id
+                DELETE r
+                "#,
+                node_label, match_field
+            )
+        } else {
+            format!(
+                r#"
+                MATCH (n:Note {{id: $note_id}})-[r:LINKED_TO]->(e:{} {{{}: $entity_id}})
+                DELETE r
+                "#,
+                node_label, match_field
+            )
+        };
+
+        let q = query(&cypher)
+            .param("note_id", note_id.to_string())
+            .param("entity_id", match_value);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Propagate LINKED_TO relationships via structural code relations (IMPORTS, CALLS).
+    ///
+    /// For each note already LINKED_TO a File in the given project, this creates
+    /// LINKED_TO relationships to files that are structurally connected (1 hop via
+    /// IMPORTS or CALLS). Propagated links are marked with `propagated: true` and
+    /// `propagation_source: 'structural'` to distinguish them from explicit links.
+    ///
+    /// Also propagates via CO_CHANGED relationships (files historically modified together).
+    ///
+    /// Uses MERGE for idempotent creation. Scoped to a single project to avoid
+    /// cross-project contamination.
+    ///
+    /// Returns the number of propagated links created.
+    pub async fn propagate_structural_links(&self, project_id: Uuid) -> Result<usize> {
+        // Propagate via IMPORTS and CALLS (1 hop)
+        let propagate_code_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f1:File)
+            MATCH (n:Note)-[existing:LINKED_TO]->(f1)
+            WHERE existing.propagated IS NULL OR existing.propagated = false
+            MATCH (f1)-[:IMPORTS|CALLS*1]->(f2:File)<-[:CONTAINS]-(p)
+            WHERE f1 <> f2 AND NOT (n)-[:LINKED_TO]->(f2)
+            MERGE (n)-[r:LINKED_TO]->(f2)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'structural',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(propagate_code_q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total += row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        // Propagate via CO_CHANGED (files historically modified together)
+        let propagate_cochange_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f1:File)
+            MATCH (n:Note)-[existing:LINKED_TO]->(f1)
+            WHERE existing.propagated IS NULL OR existing.propagated = false
+            MATCH (f1)-[:CO_CHANGED]->(f2:File)<-[:CONTAINS]-(p)
+            WHERE f1 <> f2 AND NOT (n)-[:LINKED_TO]->(f2)
+            MERGE (n)-[r:LINKED_TO]->(f2)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'co_changed',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        if let Ok(mut result) = self.graph.execute(propagate_cochange_q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total += row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                propagated = total,
+                "Propagated {} structural knowledge links",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Propagate knowledge links via semantic similarity (embeddings).
+    ///
+    /// For each File in the project that has an embedding, queries the
+    /// `note_embeddings` HNSW index for the top-K nearest notes.
+    /// Creates LINKED_TO relationships with `propagation_source = 'semantic'`
+    /// and `similarity_score` for matches above `min_similarity`.
+    ///
+    /// Only creates links where none already exist (MERGE + WHERE NOT).
+    /// Limits to K=5 notes per file to avoid noise.
+    pub async fn propagate_semantic_links(
+        &self,
+        project_id: Uuid,
+        min_similarity: f64,
+    ) -> Result<usize> {
+        // Step 1: Get file paths + embeddings for files in the project
+        let files_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE f.embedding IS NOT NULL
+            RETURN f.path AS path, f.embedding AS embedding
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut file_embeddings: Vec<(String, Vec<f64>)> = Vec::new();
+        if let Ok(mut result) = self.graph.execute(files_q).await {
+            while let Ok(Some(row)) = result.next().await {
+                if let (Ok(path), Ok(emb)) =
+                    (row.get::<String>("path"), row.get::<Vec<f64>>("embedding"))
+                {
+                    file_embeddings.push((path, emb));
+                }
+            }
+        }
+
+        if file_embeddings.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total = 0usize;
+
+        // Step 2: For each file, vector search notes and create LINKED_TO
+        for (file_path, embedding) in &file_embeddings {
+            let emb_f32: Vec<f32> = embedding.iter().map(|&v| v as f32).collect();
+
+            // Use vector search to find top-5 notes similar to this file
+            let search_q = query(
+                r#"
+                CALL db.index.vector.queryNodes('note_embeddings', $k, $embedding)
+                YIELD node AS n, score
+                WHERE score > $min_similarity
+                  AND n.status IN ['active', 'needs_review']
+                WITH n, score
+                MATCH (f:File {path: $file_path})
+                WHERE NOT (n)-[:LINKED_TO]->(f)
+                MERGE (n)-[r:LINKED_TO]->(f)
+                ON CREATE SET
+                    r.propagated = true,
+                    r.propagation_source = 'semantic',
+                    r.similarity_score = score,
+                    r.last_verified = datetime()
+                RETURN count(r) AS cnt
+                "#,
+            )
+            .param("k", 5i64)
+            .param("embedding", emb_f32)
+            .param("min_similarity", min_similarity)
+            .param("file_path", file_path.clone());
+
+            if let Ok(mut result) = self.graph.execute(search_q).await {
+                if let Ok(Some(row)) = result.next().await {
+                    total += row.get::<i64>("cnt").unwrap_or(0) as usize;
+                }
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                files_processed = file_embeddings.len(),
+                links_created = total,
+                "Propagated {} semantic knowledge links from {} files",
+                total,
+                file_embeddings.len()
+            );
+        }
+
+        Ok(total)
+    }
+
+    /// Semantically anchor a SINGLE note to the most similar files in its
+    /// project, using the note's own embedding against the `file_embedding_index`
+    /// vector index. Used as a creation-time fallback when content-based
+    /// anchoring found no file paths in the note text — this is what keeps
+    /// "concept" notes (e.g. "always validate input") from becoming orphans.
+    ///
+    /// Creates LINKED_TO with `propagation_source = 'semantic_creation'` for the
+    /// top-K matches above `min_similarity`. Idempotent (skips existing links).
+    /// Returns the number of links created. No-op if the note has no embedding.
+    pub async fn semantic_anchor_note(
+        &self,
+        note_id: Uuid,
+        project_id: Uuid,
+        min_similarity: f64,
+    ) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $note_id})
+            WHERE n.embedding IS NOT NULL
+            CALL db.index.vector.queryNodes('file_embedding_index', $k, n.embedding)
+            YIELD node AS f, score
+            WHERE score > $min_similarity
+              AND f.project_id = $project_id
+              AND NOT (n)-[:LINKED_TO]->(f)
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'semantic_creation',
+                r.similarity_score = score,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("note_id", note_id.to_string())
+        .param("k", 3i64)
+        .param("min_similarity", min_similarity)
+        .param("project_id", project_id.to_string());
+
+        let mut created = 0usize;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                created = row.get::<i64>("cnt").unwrap_or(0) as usize;
+            }
+        }
+
+        if created > 0 {
+            tracing::debug!(
+                %note_id,
+                %project_id,
+                links_created = created,
+                "Semantic-anchored note to similar files (creation fallback)"
+            );
+        }
+
+        Ok(created)
+    }
+
+    /// Final-pass drainer: link every still-orphan note of a project to its
+    /// Project node via LINKED_TO. Notes that match no file by content or
+    /// embedding (health reports, RFCs, project-level observations) would
+    /// otherwise stay orphans forever; anchoring them to the Project gives them
+    /// an owner without inventing a spurious file link. Idempotent (MERGE).
+    /// Returns the number of fallback links created.
+    pub async fn anchor_orphan_notes_to_project(&self, project_id: Uuid) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})
+            MATCH (n:Note {project_id: $pid})
+            WHERE NOT (n)-[:LINKED_TO]->()
+            MERGE (n)-[r:LINKED_TO]->(p)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'project_fallback',
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let mut created = 0usize;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                created = row.get::<i64>("cnt").unwrap_or(0) as usize;
+            }
+        }
+
+        if created > 0 {
+            tracing::info!(
+                %project_id,
+                links_created = created,
+                "Anchored orphan notes to Project node (final fallback)"
+            );
+        }
+
+        Ok(created)
+    }
+
+    // ================================================================
+    // High-Level Entity Propagation (FeatureGraph, Skill, Protocol)
+    // ================================================================
+
+    /// Propagate notes linked to FeatureGraphs to their member files (batch).
+    ///
+    /// For each note LINKED_TO a FeatureGraph, creates LINKED_TO relationships
+    /// to files that are members of that feature graph (via INCLUDES_ENTITY).
+    /// Scoped to a single project via BELONGS_TO.
+    pub async fn propagate_feature_graph_links(&self, project_id: Uuid) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (fg:FeatureGraph)-[:BELONGS_TO]->(p:Project {id: $project_id})
+            MATCH (n:Note)-[existing:LINKED_TO]->(fg)
+            WHERE existing.propagated IS NULL OR existing.propagated = false
+            MATCH (fg)-[:INCLUDES_ENTITY]->(f:File)
+            WHERE NOT (n)-[:LINKED_TO]->(f)
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'feature_graph',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total = row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                propagated = total,
+                source = "feature_graph",
+                "Propagated {} knowledge links via FeatureGraph membership",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Propagate notes linked to Skills to files touched by the skill's member notes (batch).
+    ///
+    /// Path: Note -[:LINKED_TO]-> Skill <-[:MEMBER_OF]- MemberNote -[:LINKED_TO]-> File
+    /// Scoped to project via the member note's project_id.
+    pub async fn propagate_skill_member_links(&self, project_id: Uuid) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note {project_id: $project_id})-[existing:LINKED_TO]->(s:Skill)
+            WHERE existing.propagated IS NULL OR existing.propagated = false
+            MATCH (member:Note)-[:MEMBER_OF]->(s)
+            MATCH (member)-[:LINKED_TO]->(f:File)
+            WHERE NOT (n)-[:LINKED_TO]->(f) AND n <> member
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'skill_member',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total = row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                propagated = total,
+                source = "skill_member",
+                "Propagated {} knowledge links via Skill member notes",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Propagate notes linked to Protocols to files via Protocol → Skill → MemberNotes → Files (batch).
+    ///
+    /// Path: Note -[:LINKED_TO]-> Protocol -[:BELONGS_TO_SKILL]-> Skill <-[:MEMBER_OF]- MemberNote -[:LINKED_TO]-> File
+    /// Scoped to project via the member note's project_id.
+    pub async fn propagate_protocol_skill_links(&self, project_id: Uuid) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note {project_id: $project_id})-[existing:LINKED_TO]->(proto:Protocol)
+            WHERE existing.propagated IS NULL OR existing.propagated = false
+            MATCH (proto)-[:BELONGS_TO_SKILL]->(s:Skill)
+            MATCH (member:Note)-[:MEMBER_OF]->(s)
+            MATCH (member)-[:LINKED_TO]->(f:File)
+            WHERE NOT (n)-[:LINKED_TO]->(f) AND n <> member
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'protocol_skill',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total = row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                propagated = total,
+                source = "protocol_skill",
+                "Propagated {} knowledge links via Protocol→Skill→MemberNotes",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Propagate all high-level entity links (FeatureGraph + Skill + Protocol) for a project.
+    ///
+    /// Called from bootstrap_knowledge_fabric as a fallback/initialization path.
+    /// The primary propagation path is event-driven via link_note_to_entity hooks.
+    pub async fn propagate_high_level_links(&self, project_id: Uuid) -> Result<usize> {
+        let fg = self
+            .propagate_feature_graph_links(project_id)
+            .await
+            .unwrap_or(0);
+        let skill = self
+            .propagate_skill_member_links(project_id)
+            .await
+            .unwrap_or(0);
+        let proto = self
+            .propagate_protocol_skill_links(project_id)
+            .await
+            .unwrap_or(0);
+        let total = fg + skill + proto;
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                feature_graph = fg,
+                skill_member = skill,
+                protocol_skill = proto,
+                total = total,
+                "Propagated {} high-level knowledge links (batch)",
+                total
+            );
+        }
+
+        Ok(total)
+    }
+
+    // ================================================================
+    // Single-Note Propagation (event-driven, called from link_note_to_entity)
+    // ================================================================
+
+    /// Propagate a single note linked to a FeatureGraph to its member files.
+    pub async fn propagate_note_via_feature_graph(
+        &self,
+        note_id: Uuid,
+        feature_graph_id: &str,
+    ) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $note_id})
+            MATCH (fg:FeatureGraph {id: $fg_id})-[:INCLUDES_ENTITY]->(f:File)
+            WHERE NOT (n)-[:LINKED_TO]->(f)
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'feature_graph',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("note_id", note_id.to_string())
+        .param("fg_id", feature_graph_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total = row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %note_id,
+                feature_graph_id,
+                propagated = total,
+                "Event-driven: propagated note to {} files via FeatureGraph",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Propagate a single note linked to a Skill to files of the skill's member notes.
+    pub async fn propagate_note_via_skill(&self, note_id: Uuid, skill_id: &str) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $note_id})
+            MATCH (member:Note)-[:MEMBER_OF]->(s:Skill {id: $skill_id})
+            MATCH (member)-[:LINKED_TO]->(f:File)
+            WHERE NOT (n)-[:LINKED_TO]->(f) AND n <> member
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'skill_member',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("note_id", note_id.to_string())
+        .param("skill_id", skill_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total = row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %note_id,
+                skill_id,
+                propagated = total,
+                "Event-driven: propagated note to {} files via Skill members",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Propagate a single note linked to a Protocol to files via Protocol → Skill → MemberNotes.
+    pub async fn propagate_note_via_protocol(
+        &self,
+        note_id: Uuid,
+        protocol_id: &str,
+    ) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (proto:Protocol {id: $proto_id})-[:BELONGS_TO_SKILL]->(s:Skill)
+            MATCH (member:Note)-[:MEMBER_OF]->(s)
+            MATCH (member)-[:LINKED_TO]->(f:File)
+            MATCH (n:Note {id: $note_id})
+            WHERE NOT (n)-[:LINKED_TO]->(f) AND n <> member
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'protocol_skill',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("note_id", note_id.to_string())
+        .param("proto_id", protocol_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total = row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %note_id,
+                protocol_id,
+                propagated = total,
+                "Event-driven: propagated note to {} files via Protocol→Skill",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Get all notes attached to an entity
+    pub async fn get_notes_for_entity(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<Vec<Note>> {
+        let node_label = match entity_type {
+            EntityType::Project => "Project",
+            EntityType::File => "File",
+            EntityType::Module => "Module",
+            EntityType::Function => "Function",
+            EntityType::Struct => "Struct",
+            EntityType::Trait => "Trait",
+            EntityType::Enum => "Enum",
+            EntityType::Impl => "Impl",
+            EntityType::Task => "Task",
+            EntityType::Plan => "Plan",
+            EntityType::Commit => "Commit",
+            EntityType::Decision => "Decision",
+            EntityType::Workspace => "Workspace",
+            EntityType::WorkspaceMilestone => "WorkspaceMilestone",
+            EntityType::Resource => "Resource",
+            EntityType::Component => "Component",
+            EntityType::Step => "Step",
+            EntityType::Constraint => "Constraint",
+            EntityType::Milestone => "Milestone",
+            EntityType::Release => "Release",
+            EntityType::FeatureGraph => "FeatureGraph",
+            EntityType::Protocol => "Protocol",
+            EntityType::ProtocolState => "ProtocolState",
+            EntityType::ProtocolRun => "ProtocolRun",
+            EntityType::PlanRun => "PlanRun",
+            EntityType::Skill => "Skill",
+            EntityType::Note => "Note",
+            EntityType::ChatSession => "ChatSession",
+            EntityType::Process => "Process",
+            EntityType::Document => "Document",
+        };
+
+        let (match_field, match_value, use_suffix_match) = match entity_type {
+            EntityType::File => {
+                if entity_id.starts_with('/') {
+                    ("path", entity_id.to_string(), false)
+                } else {
+                    ("path", format!("/{}", entity_id), true)
+                }
+            }
+            EntityType::Commit => ("hash", entity_id.to_string(), false),
+            _ => ("id", entity_id.to_string(), false),
+        };
+
+        let cypher = if use_suffix_match {
+            format!(
+                r#"
+                MATCH (n:Note)-[:LINKED_TO]->(e:{})
+                WHERE e.{} ENDS WITH $entity_id
+                  AND n.status IN ['active', 'needs_review']
+                RETURN n
+                ORDER BY n.importance DESC, n.created_at DESC
+                "#,
+                node_label, match_field
+            )
+        } else {
+            format!(
+                r#"
+                MATCH (n:Note)-[:LINKED_TO]->(e:{} {{{}: $entity_id}})
+                WHERE n.status IN ['active', 'needs_review']
+                RETURN n
+                ORDER BY n.importance DESC, n.created_at DESC
+                "#,
+                node_label, match_field
+            )
+        };
+
+        let q = query(&cypher).param("entity_id", match_value);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut notes = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            notes.push(self.node_to_note(&node)?);
+        }
+
+        Ok(notes)
+    }
+
+    /// Compute pairwise coupling strength between two projects.
+    /// Returns a value in [0.0, 1.0] based on 4 signals:
+    /// structural twins, imported skills, shared notes, tag overlap.
+    /// Used to weight cross-project note propagation (biomimicry P2P coupling).
+    ///
+    /// Results are cached with a 5-minute TTL to avoid 4 Neo4j queries per
+    /// foreign project on every chat request.
+    pub async fn get_pairwise_coupling(
+        &self,
+        project_a_id: Uuid,
+        project_b_id: Uuid,
+    ) -> Result<f64> {
+        if project_a_id == project_b_id {
+            return Ok(1.0);
+        }
+
+        // Sorted key for cache symmetry: coupling(A,B) == coupling(B,A)
+        let cache_key = if project_a_id < project_b_id {
+            (project_a_id, project_b_id)
+        } else {
+            (project_b_id, project_a_id)
+        };
+
+        const COUPLING_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
+
+        // Check cache (read lock)
+        {
+            let cache = self.coupling_cache.read().await;
+            if let Some((score, cached_at)) = cache.get(&cache_key) {
+                if cached_at.elapsed() < COUPLING_CACHE_TTL {
+                    return Ok(*score);
+                }
+                // Expired — fall through to recompute
+            }
+        }
+
+        const W_TWINS: f64 = 0.35;
+        const W_SKILLS: f64 = 0.25;
+        const W_NOTES: f64 = 0.20;
+        const W_TAGS: f64 = 0.20;
+        const MAX_TWINS: f64 = 20.0;
+        const MAX_SKILLS: f64 = 10.0;
+        const MAX_NOTES: f64 = 50.0;
+
+        let a = project_a_id.to_string();
+        let b = project_b_id.to_string();
+
+        // Signal 1: Structural twins (files with same WL hash)
+        let twins_q = query(
+            r#"
+            MATCH (pa:Project {id: $a})-[:CONTAINS]->(fa:File)
+            MATCH (pb:Project {id: $b})-[:CONTAINS]->(fb:File)
+            WHERE fa.wl_hash IS NOT NULL AND fa.wl_hash = fb.wl_hash
+            RETURN count(DISTINCT fa) AS cnt
+            "#,
+        )
+        .param("a", a.clone())
+        .param("b", b.clone());
+
+        let twins: f64 = match self.graph.execute(twins_q).await {
+            Ok(mut r) => match r.next().await {
+                Ok(Some(row)) => {
+                    (row.get::<i64>("cnt").unwrap_or(0) as f64).min(MAX_TWINS) / MAX_TWINS
+                }
+                _ => 0.0,
+            },
+            _ => 0.0,
+        };
+
+        // Signal 2: Imported skills (skills exported from one, imported in the other)
+        let skills_q = query(
+            r#"
+            MATCH (sa:Skill {project_id: $a})-[:IMPORTED_FROM]->(sb:Skill {project_id: $b})
+            RETURN count(sa) AS cnt
+            UNION ALL
+            MATCH (sb2:Skill {project_id: $b})-[:IMPORTED_FROM]->(sa2:Skill {project_id: $a})
+            RETURN count(sb2) AS cnt
+            "#,
+        )
+        .param("a", a.clone())
+        .param("b", b.clone());
+
+        let skills: f64 = match self.graph.execute(skills_q).await {
+            Ok(mut r) => {
+                let mut total = 0i64;
+                while let Ok(Some(row)) = r.next().await {
+                    total += row.get::<i64>("cnt").unwrap_or(0);
+                }
+                (total as f64).min(MAX_SKILLS) / MAX_SKILLS
+            }
+            _ => 0.0,
+        };
+
+        // Signal 3: Shared notes (notes linked to entities in both projects)
+        let notes_q = query(
+            r#"
+            MATCH (n:Note)-[:LINKED_TO]->(ea)<-[:CONTAINS]-(pa:Project {id: $a})
+            MATCH (n)-[:LINKED_TO]->(eb)<-[:CONTAINS]-(pb:Project {id: $b})
+            RETURN count(DISTINCT n) AS cnt
+            "#,
+        )
+        .param("a", a.clone())
+        .param("b", b.clone());
+
+        let shared_notes: f64 = match self.graph.execute(notes_q).await {
+            Ok(mut r) => match r.next().await {
+                Ok(Some(row)) => {
+                    (row.get::<i64>("cnt").unwrap_or(0) as f64).min(MAX_NOTES) / MAX_NOTES
+                }
+                _ => 0.0,
+            },
+            _ => 0.0,
+        };
+
+        // Signal 4: Tag overlap (Jaccard similarity of note tags)
+        let tags_q = query(
+            r#"
+            MATCH (na:Note {project_id: $a}) WHERE na.tags IS NOT NULL
+            WITH collect(na.tags) AS a_tags_raw
+            WITH reduce(s = [], t IN a_tags_raw | s + t) AS a_tags_flat
+            WITH apoc.coll.toSet(a_tags_flat) AS a_tags
+            MATCH (nb:Note {project_id: $b}) WHERE nb.tags IS NOT NULL
+            WITH a_tags, collect(nb.tags) AS b_tags_raw
+            WITH a_tags, reduce(s = [], t IN b_tags_raw | s + t) AS b_tags_flat
+            WITH a_tags, apoc.coll.toSet(b_tags_flat) AS b_tags
+            WITH a_tags, b_tags,
+                 [t IN a_tags WHERE t IN b_tags] AS intersection
+            RETURN CASE WHEN size(a_tags) + size(b_tags) - size(intersection) = 0 THEN 0.0
+                        ELSE toFloat(size(intersection)) / (size(a_tags) + size(b_tags) - size(intersection))
+                   END AS jaccard
+            "#,
+        )
+        .param("a", a)
+        .param("b", b);
+
+        let tag_overlap: f64 = match self.graph.execute(tags_q).await {
+            Ok(mut r) => match r.next().await {
+                Ok(Some(row)) => row.get::<f64>("jaccard").unwrap_or(0.0),
+                _ => 0.0,
+            },
+            _ => 0.0,
+        };
+
+        let coupling =
+            W_TWINS * twins + W_SKILLS * skills + W_NOTES * shared_notes + W_TAGS * tag_overlap;
+
+        // Store in cache (write lock)
+        {
+            let mut cache = self.coupling_cache.write().await;
+            cache.insert(cache_key, (coupling, std::time::Instant::now()));
+            // Lazy expiration: remove expired entries when cache grows large
+            if cache.len() > 100 {
+                cache.retain(|_, (_, cached_at)| cached_at.elapsed() < COUPLING_CACHE_TTL);
+            }
+        }
+
+        Ok(coupling)
+    }
+
+    /// Get propagated notes for an entity (traversing the graph)
+    /// Whitelist of relation types allowed in propagation traversal.
+    /// Prevents Cypher injection via user-supplied relation_types parameter.
+    const ALLOWED_PROPAGATION_RELATIONS: &'static [&'static str] = &[
+        "CONTAINS",
+        "IMPORTS",
+        "CALLS",
+        "IMPLEMENTS_TRAIT",
+        "IMPLEMENTS_FOR",
+        "CO_CHANGED",
+        "CO_CHANGED_TRANSITIVE",
+        "TOUCHES",
+        "MODIFIES",
+        "AFFECTS",
+        "DISCUSSED",
+        "SYNAPSE",
+    ];
+
+    /// Default relation types for backward-compatible propagation.
+    const DEFAULT_PROPAGATION_RELATIONS: &'static [&'static str] =
+        &["CONTAINS", "IMPORTS", "CALLS"];
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_propagated_notes(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+        max_depth: u32,
+        min_score: f64,
+        relation_types: Option<&[String]>,
+        source_project_id: Option<Uuid>,
+        force_cross_project: bool,
+    ) -> Result<Vec<PropagatedNote>> {
+        let node_label = match entity_type {
+            EntityType::Project => "Project",
+            EntityType::File => "File",
+            EntityType::Module => "Module",
+            EntityType::Function => "Function",
+            EntityType::Struct => "Struct",
+            EntityType::Trait => "Trait",
+            EntityType::Enum => "Enum",
+            EntityType::Impl => "Impl",
+            EntityType::Task => "Task",
+            EntityType::Plan => "Plan",
+            EntityType::Commit => "Commit",
+            EntityType::Decision => "Decision",
+            EntityType::Workspace => "Workspace",
+            EntityType::WorkspaceMilestone => "WorkspaceMilestone",
+            EntityType::Resource => "Resource",
+            EntityType::Component => "Component",
+            EntityType::Step => "Step",
+            EntityType::Constraint => "Constraint",
+            EntityType::Milestone => "Milestone",
+            EntityType::Release => "Release",
+            EntityType::FeatureGraph => "FeatureGraph",
+            EntityType::Protocol => "Protocol",
+            EntityType::ProtocolState => "ProtocolState",
+            EntityType::ProtocolRun => "ProtocolRun",
+            EntityType::PlanRun => "PlanRun",
+            EntityType::Skill => "Skill",
+            EntityType::Note => "Note",
+            EntityType::ChatSession => "ChatSession",
+            EntityType::Process => "Process",
+            EntityType::Document => "Document",
+        };
+
+        let (match_field, match_value, use_suffix_match) = match entity_type {
+            EntityType::File => {
+                if entity_id.starts_with('/') {
+                    ("path", entity_id.to_string(), false)
+                } else {
+                    ("path", format!("/{}", entity_id), true)
+                }
+            }
+            EntityType::Commit => ("hash", entity_id.to_string(), false),
+            _ => ("id", entity_id.to_string(), false),
+        };
+
+        // Build the relation traversal pattern from the whitelist.
+        // If relation_types is None, use the default (CONTAINS|IMPORTS|CALLS).
+        // Only whitelisted relations are allowed to prevent Cypher injection.
+        let rel_pattern = match relation_types {
+            Some(types) => {
+                let filtered: Vec<&str> = types
+                    .iter()
+                    .filter_map(|r| {
+                        let upper = r.to_uppercase();
+                        Self::ALLOWED_PROPAGATION_RELATIONS
+                            .iter()
+                            .find(|&&allowed| allowed == upper)
+                            .copied()
+                    })
+                    .collect();
+                if filtered.is_empty() {
+                    Self::DEFAULT_PROPAGATION_RELATIONS.join("|")
+                } else {
+                    filtered.join("|")
+                }
+            }
+            None => Self::DEFAULT_PROPAGATION_RELATIONS.join("|"),
+        };
+
+        // Build the target match clause. For relative file paths, use ENDS WITH
+        // to match against the suffix of the absolute path stored in Neo4j.
+        let target_match = if use_suffix_match {
+            format!(
+                "MATCH (target:{}) WHERE target.{} ENDS WITH $entity_id",
+                node_label, match_field
+            )
+        } else {
+            format!(
+                "MATCH (target:{} {{{}: $entity_id}})",
+                node_label, match_field
+            )
+        };
+
+        // Query for notes propagated through the graph.
+        //
+        // Scoring formula integrates 5 factors:
+        //   1. Distance decay: 1/(distance+1)
+        //   2. Importance weight: critical=1.0, high=0.8, medium=0.5, low=0.3
+        //   3. PageRank hub boost: (1 + avg_path_pagerank * 5)
+        //   4. Relation type weight: product of per-relation weights along the path
+        //      For SYNAPSE relations, uses the dynamic r.weight (Hebbian strength)
+        //      instead of a static value.
+        //   5. Scar penalty: (1 - scar_intensity * 0.5)
+        //      Notes with high scar_intensity (from past invalidations) are de-prioritized.
+        //      Max penalty = 50% score reduction at scar_intensity=1.0.
+        //   6. Energy factor: (0.4 + energy * 0.6)
+        //      Low-energy ("dead") notes are de-prioritized but never zeroed, so a
+        //      stale-but-relevant note still surfaces below a fresh equivalent.
+        //
+        // Relation weights (defined in Cypher CASE):
+        //   CONTAINS=1.0, IMPORTS=1.0, CALLS=0.9, IMPLEMENTS_TRAIT=0.85,
+        //   IMPLEMENTS_FOR=0.85, AFFECTS=0.9, MODIFIES=0.7, TOUCHES=0.6,
+        //   CO_CHANGED=0.6, DISCUSSED=0.5, SYNAPSE=dynamic r.weight, default=0.5
+        let cypher = format!(
+            r#"
+            {}
+            MATCH path = (n:Note)-[:LINKED_TO]->(source)-[:{}*0..{}]->(target)
+            WHERE n.status = 'active'
+              AND (NOT $scoped OR coalesce(n.project_id, '') IN ['', $scope_project])
+              AND (NOT $consent_cross OR coalesce(n.project_id, '') IN ['', $consent_reader]
+                   OR coalesce(n.sharing_consent, 'not_set') <> 'explicit_deny')
+            WITH n, source, path, length(path) - 1 AS distance,
+                 [node IN nodes(path) | coalesce(node.name, node.path, node.id)] AS path_names,
+                 [r IN relationships(path) | type(r)] AS rel_types,
+                 [r IN tail(relationships(path)) | CASE type(r) WHEN 'SYNAPSE' THEN coalesce(r.weight, 0.5) ELSE null END] AS hop_weights
+            WITH n, source, distance, path_names, rel_types, hop_weights,
+                 CASE n.importance
+                     WHEN 'critical' THEN 1.0
+                     WHEN 'high' THEN 0.8
+                     WHEN 'medium' THEN 0.5
+                     ELSE 0.3
+                 END AS importance_weight,
+                 CASE WHEN size(nodes(path)) > 0
+                      THEN reduce(s = 0.0, node IN nodes(path) | s + coalesce(node.pagerank, 0.05)) / size(nodes(path))
+                      ELSE 0.05
+                 END AS avg_path_pagerank,
+                 CASE WHEN size(rel_types) <= 1 THEN 1.0
+                      ELSE reduce(w = 1.0, r IN tail(relationships(path)) |
+                          w * CASE type(r)
+                              WHEN 'CONTAINS' THEN 1.0
+                              WHEN 'IMPORTS' THEN 1.0
+                              WHEN 'CALLS' THEN 0.9
+                              WHEN 'IMPLEMENTS_TRAIT' THEN 0.85
+                              WHEN 'IMPLEMENTS_FOR' THEN 0.85
+                              WHEN 'AFFECTS' THEN 0.9
+                              WHEN 'MODIFIES' THEN 0.7
+                              WHEN 'TOUCHES' THEN 0.6
+                              WHEN 'CO_CHANGED' THEN 0.6
+                              WHEN 'CO_CHANGED_TRANSITIVE' THEN 0.4
+                              WHEN 'DISCUSSED' THEN 0.5
+                              WHEN 'SYNAPSE' THEN coalesce(r.weight, 0.5)
+                              ELSE 0.5
+                          END)
+                 END AS path_rel_weight
+            WITH n, source, distance, path_names, rel_types, avg_path_pagerank, path_rel_weight, hop_weights,
+                 (1.0 / (distance + 1)) * importance_weight * (1.0 + avg_path_pagerank * 5.0) * path_rel_weight
+                 * (1.0 - COALESCE(n.scar_intensity, 0.0) * 0.5)
+                 * (0.4 + COALESCE(n.energy, 0.5) * 0.6) AS score
+            WHERE score >= $min_score
+            RETURN DISTINCT n, score, coalesce(source.name, source.path, source.id) AS source_entity,
+                   path_names, distance, avg_path_pagerank,
+                   tail(rel_types) AS relation_path, path_rel_weight, hop_weights
+            ORDER BY score DESC
+            LIMIT $limit
+            "#,
+            target_match, rel_pattern, max_depth
+        );
+
+        let scope =
+            crate::notes::PropagationScope::from_params(source_project_id, force_cross_project);
+        let scope_project = scope.cypher_project().map(|p| p.to_string());
+        // In CrossProject the coupling weights the score AFTER the query: cutting at
+        // the final size first would drop notes the weighting would have promoted.
+        // Read a wider candidate set, weight, then cut (see the end of the function).
+        let cross_project = matches!(scope, crate::notes::PropagationScope::CrossProject(_));
+        let (direct_limit, transitive_limit): (i64, i64) = if cross_project {
+            (
+                CROSS_PROJECT_DIRECT_CANDIDATES,
+                CROSS_PROJECT_TRANSITIVE_CANDIDATES,
+            )
+        } else {
+            (20, 10)
+        };
+        let q = query(&cypher)
+            .param("entity_id", match_value.clone())
+            .param("min_score", min_score)
+            .param("scoped", scope_project.is_some())
+            .param(
+                "consent_cross",
+                matches!(scope, crate::notes::PropagationScope::CrossProject(_)),
+            )
+            .param(
+                "consent_reader",
+                source_project_id.map(|p| p.to_string()).unwrap_or_default(),
+            )
+            .param("limit", direct_limit)
+            .param("scope_project", scope_project.clone().unwrap_or_default());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut propagated_notes = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            let note = self.node_to_note(&node)?;
+            let score: f64 = row.get("score")?;
+            let source_entity: String = row.get("source_entity")?;
+            let path_names: Vec<String> = row.get("path_names").unwrap_or_default();
+            let distance: i64 = row.get("distance")?;
+            let avg_path_pagerank: Option<f64> = row.get::<f64>("avg_path_pagerank").ok();
+
+            let rel_types: Vec<String> = row.get("relation_path").unwrap_or_default();
+            let path_rel_weight: Option<f64> = row.get::<f64>("path_rel_weight").ok();
+            // hop_weights: parallel array — null for structural, f64 for SYNAPSE
+            let hop_weights: Vec<Option<f64>> = row
+                .get::<Vec<f64>>("hop_weights")
+                .map(|ws| {
+                    ws.into_iter()
+                        .map(|w| if w == 0.0 { None } else { Some(w) })
+                        .collect()
+                })
+                .unwrap_or_else(|_| vec![None; rel_types.len()]);
+
+            // Build RelationHop vec combining type + weight info
+            let relation_path: Vec<crate::notes::RelationHop> = rel_types
+                .iter()
+                .zip(hop_weights.iter().chain(std::iter::repeat(&None)))
+                .map(|(rt, w)| {
+                    if rt == "SYNAPSE" {
+                        crate::notes::RelationHop::neural(w.unwrap_or(0.5))
+                    } else {
+                        crate::notes::RelationHop::structural(rt.clone())
+                    }
+                })
+                .collect();
+
+            let scar_intensity = note.scar_intensity;
+            propagated_notes.push(PropagatedNote {
+                note,
+                relevance_score: score,
+                source_entity,
+                propagation_path: path_names,
+                distance: distance as u32,
+                path_pagerank: avg_path_pagerank,
+                relation_path,
+                path_rel_weight,
+                scar_intensity,
+            });
+        }
+
+        // Also include notes reached via LINKED_TO_TRANSITIVE (pre-computed
+        // transitive links along the IMPORTS graph). These have a stored weight
+        // that attenuates the score.
+        let seen_note_ids: std::collections::HashSet<Uuid> =
+            propagated_notes.iter().map(|pn| pn.note.id).collect();
+
+        let transitive_cypher = format!(
+            r#"
+            {}
+            MATCH (n:Note)-[t:LINKED_TO_TRANSITIVE]->(target)
+            WHERE n.status = 'active'
+              AND (NOT $scoped OR coalesce(n.project_id, '') IN ['', $scope_project])
+              AND (NOT $consent_cross OR coalesce(n.project_id, '') IN ['', $consent_reader]
+                   OR coalesce(n.sharing_consent, 'not_set') <> 'explicit_deny')
+            WITH n, t,
+                 CASE n.importance
+                     WHEN 'critical' THEN 1.0
+                     WHEN 'high' THEN 0.8
+                     WHEN 'medium' THEN 0.5
+                     ELSE 0.3
+                 END AS importance_weight
+            WITH n,
+                 coalesce(t.weight, 0.5) * importance_weight
+                 * (1.0 - COALESCE(n.scar_intensity, 0.0) * 0.5) AS score,
+                 t.depth AS depth, t.weight AS tw
+            WHERE score >= $min_score
+            RETURN DISTINCT n, score, 'transitive' AS source_entity,
+                   [] AS path_names, coalesce(depth, 1) AS distance,
+                   null AS avg_path_pagerank,
+                   ['LINKED_TO_TRANSITIVE'] AS relation_path,
+                   tw AS path_rel_weight,
+                   [] AS hop_weights
+            ORDER BY score DESC
+            LIMIT $limit
+            "#,
+            target_match
+        );
+
+        let tq = query(&transitive_cypher)
+            .param("entity_id", match_value)
+            .param("min_score", min_score)
+            .param("scoped", scope_project.is_some())
+            .param(
+                "consent_cross",
+                matches!(scope, crate::notes::PropagationScope::CrossProject(_)),
+            )
+            .param(
+                "consent_reader",
+                source_project_id.map(|p| p.to_string()).unwrap_or_default(),
+            )
+            .param("limit", transitive_limit)
+            .param("scope_project", scope_project.unwrap_or_default());
+
+        // A failure here is not swallowed: it is logged and returned, so the caller
+        // knows the transitive notes are missing instead of silently getting fewer.
+        let transitive_failed = |stage: &str, e: anyhow::Error| {
+            tracing::warn!(
+                entity = %entity_id,
+                stage,
+                error = %e,
+                "get_propagated_notes: LINKED_TO_TRANSITIVE query failed"
+            );
+            e.context(format!(
+                "get_propagated_notes: LINKED_TO_TRANSITIVE query failed ({stage})"
+            ))
+        };
+        let mut tresult = self
+            .graph
+            .execute(tq)
+            .await
+            .map_err(|e| transitive_failed("execute", e.into()))?;
+        while let Some(row) = tresult
+            .next()
+            .await
+            .map_err(|e| transitive_failed("fetch", e.into()))?
+        {
+            let node = row
+                .get::<neo4rs::Node>("n")
+                .map_err(|e| transitive_failed("decode node", e.into()))?;
+            let note = self
+                .node_to_note(&node)
+                .map_err(|e| transitive_failed("decode note", e))?;
+            // Deduplicate: skip if already found via direct path
+            if seen_note_ids.contains(&note.id) {
+                continue;
+            }
+            let score: f64 = row.get("score").unwrap_or(0.0);
+            let distance: i64 = row.get("distance").unwrap_or(1);
+            let path_rel_weight: Option<f64> = row.get::<f64>("path_rel_weight").ok();
+            let scar_intensity = note.scar_intensity;
+            propagated_notes.push(PropagatedNote {
+                note,
+                relevance_score: score,
+                source_entity: "transitive".to_string(),
+                propagation_path: vec![],
+                distance: distance as u32,
+                path_pagerank: None,
+                relation_path: vec![crate::notes::RelationHop::structural(
+                    "LINKED_TO_TRANSITIVE".to_string(),
+                )],
+                path_rel_weight,
+                scar_intensity,
+            });
+        }
+
+        // Re-sort after merging transitive results
+        propagated_notes.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if !cross_project {
+            propagated_notes.truncate(20);
+        }
+
+        // Defence in depth: the Cypher already applied the scope before LIMIT; this
+        // re-check can only drop notes, never widen the result.
+        propagated_notes.retain(|pn| scope.admits(pn.note.project_id));
+
+        // Cross-project coupling weighting (biomimicry P2P coupling)
+        // If source_project_id is set, weight notes from other projects by coupling_strength.
+        // Projects with coupling < 0.2 are suppressed (PropagationScope::weigh_foreign).
+        if let (Some(src_pid), crate::notes::PropagationScope::CrossProject(_)) =
+            (source_project_id, scope)
+        {
+            let mut coupling_cache: std::collections::HashMap<Uuid, Option<f64>> =
+                std::collections::HashMap::new();
+            let mut filtered_notes = Vec::with_capacity(propagated_notes.len());
+            // One consent rule for every cross-project read (sharing::consent_gate).
+            let mut consent = crate::sharing::consent_gate::ConsentReader::new(self, Some(src_pid));
+
+            for mut pn in propagated_notes {
+                let note_pid = pn.note.project_id;
+                match note_pid {
+                    Some(pid) if pid != src_pid => {
+                        // Consent: ExplicitDeny was already dropped by the Cypher; this
+                        // is the same predicate applied in full (owner policy for NotSet).
+                        let verdict = consent.note(&pn.note).await;
+                        if !verdict.is_allow() {
+                            tracing::debug!(
+                                note_id = %pn.note.id,
+                                note_project = %pid,
+                                ?verdict,
+                                "Dropped cross-project note (consent)"
+                            );
+                            continue;
+                        }
+                        // Cross-project note — look up coupling (cached per foreign project)
+                        let coupling = match coupling_cache.get(&pid) {
+                            Some(&c) => c,
+                            None => {
+                                let c = match self.get_pairwise_coupling(src_pid, pid).await {
+                                    Ok(c) => Some(c),
+                                    Err(e) => {
+                                        // Fail closed: unknown coupling means the
+                                        // foreign note is dropped, and we say so.
+                                        tracing::warn!(
+                                            source_project = %src_pid,
+                                            note_project = %pid,
+                                            error = %e,
+                                            "Coupling computation failed; dropping cross-project notes of this project"
+                                        );
+                                        None
+                                    }
+                                };
+                                coupling_cache.insert(pid, c);
+                                c
+                            }
+                        };
+                        match crate::notes::PropagationScope::weigh_foreign(
+                            pn.relevance_score,
+                            coupling,
+                            min_score,
+                        ) {
+                            Some(weighted) => {
+                                pn.relevance_score = weighted;
+                                filtered_notes.push(pn);
+                            }
+                            None => {
+                                tracing::debug!(
+                                    note_id = %pn.note.id,
+                                    source_project = %src_pid,
+                                    note_project = %pid,
+                                    ?coupling,
+                                    "Suppressed cross-project note propagation (coupling)"
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        // Same project or global note — keep as-is
+                        filtered_notes.push(pn);
+                    }
+                }
+            }
+
+            // Re-sort after weighting
+            filtered_notes.sort_by(|a, b| {
+                b.relevance_score
+                    .partial_cmp(&a.relevance_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            // The cut comes last: weighted scores decide who stays in the top 20.
+            filtered_notes.truncate(20);
+
+            return Ok(filtered_notes);
+        }
+
+        Ok(propagated_notes)
+    }
+
+    /// Get workspace-level notes for a project (propagated from parent workspace)
+    /// These are notes attached to the workspace that should propagate to all projects in it
+    pub async fn get_workspace_notes_for_project(
+        &self,
+        project_id: Uuid,
+        propagation_factor: f64,
+    ) -> Result<Vec<PropagatedNote>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:BELONGS_TO_WORKSPACE]->(w:Workspace)
+            MATCH (n:Note)-[:LINKED_TO]->(w)
+            WHERE n.status IN ['active', 'needs_review']
+            RETURN n, w.name AS workspace_name
+            ORDER BY n.importance DESC, n.created_at DESC
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut workspace_notes = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            let workspace_name: String = row.get("workspace_name").unwrap_or_default();
+            let note = self.node_to_note(&node)?;
+
+            let scar_intensity = note.scar_intensity;
+            workspace_notes.push(PropagatedNote {
+                note,
+                relevance_score: propagation_factor,
+                source_entity: format!("workspace:{}", workspace_name),
+                propagation_path: vec![format!("workspace:{}", workspace_name)],
+                distance: 1, // One hop: project -> workspace
+                path_pagerank: None,
+                relation_path: vec![crate::notes::RelationHop::structural("BELONGS_TO")],
+                path_rel_weight: Some(1.0),
+                scar_intensity,
+            });
+        }
+
+        Ok(workspace_notes)
+    }
+
+    /// Mark a note as superseded by another
+    pub async fn supersede_note(&self, old_note_id: Uuid, new_note_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (old:Note {id: $old_id})
+            MATCH (new:Note {id: $new_id})
+            SET old.status = 'archived',
+                old.superseded_by = $new_id
+            SET new.supersedes = $old_id
+            MERGE (new)-[:SUPERSEDES]->(old)
+            "#,
+        )
+        .param("old_id", old_note_id.to_string())
+        .param("new_id", new_note_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Confirm a note is still valid
+    pub async fn confirm_note(&self, note_id: Uuid, confirmed_by: &str) -> Result<Option<Note>> {
+        // A confirmation is a SIGNATURE only when a person gives it. Agent
+        // sessions are stamped `agent:<uuid>` (see `notes::provenance`), and a
+        // heuristic under `system/`: their confirmation moves the freshness
+        // clock, never the human signature — otherwise the one field that means
+        // "a person answered for this" would be written by a model.
+        let by_human = !confirmed_by.starts_with("agent:")
+            && !confirmed_by.starts_with("system")
+            && !confirmed_by.is_empty();
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            SET n.last_confirmed_at = datetime(),
+                n.last_confirmed_by = $confirmed_by,
+                n.human_confirmed_at = CASE WHEN $by_human THEN datetime() ELSE n.human_confirmed_at END,
+                n.human_confirmed_by = CASE WHEN $by_human THEN $confirmed_by ELSE n.human_confirmed_by END,
+                n.staleness_score = 0.0,
+                // Confirming a superseded note must not resurrect it: the
+                // newer note that replaced it wins.
+                n.status = CASE
+                    WHEN n.superseded_by IS NOT NULL OR EXISTS { (n)<-[:SUPERSEDES]-() } THEN n.status
+                    ELSE 'active'
+                END,
+                n.energy = CASE
+                    WHEN n.superseded_by IS NOT NULL OR EXISTS { (n)<-[:SUPERSEDES]-() } THEN n.energy
+                    WHEN coalesce(n.energy, 1.0) + 0.3 > 1.0 THEN 1.0
+                    ELSE coalesce(n.energy, 1.0) + 0.3
+                END,
+                n.last_activated = datetime()
+            RETURN n
+            "#,
+        )
+        .param("id", note_id.to_string())
+        .param("confirmed_by", confirmed_by)
+        .param("by_human", by_human);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            Ok(Some(self.node_to_note(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get notes that need review (stale or needs_review status)
+    pub async fn get_notes_needing_review(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<Note>> {
+        // `project_id` wins over `workspace_slug` (same priority as list_notes).
+        // Every value is a bound parameter; the fragments below are static.
+        let scope = if project_id.is_some() {
+            "AND n.project_id = $project_id"
+        } else if workspace_slug.is_some() {
+            "AND n.project_id IN [(w:Workspace {slug: $workspace_slug})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]"
+        } else {
+            ""
+        };
+
+        let cypher = format!(
+            r#"
+            MATCH (n:Note)
+            WHERE n.status IN ['needs_review', 'stale']
+            {}
+            RETURN n
+            ORDER BY n.staleness_score DESC, n.importance DESC
+            LIMIT 500
+            "#,
+            scope
+        );
+
+        let mut q = query(&cypher);
+        if let Some(pid) = project_id {
+            q = q.param("project_id", pid.to_string());
+        } else if let Some(ws) = workspace_slug {
+            q = q.param("workspace_slug", ws.to_string());
+        }
+
+        let mut result = self.graph.execute(q).await?;
+        let mut notes = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            notes.push(self.node_to_note(&node)?);
+        }
+
+        Ok(notes)
+    }
+
+    /// Update staleness scores for all active notes.
+    ///
+    /// The per-type `base_decay_days` CASE below MUST mirror
+    /// `Note::base_decay_days()` (parity test `staleness_cypher_matches_rust`).
+    /// Assertions are excluded by the WHERE clause (Rust: `f64::MAX`, never stale).
+    ///
+    /// The formula incorporates `freshness_pinged_at`: if a linked file was
+    /// recently touched by a commit, the note receives a freshness discount
+    /// that decays as `exp(-days_since_ping / 30)` (time constant 30 days, i.e.
+    /// a half-life of ~20.8 days). This means actively-maintained
+    /// code keeps its linked notes fresher.
+    pub async fn update_staleness_scores(&self) -> Result<usize> {
+        // This updates staleness based on time since last confirmation,
+        // with a freshness discount from recent commit touches.
+        let q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.status = 'active' AND n.note_type <> 'assertion'
+            WITH n,
+                 duration.between(
+                     datetime(n.last_confirmed_at),
+                     datetime()
+                 ).days AS days_since_confirmed,
+                 CASE n.note_type
+                     WHEN 'context' THEN 30.0
+                     WHEN 'tip' THEN 90.0
+                     WHEN 'observation' THEN 90.0
+                     WHEN 'gotcha' THEN 180.0
+                     WHEN 'guideline' THEN 365.0
+                     WHEN 'pattern' THEN 365.0
+                     WHEN 'rfc' THEN 365.0
+                     ELSE 90.0
+                 END AS base_decay_days,
+                 CASE n.importance
+                     WHEN 'critical' THEN 0.5
+                     WHEN 'high' THEN 0.7
+                     WHEN 'medium' THEN 1.0
+                     ELSE 1.3
+                 END AS decay_factor,
+                 CASE
+                     WHEN n.freshness_pinged_at IS NOT NULL
+                     THEN duration.between(datetime(n.freshness_pinged_at), datetime()).days
+                     ELSE -1
+                 END AS days_since_ping
+            WITH n, days_since_confirmed, base_decay_days, decay_factor,
+                 CASE
+                     WHEN days_since_ping >= 0
+                     THEN exp(-1.0 * days_since_ping / 30.0) * 0.5
+                     ELSE 0.0
+                 END AS freshness_discount
+            WITH n,
+                 CASE
+                     WHEN base_decay_days = 0 THEN 0
+                     ELSE (1.0 - exp(-1.0 * days_since_confirmed / base_decay_days)) * decay_factor
+                 END AS raw_staleness,
+                 freshness_discount
+            WITH n,
+                 CASE WHEN (raw_staleness - freshness_discount) > 1.0 THEN 1.0
+                      WHEN (raw_staleness - freshness_discount) < 0.0 THEN 0.0
+                      ELSE (raw_staleness - freshness_discount) END AS clamped_staleness
+            WHERE abs(n.staleness_score - clamped_staleness) > 0.01
+            SET n.staleness_score = clamped_staleness,
+                n.status = CASE WHEN clamped_staleness > 0.8 THEN 'stale' ELSE n.status END
+            RETURN count(n) AS updated
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let updated: i64 = row.get("updated")?;
+            Ok(updated as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get anchors for a note
+    pub async fn get_note_anchors(&self, note_id: Uuid) -> Result<Vec<NoteAnchor>> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})-[r:LINKED_TO]->(e)
+            RETURN labels(e)[0] AS entity_type,
+                   coalesce(e.id, e.path, e.hash) AS entity_id,
+                   r.signature_hash AS sig_hash,
+                   r.body_hash AS body_hash,
+                   r.last_verified AS last_verified
+            "#,
+        )
+        .param("id", note_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut anchors = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let entity_type_str: String = row.get("entity_type")?;
+            let entity_id: String = row.get("entity_id")?;
+            let sig_hash: Option<String> = row.get("sig_hash").ok();
+            let body_hash: Option<String> = row.get("body_hash").ok();
+            let last_verified: String = row
+                .get::<String>("last_verified")
+                .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339());
+
+            let entity_type = entity_type_str
+                .to_lowercase()
+                .parse::<EntityType>()
+                .unwrap_or(EntityType::File);
+
+            anchors.push(NoteAnchor {
+                entity_type,
+                entity_id,
+                signature_hash: sig_hash.filter(|s| !s.is_empty()),
+                body_hash: body_hash.filter(|s| !s.is_empty()),
+                last_verified: last_verified.parse().unwrap_or_else(|_| chrono::Utc::now()),
+                is_valid: true,
+            });
+        }
+
+        Ok(anchors)
+    }
+
+    /// Store a vector embedding on a Note node.
+    ///
+    /// Uses `db.create.setNodeVectorProperty` to ensure the correct type
+    /// for the HNSW vector index. Also stores the model name for traceability.
+    pub async fn set_note_embedding(
+        &self,
+        note_id: Uuid,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        // Convert f32 to f64 for neo4rs compatibility
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            CALL db.create.setNodeVectorProperty(n, 'embedding', $embedding)
+            SET n.embedding_model = $model,
+                n.embedded_at = datetime()
+            "#,
+        )
+        .param("id", note_id.to_string())
+        .param("embedding", embedding_f64)
+        .param("model", model.to_string());
+
+        self.graph
+            .run(q)
+            .await
+            .context(format!("Failed to set embedding on note {}", note_id))?;
+
+        Ok(())
+    }
+
+    /// Retrieve the stored embedding vector for a note.
+    pub async fn get_note_embedding(&self, note_id: Uuid) -> Result<Option<Vec<f32>>> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            WHERE n.embedding IS NOT NULL
+            RETURN n.embedding AS embedding
+            "#,
+        )
+        .param("id", note_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let embedding_f64: Vec<f64> = row.get("embedding")?;
+            let embedding_f32: Vec<f32> = embedding_f64.iter().map(|&x| x as f32).collect();
+            Ok(Some(embedding_f32))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get note embeddings for a project, at most `limit` of them, in a single batch query.
+    ///
+    /// Returns notes that have embeddings, with their vector, metadata, and a content preview.
+    /// Used for UMAP 2D projection in the visualization API.
+    ///
+    /// The page is ordered by note id, not by insertion, so two calls on the same project
+    /// return the same sample. `MATCH ... LIMIT` stops the scan: this is a projection for
+    /// a picture, not an export, and every row carries a full vector.
+    pub async fn get_note_embeddings_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<super::models::NoteEmbeddingPoint>> {
+        let q = query(
+            r#"
+            MATCH (n:Note {project_id: $project_id})
+            WHERE n.embedding IS NOT NULL
+              AND n.status IN ['active', 'needs_review']
+            RETURN n.id AS id,
+                   n.embedding AS embedding,
+                   n.note_type AS note_type,
+                   n.importance AS importance,
+                   coalesce(n.energy, 0.5) AS energy,
+                   coalesce(n.tags, []) AS tags,
+                   left(n.content, 120) AS content_preview
+            ORDER BY n.id
+            LIMIT $limit
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut points = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let id_str: String = match row.get("id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let id = Uuid::parse_str(&id_str).unwrap_or_default();
+            // Skip notes with corrupt/unparseable embeddings instead of crashing the whole endpoint
+            let embedding_f64: Vec<f64> = match row.get("embedding") {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %id_str,
+                        "Skipping note with unparseable embedding: {}", e
+                    );
+                    continue;
+                }
+            };
+            let embedding: Vec<f32> = embedding_f64.iter().map(|&x| x as f32).collect();
+            let note_type: String = row
+                .get("note_type")
+                .unwrap_or_else(|_| "context".to_string());
+            let importance: String = row
+                .get("importance")
+                .unwrap_or_else(|_| "medium".to_string());
+            let energy: f64 = row.get("energy").unwrap_or(0.5);
+            let tags: Vec<String> = row.get("tags").unwrap_or_default();
+            let content_preview: String =
+                row.get("content_preview").unwrap_or_else(|_| String::new());
+
+            points.push(super::models::NoteEmbeddingPoint {
+                id,
+                embedding,
+                note_type,
+                importance,
+                energy,
+                tags,
+                content_preview,
+            });
+        }
+
+        Ok(points)
+    }
+
+    /// Search notes by vector similarity using the HNSW index.
+    ///
+    /// Returns notes ordered by descending cosine similarity score,
+    /// filtered by optional project_id or workspace_slug for data isolation.
+    ///
+    /// Filtering priority: `project_id` > `workspace_slug` > global (no filter).
+    pub async fn vector_search_notes(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        min_similarity: Option<f64>,
+    ) -> Result<Vec<(Note, f64)>> {
+        // Convert f32 to f64 for neo4rs
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+
+        // We query more than limit to allow for post-filtering by project_id/workspace and status
+        let has_filter = project_id.is_some() || workspace_slug.is_some();
+        let query_limit = if has_filter { limit * 3 } else { limit * 2 };
+
+        // Build Cypher with the appropriate project filter
+        let (cypher, project_filter_value) = if let Some(pid) = project_id {
+            // Direct project_id filter
+            let cypher = r#"
+                CALL db.index.vector.queryNodes('note_embeddings', $query_limit, $embedding)
+                YIELD node AS n, score
+                WHERE n.status IN ['active', 'needs_review']
+                AND n.project_id = $project_id
+                RETURN n, score
+                ORDER BY score DESC
+                LIMIT $limit
+            "#;
+            (cypher.to_string(), Some(pid.to_string()))
+        } else if workspace_slug.is_some() {
+            // Workspace filter: match notes belonging to any project in the workspace,
+            // plus global notes (project_id IS NULL) for completeness
+            let cypher = r#"
+                CALL db.index.vector.queryNodes('note_embeddings', $query_limit, $embedding)
+                YIELD node AS n, score
+                WHERE n.status IN ['active', 'needs_review']
+                AND (
+                    n.project_id IN [(w:Workspace {slug: $ws_slug})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]
+                    OR n.project_id IS NULL
+                    OR n.project_id = ''
+                )
+                RETURN n, score
+                ORDER BY score DESC
+                LIMIT $limit
+                "#;
+            (cypher.to_string(), None)
+        } else {
+            // No filter — return all notes
+            let cypher = r#"
+                CALL db.index.vector.queryNodes('note_embeddings', $query_limit, $embedding)
+                YIELD node AS n, score
+                WHERE n.status IN ['active', 'needs_review']
+                RETURN n, score
+                ORDER BY score DESC
+                LIMIT $limit
+            "#;
+            (cypher.to_string(), None)
+        };
+
+        let mut q = query(&cypher)
+            .param("query_limit", query_limit as i64)
+            .param("embedding", embedding_f64)
+            .param("limit", limit as i64);
+
+        if let Some(pid) = project_filter_value {
+            q = q.param("project_id", pid);
+        } else if let (Some(ws), None) = (workspace_slug, project_id) {
+            q = q.param("ws_slug", ws.to_string());
+        }
+
+        let mut result = self.graph.execute(q).await?;
+        let mut notes = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            let score: f64 = row.get("score")?;
+
+            // Filter by minimum cosine similarity threshold
+            if let Some(min_sim) = min_similarity {
+                if score < min_sim {
+                    continue;
+                }
+            }
+
+            let note = self.node_to_note(&node)?;
+            // Knowledge Scars: penalize scarred notes in search results
+            // Biomimicry: Elun HypersphereIdentity.Scar — scarred knowledge is less trusted
+            let adjusted_score = score * (1.0 - note.scar_intensity * 0.7);
+            notes.push((note, adjusted_score));
+        }
+
+        Ok(notes)
+    }
+
+    pub async fn list_notes_without_embedding(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Note>, usize)> {
+        // Count total notes without embedding
+        let count_cypher = r#"
+            MATCH (n:Note)
+            WHERE n.embedding IS NULL
+            RETURN count(n) AS total
+        "#;
+        let mut count_result = self.graph.execute(query(count_cypher)).await?;
+        let total: usize = if let Some(row) = count_result.next().await? {
+            let count: i64 = row.get("total")?;
+            count as usize
+        } else {
+            0
+        };
+
+        if total == 0 {
+            return Ok((vec![], 0));
+        }
+
+        // Fetch notes without embedding
+        let cypher = r#"
+            MATCH (n:Note)
+            WHERE n.embedding IS NULL
+            RETURN n
+            ORDER BY n.created_at ASC, n.id ASC
+            SKIP $offset
+            LIMIT $limit
+        "#;
+
+        let q = query(cypher)
+            .param("offset", offset as i64)
+            .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut notes = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            let note = self.node_to_note(&node)?;
+            notes.push(note);
+        }
+
+        Ok((notes, total))
+    }
+
+    // ========================================================================
+    // Code embedding operations (File & Function vector search)
+    // ========================================================================
+
+    /// Store a vector embedding on a File node.
+    pub async fn set_file_embedding(
+        &self,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+
+        let q = query(
+            r#"
+            MATCH (f:File {path: $path})
+            CALL db.create.setNodeVectorProperty(f, 'embedding', $embedding)
+            SET f.embedding_model = $model,
+                f.embedded_at = datetime()
+            "#,
+        )
+        .param("path", file_path.to_string())
+        .param("embedding", embedding_f64)
+        .param("model", model.to_string());
+
+        self.graph
+            .run(q)
+            .await
+            .context(format!("Failed to set embedding on file {}", file_path))?;
+
+        Ok(())
+    }
+
+    /// Store a vector embedding on a Function node.
+    pub async fn set_function_embedding(
+        &self,
+        function_name: &str,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+
+        let q = query(
+            r#"
+            MATCH (fn:Function)<-[:CONTAINS]-(f:File {path: $file_path})
+            WHERE fn.name = $name
+            WITH fn LIMIT 1
+            CALL db.create.setNodeVectorProperty(fn, 'embedding', $embedding)
+            SET fn.embedding_model = $model,
+                fn.embedded_at = datetime()
+            "#,
+        )
+        .param("name", function_name.to_string())
+        .param("file_path", file_path.to_string())
+        .param("embedding", embedding_f64)
+        .param("model", model.to_string());
+
+        self.graph.run(q).await.context(format!(
+            "Failed to set embedding on function {} in {}",
+            function_name, file_path
+        ))?;
+
+        Ok(())
+    }
+
+    /// Search files by vector similarity using the HNSW index.
+    pub async fn vector_search_files(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, f64)>> {
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+        let query_limit = (limit * 3) as i64; // over-fetch for post-filtering
+
+        let cypher = if let Some(_pid) = project_id {
+            r#"
+            CALL db.index.vector.queryNodes('file_embedding_index', $query_limit, $embedding)
+            YIELD node AS f, score
+            WHERE EXISTS { MATCH (f)<-[:CONTAINS]-(p:Project {id: $project_id}) }
+            RETURN f.path AS path, score
+            ORDER BY score DESC
+            LIMIT $limit
+            "#
+        } else {
+            r#"
+            CALL db.index.vector.queryNodes('file_embedding_index', $query_limit, $embedding)
+            YIELD node AS f, score
+            RETURN f.path AS path, score
+            ORDER BY score DESC
+            LIMIT $limit
+            "#
+        };
+
+        let mut q = query(cypher)
+            .param("embedding", embedding_f64)
+            .param("query_limit", query_limit)
+            .param("limit", limit as i64);
+
+        if let Some(pid) = project_id {
+            q = q.param("project_id", pid.to_string());
+        }
+
+        let mut result = self.graph.execute(q).await?;
+        let mut results = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let path: String = row.get("path")?;
+            let score: f64 = row.get("score")?;
+            results.push((path, score));
+        }
+
+        Ok(results)
+    }
+
+    /// Search functions by vector similarity using the HNSW index.
+    pub async fn vector_search_functions(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+        let query_limit = (limit * 3) as i64;
+
+        let cypher = if let Some(_pid) = project_id {
+            r#"
+            CALL db.index.vector.queryNodes('function_embedding_index', $query_limit, $embedding)
+            YIELD node AS fn, score
+            MATCH (fn)<-[:CONTAINS]-(f:File)
+            WHERE EXISTS { MATCH (f)<-[:CONTAINS]-(p:Project {id: $project_id}) }
+            RETURN fn.name AS name, f.path AS path, score
+            ORDER BY score DESC
+            LIMIT $limit
+            "#
+        } else {
+            r#"
+            CALL db.index.vector.queryNodes('function_embedding_index', $query_limit, $embedding)
+            YIELD node AS fn, score
+            MATCH (fn)<-[:CONTAINS]-(f:File)
+            RETURN fn.name AS name, f.path AS path, score
+            ORDER BY score DESC
+            LIMIT $limit
+            "#
+        };
+
+        let mut q = query(cypher)
+            .param("embedding", embedding_f64)
+            .param("query_limit", query_limit)
+            .param("limit", limit as i64);
+
+        if let Some(pid) = project_id {
+            q = q.param("project_id", pid.to_string());
+        }
+
+        let mut result = self.graph.execute(q).await?;
+        let mut results = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let name: String = row.get("name")?;
+            let path: String = row.get("path")?;
+            let score: f64 = row.get("score")?;
+            results.push((name, path, score));
+        }
+
+        Ok(results)
+    }
+
+    // ========================================================================
+    // Synapse operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    /// Create bidirectional SYNAPSE relationships between a note and its neighbors.
+    ///
+    /// Uses MERGE for idempotence. Creates edges in both directions with the same weight.
+    /// Returns the number of synapses created (counting each direction separately).
+    pub async fn create_synapses(&self, note_id: Uuid, neighbors: &[(Uuid, f64)]) -> Result<usize> {
+        if neighbors.is_empty() {
+            return Ok(0);
+        }
+
+        let (ids, weights) = synapse_bind_params(neighbors)?;
+
+        let cypher = r#"
+            MATCH (source:Note {id: $source_id})
+            UNWIND range(0, size($ids) - 1) AS i
+            WITH source, $ids[i] AS nid, $weights[i] AS w
+            MATCH (target:Note {id: nid})
+            MERGE (source)-[s1:SYNAPSE]->(target)
+            ON CREATE SET s1.weight = w, s1.created_at = datetime(),
+              s1.source = 'cosine'
+            ON MATCH SET s1.weight = w
+            MERGE (target)-[s2:SYNAPSE]->(source)
+            ON CREATE SET s2.weight = w, s2.created_at = datetime(),
+              s2.source = 'cosine'
+            ON MATCH SET s2.weight = w
+            RETURN count(s1) + count(s2) AS total
+            "#;
+
+        let q = query(cypher)
+            .param("source_id", note_id.to_string())
+            .param("ids", ids)
+            .param("weights", weights);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let total: i64 = row.get("total")?;
+            Ok(total as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get all SYNAPSE relationships for a note (both directions).
+    ///
+    /// Returns (neighbor_id, weight) sorted by weight descending.
+    pub async fn get_synapses(&self, note_id: Uuid) -> Result<Vec<(Uuid, f64)>> {
+        let cypher = r#"
+            MATCH (n:Note {id: $id})-[s:SYNAPSE]-(neighbor:Note)
+            RETURN DISTINCT neighbor.id AS neighbor_id, s.weight AS weight
+            ORDER BY weight DESC
+        "#;
+
+        let q = query(cypher).param("id", note_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut synapses = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let neighbor_id_str: String = row.get("neighbor_id")?;
+            let weight: f64 = row.get("weight")?;
+            if let Ok(nid) = neighbor_id_str.parse::<Uuid>() {
+                synapses.push((nid, weight));
+            }
+        }
+
+        Ok(synapses)
+    }
+
+    /// Delete all SYNAPSE relationships for a note (both directions).
+    ///
+    /// Returns the number of deleted relationships.
+    pub async fn delete_synapses(&self, note_id: Uuid) -> Result<usize> {
+        let cypher = r#"
+            MATCH (n:Note {id: $id})-[s:SYNAPSE]-()
+            DELETE s
+            RETURN count(s) AS deleted
+        "#;
+
+        let q = query(cypher).param("id", note_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let deleted: i64 = row.get("deleted")?;
+            Ok(deleted as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    // ========================================================================
+    // Cross-entity SYNAPSE operations (Decision ↔ Note)
+    // ========================================================================
+
+    /// Create bidirectional SYNAPSE relationships between any two nodes (Note or Decision).
+    ///
+    /// Unlike `create_synapses` which is Note-specific, this method matches nodes
+    /// by their `id` property regardless of label. This enables Decision↔Note
+    /// and Decision↔Decision synapses for cross-entity neural linking.
+    ///
+    /// Uses MERGE for idempotence. Returns the number of synapses created.
+    pub async fn create_cross_entity_synapses(
+        &self,
+        source_id: Uuid,
+        neighbors: &[(Uuid, f64)],
+    ) -> Result<usize> {
+        if neighbors.is_empty() {
+            return Ok(0);
+        }
+
+        let (ids, weights) = synapse_bind_params(neighbors)?;
+
+        let cypher = r#"
+            MATCH (source {id: $source_id})
+            WHERE source:Note OR source:Decision
+            UNWIND range(0, size($ids) - 1) AS i
+            WITH source, $ids[i] AS nid, $weights[i] AS w
+            MATCH (target {id: nid})
+            WHERE target:Note OR target:Decision
+            MERGE (source)-[s1:SYNAPSE]->(target)
+            ON CREATE SET s1.weight = w, s1.created_at = datetime(),
+              s1.source = 'cosine'
+            ON MATCH SET s1.weight = w
+            MERGE (target)-[s2:SYNAPSE]->(source)
+            ON CREATE SET s2.weight = w, s2.created_at = datetime(),
+              s2.source = 'cosine'
+            ON MATCH SET s2.weight = w
+            RETURN count(s1) + count(s2) AS total
+            "#;
+
+        let q = query(cypher)
+            .param("source_id", source_id.to_string())
+            .param("ids", ids)
+            .param("weights", weights);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let total: i64 = row.get("total")?;
+            Ok(total as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get all SYNAPSE relationships for any node (Note or Decision), both directions.
+    ///
+    /// Returns (neighbor_id, weight, entity_type) where entity_type is "Note" or "Decision".
+    /// Sorted by weight descending.
+    pub async fn get_cross_entity_synapses(
+        &self,
+        node_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64, String)>> {
+        let cypher = r#"
+            MATCH (n {id: $id})-[s:SYNAPSE]-(neighbor)
+            WHERE (n:Note OR n:Decision) AND (neighbor:Note OR neighbor:Decision)
+            RETURN DISTINCT neighbor.id AS neighbor_id, s.weight AS weight,
+                   CASE WHEN neighbor:Decision THEN 'Decision' ELSE 'Note' END AS entity_type
+            ORDER BY weight DESC
+        "#;
+
+        let q = query(cypher).param("id", node_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut synapses = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let neighbor_id_str: String = row.get("neighbor_id")?;
+            let weight: f64 = row.get("weight")?;
+            let entity_type: String = row.get("entity_type")?;
+            if let Ok(nid) = neighbor_id_str.parse::<Uuid>() {
+                synapses.push((nid, weight, entity_type));
+            }
+        }
+
+        Ok(synapses)
+    }
+
+    /// List Decision nodes that have embeddings but no SYNAPSE relationships.
+    ///
+    /// Used by `backfill_synapses` to process Decision nodes for cross-entity linking.
+    pub async fn list_decisions_needing_synapses(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DecisionNode>, usize)> {
+        // Count total
+        let count_q = query(
+            r#"
+            MATCH (d:Decision)
+            WHERE d.embedding IS NOT NULL AND NOT (d)-[:SYNAPSE]->()
+            RETURN count(d) AS total
+            "#,
+        );
+        let mut result = self.graph.execute(count_q).await?;
+        let total = if let Some(row) = result.next().await? {
+            row.get::<i64>("total").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        if total == 0 || limit == 0 {
+            return Ok((vec![], total));
+        }
+
+        // Fetch batch
+        let fetch_q = query(
+            r#"
+            MATCH (d:Decision)
+            WHERE d.embedding IS NOT NULL AND NOT (d)-[:SYNAPSE]->()
+            RETURN d
+            ORDER BY d.decided_at, d.id
+            SKIP $offset LIMIT $limit
+            "#,
+        )
+        .param("offset", offset as i64)
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(fetch_q).await?;
+        let mut decisions = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("d")?;
+            decisions.push(Self::node_to_decision(&node)?);
+        }
+
+        Ok((decisions, total))
+    }
+
+    // ========================================================================
+    // Energy operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    /// Retrieve all SYNAPSE weights for a project (or globally when `project_id` is None).
+    ///
+    /// Used to calibrate adaptive thresholds from the real weight distribution.
+    pub async fn get_all_synapse_weights(
+        &self,
+        project_id: Option<uuid::Uuid>,
+    ) -> Result<Vec<f64>> {
+        let q = if let Some(pid) = project_id {
+            query(
+                r#"
+                MATCH (p:Project {id: $project_id})-[:HAS_NOTE]->(n1:Note)-[s:SYNAPSE]->(n2:Note)
+                RETURN s.weight AS weight
+                "#,
+            )
+            .param("project_id", pid.to_string())
+        } else {
+            query(
+                r#"
+                MATCH ()-[s:SYNAPSE]->()
+                RETURN s.weight AS weight
+                "#,
+            )
+        };
+
+        let mut result = self.graph.execute(q).await?;
+        let mut weights = Vec::new();
+        while let Some(row) = result.next().await? {
+            if let Ok(w) = row.get::<f64>("weight") {
+                weights.push(w);
+            }
+        }
+        Ok(weights)
+    }
+
+    /// Apply exponential energy decay to all active notes.
+    ///
+    /// Formula: `energy = energy × exp(-days_since_last_update / tau)`, where the
+    /// `half_life` parameter is really a TIME CONSTANT tau (default 90 days,
+    /// `ENERGY_HALF_LIFE_DAYS`): energy halves every `tau·ln2 ≈ 62.4` days.
+    /// NOTE: `Note::computed_energy()` (read-time, used for ranking) uses a true
+    /// half-life `0.5^(t/90)` (halves every 90 days). The two are intentionally
+    /// left as-is: unifying would shift prod ranking and archival thresholds.
+    /// then `energy_updated_at = now`.
+    ///
+    /// **Temporally idempotent**: each call applies only the decay of the time
+    /// elapsed since the previous update, so calling it once after 30 days ≡
+    /// calling it daily for 30 days, and calling it twice in a row changes
+    /// nothing.
+    ///
+    /// The previous formula multiplied the CURRENT (already decayed) energy by
+    /// `exp(-days_since_last_activated / half_life)` on every call, so the decay
+    /// compounded with each call — and deep maintenance called it once per
+    /// project. Energy of every idle note collapsed to 0 and consolidation
+    /// archived ~4,000 notes (3,051 of them consolidated) as `low_energy_60d`.
+    /// Data migration `2026-09-restore-energy-decay-victims` repairs that.
+    ///
+    /// A note without `energy_updated_at` is only stamped on its first pass
+    /// (its energy is current as of now). Notes decaying below 0.05 are
+    /// floored to 0.0 ("dead neuron").
+    pub async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        // Notes of dormant projects are only stamped: their energy is frozen
+        // while nobody works on the project, and decay resumes from the
+        // moment it is active again (see dormant_project_ids).
+        let dormant = self.dormant_project_ids().await?;
+        let q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.status = 'active'
+              AND n.energy > 0.0
+            WITH n,
+                 CASE WHEN n.energy_updated_at IS NULL
+                        OR (n.project_id IS NOT NULL AND n.project_id IN $dormant) THEN 0.0
+                      ELSE toFloat(duration.inSeconds(datetime(n.energy_updated_at), datetime()).seconds) / 86400.0
+                 END AS days_elapsed
+            WITH n,
+                 n.energy * exp(-1.0 * days_elapsed / $half_life) AS new_energy
+            WITH n,
+                 CASE WHEN new_energy < 0.05 THEN 0.0 ELSE new_energy END AS clamped_energy
+            SET n.energy_updated_at = datetime()
+            WITH n, clamped_energy
+            WHERE abs(n.energy - clamped_energy) > 0.001
+            SET n.energy = clamped_energy
+            RETURN count(n) AS updated
+            "#,
+        )
+        .param("half_life", half_life_days)
+        .param("dormant", dormant);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let updated: i64 = row.get("updated")?;
+            Ok(updated as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Boost a note's energy by `amount` (capped at 1.0) and reset `last_activated` to now.
+    pub async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            // `energy` is kept current by update_energy_scores: decaying it
+            // again here from last_activated double-counted the idle time.
+            WITH n, coalesce(n.energy, 1.0) AS current_e
+            SET n.energy = CASE WHEN current_e + $amount > 1.0 THEN 1.0 ELSE current_e + $amount END,
+                n.last_activated = datetime(),
+                n.energy_updated_at = datetime()
+            "#,
+        )
+        .param("id", note_id.to_string())
+        .param("amount", amount);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Track re-activation: increment reactivation_count and set last_reactivated.
+    pub async fn track_reactivation(&self, note_ids: &[Uuid]) -> Result<usize> {
+        if note_ids.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<String> = note_ids.iter().map(|id| id.to_string()).collect();
+        let q = query(
+            r#"
+            UNWIND $ids AS nid
+            MATCH (n:Note {id: nid})
+            SET n.reactivation_count = coalesce(n.reactivation_count, 0) + 1,
+                n.last_reactivated = datetime()
+            RETURN count(n) AS updated
+            "#,
+        )
+        .param("ids", ids);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("updated").unwrap_or(0) as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::coactivate_session`].
+    ///
+    /// The same pair logic as [`Self::reinforce_synapses`] — same project, both directions,
+    /// `MERGE ... ON CREATE` — plus the provenance: `rule`, `measure`, `at`, and the session
+    /// that did it.
+    ///
+    /// `last_session` names the last activator, never the creator: an edge that existed
+    /// before this call keeps its history and gains the new fact.
+    pub async fn coactivate_session(
+        &self,
+        project: Uuid,
+        notes: &[Uuid],
+        session: Uuid,
+        provenance: &crate::graph::rules::AccountableProvenance,
+    ) -> Result<usize> {
+        use super::batch::{bolt_map, BoltMap};
+
+        if notes.len() < 2 {
+            return Ok(0);
+        }
+        let mut pairs: Vec<BoltMap> = Vec::new();
+        for i in 0..notes.len() {
+            for j in (i + 1)..notes.len() {
+                pairs.push(bolt_map(&[
+                    ("a", notes[i].to_string().into()),
+                    ("b", notes[j].to_string().into()),
+                ]));
+            }
+        }
+
+        let cypher = r#"
+            UNWIND $items AS pair
+            MATCH (a:Note {id: pair.a}), (b:Note {id: pair.b})
+            WHERE a.project_id = $project AND b.project_id = $project AND a.id <> b.id
+            // Same revival as reinforce_synapses: an archived pair comes back
+            // at its weight, never at the 0.5 of a new edge.
+            OPTIONAL MATCH (a)-[f1:FORGOTTEN]->(b)
+            OPTIONAL MATCH (b)-[f2:FORGOTTEN]->(a)
+            WITH pair, a, b, f1, f2,
+                 coalesce(f1.weight, f2.weight, 0.5) AS archived,
+                 [x IN [f1, f2] WHERE x IS NOT NULL] AS stale
+            WITH pair, a, b, stale,
+                 CASE WHEN archived < $revive_floor THEN $revive_floor ELSE archived END AS start
+            FOREACH (x IN stale | DELETE x)
+            MERGE (a)-[s1:SYNAPSE]->(b)
+              ON CREATE SET s1.weight = start, s1.created_at = datetime(),
+                s1.reinforcement_count = 1, s1.source = 'coactivation'
+              ON MATCH SET s1.weight = CASE
+                  WHEN s1.weight + 0.2 > 1.0 THEN 1.0 ELSE s1.weight + 0.2 END,
+                s1.reinforcement_count = coalesce(s1.reinforcement_count, 0) + 1
+            SET s1.last_reinforced_at = datetime(), s1.decayed_at = datetime(),
+                s1.rule = $rule,
+                s1.measure = $measure, s1.at = $at, s1.last_session = $session
+            MERGE (b)-[s2:SYNAPSE]->(a)
+              ON CREATE SET s2.weight = start, s2.created_at = datetime(),
+                s2.reinforcement_count = 1, s2.source = 'coactivation'
+              ON MATCH SET s2.weight = CASE
+                  WHEN s2.weight + 0.2 > 1.0 THEN 1.0 ELSE s2.weight + 0.2 END,
+                s2.reinforcement_count = coalesce(s2.reinforcement_count, 0) + 1
+            SET s2.last_reinforced_at = datetime(), s2.rule = $rule,
+                s2.measure = $measure, s2.at = $at, s2.last_session = $session
+            RETURN count(s1) + count(s2) AS n
+        "#;
+        let mut result = self
+            .graph
+            .execute(
+                query(cypher)
+                    .param("items", pairs)
+                    .param("project", project.to_string())
+                    .param("session", session.to_string())
+                    .param("rule", provenance.rule.clone())
+                    .param("measure", provenance.measure.clone())
+                    .param("at", provenance.at.clone())
+                    .param(
+                        "revive_floor",
+                        crate::neurons::forgetting::DecayPolicy::default().forget_threshold,
+                    ),
+            )
+            .await?;
+        let n: i64 = match result.next().await? {
+            Some(row) => row.get("n").unwrap_or(0),
+            None => 0,
+        };
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// Reinforce synapses between co-activated notes (Hebbian learning).
+    ///
+    /// For every pair (i, j) in note_ids, MERGE a bidirectional SYNAPSE.
+    ///
+    /// Requires at least 2 ids (explicit error otherwise, never a silent no-op).
+    /// Only `:Note` nodes are linked (Decision ids match nothing: explicitly not
+    /// supported), and only pairs whose notes share the same non-null
+    /// `project_id` — cross-project pairs and unknown projects are skipped by
+    /// the query. The returned count is exact: 2 directed synapses per pair that was
+    /// really reinforced (skipped pairs are not counted).
+    /// Uses a single UNWIND query to batch all pairs instead of N*(N-1)/2
+    /// individual queries, reducing 45 queries (10 notes) to 1.
+    ///
+    /// Performance improvement:
+    /// - Before: 10 notes → 45 individual Cypher queries (~500ms)
+    /// - After:  10 notes → 1 UNWIND query (~20ms)
+    pub async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize> {
+        use super::batch::{bolt_map, BoltMap};
+
+        if note_ids.len() < 2 {
+            anyhow::bail!(
+                "reinforce_synapses needs at least 2 note ids (got {})",
+                note_ids.len()
+            );
+        }
+
+        // Build all unique pairs as BoltMaps for UNWIND
+        let mut pairs: Vec<BoltMap> = Vec::new();
+        for i in 0..note_ids.len() {
+            for j in (i + 1)..note_ids.len() {
+                pairs.push(bolt_map(&[
+                    ("a", note_ids[i].to_string().into()),
+                    ("b", note_ids[j].to_string().into()),
+                ]));
+            }
+        }
+
+        let cypher = r#"
+            UNWIND $items AS pair
+            MATCH (a:Note {id: pair.a}), (b:Note {id: pair.b})
+            WHERE a.project_id IS NOT NULL AND a.project_id <> '' AND a.project_id = b.project_id AND a.id <> b.id
+            // An ARCHIVED edge revives: the pair keeps its history instead of
+            // restarting as a brand-new 0.5, and the archive row goes away.
+            OPTIONAL MATCH (a)-[f1:FORGOTTEN]->(b)
+            OPTIONAL MATCH (b)-[f2:FORGOTTEN]->(a)
+            WITH a, b, f1, f2,
+                 coalesce(f1.weight, f2.weight, 0.5) AS archived,
+                 [x IN [f1, f2] WHERE x IS NOT NULL] AS stale
+            WITH a, b, stale,
+                 CASE WHEN archived < $revive_floor THEN $revive_floor ELSE archived END AS start
+            FOREACH (x IN stale | DELETE x)
+            MERGE (a)-[s1:SYNAPSE]->(b)
+              ON CREATE SET s1.weight = start, s1.created_at = datetime(),
+                s1.last_reinforced_at = datetime(), s1.reinforcement_count = 1,
+                s1.source = 'coactivation'
+              ON MATCH SET s1.weight = CASE
+                  WHEN s1.weight + $boost > 1.0 THEN 1.0
+                  ELSE s1.weight + $boost
+              END,
+                s1.last_reinforced_at = datetime(),
+                s1.decayed_at = datetime(),
+                s1.reinforcement_count = coalesce(s1.reinforcement_count, 0) + 1,
+                s1.source = CASE WHEN s1.source IS NULL OR s1.source = 'cosine' THEN 'coactivation' ELSE s1.source END
+            MERGE (b)-[s2:SYNAPSE]->(a)
+              ON CREATE SET s2.weight = start, s2.created_at = datetime(),
+                s2.last_reinforced_at = datetime(), s2.reinforcement_count = 1,
+                s2.source = 'coactivation'
+              ON MATCH SET s2.weight = CASE
+                  WHEN s2.weight + $boost > 1.0 THEN 1.0
+                  ELSE s2.weight + $boost
+              END,
+                s2.last_reinforced_at = datetime(),
+                s2.decayed_at = datetime(),
+                s2.reinforcement_count = coalesce(s2.reinforcement_count, 0) + 1,
+                s2.source = CASE WHEN s2.source IS NULL OR s2.source = 'cosine' THEN 'coactivation' ELSE s2.source END
+            RETURN count(*) AS reinforced
+            "#;
+
+        // Count what the query really wrote: pairs skipped by the project guard
+        // (cross-project, unknown project, unknown id) match no row.
+        let mut reinforced_pairs = 0usize;
+        for chunk in pairs.chunks(super::batch::BATCH_SIZE) {
+            let mut result = self
+                .graph
+                .execute(
+                    query(cypher)
+                        .param("items", chunk.to_vec())
+                        .param("boost", boost)
+                        .param(
+                            "revive_floor",
+                            crate::neurons::forgetting::DecayPolicy::default().forget_threshold,
+                        ),
+                )
+                .await?;
+            if let Some(row) = result.next().await? {
+                reinforced_pairs += row.get::<i64>("reinforced").unwrap_or(0) as usize;
+            }
+        }
+
+        // Each reinforced pair creates/updates 2 synapses (bidirectional)
+        Ok(reinforced_pairs * 2)
+    }
+
+    /// Weaken the synapses of ONE node (note or decision) by `amount` and
+    /// delete those that fall below `prune_threshold`. Synapses that
+    /// cross two known projects are left alone. Returns how many were
+    /// weakened. The counterpart of reinforcing a node's synapses: negative
+    /// feedback on one piece of knowledge must not decay the whole graph.
+    pub async fn weaken_node_synapses(
+        &self,
+        node_id: Uuid,
+        amount: f64,
+        prune_threshold: f64,
+    ) -> Result<usize> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    r#"
+                    MATCH (n {id: $id})-[s:SYNAPSE]-(m)
+                    // Never touch a synapse that crosses projects: both ends must
+                    // share the project (a Decision has no project_id: it is not a
+                    // cross-project signal by itself).
+                    WHERE n.project_id IS NULL OR n.project_id = '' OR m.project_id IS NULL OR m.project_id = '' OR n.project_id = m.project_id
+                    SET s.weight = s.weight - $amount
+                    WITH collect(s) AS all_syn
+                    WITH all_syn, [x IN all_syn WHERE x.weight < $threshold] AS weak
+                    FOREACH (x IN weak | DELETE x)
+                    RETURN size(all_syn) AS weakened
+                    "#,
+                )
+                .param("id", node_id.to_string())
+                .param("amount", amount)
+                .param("threshold", prune_threshold),
+            )
+            .await?;
+        Ok(match result.next().await? {
+            Some(row) => row.get::<i64>("weakened").unwrap_or(0) as usize,
+            None => 0,
+        })
+    }
+
+    /// Ids of dormant projects: no human activity — code sync (`last_synced`,
+    /// updated by the watcher and commits) nor chat session — for
+    /// [`crate::notes::PROJECT_DORMANT_AFTER_DAYS`] days.
+    ///
+    /// Knowledge of a dormant project is frozen: its notes' energy and its
+    /// synapses do not decay. Coming back to a project months later must find
+    /// it as it was left, not forgotten because nobody touched it.
+    pub async fn dormant_project_ids(&self) -> Result<Vec<String>> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    r#"
+                    MATCH (p:Project)
+                    OPTIONAL MATCH (s:ChatSession {project_slug: p.slug})
+                    WITH p, max(s.updated_at) AS chat_at
+                    WITH p, CASE
+                        WHEN chat_at IS NULL THEN p.last_synced
+                        WHEN p.last_synced IS NULL OR chat_at > p.last_synced THEN chat_at
+                        ELSE p.last_synced
+                    END AS active_at
+                    WHERE active_at IS NULL
+                       OR datetime(active_at) < datetime() - duration({days: $days})
+                    RETURN collect(p.id) AS dormant
+                    "#,
+                )
+                .param("days", crate::notes::PROJECT_DORMANT_AFTER_DAYS),
+            )
+            .await?;
+        Ok(match result.next().await? {
+            Some(row) => row.get::<Vec<String>>("dormant").unwrap_or_default(),
+            None => Vec::new(),
+        })
+    }
+
+    /// One forgetting pass over ONE project's notes.
+    ///
+    /// See [`crate::neurons::forgetting`] for the model. This is the
+    /// project-scoped form of [`Self::decay_synapses`]: per-project maintenance
+    /// used to call the global pass, so one pass over N projects decayed every
+    /// synapse N times (×3 in deep maintenance) and the whole SYNAPSE layer was
+    /// wiped. A dormant project is frozen: its knowledge does not decay.
+    pub async fn decay_project_synapses(
+        &self,
+        project_id: Uuid,
+        policy: &DecayPolicy,
+    ) -> Result<PassReport> {
+        if self
+            .dormant_project_ids()
+            .await?
+            .contains(&project_id.to_string())
+        {
+            return Ok(PassReport::default());
+        }
+        let dormant = self.dormant_project_ids().await?;
+        self.forgetting_pass(policy, Some(project_id.to_string()), dormant)
+            .await
+    }
+
+    /// One forgetting pass over every synapse of the graph.
+    ///
+    /// The weight after the pass is `w · 2^(−Δt / h)`, with `Δt` read on the
+    /// edge itself (`coalesce(last_reinforced_at, created_at)`): the SAME result
+    /// whether the caller runs once over six hours or twice over three, and a
+    /// downtime is caught up instead of suspending forgetting.
+    ///
+    /// An edge reinforced [`DecayPolicy::protected_after`] times never falls
+    /// below [`DecayPolicy::protection_floor`]. An edge that may be forgotten is
+    /// ARCHIVED as `:FORGOTTEN` — with its weight, provenance, counters and the
+    /// date — never destroyed: `reinforce_synapses` revives it at the weight it
+    /// had. One pass archives at most [`DecayPolicy::archive_cap`] edges and
+    /// never takes a node below [`DecayPolicy::min_degree`].
+    pub async fn decay_synapses(&self, policy: &DecayPolicy) -> Result<PassReport> {
+        let dormant = self.dormant_project_ids().await?;
+        self.forgetting_pass(policy, None, dormant).await
+    }
+
+    /// The pass itself. `scope` is `Some(project)` for a project pass, `None`
+    /// for the global one, which freezes the dormant projects.
+    async fn forgetting_pass(
+        &self,
+        policy: &DecayPolicy,
+        scope: Option<String>,
+        dormant: Vec<String>,
+    ) -> Result<PassReport> {
+        // The scope guard, spliced into both queries. A project pass walks only
+        // its own notes; the global pass walks everything except the dormant
+        // projects.
+        let guard = if scope.is_some() {
+            "AND a.project_id = $scope"
+        } else {
+            "AND (a.project_id IS NULL OR NOT a.project_id IN $dormant)"
+        };
+
+        // ---- 1. Proportional decay -------------------------------------
+        // Elapsed time, not a number of passes. `h` depends on the provenance:
+        // a co-activation edge (validated by use) halves slower than a
+        // similarity edge (created by the backfill, never reinforced).
+        let decay_q = format!(
+            r#"
+            MATCH (a)-[s:SYNAPSE]->()
+            WHERE true {guard}
+            WITH s,
+                 coalesce(s.reinforcement_count, 0) AS rc,
+                 CASE WHEN s.source = 'coactivation' THEN $half_life_coactivation
+                      ELSE $half_life_similarity END AS h,
+                 // The stored weight is valid AS OF its own `decayed_at`: the
+                 // elapsed time is what happened since, never since creation.
+                 // An edge that never carried one is stamped now, not decayed:
+                 // the legacy pass already charged for its age, and charging it
+                 // a second time is what archived 928 edges in one pass on the
+                 // restored copy (measured 02/11/2026).
+                 duration.inSeconds(
+                     coalesce(s.decayed_at, datetime()),
+                     datetime()
+                 ).seconds AS elapsed
+            WITH s, rc, h,
+                 CASE WHEN elapsed < 0 THEN 0 ELSE elapsed END AS elapsed
+            WITH s, rc,
+                 s.weight * (2 ^ (-(toFloat(elapsed)) / (h * 86400.0))) AS raw
+            WITH s, rc,
+                 CASE WHEN rc >= $protected_after AND raw < $protection_floor
+                      THEN $protection_floor ELSE raw END AS w
+            SET s.weight = w, s.decayed_at = datetime()
+            RETURN count(s) AS decayed,
+                   sum(CASE WHEN w < $dormancy THEN 1 ELSE 0 END) AS dormant,
+                   sum(CASE WHEN rc >= $protected_after THEN 1 ELSE 0 END) AS protected
+            "#,
+            guard = guard
+        );
+        let mut result = self
+            .graph
+            .execute(
+                query(&decay_q)
+                    .param("scope", scope.clone())
+                    .param("dormant", dormant.clone())
+                    .param("half_life_coactivation", policy.half_life_days)
+                    .param("half_life_similarity", policy.similarity_half_life_days)
+                    .param("protected_after", policy.protected_after as i64)
+                    .param("protection_floor", policy.protection_floor)
+                    .param("dormancy", policy.dormancy_threshold),
+            )
+            .await?;
+        let mut report = match result.next().await? {
+            Some(row) => PassReport::new(
+                row.get::<i64>("decayed").unwrap_or(0) as usize,
+                row.get::<i64>("dormant").unwrap_or(0) as usize,
+                row.get::<i64>("protected").unwrap_or(0) as usize,
+            ),
+            None => PassReport::default(),
+        };
+
+        // ---- 2. Archive, never destroy ---------------------------------
+        // Three conditions, all required: below the forget threshold, never
+        // proven by use, untouched for `forget_after_days`. Two floors: a node
+        // keeps at least `min_degree` edges, and one pass archives at most
+        // `archive_cap` edges, so a single pass can never empty a graph.
+        let cap = policy.archive_cap(report.decayed);
+        let archive_q = format!(
+            r#"
+            MATCH (a)-[s:SYNAPSE]->(b)
+            WHERE true {guard}
+              AND s.weight < $forget_threshold
+              AND coalesce(s.reinforcement_count, 0) < $protected_after
+              AND coalesce(s.last_reinforced_at, s.created_at)
+                  < datetime() - duration({{days: $forget_after_days}})
+              AND COUNT {{ (a)-[:SYNAPSE]->() }} > $min_degree
+              AND COUNT {{ (b)-[:SYNAPSE]->() }} > $min_degree
+            WITH a, b, s
+            LIMIT $cap
+            CREATE (a)-[f:FORGOTTEN]->(b)
+            SET f += properties(s),
+                f.forgotten_at = datetime(),
+                f.forgotten_reason = 'decay'
+            DELETE s
+            RETURN count(f) AS archived
+            "#,
+            guard = guard
+        );
+        let mut result = self
+            .graph
+            .execute(
+                query(&archive_q)
+                    .param("scope", scope)
+                    .param("dormant", dormant)
+                    .param("forget_threshold", policy.forget_threshold)
+                    .param("protected_after", policy.protected_after as i64)
+                    .param("forget_after_days", policy.forget_after_days)
+                    .param("min_degree", policy.min_degree as i64)
+                    .param("cap", cap as i64),
+            )
+            .await?;
+        report.archived = match result.next().await? {
+            Some(row) => row.get::<i64>("archived").unwrap_or(0) as usize,
+            None => 0,
+        };
+        // Reaching the cap means the pass stopped early: what is left is for
+        // the next one, and the caller must see it rather than believe the
+        // graph is clean.
+        report.capped = report.archived >= cap && report.archived > 0;
+
+        tracing::debug!(
+            decayed = report.decayed,
+            dormant = report.dormant,
+            protected = report.protected,
+            archived = report.archived,
+            capped = report.capped,
+            "forgetting pass"
+        );
+
+        // ---- 3. Decay knowledge scars (20x slower than synapse decay) ---
+        // Biomimicry: Elun Scar — scars heal very slowly, allowing the system
+        // to remember failures.
+        let scar_decay_rate = SCAR_DECAY_PER_PASS;
+        let scar_decay_q = query(
+            r#"
+            MATCH (n)
+            WHERE n.scar_intensity IS NOT NULL AND n.scar_intensity > 0
+            AND (n:Note OR n:Decision)
+            SET n.scar_intensity = CASE
+                WHEN n.scar_intensity - $scar_decay < 0.001 THEN 0.0
+                ELSE n.scar_intensity - $scar_decay
+            END
+            RETURN count(n) AS healed
+            "#,
+        )
+        .param("scar_decay", scar_decay_rate);
+        if let Ok(mut result) = self.graph.execute(scar_decay_q).await {
+            if let Ok(Some(row)) = result.next().await {
+                let healed: i64 = row.get("healed").unwrap_or(0);
+                if healed > 0 {
+                    tracing::debug!(
+                        "Decayed scars on {} nodes (rate: {:.4})",
+                        healed,
+                        scar_decay_rate
+                    );
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Apply scars to nodes traversed during a failed reasoning path.
+    ///
+    /// Biomimicry: Elun HypersphereIdentity.Scar — nodes that led to failure
+    /// receive a scar that penalizes their score in future searches.
+    /// Scar increment is +0.2 per failure, capped at 1.0.
+    ///
+    /// Works on both Note and Decision nodes.
+    pub async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> Result<usize> {
+        if node_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let ids: Vec<String> = node_ids.iter().map(|id| id.to_string()).collect();
+
+        // Apply scars on Note nodes
+        let note_q = query(
+            r#"
+            UNWIND $ids AS nid
+            MATCH (n:Note {id: nid})
+            SET n.scar_intensity = CASE
+                WHEN coalesce(n.scar_intensity, 0.0) + $increment > 1.0 THEN 1.0
+                ELSE coalesce(n.scar_intensity, 0.0) + $increment
+            END
+            RETURN count(n) AS scarred
+            "#,
+        )
+        .param("ids", ids.clone())
+        .param("increment", increment);
+
+        let mut result = self.graph.execute(note_q).await?;
+        let note_scarred = if let Some(row) = result.next().await? {
+            row.get::<i64>("scarred").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        // Apply scars on Decision nodes
+        let decision_q = query(
+            r#"
+            UNWIND $ids AS nid
+            MATCH (d:Decision {id: nid})
+            SET d.scar_intensity = CASE
+                WHEN coalesce(d.scar_intensity, 0.0) + $increment > 1.0 THEN 1.0
+                ELSE coalesce(d.scar_intensity, 0.0) + $increment
+            END
+            RETURN count(d) AS scarred
+            "#,
+        )
+        .param("ids", ids)
+        .param("increment", increment);
+
+        let mut result = self.graph.execute(decision_q).await?;
+        let decision_scarred = if let Some(row) = result.next().await? {
+            row.get::<i64>("scarred").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        Ok(note_scarred + decision_scarred)
+    }
+
+    /// Heal (reset) scars on a specific node.
+    ///
+    /// Sets scar_intensity back to 0.0 for the given note or decision.
+    /// Used for manual scar removal via `admin(action: "heal_scars")`.
+    pub async fn heal_scars(&self, node_id: Uuid) -> Result<bool> {
+        let id_str = node_id.to_string();
+
+        // Try Note first
+        let note_q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            SET n.scar_intensity = 0.0
+            RETURN count(n) AS healed
+            "#,
+        )
+        .param("id", id_str.clone());
+
+        let mut result = self.graph.execute(note_q).await?;
+        let note_healed = if let Some(row) = result.next().await? {
+            row.get::<i64>("healed").unwrap_or(0) > 0
+        } else {
+            false
+        };
+
+        if note_healed {
+            return Ok(true);
+        }
+
+        // Try Decision
+        let decision_q = query(
+            r#"
+            MATCH (d:Decision {id: $id})
+            SET d.scar_intensity = 0.0
+            RETURN count(d) AS healed
+            "#,
+        )
+        .param("id", id_str);
+
+        let mut result = self.graph.execute(decision_q).await?;
+        let decision_healed = if let Some(row) = result.next().await? {
+            row.get::<i64>("healed").unwrap_or(0) > 0
+        } else {
+            false
+        };
+
+        Ok(decision_healed)
+    }
+
+    /// Consolidate memory: promote eligible notes and archive stale/dead ones.
+    ///
+    /// Promotion (ephemeral -> consolidated):
+    ///   activation_count > 5 AND age > 14 days AND energy > 0.3
+    ///
+    /// Auto-archival:
+    ///   activation_count == 0 AND age > 90 days -> archive
+    ///   energy < 0.05 AND age > 60 days -> archive
+    ///
+    /// Also keeps legacy behavior: archive stale ephemerals (>48h idle)
+    /// and evaluate existing promotion rules.
+    ///
+    /// Returns (promoted_count, archived_count).
+    pub async fn consolidate_memory(&self) -> Result<(usize, usize)> {
+        use crate::notes::lifecycle::NoteLifecycleManager;
+
+        /// Notes per sweep page.
+        const CONSOLIDATION_BATCH: i64 = 500;
+        /// Hard cap on pages per run, against a cursor that would not advance.
+        const CONSOLIDATION_MAX_PAGES: usize = 500;
+
+        let lifecycle = NoteLifecycleManager::new();
+        let now = chrono::Utc::now();
+
+        let mut promoted = 0usize;
+        let mut archived = 0usize;
+        let mut pages = 0usize;
+        // Keyset cursor on (energy, id), ASCENDING.
+        //
+        // The sweep used to be `ORDER BY n.energy DESC LIMIT 500`: the notes with
+        // the LEAST energy — precisely the ones every archival rule targets —
+        // were at the bottom of that page and were never reached on a graph of
+        // more than 500 active notes. The janitor existed and never ran on the
+        // population it was written for.
+        //
+        // The cursor advances past every note it has seen, whether the note was
+        // archived, promoted or left alone, so a page is never served twice.
+        let mut cursor: Option<(f64, String)> = None;
+
+        loop {
+            if pages >= CONSOLIDATION_MAX_PAGES {
+                tracing::warn!(
+                    pages,
+                    "consolidate_memory stopped on its page cap; the next run resumes from the start"
+                );
+                break;
+            }
+            pages += 1;
+
+            let (after_energy, after_id) = match &cursor {
+                Some((energy, id)) => (Some(*energy), Some(id.clone())),
+                None => (None, None),
+            };
+
+            let q = query(
+                r#"
+                MATCH (n:Note)
+                WHERE n.status = 'active'
+                  AND ($after_energy IS NULL
+                       OR coalesce(n.energy, 1.0) > $after_energy
+                       OR (coalesce(n.energy, 1.0) = $after_energy AND n.id > $after_id))
+                OPTIONAL MATCH (n)-[s:SYNAPSE]-()
+                RETURN n, coalesce(n.energy, 1.0) AS sweep_energy, count(s) AS synapse_count
+                ORDER BY coalesce(n.energy, 1.0) ASC, n.id ASC
+                LIMIT $batch
+                "#,
+            )
+            .param("after_energy", after_energy)
+            .param("after_id", after_id)
+            .param("batch", CONSOLIDATION_BATCH);
+
+            let mut result = self.graph.execute(q).await?;
+            let mut seen = 0usize;
+
+            while let Some(row) = result.next().await? {
+                seen += 1;
+                let node = row.get::<neo4rs::Node>("n")?;
+                // A node the reader cannot decode must not stop the sweep: the
+                // janitor walks thousands of notes, and one malformed row used to
+                // abort the whole run (measured: three nodes without `content` in
+                // a test database made `consolidate_memory` fail outright).
+                let note = match self.node_to_note(&node) {
+                    Ok(note) => note,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "consolidate_memory: skipping a Note it cannot decode"
+                        );
+                        continue;
+                    }
+                };
+                // Advance BEFORE any `continue`: a note that is left alone must
+                // still move the cursor, or the same page comes back for ever.
+                //
+                // The cursor takes the same coalesced energy the WHERE and the
+                // ORDER BY use. Reading `note.energy` here would default a note
+                // with no energy property to 1.0 and skip everything the query
+                // sorted before it.
+                cursor = Some((
+                    row.get::<f64>("sweep_energy").unwrap_or(1.0),
+                    note.id.to_string(),
+                ));
+                let synapse_count = row.get::<i64>("synapse_count").unwrap_or(0);
+                // Usage signal. `activation_count` is never incremented anywhere
+                // (0 on every note), so the "never activated for 90 days" rule
+                // relied on the synapse-count fallback alone — and once the
+                // SYNAPSE layer was wiped, every note older than 90 days would be
+                // archived as dead. `reactivation_count` is the counter the
+                // activation path actually maintains.
+                let activation_count = note
+                    .activation_count
+                    .max(note.reactivation_count)
+                    .max(synapse_count);
+
+                // Check auto-archival (new threshold-based rules)
+                if lifecycle.should_auto_archive(&note, activation_count, now) {
+                    let age_days = now.signed_duration_since(note.created_at).num_days();
+                    let reason = if activation_count == 0 && age_days > 90 {
+                        "dead_note_no_activations_90d"
+                    } else {
+                        "low_energy_60d"
+                    };
+                    let archive_q = query(
+                    r#"
+                    MATCH (n:Note {id: $id})
+                    SET n.status = 'archived',
+                        n.changes_json = $changes_json
+                    "#,
+                )
+                .param("id", note.id.to_string())
+                .param(
+                    "changes_json",
+                    serde_json::to_string(&{
+                        let mut changes = note.changes.clone();
+                        changes.push(NoteChange::with_details(
+                            crate::notes::ChangeType::StatusChanged,
+                            "consolidate_memory".to_string(),
+                            serde_json::json!({"reason": reason, "activation_count": activation_count, "energy": note.energy, "age_days": age_days}),
+                        ));
+                        changes
+                    })?,
+                );
+                    self.graph.run(archive_q).await?;
+                    archived += 1;
+                    continue;
+                }
+
+                // Check archival for ephemeral (legacy: >48h idle)
+                if lifecycle.should_archive_ephemeral(&note, now) {
+                    let archive_q = query(
+                        r#"
+                    MATCH (n:Note {id: $id})
+                    SET n.status = 'archived',
+                        n.changes_json = $changes_json
+                    "#,
+                    )
+                    .param("id", note.id.to_string())
+                    .param(
+                        "changes_json",
+                        serde_json::to_string(&{
+                            let mut changes = note.changes.clone();
+                            changes.push(NoteChange::with_details(
+                            crate::notes::ChangeType::StatusChanged,
+                            "consolidate_memory".to_string(),
+                            serde_json::json!({"reason": "ephemeral_expired", "idle_hours": 48}),
+                        ));
+                            changes
+                        })?,
+                    );
+                    self.graph.run(archive_q).await?;
+                    archived += 1;
+                    continue;
+                }
+
+                // Skip already-consolidated notes for promotion
+                if note.memory_horizon == crate::notes::MemoryHorizon::Consolidated {
+                    continue;
+                }
+
+                // Check direct ephemeral -> consolidated promotion (new threshold-based)
+                if lifecycle.should_promote_to_consolidated(&note, activation_count, now) {
+                    let promote_q = query(
+                    r#"
+                    MATCH (n:Note {id: $id})
+                    SET n.memory_horizon = 'consolidated',
+                        n.changes_json = $changes_json
+                    "#,
+                )
+                .param("id", note.id.to_string())
+                .param(
+                    "changes_json",
+                    serde_json::to_string(&{
+                        let mut changes = note.changes.clone();
+                        changes.push(NoteChange::with_details(
+                            crate::notes::ChangeType::Promoted,
+                            "consolidate_memory".to_string(),
+                            serde_json::json!({
+                                "from": "ephemeral",
+                                "to": "consolidated",
+                                "reason": format!("auto-promote: activations={}, age>14d, energy={:.2}", activation_count, note.energy)
+                            }),
+                        ));
+                        changes
+                    })?,
+                );
+                    self.graph.run(promote_q).await?;
+                    promoted += 1;
+                    continue;
+                }
+
+                // Evaluate existing promotion rules (ephemeral->operational, operational->consolidated)
+                let promo = lifecycle.evaluate_promotion(&note, activation_count as u64);
+                if let Some(new_horizon) = promo.new_horizon {
+                    let promote_q = query(
+                        r#"
+                    MATCH (n:Note {id: $id})
+                    SET n.memory_horizon = $new_horizon,
+                        n.changes_json = $changes_json
+                    "#,
+                    )
+                    .param("id", note.id.to_string())
+                    .param("new_horizon", new_horizon.to_string())
+                    .param(
+                        "changes_json",
+                        serde_json::to_string(&{
+                            let mut changes = note.changes.clone();
+                            changes.push(NoteChange::with_details(
+                                crate::notes::ChangeType::Promoted,
+                                "consolidate_memory".to_string(),
+                                serde_json::json!({
+                                    "from": promo.current_horizon.to_string(),
+                                    "to": new_horizon.to_string(),
+                                    "reason": promo.reason
+                                }),
+                            ));
+                            changes
+                        })?,
+                    );
+                    self.graph.run(promote_q).await?;
+                    promoted += 1;
+                }
+            }
+
+            if seen < CONSOLIDATION_BATCH as usize {
+                break;
+            }
+        }
+
+        Ok((promoted, archived))
+    }
+
+    /// What the heuristic authors wrote, by shape: status × type × importance.
+    ///
+    /// Read-only. The administrator's answer to "how much of my knowledge base is
+    /// a regex's prose?", before touching anything.
+    pub async fn auto_observed_report(
+        &self,
+        project_id: Option<uuid::Uuid>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let q = query(super::data_migrations::COUNT_AUTO_OBSERVED_BY_SHAPE)
+            .param("scope", project_id.map(|p| p.to_string()));
+        let mut result = self.graph.execute(q).await?;
+        let mut rows = Vec::new();
+        while let Some(row) = result.next().await? {
+            rows.push(serde_json::json!({
+                "status": row.get::<String>("status").unwrap_or_default(),
+                "note_type": row.get::<String>("note_type").unwrap_or_default(),
+                "importance": row.get::<String>("importance").unwrap_or_default(),
+                "notes": row.get::<i64>("notes").unwrap_or(0),
+                "avg_size": row.get::<i64>("avg_size").unwrap_or(0),
+            }));
+        }
+        Ok(rows)
+    }
+
+    /// Archive — never delete — the detector notes no person has confirmed.
+    ///
+    /// Bounded batches, so the call is safe on a live instance. Returns how many
+    /// notes moved.
+    pub async fn archive_unconfirmed_auto_observed(
+        &self,
+        project_id: Option<uuid::Uuid>,
+    ) -> Result<usize> {
+        const BATCH: i64 = 2_000;
+        const MAX_PAGES: usize = 500;
+
+        let mut total = 0usize;
+        for _ in 0..MAX_PAGES {
+            let q = query(super::data_migrations::ARCHIVE_UNCONFIRMED_AUTO_OBSERVED)
+                .param("scope", project_id.map(|p| p.to_string()))
+                .param("batch", BATCH);
+            let mut result = self.graph.execute(q).await?;
+            let processed = if let Some(row) = result.next().await? {
+                row.get::<i64>("processed").unwrap_or(0)
+            } else {
+                0
+            };
+            total += processed as usize;
+            if processed == 0 {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Initialize energy for notes that don't have it yet.
+    ///
+    /// `project_id`: when `Some`, restricts the update to that project's notes
+    /// (`n.project_id`, the same property the vector search filters on).
+    pub async fn init_note_energy(&self, project_id: Option<uuid::Uuid>) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.energy IS NULL
+              AND ($project_id IS NULL OR n.project_id = $project_id)
+            SET n.energy = 1.0,
+                n.last_activated = coalesce(n.last_confirmed_at, n.created_at, datetime())
+            RETURN count(n) AS updated
+            "#,
+        )
+        .param("project_id", project_id.map(|p| p.to_string()));
+
+        let mut result = self.graph.execute(q).await?;
+        let updated = if let Some(row) = result.next().await? {
+            row.get::<i64>("updated").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        Ok(updated)
+    }
+
+    /// List notes that have an embedding but no outgoing SYNAPSE.
+    pub async fn list_notes_needing_synapses(
+        &self,
+        limit: usize,
+        offset: usize,
+        project_id: Option<uuid::Uuid>,
+    ) -> Result<(Vec<Note>, usize)> {
+        // Count total
+        let count_q = if let Some(pid) = project_id {
+            query(
+                r#"
+                MATCH (p:Project {id: $project_id})-[:HAS_NOTE]->(n:Note)
+                WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+                  AND n.status IN ['active', 'needs_review']
+                RETURN count(n) AS total
+                "#,
+            )
+            .param("project_id", pid.to_string())
+        } else {
+            query(
+                r#"
+                MATCH (n:Note)
+                WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+                  AND n.status IN ['active', 'needs_review']
+                RETURN count(n) AS total
+                "#,
+            )
+        };
+        let mut result = self.graph.execute(count_q).await?;
+        let total = if let Some(row) = result.next().await? {
+            row.get::<i64>("total").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        if total == 0 || limit == 0 {
+            return Ok((vec![], total));
+        }
+
+        // Fetch batch
+        let fetch_q = if let Some(pid) = project_id {
+            query(
+                r#"
+                MATCH (p:Project {id: $project_id})-[:HAS_NOTE]->(n:Note)
+                WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+                  AND n.status IN ['active', 'needs_review']
+                RETURN n
+                ORDER BY n.created_at, n.id
+                SKIP $offset LIMIT $limit
+                "#,
+            )
+            .param("project_id", pid.to_string())
+            .param("offset", offset as i64)
+            .param("limit", limit as i64)
+        } else {
+            query(
+                r#"
+                MATCH (n:Note)
+                WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+                  AND n.status IN ['active', 'needs_review']
+                RETURN n
+                ORDER BY n.created_at, n.id
+                SKIP $offset LIMIT $limit
+                "#,
+            )
+            .param("offset", offset as i64)
+            .param("limit", limit as i64)
+        };
+
+        let mut result = self.graph.execute(fetch_q).await?;
+        let mut notes = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            notes.push(self.node_to_note(&node)?);
+        }
+
+        Ok((notes, total))
+    }
+
+    // Helper function to convert Note scope to type string
+    fn scope_type_string(&self, scope: &NoteScope) -> String {
+        match scope {
+            NoteScope::Workspace => "workspace".to_string(),
+            NoteScope::Project => "project".to_string(),
+            NoteScope::Module(_) => "module".to_string(),
+            NoteScope::File(_) => "file".to_string(),
+            NoteScope::Function(_) => "function".to_string(),
+            NoteScope::Struct(_) => "struct".to_string(),
+            NoteScope::Trait(_) => "trait".to_string(),
+        }
+    }
+
+    // Helper function to convert Note scope to path string
+    fn scope_path_string(&self, scope: &NoteScope) -> String {
+        match scope {
+            NoteScope::Workspace | NoteScope::Project => String::new(),
+            NoteScope::Module(path) => path.clone(),
+            NoteScope::File(path) => path.clone(),
+            NoteScope::Function(name) => name.clone(),
+            NoteScope::Struct(name) => name.clone(),
+            NoteScope::Trait(name) => name.clone(),
+        }
+    }
+
+    // Helper function to convert Neo4j node to Note
+    pub(crate) fn node_to_note(&self, node: &neo4rs::Node) -> Result<Note> {
+        let scope_type: String = node
+            .get("scope_type")
+            .unwrap_or_else(|_| "project".to_string());
+        let scope_path: String = node.get("scope_path").unwrap_or_default();
+
+        let scope = match scope_type.as_str() {
+            "module" => NoteScope::Module(scope_path),
+            "file" => NoteScope::File(scope_path),
+            "function" => NoteScope::Function(scope_path),
+            "struct" => NoteScope::Struct(scope_path),
+            "trait" => NoteScope::Trait(scope_path),
+            _ => NoteScope::Project,
+        };
+
+        let note_type_str: String = node.get("note_type")?;
+        let status_str: String = node.get("status")?;
+        let importance_str: String = node
+            .get("importance")
+            .unwrap_or_else(|_| "medium".to_string());
+
+        let changes_json: String = node
+            .get("changes_json")
+            .unwrap_or_else(|_| "[]".to_string());
+        let changes: Vec<NoteChange> = serde_json::from_str(&changes_json).unwrap_or_default();
+
+        let assertion_rule_json: String = node
+            .get("assertion_rule_json")
+            .unwrap_or_else(|_| String::new());
+        let assertion_rule = if assertion_rule_json.is_empty() {
+            None
+        } else {
+            serde_json::from_str(&assertion_rule_json).ok()
+        };
+
+        let created_by: String = node.get("created_by")?;
+        Ok(Note {
+            id: node.get::<String>("id")?.parse()?,
+            project_id: node.get::<String>("project_id").ok().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse().ok()
+                }
+            }),
+            note_type: note_type_str.parse().unwrap_or(NoteType::Observation),
+            status: status_str.parse().unwrap_or(NoteStatus::Active),
+            importance: importance_str.parse().unwrap_or(NoteImportance::Medium),
+            scope,
+            content: node.get("content")?,
+            tags: node.get("tags").unwrap_or_default(),
+            anchors: vec![], // Anchors are loaded separately
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            created_by: created_by.clone(),
+            // A note written before this property existed is guessed from its
+            // author name: anything under `system/` is a heuristic, not a person.
+            author_kind: node
+                .get::<String>("author_kind")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| NoteAuthorKind::infer_from_created_by(&created_by)),
+            confidence: node.get("confidence").ok(),
+            human_confirmed_at: node
+                .get::<String>("human_confirmed_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            human_confirmed_by: node
+                .get::<String>("human_confirmed_by")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            last_confirmed_at: node
+                .get::<String>("last_confirmed_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            // A freshness clock, not a signature: the author is NOT vouching for
+            // it here. A person's note gets its signature from `with_author`.
+            // Kept as the stored property historically was (an empty string when
+            // nobody signed) — `tests/store_conformance.rs` pins that round-trip,
+            // and `human_confirmed_*` is now the field that answers "who signed".
+            last_confirmed_by: node.get::<String>("last_confirmed_by").ok(),
+            staleness_score: node.get("staleness_score").unwrap_or(0.0),
+            energy: node.get("energy").unwrap_or(1.0),
+            scar_intensity: node.get("scar_intensity").unwrap_or(0.0),
+            memory_horizon: node
+                .get::<String>("memory_horizon")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(MemoryHorizon::Consolidated), // Existing notes default to consolidated
+            activation_count: node.get::<i64>("activation_count").unwrap_or(0),
+            last_activated: node
+                .get::<String>("last_activated")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            supersedes: node
+                .get::<String>("supersedes")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            superseded_by: node
+                .get::<String>("superseded_by")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            valid_from: node
+                .get::<String>("valid_from")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            valid_until: node
+                .get::<String>("valid_until")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            revision: node
+                .get::<String>("revision_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            changes,
+            assertion_rule,
+            // Lu, et pas laissé à `None` : sans cette lecture, une passe de re-vérification
+            // n'a aucun « avant » et ne peut jamais constater une dérive — elle réécrirait
+            // le même verdict en boucle.
+            last_assertion_result: {
+                let raw: String = node.get("last_assertion_result_json").unwrap_or_default();
+                if raw.is_empty() {
+                    None
+                } else {
+                    serde_json::from_str(&raw).ok()
+                }
+            },
+            revision_reason: node
+                .get::<String>("revision_reason")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            reactivation_count: node.get("reactivation_count").unwrap_or(0),
+            last_reactivated: node
+                .get::<String>("last_reactivated")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            freshness_pinged_at: node
+                .get::<String>("freshness_pinged_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            sharing_consent: node
+                .get::<String>("sharing_consent")
+                .ok()
+                .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok())
+                .unwrap_or_default(),
+        })
+    }
+
+    // ========================================================================
+    // Graph visualization batch queries
+    // ========================================================================
+
+    /// Get all LINKED_TO edges from notes in a project to code entities (batch).
+    /// Returns (note_id, entity_type_label, entity_id).
+    pub async fn get_project_note_entity_links(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String, String)>> {
+        let q = query(
+            "MATCH (n:Note {project_id: $pid})-[:LINKED_TO]->(e)
+             RETURN n.id AS note_id,
+                    CASE
+                      WHEN e:File THEN 'file'
+                      WHEN e:Function THEN 'function'
+                      WHEN e:Struct THEN 'struct'
+                      WHEN e:Trait THEN 'trait'
+                      WHEN e:Enum THEN 'enum'
+                      ELSE 'unknown'
+                    END AS entity_type,
+                    COALESCE(e.path, e.id, toString(elementId(e))) AS entity_id",
+        )
+        .param("pid", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut links = Vec::new();
+        while let Some(row) = result.next().await? {
+            let note_id: String = row.get("note_id").unwrap_or_default();
+            let entity_type: String = row.get("entity_type").unwrap_or_default();
+            let entity_id: String = row.get("entity_id").unwrap_or_default();
+            if !note_id.is_empty() && !entity_id.is_empty() {
+                links.push((note_id, entity_type, entity_id));
+            }
+        }
+        Ok(links)
+    }
+
+    /// Get all SYNAPSE edges between notes in a project (batch, deduplicated).
+    /// Returns (source_note_id, target_note_id, weight).
+    pub async fn get_project_note_synapses(
+        &self,
+        project_id: Uuid,
+        min_weight: f64,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let q = query(
+            "MATCH (a:Note {project_id: $pid})-[s:SYNAPSE]->(b:Note {project_id: $pid})
+             WHERE s.weight >= $min_weight AND a.id < b.id
+             RETURN a.id AS source_id, b.id AS target_id, s.weight AS weight
+             ORDER BY s.weight DESC",
+        )
+        .param("pid", project_id.to_string())
+        .param("min_weight", min_weight);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut synapses = Vec::new();
+        while let Some(row) = result.next().await? {
+            let source: String = row.get("source_id").unwrap_or_default();
+            let target: String = row.get("target_id").unwrap_or_default();
+            let weight: f64 = row.get("weight").unwrap_or(0.0);
+            if !source.is_empty() && !target.is_empty() {
+                synapses.push((source, target, weight));
+            }
+        }
+        Ok(synapses)
+    }
+}
+
+#[cfg(test)]
+mod staleness_parity_tests {
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    use crate::notes::models::{Note, NoteType};
+
+    /// Every note type's `WHEN 'x' THEN N` in the staleness Cypher must equal
+    /// `Note::base_decay_days()`; assertions are excluded from the query.
+    #[test]
+    fn staleness_cypher_matches_rust() {
+        let src = include_str!("note.rs");
+        let start = src.find("CASE n.note_type").expect("case");
+        let block = &src[start..start + src[start..].find("END AS base_decay_days").unwrap()];
+        for t in [
+            NoteType::Context,
+            NoteType::Tip,
+            NoteType::Observation,
+            NoteType::Gotcha,
+            NoteType::Guideline,
+            NoteType::Pattern,
+            NoteType::Rfc,
+        ] {
+            let note = Note::new(None, t, "x".into(), "t".into());
+            let name = t.to_string();
+            let cypher = block
+                .lines()
+                .find_map(|l| {
+                    let l = l.trim();
+                    l.strip_prefix(&format!("WHEN '{}' THEN ", name))
+                        .map(|v| v.parse::<f64>().unwrap())
+                })
+                .unwrap_or(90.0); // ELSE branch
+            assert_eq!(cypher, note.base_decay_days(), "{name}");
+        }
+        assert_eq!(
+            Note::new(None, NoteType::Assertion, "x".into(), "t".into()).base_decay_days(),
+            f64::MAX
+        );
+        assert!(src.contains("n.note_type <> 'assertion'"));
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+    const PAYLOADS: &[&str] = &[
+        "a' OR 1=1 //",
+        "x\\",
+        "it's",
+        "\\' OR true //",
+        "}) DETACH DELETE n //",
+    ];
+
+    fn assert_clean(clause: &str, payload: &str) {
+        assert!(
+            !clause.contains(payload.trim()),
+            "payload leaked into Cypher: {clause}"
+        );
+        assert!(!clause.contains("OR 1=1"), "payload leaked: {clause}");
+        assert!(!clause.contains("DETACH"), "payload leaked: {clause}");
+    }
+
+    #[test]
+    fn list_notes_where_binds_slug_tags_and_search() {
+        for p in PAYLOADS {
+            let filters = NoteFilters {
+                tags: Some(vec![p.to_string()]),
+                search: Some(p.to_string()),
+                ..Default::default()
+            };
+            let wb = build_note_where(None, Some(p), &filters);
+            let clause = wb.build();
+            assert_clean(&clause, p);
+            assert!(clause.contains("{slug: $wb_0}"), "{clause}");
+            assert!(clause.contains("$wb_1 IN n.tags"), "{clause}");
+            assert!(clause.contains("CONTAINS $wb_2"), "{clause}");
+            let params = wb.params();
+            assert_eq!(params[0].1, WhereParam::Str(p.to_string()));
+            assert_eq!(params[1].1, WhereParam::Str(p.to_string()));
+            assert_eq!(params[2].1, WhereParam::Str(p.to_lowercase()));
+        }
+    }
+
+    #[test]
+    fn list_notes_where_binds_project_id() {
+        let pid = Uuid::new_v4();
+        let wb = build_note_where(Some(pid), None, &NoteFilters::default());
+        assert_eq!(wb.build(), "WHERE n.project_id = $wb_0");
+        assert_eq!(wb.params()[0].1, WhereParam::Str(pid.to_string()));
+    }
+
+    #[test]
+    fn note_sort_is_whitelisted() {
+        assert_eq!(note_order_field(Some("updated_at")), "updated_at");
+        assert_eq!(
+            note_order_field(Some(
+                "created_at DESC RETURN n UNION MATCH (x) DETACH DELETE x //"
+            )),
+            "created_at"
+        );
+        assert_eq!(note_order_field(None), "created_at");
+        assert_eq!(note_order_dir(Some("ASC")), "ASC");
+        assert_eq!(note_order_dir(Some("desc; MATCH (n) DELETE n")), "DESC");
+    }
+
+    #[test]
+    fn update_note_clauses_carry_no_values() {
+        let clauses = note_update_set_clauses(true, true, true, true, Some(0.5)).join(", ");
+        assert!(clauses.contains("n.content = $content"));
+        assert!(clauses.contains("n.tags = $tags"));
+        assert!(clauses.contains("n.status = $status"));
+        assert!(clauses.contains("n.importance = $importance"));
+        assert!(!clauses.contains('\''));
+        // non-finite staleness must not render invalid Cypher
+        let nan = note_update_set_clauses(false, false, false, false, Some(f64::NAN)).join(", ");
+        assert!(!nan.contains("NaN"));
+    }
+}
+
+#[cfg(test)]
+mod synapse_param_tests {
+    use super::synapse_bind_params;
+    #[allow(unused_imports)]
+    use uuid::Uuid;
+
+    #[test]
+    fn finite_weights_become_parallel_lists() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (ids, w) = synapse_bind_params(&[(a, 0.5), (b, 1.0)]).unwrap();
+        assert_eq!(ids, vec![a.to_string(), b.to_string()]);
+        assert_eq!(w, vec![0.5, 1.0]);
+    }
+
+    #[test]
+    fn non_finite_weights_are_rejected() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(synapse_bind_params(&[(Uuid::new_v4(), 0.3), (Uuid::new_v4(), bad)]).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod project_param_tests {
+    //! The write side of a note's scope. `None` must stay `None`: an empty
+    //! string is a third state that reads back as `None` but that every
+    //! `IS NULL` predicate misses, which is how 3 319 notes ended up stranded.
+    use super::note_project_param;
+    #[allow(unused_imports)]
+    use uuid::Uuid;
+
+    #[test]
+    fn a_global_note_writes_a_null_and_not_an_empty_string() {
+        assert_eq!(
+            note_project_param(None),
+            None,
+            "None must reach Cypher as a NULL, never as ''"
+        );
+        let id = Uuid::new_v4();
+        assert_eq!(note_project_param(Some(id)), Some(id.to_string()));
+    }
+}

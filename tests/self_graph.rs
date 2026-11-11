@@ -1,0 +1,1171 @@
+//! Le soi comme SUJET, contre un VRAI Neo4j.
+//!
+//! Ces tests existent parce que la couverture le réclamait, et elle avait raison : le Cypher
+//! du soi avait été validé à la main (un `cypher-shell`, une requête, un compte), mais le
+//! **code Rust qui l'entoure** — quels paramètres, quel retour, quelle arête en sort — n'avait
+//! jamais tourné. Une requête juste appelée par une fonction fausse reste un graphe faux.
+//!
+//! Ils tournent dans le job Coverage, qui a un Neo4j : `HARNESS_NEO4J_REQUIRED=1` y est posé,
+//! donc une base absente fait échouer au lieu d'uploader un 0 %. Sans ce drapeau, un poste
+//! sans base saute les tests en le disant.
+//!
+//! Chaque test crée son propre projet (slug unique) et le supprime : le job partage une seule
+//! base entre plusieurs suites.
+
+use chrono::Utc;
+use neo4rs::{query, Graph};
+use project_orchestrator::graph::rules;
+use project_orchestrator::neo4j::client::Neo4jClient;
+use project_orchestrator::neo4j::models::{ChatSessionNode, ProjectNode};
+use project_orchestrator::neo4j::AGENT_SELF_MIGRATION_KEY;
+
+use project_orchestrator::notes::models::{Note, NoteType};
+use uuid::Uuid;
+
+/// These tests share SINGLETON nodes (the durable `:Agent` root) and the same Neo4j: run in
+/// parallel they deadlock on it — measured in CI, `Neo.TransientError.Transaction.DeadlockDetected`
+/// on `MERGE (:Agent {id: <root>})`. The suite is therefore serial with itself. Cross-suite
+/// parallelism is unaffected: the coverage job runs each `--test` binary one after the other.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().await
+}
+
+struct Env {
+    client: Neo4jClient,
+    raw: Graph,
+    project: ProjectNode,
+}
+
+async fn env(label: &str) -> Option<Env> {
+    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17687".into());
+    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
+    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+
+    let connected = async {
+        let client = Neo4jClient::new(&uri, &user, &password).await.ok()?;
+        let raw = Graph::new(&uri, &user, &password).await.ok()?;
+        Some((client, raw))
+    }
+    .await;
+
+    let Some((client, raw)) = connected else {
+        assert!(
+            std::env::var("HARNESS_NEO4J_REQUIRED").is_err(),
+            "HARNESS_NEO4J_REQUIRED is set but no Neo4j answers at {uri}"
+        );
+        eprintln!("Skipping self-graph tests: no Neo4j at {uri}");
+        return None;
+    };
+
+    let slug = format!("selfgraph-{label}-{}", Uuid::new_v4().simple());
+    let project = ProjectNode {
+        id: Uuid::new_v4(),
+        name: slug.clone(),
+        slug: slug.clone(),
+        root_path: format!("/tmp/{slug}"),
+        description: None,
+        created_at: Utc::now(),
+        last_synced: None,
+        analytics_computed_at: None,
+        last_co_change_computed_at: None,
+        default_note_energy: None,
+        scaffolding_override: None,
+        sharing_policy: None,
+        profile: Default::default(),
+        watch_enabled: false,
+    };
+    client.create_project(&project).await.unwrap();
+    Some(Env {
+        client,
+        raw,
+        project,
+    })
+}
+
+/// Removes everything this test wrote: the project cascade takes its notes, and the agent
+/// nodes are deleted by id because they belong to no project.
+async fn cleanup(e: &Env) {
+    e.client
+        .delete_project(e.project.id, &e.project.name)
+        .await
+        .expect("the project's own cascade");
+}
+
+async fn drop_nodes(e: &Env, label: &str, ids: &[Uuid]) {
+    let ids: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+    e.raw
+        .run(
+            query(&format!(
+                "MATCH (n:{label}) WHERE n.id IN $ids DETACH DELETE n"
+            ))
+            .param("ids", ids),
+        )
+        .await
+        .expect("cleanup of standalone nodes");
+}
+
+fn a_note(written_by: &str) -> Note {
+    let mut n = Note::new(
+        None,
+        NoteType::Guideline,
+        "a foundation".into(),
+        written_by.to_string(),
+    );
+    n.status = project_orchestrator::notes::NoteStatus::Active;
+    n
+}
+
+#[tokio::test]
+async fn a_write_makes_its_agent_a_node_and_gives_it_the_note() {
+    let _serial = serial().await;
+    // The edge is drawn at the write, by the real Cypher, not only reconstructed later.
+    let Some(e) = env("authored").await else {
+        return;
+    };
+    // The writer is the durable self of the store, the actor every write path stamps.
+    let agent = e.client.agent_identity_namespace().await.unwrap();
+    let note = a_note(&format!("agent:{agent}"));
+    e.client.create_note(&note).await.unwrap();
+
+    assert_eq!(
+        authored_count(&e, agent, note.id).await,
+        1,
+        "the author owns its note"
+    );
+    let node = e.client.find_agent(agent).await.unwrap();
+    assert!(node.is_some(), "and the author exists as a node");
+
+    // The self is shared by the store and stays; the edge goes with the note.
+    e.client.delete_note(note.id).await.unwrap();
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn a_write_by_a_foreign_actor_draws_no_edge_and_makes_no_node() {
+    let _serial = serial().await;
+    // An actor that is neither this store's self nor one of its facets: the note is kept
+    // (provenance never refuses a write), but no agent is made and no edge is drawn.
+    let Some(e) = env("foreign").await else {
+        return;
+    };
+    let foreign = Uuid::new_v4();
+    let note = a_note(&format!("agent:{foreign}"));
+    e.client.create_note(&note).await.unwrap();
+
+    assert!(
+        e.client.get_note(note.id).await.unwrap().is_some(),
+        "the note is written"
+    );
+    assert_eq!(
+        authored_count(&e, foreign, note.id).await,
+        0,
+        "no edge to a foreign actor"
+    );
+    assert!(
+        e.client.find_agent(foreign).await.unwrap().is_none(),
+        "and no node for it"
+    );
+    // The backfill does not adopt it either.
+    e.client.backfill_agents().await.unwrap();
+    assert_eq!(authored_count(&e, foreign, note.id).await, 0);
+    assert!(e.client.find_agent(foreign).await.unwrap().is_none());
+
+    e.client.delete_note(note.id).await.unwrap();
+    cleanup(&e).await;
+}
+
+/// `(:Agent {id: agent})-[:AUTHORED]->(:Note {id: note})` edges, counted.
+async fn authored_count(e: &Env, agent: Uuid, note: Uuid) -> i64 {
+    let mut rows = e
+        .raw
+        .execute(
+            query(
+                "MATCH (a:Agent {id: $agent})-[:AUTHORED]->(n:Note {id: $note}) \
+                 RETURN count(*) AS n",
+            )
+            .param("agent", agent.to_string())
+            .param("note", note.to_string()),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("a row");
+    row.get::<i64>("n").unwrap_or(0)
+}
+
+#[tokio::test]
+async fn the_backfill_rebuilds_the_attribution_and_says_what_it_did() {
+    let _serial = serial().await;
+    // The same edges the write draws, rebuilt from what is already written: one path.
+    let Some(e) = env("backfill").await else {
+        return;
+    };
+    // Before the self was the identity, a write stamped the MODEL facet of this store: the
+    // facet exists (its `FACET_OF` hangs it under the self) and the note names it.
+    let root = e.client.agent_identity_namespace().await.unwrap();
+    e.client
+        .ensure_agent(root, Some("claude-opus-5-5"))
+        .await
+        .unwrap();
+    let agent =
+        project_orchestrator::notes::provenance::model_facet_id(root, "claude-opus-5-5").unwrap();
+    let note = a_note(&format!("agent:{agent}"));
+    // Written without the write hook, so the edge is genuinely missing: this is the state
+    // a database predating the feature is in.
+    e.raw
+        .run(
+            query(
+                "CREATE (n:Note {id: $id, note_type: 'Guideline', status: 'Active', \
+                 importance: 'High', content: 'a foundation', created_by: $by, \
+                 project_id: $pid, created_at: datetime(), \
+                 last_confirmed_at: datetime(), energy: 1.0, activation_count: 0})",
+            )
+            .param("id", note.id.to_string())
+            .param("by", format!("agent:{agent}"))
+            .param("pid", e.project.id.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let first = e.client.backfill_agents().await.unwrap();
+    assert!(first.from_notes >= 1, "{first:?}");
+    assert_eq!(first.authored, 1, "the missing edge was drawn: {first:?}");
+    assert!(first.after >= first.before, "{first:?}");
+    // Drawn on the self, the identity that writes, not on the facet the note names.
+    assert_eq!(authored_count(&e, root, note.id).await, 1);
+    assert_eq!(authored_count(&e, agent, note.id).await, 0);
+
+    let second = e.client.backfill_agents().await.unwrap();
+    assert_eq!(second.authored, 0, "idempotent: {second:?}");
+
+    // The facet goes; the self is shared by the store and stays.
+    drop_nodes(&e, "Agent", &[agent]).await;
+    e.client.delete_note(note.id).await.unwrap();
+    cleanup(&e).await;
+}
+
+/// `(:DataMigration {key})` marker of the agent-identity migration: its status and run count.
+async fn identity_marker(e: &Env) -> Option<(String, i64)> {
+    let mut rows = e
+        .raw
+        .execute(
+            query("MATCH (m:DataMigration {key: $key}) RETURN m.status AS status, m.runs AS runs")
+                .param("key", AGENT_SELF_MIGRATION_KEY),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap()?;
+    Some((row.get("status").unwrap(), row.get("runs").unwrap()))
+}
+
+#[tokio::test]
+async fn the_startup_runner_moves_the_facet_edges_once_and_replays_moving_nothing() {
+    let _serial = serial().await;
+    // The migration is wired on the startup path (`run_data_migrations`), not called by
+    // hand: what this pins is that the boot moves a facet edge to the self, and that the
+    // next boot finds the marker and moves nothing.
+    let Some(e) = env("startup-migration").await else {
+        return;
+    };
+    let root = e.client.agent_identity_namespace().await.unwrap();
+    e.client
+        .ensure_agent(root, Some("claude-opus-5-5"))
+        .await
+        .unwrap();
+    let facet =
+        project_orchestrator::notes::provenance::model_facet_id(root, "claude-opus-5-5").unwrap();
+    // The state a database predating the self is in: the edge hangs on the model facet.
+    let note = a_note(&format!("agent:{facet}"));
+    e.client.create_note(&note).await.unwrap();
+    e.raw
+        .run(
+            query(
+                "MATCH (f:Agent {id: $facet}), (n:Note {id: $note}) \
+                 MERGE (f)-[:AUTHORED]->(n)",
+            )
+            .param("facet", facet.to_string())
+            .param("note", note.id.to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authored_count(&e, facet, note.id).await, 1);
+
+    // First boot: the runner reports the identity migration with what it moved.
+    let first = e.client.run_data_migrations().await;
+    let mine = first
+        .iter()
+        .find(|o| o.id == AGENT_SELF_MIGRATION_KEY)
+        .expect("the identity migration is on the startup path");
+    assert!(mine.completed && mine.error.is_none(), "{mine:?}");
+    assert!(mine.processed >= 1, "our facet edge moved: {mine:?}");
+    assert_eq!(authored_count(&e, root, note.id).await, 1);
+    assert_eq!(authored_count(&e, facet, note.id).await, 0);
+    let (status, runs) = identity_marker(&e).await.expect("the marker is written");
+    assert_eq!(status, "done");
+
+    // Second boot: the marker is there, the migration replays and moves nothing.
+    let second = e.client.run_data_migrations().await;
+    let mine = second
+        .iter()
+        .find(|o| o.id == AGENT_SELF_MIGRATION_KEY)
+        .expect("replayed on every start");
+    assert!(mine.completed && mine.error.is_none(), "{mine:?}");
+    assert_eq!(mine.processed, 0, "{mine:?}");
+    assert_eq!(authored_count(&e, root, note.id).await, 1, "not duplicated");
+    let (status, runs_after) = identity_marker(&e).await.unwrap();
+    assert_eq!(status, "done");
+    assert_eq!(runs_after, runs + 1, "the marker counts the replay");
+
+    e.client.delete_note(note.id).await.unwrap();
+    drop_nodes(&e, "Agent", &[facet]).await;
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
+    let _serial = serial().await;
+    let Some(e) = env("knows").await else {
+        return;
+    };
+    // The durable self of this store: the only subject it can know anything as. The database
+    // is shared by every suite, so the assertions below are about what THIS test adds.
+    let self_id = e.client.agent_identity_namespace().await.unwrap();
+    // As production does (`agent-knows-core`): the subject exists before it is given
+    // anything. `link_agent_knows` MATCHes both ends — a missing subject is a silent no-op,
+    // which is the trap this line documents.
+    e.client.ensure_agent(self_id, None).await.unwrap();
+    let before = e.client.agent_knows(self_id, None, 10_000).await.unwrap();
+    let prov =
+        rules::AccountableProvenance::new("agent-knows-core", "3 portées lues, 3 notes épinglées")
+            .unwrap();
+
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let mut n = a_note("api");
+        n.content = format!("belief {i}");
+        n.project_id = Some(e.project.id);
+        e.client.create_note(&n).await.unwrap();
+        assert!(
+            e.client
+                .link_agent_knows(self_id, n.id, rules::KnowledgeScope::Global, None, &prov)
+                .await
+                .unwrap(),
+            "first link creates the edge"
+        );
+        assert!(
+            !e.client
+                .link_agent_knows(self_id, n.id, rules::KnowledgeScope::Global, None, &prov)
+                .await
+                .unwrap(),
+            "a second link attests, it does not create"
+        );
+        ids.push(n.id);
+    }
+
+    let known = e.client.agent_knows(self_id, None, 2).await.unwrap();
+    assert_eq!(known.notes.len(), 2, "bounded");
+    assert_eq!(
+        known.available,
+        before.available + 3,
+        "and the total is published"
+    );
+    assert_eq!(
+        known.withheld(),
+        known.available - 2,
+        "« la part lue est dite »"
+    );
+
+    // And the bound is what limits, not luck: unbounded, all three come back.
+    let all = e.client.agent_knows(self_id, None, 10_000).await.unwrap();
+    assert_eq!(all.withheld(), 0);
+    for id in &ids {
+        assert!(all.notes.contains(id), "{id} is known");
+    }
+
+    // The provenance is ON the edge, not in a table beside it.
+    let mut rows = e
+        .raw
+        .execute(
+            query(
+                "MATCH (:Agent {id: $agent})-[r:KNOWS]->(:Note {id: $note}) \
+                 RETURN r.rule AS rule, r.measure AS measure, r.at AS at",
+            )
+            .param("agent", self_id.to_string())
+            .param("note", ids[0].to_string()),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("an edge");
+    assert_eq!(row.get::<String>("rule").unwrap(), "agent-knows-core");
+    assert!(row.get::<String>("measure").unwrap().contains('3'));
+    assert!(!row.get::<String>("at").unwrap().is_empty());
+
+    for id in &ids {
+        e.client.delete_note(*id).await.unwrap();
+    }
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn a_knows_edge_to_a_missing_note_draws_nothing() {
+    let _serial = serial().await;
+    let Some(e) = env("knows-missing").await else {
+        return;
+    };
+    let self_id = e.client.agent_identity_namespace().await.unwrap();
+    let drawn = e
+        .client
+        .link_agent_knows(
+            self_id,
+            Uuid::new_v4(),
+            rules::KnowledgeScope::Global,
+            None,
+            &rules::AccountableProvenance::new("agent-knows-core", "measured").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!drawn, "no target, no edge — and no error either");
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn what_a_subject_applies_becomes_a_uses_edge_with_its_provenance() {
+    let _serial = serial().await;
+    let Some(e) = env("uses").await else {
+        return;
+    };
+    // The durable self: the only agent this store can write for (a foreign id is refused).
+    let agent = e.client.agent_identity_namespace().await.unwrap();
+    let persona = Uuid::new_v4();
+    e.raw
+        .run(query("CREATE (:Persona {id: $id, name: 'Pentest'})").param("id", persona.to_string()))
+        .await
+        .unwrap();
+
+    let outcome = rules::run_with(
+        &e.client,
+        rules::AGENT_USES_ACTIVATED.name,
+        rules::Measurement::Activation {
+            session: Uuid::new_v4(),
+            agent,
+            personas: vec![persona],
+            skills: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.written, 1, "{outcome:?}");
+
+    let mut rows = e
+        .raw
+        .execute(
+            query(
+                "MATCH (:Agent {id: $agent})-[r:USES]->(:Persona {id: $p}) \
+                 RETURN r.rule AS rule, r.measure AS measure",
+            )
+            .param("agent", agent.to_string())
+            .param("p", persona.to_string()),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("a USES edge");
+    assert_eq!(row.get::<String>("rule").unwrap(), "agent-uses-activated");
+    assert!(row.get::<String>("measure").unwrap().contains("activés"));
+
+    // A label that is not a bare identifier never reaches the query.
+    let refused = e
+        .client
+        .link_agent_uses(
+            agent,
+            "Persona) DETACH DELETE (n",
+            persona,
+            &rules::AccountableProvenance::new("agent-uses-activated", "measured").unwrap(),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "an unusable label is refused, not escaped"
+    );
+
+    // The self is shared by the store and stays; the edge goes with the persona.
+    drop_nodes(&e, "Persona", &[persona]).await;
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn a_session_welds_the_notes_it_really_had_in_context() {
+    let _serial = serial().await;
+    let Some(e) = env("coact").await else {
+        return;
+    };
+    let session = Uuid::new_v4();
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let mut n = a_note("api");
+        n.content = format!("seen {i}");
+        n.project_id = Some(e.project.id);
+        e.client.create_note(&n).await.unwrap();
+        ids.push(n.id);
+    }
+
+    let outcome = rules::run_with(
+        &e.client,
+        rules::SESSION_CO_ACTIVATION.name,
+        rules::Measurement::SessionNotes {
+            session,
+            project: Some(e.project.id),
+            notes: ids.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.written, 6, "3 pairs, both directions: {outcome:?}");
+
+    let mut rows = e
+        .raw
+        .execute(
+            query(
+                "MATCH (:Note {id: $a})-[s:SYNAPSE]->(:Note {id: $b}) \
+                 RETURN s.rule AS rule, s.last_session AS session, s.measure AS measure",
+            )
+            .param("a", ids[0].to_string())
+            .param("b", ids[1].to_string()),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("a synapse");
+    assert_eq!(row.get::<String>("rule").unwrap(), "session-co-activation");
+    assert_eq!(row.get::<String>("session").unwrap(), session.to_string());
+    assert!(row.get::<String>("measure").unwrap().contains('3'));
+
+    // A session with one note, or without a project, welds nothing.
+    let alone = rules::run_with(
+        &e.client,
+        rules::SESSION_CO_ACTIVATION.name,
+        rules::Measurement::SessionNotes {
+            session,
+            project: Some(e.project.id),
+            notes: vec![ids[0]],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(alone.written, 0);
+
+    let homeless = rules::run_with(
+        &e.client,
+        rules::SESSION_CO_ACTIVATION.name,
+        rules::Measurement::SessionNotes {
+            session,
+            project: None,
+            notes: ids.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(homeless.written, 0);
+
+    for id in &ids {
+        e.client.delete_note(*id).await.unwrap();
+    }
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn a_session_episode_belongs_to_the_agent_that_lived_it() {
+    let _serial = serial().await;
+    // The whole real path: the collector names the agent of the session, `save_session_episode`
+    // writes the episode and draws `LIVED` in the same statement.
+    let Some(e) = env("lived").await else {
+        return;
+    };
+    let session = live_session(&e, "lived");
+    let sid = session.id;
+    e.client.create_chat_session(&session).await.unwrap();
+
+    let episode = project_orchestrator::episodes::collector::collect_session_episode(
+        &e.client,
+        sid,
+        "user_closed",
+    )
+    .await
+    .unwrap()
+    .expect("a session with a preview and messages leaves an episode");
+    let agent = episode
+        .session
+        .as_ref()
+        .and_then(|s| s.agent_id)
+        .expect("the collector names the agent of the session");
+    assert!(e.client.save_session_episode(&episode).await.unwrap());
+
+    let mut rows = e
+        .raw
+        .execute(
+            query(
+                "MATCH (:Agent {id: $a})-[:LIVED]->(:SessionEpisode {id: $e}) RETURN count(*) AS n",
+            )
+            .param("a", agent.to_string())
+            .param("e", episode.id.to_string()),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("a row");
+    assert_eq!(row.get::<i64>("n").unwrap_or(0), 1, "the agent lived it");
+
+    // And the episode says how the session ended, not a constant.
+    assert_eq!(
+        episode.session.as_ref().unwrap().close_reason,
+        "user_closed"
+    );
+
+    e.client.delete_chat_session(sid).await.unwrap();
+    drop_nodes(&e, "Agent", &[agent]).await;
+    cleanup(&e).await;
+}
+
+fn live_session(e: &Env, label: &str) -> ChatSessionNode {
+    let id = Uuid::new_v4();
+    ChatSessionNode {
+        id,
+        cli_session_id: None,
+        project_slug: Some(e.project.slug.clone()),
+        workspace_slug: None,
+        cwd: format!("/tmp/{label}"),
+        title: Some(label.into()),
+        model: "m".into(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        message_count: 0,
+        total_cost_usd: None,
+        conversation_id: None,
+        preview: Some("first message".into()),
+        permission_mode: None,
+        add_dirs: None,
+        spawned_by: None,
+        provider_id: Some("local".into()),
+        routed_by: Some("request".into()),
+        capabilities: None,
+        engine: None,
+        resume_token: None,
+        execution_place: Default::default(),
+        project_inferred: false,
+        access: Default::default(),
+        owner: None,
+        file_scope_lifted: false,
+        mirror_of: None,
+        routing_pool: None,
+        routing_mode: None,
+    }
+}
+
+#[tokio::test]
+async fn unpinning_releases_the_edge_the_rule_drew_and_spares_a_hand_placed_one() {
+    // The rule must be a RECONCILIATION, not an accumulation: what is no longer declared
+    // stops being known. And only the edges the rule drew belong to it — a KNOWS an
+    // operator placed by hand has no rule property and must survive an unpin it never
+    // asked about.
+    use project_orchestrator::chat::stages::knowledge_injection::store_pinned_notes;
+
+    let _serial = serial().await;
+    let Some(e) = env("release").await else {
+        return;
+    };
+    let self_id = e.client.agent_identity_namespace().await.unwrap();
+    e.client.ensure_agent(self_id, None).await.unwrap();
+
+    let mut kept = a_note("api");
+    let mut dropped = a_note("api");
+    let mut by_hand = a_note("api");
+    for n in [&mut kept, &mut dropped, &mut by_hand] {
+        n.project_id = Some(e.project.id);
+        e.client.create_note(n).await.unwrap();
+    }
+
+    e.client
+        .link_agent_knows(
+            self_id,
+            by_hand.id,
+            rules::KnowledgeScope::Global,
+            None,
+            &rules::AccountableProvenance::new("a person", "decided by hand").unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Two pins: the writer reconciles by itself, no restart needed.
+    store_pinned_notes(&e.client, None, &[kept.id, dropped.id])
+        .await
+        .unwrap();
+    // On n'assène AUCUN compte absolu : le soi racine est un nœud PARTAGÉ, et les autres
+    // tests de ce fichier — plus la passe de démarrage — y écrivent leurs propres arêtes.
+    // Ce qui compte est la présence ou l'absence de NOS trois notes.
+    let known = e.client.agent_knows(self_id, None, 5_000).await.unwrap();
+    assert!(
+        known.notes.contains(&kept.id) && known.notes.contains(&dropped.id),
+        "both pins are known, alongside whatever the graph already held: {known:?}"
+    );
+
+    // Drop one pin.
+    store_pinned_notes(&e.client, None, &[kept.id])
+        .await
+        .unwrap();
+    let known = e.client.agent_knows(self_id, None, 5_000).await.unwrap();
+    if known.notes.contains(&dropped.id) {
+        let mut rows = e
+            .raw
+            .execute(
+                query(
+                    "MATCH (:Agent {id: $a})-[r:KNOWS]->(:Note {id: $n}) \
+                     RETURN r.rule AS rule, r.scope AS scope, r.project_id AS project",
+                )
+                .param("a", self_id.to_string())
+                .param("n", dropped.id.to_string()),
+            )
+            .await
+            .unwrap();
+        let mut rules = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            rules.push((
+                row.get::<String>("rule").unwrap_or_default(),
+                row.get::<String>("scope").unwrap_or_default(),
+                row.get::<Option<String>>("project").unwrap_or(None),
+            ));
+        }
+        panic!("the unpinned note is still known by: {rules:?}");
+    }
+    assert!(known.notes.contains(&kept.id), "the kept pin stays");
+    assert!(
+        known.notes.contains(&by_hand.id),
+        "an edge the rule did not draw is not the rule's to remove"
+    );
+
+    // Leave the shared global scope as we found it: other tests in this file read it.
+    store_pinned_notes(&e.client, None, &[]).await.unwrap();
+    for id in [kept.id, dropped.id, by_hand.id] {
+        e.client.delete_note(id).await.unwrap();
+    }
+    drop_nodes(&e, "Agent", &[self_id]).await;
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn the_foundation_query_ranks_a_project_scale_and_a_global_one() {
+    // Les deux variantes du Cypher de classement, exercées directement : la règle peut être
+    // désactivée par un projet illisible, la requête ne doit pas rester non testée pour
+    // autant.
+    let _serial = serial().await;
+    let Some(e) = env("ranked").await else {
+        return;
+    };
+
+    // Une note de projet : active, critique, fraîche, ancrée à un fichier du projet.
+    let mut note = a_note("api");
+    note.project_id = Some(e.project.id);
+    note.importance = project_orchestrator::notes::NoteImportance::Critical;
+    note.energy = 1.0;
+    e.client.create_note(&note).await.unwrap();
+    let file = Uuid::new_v4();
+    e.raw
+        .run(
+            query(
+                "MATCH (n:Note {id: $n}) \
+                 CREATE (f:File {id: $f, path: $p, project_id: $proj}) \
+                 CREATE (n)-[:LINKED_TO]->(f)",
+            )
+            .param("n", note.id.to_string())
+            .param("f", file.to_string())
+            .param("p", format!("/tmp/{file}.rs"))
+            .param("proj", e.project.id.to_string()),
+        )
+        .await
+        .unwrap();
+
+    // Une SECONDE note ancrée : c'est ce qui fait vivre le comparateur de rang. Avec une
+    // seule, le tri n'appelle jamais son comparateur et les lignes restent non couvertes.
+    let mut second = a_note("api");
+    second.project_id = Some(e.project.id);
+    second.importance = project_orchestrator::notes::NoteImportance::Critical;
+    second.energy = 0.9;
+    e.client.create_note(&second).await.unwrap();
+    let file2 = Uuid::new_v4();
+    e.raw
+        .run(
+            query(
+                "MATCH (n:Note {id: $n}) \
+                 CREATE (f:File {id: $f, path: $p, project_id: $proj}) \
+                 CREATE (n)-[:LINKED_TO]->(f)",
+            )
+            .param("n", second.id.to_string())
+            .param("f", file2.to_string())
+            .param("p", format!("/tmp/{file2}.rs"))
+            .param("proj", e.project.id.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let ranked = e
+        .client
+        .ranked_foundation(Some(e.project.id), 6)
+        .await
+        .unwrap();
+    assert!(
+        ranked.len() >= 2,
+        "two anchored notes are ranked: {ranked:?}"
+    );
+    let hit = ranked
+        .iter()
+        .find(|c| c.note == note.id)
+        .expect("the project's note is ranked");
+    assert_eq!(hit.anchors, 1, "{hit:?}");
+    assert!(hit.score > 0.0, "{hit:?}");
+
+    // L'échelle globale ne la sert pas : elle n'a pas traversé de frontière.
+    let global = e.client.ranked_foundation(None, 8).await.unwrap();
+    assert!(
+        !global.iter().any(|c| c.note == note.id),
+        "une note d'un seul projet ne s'escalade pas"
+    );
+
+    e.raw
+        .run(query("MATCH (f:File {id: $f}) DETACH DELETE f").param("f", file.to_string()))
+        .await
+        .unwrap();
+    e.client.delete_note(note.id).await.unwrap();
+    e.client.delete_note(second.id).await.unwrap();
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn the_catalog_says_what_the_graph_really_has() {
+    let _serial = serial().await;
+    let Some(e) = env("catalog").await else {
+        return;
+    };
+    // One edge of a known shape, so the catalog has something true to report.
+    let agent = e.client.agent_identity_namespace().await.unwrap();
+    let mut note = a_note("api");
+    note.project_id = Some(e.project.id);
+    e.client.create_note(&note).await.unwrap();
+    // The subject must exist or `link_agent_knows` is a silent no-op — and a test that
+    // believes otherwise proves nothing about the catalog.
+    e.client.ensure_agent(agent, None).await.unwrap();
+    e.client
+        .link_agent_knows(
+            agent,
+            note.id,
+            rules::KnowledgeScope::Global,
+            None,
+            &rules::AccountableProvenance::new("agent-knows-core", "measured").unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let catalog = e.client.schema_catalog().await.unwrap();
+    assert!(!catalog.labels.is_empty(), "the graph has labels");
+    assert!(catalog.has_edge("KNOWS"), "KNOWS exists in this graph");
+    assert!(
+        catalog.volume("KNOWS").is_some(),
+        "and its volume is measured, not assumed"
+    );
+    assert!(
+        catalog.volume("NOT_A_REAL_TYPE").is_none(),
+        "an unknown type has no volume — which is not zero"
+    );
+    for edge in catalog.causal_edges() {
+        assert!(
+            rules::Provenance::new("x", "y").is_accountable()
+                && project_orchestrator::graph::schema::CAUSAL_TYPES.contains(&edge),
+            "the causal family never leaks a foreign type: {edge}"
+        );
+    }
+
+    e.client.delete_note(note.id).await.unwrap();
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn a_causal_walk_follows_a_real_chain_and_refuses_a_stranger_label() {
+    let _serial = serial().await;
+    let Some(e) = env("walk").await else {
+        return;
+    };
+    let task = Uuid::new_v4();
+    let decision = Uuid::new_v4();
+    e.raw
+        .run(
+            query(
+                "CREATE (t:Task {id: $t, title: 'a task'}) \
+                 CREATE (d:Decision {id: $d, description: 'a reason'}) \
+                 CREATE (t)-[:INFORMED_BY {created_at: datetime()}]->(d)",
+            )
+            .param("t", task.to_string())
+            .param("d", decision.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let walk = e
+        .client
+        .causal_walk("Task", &task.to_string(), 2)
+        .await
+        .unwrap();
+    assert!(walk.exists(), "the chain exists: {walk:?}");
+    assert_eq!(walk.steps[0].edge, "INFORMED_BY");
+    assert_eq!(walk.steps[0].label, "Decision");
+    assert!(!walk.truncated, "the chain ends before the bound");
+
+    // An anchor that does not exist is an empty walk — « this chain does not exist » — and
+    // never an error, which would read as « I could not look ».
+    let absent = e
+        .client
+        .causal_walk("Task", &Uuid::new_v4().to_string(), 2)
+        .await
+        .unwrap();
+    assert!(!absent.exists());
+
+    // A label that is not an anchor never reaches the query.
+    let refused = e.client.causal_walk("Task) DETACH DELETE (n", "x", 2).await;
+    assert!(refused.is_err());
+
+    // A chain longer than the bound must say it was cut: a walk stopped by its own depth
+    // limit cannot read as « the chain ends here ». Built in one statement — a `MATCH` on a
+    // node that does not exist yet silently creates nothing, which is how this test first
+    // proved the opposite of what it claimed.
+    let deep_t = Uuid::new_v4();
+    let hops: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+    e.raw
+        .run(
+            query(
+                "MERGE (t:Task {id: $t}) \
+                 MERGE (a:Decision {id: $a}) MERGE (b:Decision {id: $b}) MERGE (c:Decision {id: $c}) \
+                 MERGE (t)-[:PRECEDES]->(a) MERGE (a)-[:PRECEDES]->(b) MERGE (b)-[:PRECEDES]->(c)",
+            )
+            .param("t", deep_t.to_string())
+            .param("a", hops[0].to_string())
+            .param("b", hops[1].to_string())
+            .param("c", hops[2].to_string()),
+        )
+        .await
+        .unwrap();
+
+    let cut = e
+        .client
+        .causal_walk("Task", &deep_t.to_string(), 1)
+        .await
+        .unwrap();
+    assert!(cut.exists(), "the first hop exists: {cut:?}");
+    assert_eq!(cut.steps.len(), 1, "one hop, the depth asked: {cut:?}");
+    assert!(
+        cut.truncated,
+        "and the walk says it stopped on its bound: {cut:?}"
+    );
+    // A depth beyond the ceiling is clamped, never interpolated as given.
+    let clamped = e
+        .client
+        .causal_walk("Task", &deep_t.to_string(), 99)
+        .await
+        .unwrap();
+    assert_eq!(clamped.max_depth, 4);
+    assert!(
+        !clamped.truncated,
+        "a 4-hop bound reaches the end: {clamped:?}"
+    );
+
+    // An agent the graph does not have is absent, not invented.
+    assert!(e.client.find_agent(Uuid::new_v4()).await.unwrap().is_none());
+
+    drop_nodes(&e, "Task", &[task, deep_t]).await;
+    drop_nodes(&e, "Decision", &hops).await;
+    drop_nodes(&e, "Decision", &[decision]).await;
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn a_walk_cut_by_its_depth_says_it_was_cut() {
+    // « La part lue est dite », appliqué à une chaîne : une marche arrêtée par sa propre
+    // borne ne doit pas se lire « la chaîne s'arrête ici ». Deux sauts existent, la borne
+    // n'en lit qu'un, et `truncated` le dit.
+    let _serial = serial().await;
+    let Some(e) = env("truncated").await else {
+        return;
+    };
+    let task = Uuid::new_v4();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    e.raw
+        .run(
+            query(
+                "CREATE (t:Task {id: $t, title: 'a task'}) \
+                 CREATE (a:Decision {id: $a, description: 'first'}) \
+                 CREATE (b:Decision {id: $b, description: 'second'}) \
+                 CREATE (t)-[:INFORMED_BY]->(a) CREATE (a)-[:NEXT_DECISION]->(b)",
+            )
+            .param("t", task.to_string())
+            .param("a", first.to_string())
+            .param("b", second.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let cut = e
+        .client
+        .causal_walk("Task", &task.to_string(), 1)
+        .await
+        .unwrap();
+    assert_eq!(cut.steps.len(), 1, "the bound is one hop: {cut:?}");
+    assert!(
+        cut.truncated,
+        "there is more to follow and the walk says so: {cut:?}"
+    );
+
+    let whole = e
+        .client
+        .causal_walk("Task", &task.to_string(), 3)
+        .await
+        .unwrap();
+    assert_eq!(whole.steps.len(), 2, "both hops: {whole:?}");
+    assert!(!whole.truncated);
+
+    drop_nodes(&e, "Task", &[task]).await;
+    drop_nodes(&e, "Decision", &[first, second]).await;
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn an_agent_that_does_not_exist_is_absent_not_an_error() {
+    let _serial = serial().await;
+    let Some(e) = env("noagent").await else {
+        return;
+    };
+    assert!(e.client.find_agent(Uuid::new_v4()).await.unwrap().is_none());
+    // A foreign id is refused and never becomes a node.
+    let foreign = Uuid::new_v4();
+    assert!(e.client.ensure_agent(foreign, Some("m")).await.is_err());
+    assert!(e.client.find_agent(foreign).await.unwrap().is_none());
+    // The self is made; its model is a dated facet beside it, not the node itself.
+    let root = e.client.agent_identity_namespace().await.unwrap();
+    e.client.ensure_agent(root, Some("m")).await.unwrap();
+    assert_eq!(
+        e.client.find_agent(root).await.unwrap(),
+        Some(("self".to_string(), None))
+    );
+    let facet = project_orchestrator::notes::provenance::model_facet_id(root, "m").unwrap();
+    assert_eq!(
+        e.client.find_agent(facet).await.unwrap(),
+        Some(("model".to_string(), Some("m".to_string())))
+    );
+    drop_nodes(&e, "Agent", &[facet]).await;
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn a_rule_that_needs_its_caller_says_so_instead_of_pretending() {
+    let _serial = serial().await;
+    // `run()` reads the graph. A rule whose measurement lives in memory is reported as
+    // not runnable there, with a reason — never silently skipped, never faked.
+    let Some(e) = env("rules").await else {
+        return;
+    };
+    let report = rules::run(&e.client, &[]).await.unwrap();
+    let uses = report
+        .of(rules::AGENT_USES_ACTIVATED.name)
+        .expect("the rule is declared");
+    assert_eq!(uses.written, 0);
+    assert!(
+        uses.measure.contains("run_with"),
+        "it names where its measurement comes from: {}",
+        uses.measure
+    );
+    assert!(report.of(rules::AGENT_KNOWS_CORE.name).is_some());
+    cleanup(&e).await;
+}
+
+/// The graph's size, in nodes and relationships. A read that writes shows up here.
+async fn graph_size(raw: &Graph) -> (i64, i64) {
+    let mut nodes = raw
+        .execute(query("MATCH (n) RETURN count(n) AS c"))
+        .await
+        .unwrap();
+    let n: i64 = nodes.next().await.unwrap().unwrap().get("c").unwrap();
+    let mut rels = raw
+        .execute(query("MATCH ()-[r]->() RETURN count(r) AS c"))
+        .await
+        .unwrap();
+    let r: i64 = rels.next().await.unwrap().unwrap().get("c").unwrap();
+    (n, r)
+}
+
+#[tokio::test]
+async fn a_typed_path_and_the_schema_are_read_only() {
+    let _serial = serial().await;
+    let Some(e) = env("typed_path").await else {
+        return;
+    };
+    let (t, d1, d2) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    e.raw
+        .run(
+            query(
+                "CREATE (t:Task {id: $t, title: 'a task'}) \
+                 CREATE (d1:Decision {id: $d1, description: 'r1'}) \
+                 CREATE (d2:Decision {id: $d2, description: 'r2'}) \
+                 CREATE (t)-[:INFORMED_BY {created_at: datetime()}]->(d1) \
+                 CREATE (d1)-[:NEXT_DECISION]->(d2)",
+            )
+            .param("t", t.to_string())
+            .param("d1", d1.to_string())
+            .param("d2", d2.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let before = graph_size(&e.raw).await;
+    let path = e
+        .client
+        .typed_path("Task", &t.to_string(), "Decision", &d2.to_string(), 4)
+        .await
+        .unwrap();
+    let catalog = e.client.schema_catalog().await.unwrap();
+    let walk = e
+        .client
+        .causal_walk("Task", &t.to_string(), 2)
+        .await
+        .unwrap();
+    // One endpoint absent: reported, not an error.
+    let absent = e
+        .client
+        .typed_path(
+            "Task",
+            &t.to_string(),
+            "Decision",
+            &Uuid::new_v4().to_string(),
+            4,
+        )
+        .await
+        .unwrap();
+    // Both exist, but the chain runs the other way: no path, endpoints found.
+    let reversed = e
+        .client
+        .typed_path("Decision", &d2.to_string(), "Task", &t.to_string(), 4)
+        .await
+        .unwrap();
+    assert_eq!(graph_size(&e.raw).await, before, "the reads wrote nothing");
+
+    assert!(path.endpoints_found, "{path:?}");
+    assert_eq!(path.nodes.len(), 3, "{path:?}");
+    assert_eq!(path.nodes[0].label, "Task");
+    assert_eq!(path.nodes[0].title.as_deref(), Some("a task"));
+    assert_eq!(path.nodes[2].id, d2.to_string());
+    assert_eq!(path.edges, vec!["INFORMED_BY", "NEXT_DECISION"]);
+    assert!(!absent.endpoints_found && !absent.exists(), "{absent:?}");
+    assert!(
+        reversed.endpoints_found && !reversed.exists(),
+        "{reversed:?}"
+    );
+    assert!(catalog.has_edge("INFORMED_BY"));
+    assert!(walk.exists());
+
+    drop_nodes(&e, "Task", &[t]).await;
+    drop_nodes(&e, "Decision", &[d1, d2]).await;
+    cleanup(&e).await;
+}

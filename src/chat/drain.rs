@@ -1,0 +1,764 @@
+//! Drain loop — processes queued pending messages after stream ends.
+//!
+//! When `stream_response` completes, any messages queued in `pending_messages`
+//! (from auto-continue, objective tracker, or concurrent user sends) are
+//! drained one at a time: each message is persisted, broadcast, then
+//! `stream_response` is called recursively to process it.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use super::manager::{ActiveSession, ChatManager};
+use super::post_stream::{spawn_write, step_budget_of, StepBudget};
+use super::types::{ChatEvent, PendingMessage, PendingMessageKind};
+use crate::meilisearch::SearchStore;
+use crate::neo4j::models::ChatEventRecord;
+use crate::neo4j::GraphStore;
+use nexus_claude::{
+    memory::{ContextInjector, ConversationMemoryManager},
+    InteractiveClient,
+};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
+use tokio::sync::{broadcast, Mutex, RwLock};
+use tracing::{debug, info};
+use uuid::Uuid;
+
+/// A counter write still in flight: it resolves when the write is over, whatever its outcome.
+type CountWrite = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+
+/// The LAST counter write of each session still in flight. The next write waits for it, so
+/// two read-then-writes of the counter never lose one another's +1; the close waits for it
+/// ([`count_writes_settled`]) before it reads the counter (T0).
+fn count_writes() -> &'static std::sync::Mutex<HashMap<Uuid, CountWrite>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<HashMap<Uuid, CountWrite>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+/// Held by a counter write until it is over: it leaves the registry (if it is still the last
+/// one) and wakes whoever waits for it — on every path, a failure or a panic included.
+struct CountWriteDone {
+    uuid: Uuid,
+    this: CountWrite,
+    _done: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Drop for CountWriteDone {
+    fn drop(&mut self) {
+        let mut pending = count_writes().lock().unwrap_or_else(|e| e.into_inner());
+        if pending
+            .get(&self.uuid)
+            .is_some_and(|last| last.ptr_eq(&self.this))
+        {
+            pending.remove(&self.uuid);
+        }
+    }
+}
+
+/// Waits, up to `budget`, for the counter writes of `session` still in flight. `false` when
+/// the budget ran out first: the counter read next may still be one message behind.
+pub(crate) async fn count_writes_settled(session: Uuid, budget: std::time::Duration) -> bool {
+    let last = count_writes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&session)
+        .cloned();
+    match last {
+        None => true,
+        // The writes are chained: the last one over means every one before it is over.
+        Some(last) => tokio::time::timeout(budget, last).await.is_ok(),
+    }
+}
+
+/// Counts one user message on the session record, in a task of its own
+/// ([`spawn_write`]: it may land after its step budget, never dropped), AFTER the count
+/// write of the same session still in flight.
+pub(crate) fn spawn_count_write(
+    session_id: String,
+    uuid: Uuid,
+    graph: Arc<dyn GraphStore>,
+) -> tokio::task::JoinHandle<()> {
+    use futures::FutureExt;
+    let (done, over) = tokio::sync::oneshot::channel::<()>();
+    let this: CountWrite = over.map(|_| ()).boxed().shared();
+    let previous = count_writes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(uuid, this.clone());
+    spawn_write(session_id, "drain_message_count", async move {
+        let _over = CountWriteDone {
+            uuid,
+            this,
+            _done: done,
+        };
+        if let Some(previous) = previous {
+            previous.await;
+        }
+        if let Some(node) = graph.get_chat_session(uuid).await? {
+            graph
+                .update_chat_session(
+                    uuid,
+                    None,
+                    None,
+                    Some(node.message_count + 1),
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+        }
+        Ok(())
+    })
+}
+
+/// Drain the pending_messages queue: pop the next message, persist it,
+/// broadcast it, and recursively call `stream_response` to process it.
+///
+/// If the queue is empty but `has_pending` was true (race), clean up streaming status.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn drain_pending_messages(
+    has_pending: bool,
+    client: Arc<Mutex<InteractiveClient>>,
+    events_tx: broadcast::Sender<ChatEvent>,
+    session_id: String,
+    session_uuid: Option<Uuid>,
+    graph: Arc<dyn GraphStore>,
+    active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+    interrupt_flag: Arc<AtomicBool>,
+    memory_manager: Option<Arc<Mutex<ConversationMemoryManager>>>,
+    context_injector: Option<Arc<ContextInjector>>,
+    next_seq: Arc<AtomicI64>,
+    pending_messages: Arc<Mutex<VecDeque<PendingMessage>>>,
+    is_streaming: Arc<AtomicBool>,
+    streaming_text: Arc<Mutex<String>>,
+    streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
+    event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
+    nats: Option<Arc<crate::events::NatsEmitter>>,
+    shared_sdk_control_rx: Arc<
+        tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<serde_json::Value>>>,
+    >,
+    auto_continue: Arc<AtomicBool>,
+    retry_config: super::config::RetryConfig,
+    enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
+    search: Arc<dyn SearchStore>,
+    documents: crate::documents::store::DocumentStore,
+    cognitive_routing: Option<super::provider::cognitive::decider::CognitiveRouting>,
+) {
+    // Pop the next message from the queue, prioritising User > SystemHint
+    // > BackgroundOutput so a noisy Monitor cannot starve user messages
+    // (plan 806c8f2c, T2). FIFO is preserved within each priority class.
+    let (next_message, held_left) = {
+        let mut queue = pending_messages.lock().await;
+        // A Stop that landed during the turn that just ended must not be undone
+        // by the next queued message: `stream_response` re-arms the interrupt
+        // flag and token at entry, so starting one here would swallow the Stop.
+        let interrupted = interrupt_flag.load(Ordering::SeqCst);
+        let (next, dropped) = pop_next_after_turn(&mut queue, interrupted);
+        if dropped > 0 {
+            info!(
+                session_id = %session_id,
+                dropped,
+                "Stop requested: dropped automated queued messages instead of restarting the turn"
+            );
+        }
+        // A held message is leaving: the list clients show must lose it now,
+        // not when the turn it starts is over.
+        let held_left = next
+            .as_ref()
+            .filter(|m| m.held)
+            .map(|_| super::pending_queue::snapshot(&queue));
+        (next, held_left)
+    };
+    if let Some(messages) = held_left {
+        let event = ChatEvent::PendingQueue { messages };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = nats {
+            nats.publish_chat_event(&session_id, event);
+        }
+    }
+
+    if let Some(next_msg) = next_message {
+        let kind = next_msg.kind.clone();
+        let msg_content = next_msg.content;
+
+        info!(
+            "Processing queued {} for session {} (queue was non-empty after stream)",
+            match kind {
+                PendingMessageKind::SystemHint => "system_hint",
+                PendingMessageKind::User => "user_message",
+                PendingMessageKind::BackgroundOutput => "background_output",
+                PendingMessageKind::TeamMessage { .. } => "team_message",
+            },
+            session_id
+        );
+
+        // Persist the event and update message count.
+        // - SystemHint: persist as system_hint, no message_count bump
+        // - User: persist as user_message, bump message_count
+        // - BackgroundOutput: SKIP persist + SKIP broadcast — the OOB
+        //   listener has already done both before pushing to the queue
+        //   (see chat::oob_listener). Re-persisting would duplicate.
+        let needs_persist_and_broadcast = !matches!(kind, PendingMessageKind::BackgroundOutput);
+        if needs_persist_and_broadcast {
+            if let Some(uuid) = session_uuid {
+                // Writes in tasks of their own, awaited up to the step budget
+                // like the post-stream steps: a store that never answers must
+                // not keep the next turn from starting, and must not lose the
+                // message either (`spawn_write` lets it land late).
+                let steps = StepBudget {
+                    session_id: session_id.clone(),
+                    budget: step_budget_of(&active_sessions, &session_id).await,
+                    events_tx: events_tx.clone(),
+                    nats: nats.clone(),
+                };
+                let count_write = matches!(kind, PendingMessageKind::User)
+                    .then(|| spawn_count_write(session_id.clone(), uuid, graph.clone()));
+
+                let (event_type, event_data) = match kind {
+                    PendingMessageKind::SystemHint => (
+                        "system_hint".to_string(),
+                        serde_json::to_string(&ChatEvent::SystemHint {
+                            content: msg_content.clone(),
+                        })
+                        .unwrap_or_default(),
+                    ),
+                    PendingMessageKind::User => (
+                        "user_message".to_string(),
+                        serde_json::to_string(&ChatEvent::UserMessage {
+                            content: msg_content.clone(),
+                        })
+                        .unwrap_or_default(),
+                    ),
+                    PendingMessageKind::TeamMessage {
+                        ref from_session_id,
+                        ref from_name,
+                    } => (
+                        "team_message".to_string(),
+                        serde_json::to_string(&ChatEvent::TeamMessage {
+                            from_session_id: *from_session_id,
+                            from_name: from_name.clone(),
+                            content: msg_content.clone(),
+                        })
+                        .unwrap_or_default(),
+                    ),
+                    PendingMessageKind::BackgroundOutput => unreachable!(
+                        "BackgroundOutput is filtered out by needs_persist_and_broadcast"
+                    ),
+                };
+
+                let event_record = ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: uuid,
+                    seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                    event_type,
+                    data: event_data,
+                    created_at: chrono::Utc::now(),
+                };
+                let record_write = {
+                    let graph = graph.clone();
+                    spawn_write(session_id.clone(), "drain_persist", async move {
+                        graph.store_chat_events(uuid, vec![event_record]).await
+                    })
+                };
+                // One budget for both: they run side by side.
+                let count_wait = async {
+                    if let Some(write) = count_write {
+                        steps.wait_for_write("drain_message_count", write).await;
+                    }
+                };
+                tokio::join!(
+                    count_wait,
+                    steps.wait_for_write("drain_persist", record_write)
+                );
+            }
+
+            let chat_event = match kind {
+                PendingMessageKind::SystemHint => ChatEvent::SystemHint {
+                    content: msg_content.clone(),
+                },
+                PendingMessageKind::User => ChatEvent::UserMessage {
+                    content: msg_content.clone(),
+                },
+                PendingMessageKind::TeamMessage {
+                    ref from_session_id,
+                    ref from_name,
+                } => ChatEvent::TeamMessage {
+                    from_session_id: *from_session_id,
+                    from_name: from_name.clone(),
+                    content: msg_content.clone(),
+                },
+                PendingMessageKind::BackgroundOutput => unreachable!(),
+            };
+            let _ = events_tx.send(chat_event.clone());
+            if let Some(ref nats) = nats {
+                nats.publish_chat_event(&session_id, chat_event);
+            }
+        } else {
+            debug!(
+                session_id = %session_id,
+                "Drain: BackgroundOutput already persisted/broadcasted by OOB listener — \
+                 forwarding content to stream_response as prompt"
+            );
+        }
+
+        // For TeamMessage, prefix the content delivered to the model so it can
+        // distinguish peer messages from human messages. Raw content is already
+        // persisted and broadcast above (clients see `from_name` separately).
+        let prompt_content = match &kind {
+            PendingMessageKind::TeamMessage { from_name, .. } => {
+                format!("[team {}] {}", from_name, msg_content)
+            }
+            _ => msg_content,
+        };
+
+        // Recursive call to process the queued message
+        Box::pin(ChatManager::stream_response(
+            client,
+            events_tx,
+            prompt_content,
+            session_id,
+            graph,
+            active_sessions,
+            interrupt_flag,
+            memory_manager,
+            context_injector,
+            next_seq,
+            pending_messages,
+            is_streaming,
+            streaming_text,
+            streaming_events,
+            event_emitter,
+            nats,
+            shared_sdk_control_rx,
+            auto_continue,
+            retry_config,
+            enrichment_pipeline,
+            search,
+            documents,
+            cognitive_routing,
+        ))
+        .await;
+    } else if has_pending {
+        // Race: has_pending was true but pop_front returned None.
+        // Set is_streaming=false now since there's nothing to process.
+        is_streaming.store(false, Ordering::SeqCst);
+        let _ = events_tx.send(ChatEvent::StreamingStatus {
+            is_streaming: false,
+        });
+        if let Some(ref nats) = nats {
+            nats.publish_chat_event(
+                &session_id,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false,
+                },
+            );
+        }
+        if let Some(ref emitter) = event_emitter {
+            emitter.emit_updated(
+                crate::events::EntityType::ChatSession,
+                &session_id,
+                serde_json::json!({ "is_streaming": false }),
+                None,
+            );
+        }
+        streaming_text.lock().await.clear();
+        streaming_events.lock().await.clear();
+        debug!(
+            "Stream completed for session {} (pending race resolved)",
+            session_id
+        );
+    }
+}
+
+/// What may start the next turn once the previous one ended.
+///
+/// Not interrupted: the highest-priority message, as before. Interrupted: the
+/// automated entries (`SystemHint`, `BackgroundOutput` — Monitor ticks,
+/// auto-continue, objective reminders) are discarded, because they were
+/// produced by the very work the user just stopped and would re-arm the turn
+/// forever. Messages the human typed still run; team messages from peers are
+/// also kept since they represent real intent from another agent. Returns the
+/// message and how many automated entries were dropped.
+pub(crate) fn pop_next_after_turn(
+    queue: &mut VecDeque<PendingMessage>,
+    interrupted: bool,
+) -> (Option<PendingMessage>, usize) {
+    let mut dropped = 0;
+    if interrupted {
+        let before = queue.len();
+        queue.retain(|m| {
+            matches!(
+                m.kind,
+                PendingMessageKind::User | PendingMessageKind::TeamMessage { .. }
+            )
+        });
+        dropped = before - queue.len();
+    }
+    (pop_highest_priority(queue), dropped)
+}
+
+/// Pop the highest-priority `PendingMessage` from the queue, preserving
+/// FIFO order within a single priority class.
+///
+/// Priority order (lowest number = highest priority):
+///   0 — `User`, `TeamMessage` : the human's intent and peer-agent messages always win
+///   1 — `SystemHint` : system instructions (AgentGuard hints, plan-runner reminders)
+///   2 — `BackgroundOutput` : passive observations from background tools (Monitor, BashOutput, …)
+///
+/// ## Why this exists (plan 806c8f2c)
+///
+/// Without prioritisation, a noisy `Monitor` (or any background-output-emitting
+/// tool) can starve user messages: BackgroundOutput entries accumulate in
+/// `pending_messages` while a stream is running, and a strict FIFO drain
+/// processes them all before reading the user's typed message — the user
+/// perceives the chat as "ignoring me" while ticks keep firing.
+///
+/// ## Complexity
+///
+/// `O(n)` scan over the queue + `O(n)` `remove(idx)`. `n` is typically < 50;
+/// in practice the queue rarely exceeds 5-10 entries between drain cycles.
+///
+/// ## Implementation
+///
+/// Scan the queue once, track the index of the first entry of the lowest
+/// priority value seen so far (lower number = higher priority). Then
+/// `remove(idx)` it. Both ops are O(n) on `VecDeque`; n is small enough
+/// that this is fine.
+///
+/// ## FIFO tie-break
+///
+/// Within a single priority class, the iteration finds the first match
+/// (oldest in the queue), so insertion order is preserved among equals.
+fn pop_highest_priority(queue: &mut VecDeque<PendingMessage>) -> Option<PendingMessage> {
+    fn priority(kind: &PendingMessageKind) -> u8 {
+        match kind {
+            PendingMessageKind::User | PendingMessageKind::TeamMessage { .. } => 0,
+            PendingMessageKind::SystemHint => 1,
+            PendingMessageKind::BackgroundOutput => 2,
+        }
+    }
+
+    // NB: must use `min_by` with explicit tie-break on the index, because
+    // `min_by_key` returns the LAST element on equal keys (cf std docs) —
+    // which would break our FIFO-intra-class invariant. Index is unique so
+    // the secondary `cmp` always disambiguates.
+    let best_idx = queue
+        .iter()
+        .enumerate()
+        .min_by(|(ia, a), (ib, b)| {
+            priority(&a.kind)
+                .cmp(&priority(&b.kind))
+                .then_with(|| ia.cmp(ib))
+        })
+        .map(|(i, _)| i)?;
+
+    queue.remove(best_idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::types::PendingMessage;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    fn user(content: &str) -> PendingMessage {
+        PendingMessage::user(content.to_string())
+    }
+    fn system_hint(content: &str) -> PendingMessage {
+        PendingMessage::system_hint(content.to_string())
+    }
+    fn bg(content: &str) -> PendingMessage {
+        PendingMessage::background_output(content.to_string())
+    }
+
+    /// Helper: assert next pop is `expected_kind` with `expected_content`.
+    #[track_caller]
+    fn assert_next(
+        q: &mut VecDeque<PendingMessage>,
+        expected_kind: PendingMessageKind,
+        expected_content: &str,
+    ) {
+        let m = pop_highest_priority(q).expect("queue not empty");
+        assert_eq!(
+            m.kind, expected_kind,
+            "wrong kind: got {:?} content={:?}, expected {:?} content={:?}",
+            m.kind, m.content, expected_kind, expected_content
+        );
+        assert_eq!(m.content, expected_content);
+    }
+
+    /// **T1 of plan 806c8f2c — RED test that demonstrates the bug.**
+    ///
+    /// On main HEAD with `pop_highest_priority` stubbed to `pop_front`, this
+    /// test FAILS: the 3 BackgroundOutput entries are popped before the
+    /// User message, reproducing the starvation symptom observed in prod.
+    ///
+    /// After T2 replaces the stub with the real priority-aware impl, this
+    /// test PASSES — and serves as a permanent non-regression guard.
+    #[test]
+    fn test_user_message_drained_before_accumulated_background_outputs() {
+        let mut q = VecDeque::new();
+        q.push_back(bg("BG1"));
+        q.push_back(bg("BG2"));
+        q.push_back(bg("BG3"));
+        q.push_back(user("U1"));
+
+        // Expected behavior: User wins, then BG1 BG2 BG3 in FIFO order.
+        let first = pop_highest_priority(&mut q).expect("queue not empty");
+        assert_eq!(
+            first.kind,
+            PendingMessageKind::User,
+            "BUG: User message starved by accumulated BackgroundOutput. \
+             pop_highest_priority returned {:?} content={:?}",
+            first.kind,
+            first.content
+        );
+        assert_eq!(first.content, "U1");
+
+        // FIFO within BackgroundOutput class is preserved.
+        for expected in ["BG1", "BG2", "BG3"] {
+            let next = pop_highest_priority(&mut q).expect("queue not empty");
+            assert_eq!(next.kind, PendingMessageKind::BackgroundOutput);
+            assert_eq!(
+                next.content, expected,
+                "FIFO intra-class violated: expected {expected}"
+            );
+        }
+
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    // ========================================================================
+    // T3 of plan 806c8f2c — Comprehensive priority + FIFO invariants.
+    //
+    // The 9 tests below cover the full truth table of `pop_highest_priority`:
+    //   - Single-priority comparisons (User > BG, User > SystemHint, SH > BG)
+    //   - FIFO intra-class for User and BackgroundOutput (the two dominant
+    //     classes in production)
+    //   - Edge cases: empty queue, single entry
+    //   - The full mixed scenario [BG, U, SH, BG, U, SH, BG] which is the
+    //     most valuable single test — exercises priority + FIFO together.
+    // ========================================================================
+
+    #[test]
+    fn test_priority_user_beats_background() {
+        let mut q = VecDeque::new();
+        q.push_back(bg("BG"));
+        q.push_back(user("U"));
+        assert_next(&mut q, PendingMessageKind::User, "U");
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG");
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    #[test]
+    fn test_priority_user_beats_systemhint() {
+        let mut q = VecDeque::new();
+        q.push_back(system_hint("SH"));
+        q.push_back(user("U"));
+        assert_next(&mut q, PendingMessageKind::User, "U");
+        assert_next(&mut q, PendingMessageKind::SystemHint, "SH");
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    #[test]
+    fn test_priority_systemhint_beats_background() {
+        let mut q = VecDeque::new();
+        q.push_back(bg("BG"));
+        q.push_back(system_hint("SH"));
+        assert_next(&mut q, PendingMessageKind::SystemHint, "SH");
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG");
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    #[test]
+    fn test_priority_user_beats_multiple_backgrounds() {
+        // The User entry is in the MIDDLE of a sea of BGs — it must still
+        // win, then the remaining BGs come out in their original FIFO order
+        // (BG1, BG2, BG3, BG4 — note BG4 was inserted AFTER U so it stays
+        // last even though U was extracted before it).
+        let mut q = VecDeque::new();
+        q.push_back(bg("BG1"));
+        q.push_back(bg("BG2"));
+        q.push_back(bg("BG3"));
+        q.push_back(user("U"));
+        q.push_back(bg("BG4"));
+
+        assert_next(&mut q, PendingMessageKind::User, "U");
+        for expected in ["BG1", "BG2", "BG3", "BG4"] {
+            let next = pop_highest_priority(&mut q).expect("queue not empty");
+            assert_eq!(next.kind, PendingMessageKind::BackgroundOutput);
+            assert_eq!(
+                next.content, expected,
+                "FIFO intra-class violated: expected {expected}"
+            );
+        }
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    #[test]
+    fn test_priority_fifo_within_user_class() {
+        // Three User messages in a row — strict insertion order out.
+        // Catches the `min_by_key` trap (returns LAST on equal keys).
+        let mut q = VecDeque::new();
+        q.push_back(user("U1"));
+        q.push_back(user("U2"));
+        q.push_back(user("U3"));
+        assert_next(&mut q, PendingMessageKind::User, "U1");
+        assert_next(&mut q, PendingMessageKind::User, "U2");
+        assert_next(&mut q, PendingMessageKind::User, "U3");
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    #[test]
+    fn test_priority_fifo_within_background_class() {
+        // Three BackgroundOutput in a row — strict insertion order out.
+        // This is the "Monitor tick" case: agents must see ticks in the
+        // order they were produced, otherwise the assistant gets confused
+        // ("Tick 5" arriving before "Tick 4" makes no narrative sense).
+        let mut q = VecDeque::new();
+        q.push_back(bg("BG1"));
+        q.push_back(bg("BG2"));
+        q.push_back(bg("BG3"));
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG1");
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG2");
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG3");
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    #[test]
+    fn test_priority_empty_queue() {
+        let mut q: VecDeque<PendingMessage> = VecDeque::new();
+        assert!(
+            pop_highest_priority(&mut q).is_none(),
+            "empty queue must return None, not panic"
+        );
+    }
+
+    #[test]
+    fn test_priority_single_entry() {
+        let mut q = VecDeque::new();
+        q.push_back(bg("only"));
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "only");
+        assert!(
+            q.is_empty(),
+            "queue must be empty after popping the sole entry"
+        );
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    /// The most valuable single test of the suite. Mixes 3 priority classes
+    /// across 7 entries and asserts the full pop sequence:
+    ///
+    ///   queue (insertion order): BG1, U1, SH1, BG2, U2, SH2, BG3
+    ///   expected pop sequence:   U1, U2, SH1, SH2, BG1, BG2, BG3
+    ///
+    /// This single test would catch:
+    ///   - Any priority inversion (User not first)
+    ///   - Any FIFO-intra-class violation (U2 before U1, or SH2 before SH1)
+    ///   - The `min_by_key` trap (LAST on equal keys)
+    ///   - Off-by-one in the index tie-break
+    ///   - Failure to remove from the right index after `enumerate()`
+    #[test]
+    fn test_priority_mixed_complex() {
+        let mut q = VecDeque::new();
+        q.push_back(bg("BG1"));
+        q.push_back(user("U1"));
+        q.push_back(system_hint("SH1"));
+        q.push_back(bg("BG2"));
+        q.push_back(user("U2"));
+        q.push_back(system_hint("SH2"));
+        q.push_back(bg("BG3"));
+
+        // Users first, in FIFO order.
+        assert_next(&mut q, PendingMessageKind::User, "U1");
+        assert_next(&mut q, PendingMessageKind::User, "U2");
+        // Then SystemHints, in FIFO order.
+        assert_next(&mut q, PendingMessageKind::SystemHint, "SH1");
+        assert_next(&mut q, PendingMessageKind::SystemHint, "SH2");
+        // Then BackgroundOutputs, in FIFO order.
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG1");
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG2");
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG3");
+
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    fn q(items: Vec<PendingMessage>) -> VecDeque<PendingMessage> {
+        items.into_iter().collect()
+    }
+
+    /// Corner case behind "I cannot even stop it": Stop during a turn while a
+    /// Monitor tick sits in the queue. Draining it started a fresh
+    /// `stream_response`, which re-arms the interrupt flag — the Stop vanished.
+    #[test]
+    fn stop_does_not_restart_the_turn_from_automated_messages() {
+        let mut queue = q(vec![
+            PendingMessage::background_output("tick".into()),
+            PendingMessage::system_hint("continue".into()),
+        ]);
+        let (next, dropped) = pop_next_after_turn(&mut queue, true);
+        assert!(next.is_none(), "an interrupted session must go idle");
+        assert_eq!(dropped, 2);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn stop_keeps_what_the_human_typed() {
+        let mut queue = q(vec![
+            PendingMessage::background_output("tick".into()),
+            PendingMessage::user("hello".into()),
+        ]);
+        let (next, dropped) = pop_next_after_turn(&mut queue, true);
+        assert_eq!(next.unwrap().content, "hello");
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn without_stop_automated_messages_still_drain() {
+        let mut queue = q(vec![PendingMessage::background_output("tick".into())]);
+        let (next, dropped) = pop_next_after_turn(&mut queue, false);
+        assert_eq!(next.unwrap().content, "tick");
+        assert_eq!(dropped, 0);
+    }
+
+    /// Two count writes in flight at once: the second reads the counter AFTER the first
+    /// wrote it, so no +1 is lost; and once they are over, nothing is left to wait for.
+    #[tokio::test]
+    async fn count_writes_of_one_session_are_ordered_and_settle() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mut session = crate::test_helpers::test_chat_session(None);
+        session.message_count = 1;
+        let id = session.id;
+        graph.create_chat_session(&session).await.unwrap();
+        *graph.slow_chat_session_update.lock().unwrap() =
+            Some(std::time::Duration::from_millis(150));
+
+        let store: Arc<dyn GraphStore> = graph.clone();
+        let first = spawn_count_write(id.to_string(), id, store.clone());
+        let second = spawn_count_write(id.to_string(), id, store.clone());
+        assert!(
+            count_writes_settled(id, std::time::Duration::from_secs(5)).await,
+            "the last write is waited for"
+        );
+        assert_eq!(
+            graph
+                .get_chat_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .message_count,
+            3,
+            "settled means both landed, none lost"
+        );
+        first.await.unwrap();
+        second.await.unwrap();
+        assert!(!count_writes().lock().unwrap().contains_key(&id));
+        assert!(count_writes_settled(id, std::time::Duration::ZERO).await);
+    }
+}

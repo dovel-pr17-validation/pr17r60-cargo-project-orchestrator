@@ -1,0 +1,574 @@
+//! Neo4j User / Auth operations
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use super::client::Neo4jClient;
+use super::models::*;
+use anyhow::Result;
+use neo4rs::query;
+use uuid::Uuid;
+
+impl Neo4jClient {
+    // ========================================================================
+    // User / Auth operations
+    // ========================================================================
+
+    /// Upsert a user: create if not exists, update if exists.
+    ///
+    /// For OIDC users: MERGE on (auth_provider + external_id).
+    /// For password users: MERGE on (auth_provider + email).
+    pub async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
+        use crate::neo4j::models::AuthProvider;
+
+        let auth_provider_str = user.auth_provider.to_string();
+
+        let q = match user.auth_provider {
+            AuthProvider::Oidc => {
+                let external_id = user
+                    .external_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("OIDC user must have external_id"))?;
+                query(
+                    r#"
+                    MERGE (u:User {auth_provider: $auth_provider, external_id: $external_id})
+                    ON CREATE SET
+                        u.id = $id,
+                        u.email = $email,
+                        u.name = $name,
+                        u.picture_url = $picture_url,
+                        u.password_hash = $password_hash,
+                        u.created_at = datetime($created_at),
+                        u.last_login_at = datetime($last_login_at)
+                    ON MATCH SET
+                        u.email = $email,
+                        u.name = $name,
+                        u.picture_url = $picture_url,
+                        u.last_login_at = datetime($last_login_at)
+                    RETURN u
+                    "#,
+                )
+                .param("external_id", external_id.to_string())
+            }
+            AuthProvider::Password => query(
+                r#"
+                MERGE (u:User {auth_provider: $auth_provider, email: $email})
+                ON CREATE SET
+                    u.id = $id,
+                    u.name = $name,
+                    u.picture_url = $picture_url,
+                    u.external_id = $external_id,
+                    u.password_hash = $password_hash,
+                    u.created_at = datetime($created_at),
+                    u.last_login_at = datetime($last_login_at)
+                ON MATCH SET
+                    u.name = $name,
+                    u.picture_url = $picture_url,
+                    u.last_login_at = datetime($last_login_at)
+                RETURN u
+                "#,
+            ),
+        }
+        .param("id", user.id.to_string())
+        .param("auth_provider", auth_provider_str)
+        .param("email", user.email.clone())
+        .param("name", user.name.clone())
+        .param("picture_url", user.picture_url.clone().unwrap_or_default())
+        .param("external_id", user.external_id.clone().unwrap_or_default())
+        .param(
+            "password_hash",
+            user.password_hash.clone().unwrap_or_default(),
+        )
+        .param("created_at", user.created_at.to_rfc3339())
+        .param("last_login_at", user.last_login_at.to_rfc3339());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("u")?;
+            self.node_to_user(&node)
+        } else {
+            anyhow::bail!("upsert_user: no row returned")
+        }
+    }
+
+    /// Get a user by internal UUID
+    pub async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>> {
+        let q = query("MATCH (u:User {id: $id}) RETURN u").param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("u")?;
+            Ok(Some(self.node_to_user(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get a user by provider and external ID (for OIDC lookups)
+    pub async fn get_user_by_provider_id(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<UserNode>> {
+        let q =
+            query("MATCH (u:User {auth_provider: $provider, external_id: $external_id}) RETURN u")
+                .param("provider", provider)
+                .param("external_id", external_id);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("u")?;
+            Ok(Some(self.node_to_user(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get a user by email and auth provider
+    pub async fn get_user_by_email_and_provider(
+        &self,
+        email: &str,
+        provider: &str,
+    ) -> Result<Option<UserNode>> {
+        let q = query("MATCH (u:User {email: $email, auth_provider: $provider}) RETURN u")
+            .param("email", email)
+            .param("provider", provider);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("u")?;
+            Ok(Some(self.node_to_user(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get a user by email (any provider)
+    pub async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>> {
+        let q = query("MATCH (u:User {email: $email}) RETURN u").param("email", email);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("u")?;
+            Ok(Some(self.node_to_user(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Create a password-authenticated user
+    pub async fn create_password_user(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+    ) -> Result<UserNode> {
+        let now = chrono::Utc::now();
+        let user = UserNode {
+            id: Uuid::new_v4(),
+            email: email.to_string(),
+            name: name.to_string(),
+            picture_url: None,
+            auth_provider: crate::neo4j::models::AuthProvider::Password,
+            external_id: None,
+            password_hash: Some(password_hash.to_string()),
+            created_at: now,
+            last_login_at: now,
+        };
+        self.upsert_user(&user).await
+    }
+
+    /// List all users
+    pub async fn list_users(&self) -> Result<Vec<UserNode>> {
+        let q = query("MATCH (u:User) RETURN u ORDER BY u.created_at DESC");
+
+        let mut result = self.graph.execute(q).await?;
+        let mut users = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("u")?;
+            users.push(self.node_to_user(&node)?);
+        }
+        Ok(users)
+    }
+
+    /// Parse a Neo4j Node into a UserNode
+    fn node_to_user(&self, node: &neo4rs::Node) -> Result<UserNode> {
+        use crate::neo4j::models::AuthProvider;
+
+        // Parse auth_provider with backward compat: if not present, check for google_id
+        let auth_provider = node
+            .get::<String>("auth_provider")
+            .ok()
+            .and_then(|s| s.parse::<AuthProvider>().ok())
+            .unwrap_or_else(|| {
+                // Legacy: if google_id exists, treat as OIDC
+                if node.get::<String>("google_id").is_ok() {
+                    AuthProvider::Oidc
+                } else {
+                    AuthProvider::Password
+                }
+            });
+
+        // external_id: try new field first, fall back to legacy google_id
+        let external_id = node
+            .get::<String>("external_id")
+            .ok()
+            .and_then(|s| if s.is_empty() { None } else { Some(s) })
+            .or_else(|| {
+                node.get::<String>("google_id").ok().and_then(|s| {
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                })
+            });
+
+        let password_hash = node.get::<String>("password_hash").ok().and_then(|s| {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        });
+
+        Ok(UserNode {
+            id: node.get::<String>("id")?.parse()?,
+            email: node.get("email")?,
+            name: node.get("name")?,
+            picture_url: node.get::<String>("picture_url").ok().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }),
+            auth_provider,
+            external_id,
+            password_hash,
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            last_login_at: node
+                .get::<String>("last_login_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+        })
+    }
+
+    // ================================================================
+    // Refresh Tokens
+    // ================================================================
+
+    /// Store a new refresh token (hashed) linked to a user.
+    pub async fn create_refresh_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let q = query(
+            "CREATE (rt:RefreshToken {
+                token_hash: $token_hash,
+                user_id: $user_id,
+                expires_at: $expires_at,
+                created_at: $created_at,
+                revoked: false
+            })",
+        )
+        .param("token_hash", token_hash.to_string())
+        .param("user_id", user_id.to_string())
+        .param("expires_at", expires_at.to_rfc3339())
+        .param("created_at", chrono::Utc::now().to_rfc3339());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Validate a refresh token by its hash. Returns the token if valid
+    /// (not expired, not revoked).
+    pub async fn validate_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>> {
+        let q = query(
+            "MATCH (rt:RefreshToken {token_hash: $token_hash})
+             RETURN rt",
+        )
+        .param("token_hash", token_hash.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => {
+                let node: neo4rs::Node = row.get("rt")?;
+                let token = crate::neo4j::models::RefreshTokenNode {
+                    token_hash: node.get("token_hash")?,
+                    user_id: node.get::<String>("user_id")?.parse()?,
+                    expires_at: node
+                        .get::<String>("expires_at")?
+                        .parse()
+                        .unwrap_or_else(|_| chrono::Utc::now()),
+                    created_at: node
+                        .get::<String>("created_at")?
+                        .parse()
+                        .unwrap_or_else(|_| chrono::Utc::now()),
+                    revoked: node.get("revoked").unwrap_or(false),
+                };
+
+                // Check if expired or revoked
+                if token.revoked || token.expires_at < chrono::Utc::now() {
+                    Ok(None)
+                } else {
+                    Ok(Some(token))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Consume a refresh token: validate it, revoke it (rotation is single-use)
+    /// and return its user — all in ONE round trip.
+    ///
+    /// This is the hot path of `POST /auth/refresh`. It used to be three separate
+    /// round trips (validate, revoke, load the user), and each one has to acquire
+    /// a Neo4j connection from the pool: when the pool was saturated by the
+    /// workspace fan-out, the request paid that wait three times over (measured
+    /// 2026-10-31: 57 s on `/auth/refresh` while Neo4j itself answered in 5 ms).
+    ///
+    /// Doing it in one statement also closes the rotation race: two concurrent
+    /// refreshes with the same cookie can no longer both read `revoked = false`
+    /// before either of them revokes it. The loser sees `was_revoked = true` and
+    /// gets `None`.
+    ///
+    /// The returned node carries the state observed **before** the revoke, so the
+    /// caller can distinguish "unknown, expired or already used" (`None`) from
+    /// "valid, and now single-use" (`Some`). The second element is the user row
+    /// when it exists in the graph — root accounts live in the config only, so it
+    /// is legitimately `None` and the caller falls back to `auth_config`.
+    pub async fn consume_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<
+        Option<(
+            crate::neo4j::models::RefreshTokenNode,
+            Option<crate::neo4j::models::UserNode>,
+        )>,
+    > {
+        let q = query(
+            "MATCH (rt:RefreshToken {token_hash: $token_hash})
+             WITH rt, rt.revoked AS was_revoked
+             SET rt.revoked = true
+             WITH rt, was_revoked
+             OPTIONAL MATCH (u:User {id: rt.user_id})
+             RETURN rt, was_revoked, u",
+        )
+        .param("token_hash", token_hash.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let Some(row) = result.next().await? else {
+            return Ok(None);
+        };
+
+        let node: neo4rs::Node = row.get("rt")?;
+        let was_revoked: bool = row.get("was_revoked").unwrap_or(false);
+        let token = crate::neo4j::models::RefreshTokenNode {
+            token_hash: node.get("token_hash")?,
+            user_id: node.get::<String>("user_id")?.parse()?,
+            expires_at: node
+                .get::<String>("expires_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            // The observed state, not the one we just wrote.
+            revoked: was_revoked,
+        };
+
+        // Already used, or expired: not a valid rotation. Either way the row is
+        // now revoked, which is the right outcome for both cases.
+        if was_revoked || token.expires_at < chrono::Utc::now() {
+            return Ok(None);
+        }
+
+        // A null `u` (root account, or a user deleted since the login) is not an
+        // error: `node_to_user` on a null would fail, so ask for the node and
+        // treat "not a node" as "no user row".
+        let user = row
+            .get::<neo4rs::Node>("u")
+            .ok()
+            .and_then(|node| self.node_to_user(&node).ok());
+
+        Ok(Some((token, user)))
+    }
+
+    /// Revoke a single refresh token by its hash.
+    pub async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool> {
+        let q = query(
+            "MATCH (rt:RefreshToken {token_hash: $token_hash})
+             SET rt.revoked = true
+             RETURN rt",
+        )
+        .param("token_hash", token_hash.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    // ================================================================
+    // MCP Tokens (long-lived, revocable, scoped — see McpTokenNode)
+    // ================================================================
+
+    /// Record a newly issued MCP token (keyed by its JWT `jti` claim).
+    pub async fn create_mcp_token(
+        &self,
+        user_id: Uuid,
+        jti: &str,
+        label: &str,
+        scope: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let q = query(
+            "CREATE (mt:McpToken {
+                jti: $jti,
+                user_id: $user_id,
+                label: $label,
+                scope: $scope,
+                expires_at: $expires_at,
+                created_at: $created_at,
+                revoked: false
+            })",
+        )
+        .param("jti", jti.to_string())
+        .param("user_id", user_id.to_string())
+        .param("label", label.to_string())
+        .param("scope", scope.to_string())
+        .param("expires_at", expires_at.to_rfc3339())
+        .param("created_at", chrono::Utc::now().to_rfc3339());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Check whether an MCP token (by `jti`) is still active: it must exist,
+    /// not be revoked, and not be expired. Called by the auth middleware on
+    /// every request bearing a `token_type=mcp` JWT.
+    pub async fn is_mcp_token_active(&self, jti: &str) -> Result<bool> {
+        let q = query("MATCH (mt:McpToken {jti: $jti}) RETURN mt.revoked AS revoked, mt.expires_at AS expires_at")
+            .param("jti", jti.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => {
+                let revoked: bool = row.get("revoked").unwrap_or(true);
+                let expires_at: chrono::DateTime<chrono::Utc> = row
+                    .get::<String>("expires_at")?
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                Ok(!revoked && expires_at > chrono::Utc::now())
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Revoke a single MCP token by `jti`. Returns false when no such token
+    /// exists or it doesn't belong to the given user.
+    pub async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool> {
+        let q = query(
+            "MATCH (mt:McpToken {jti: $jti, user_id: $user_id})
+             SET mt.revoked = true
+             RETURN mt",
+        )
+        .param("jti", jti.to_string())
+        .param("user_id", user_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// List all MCP tokens for a user (including revoked/expired, for
+    /// inventory UIs).
+    pub async fn list_mcp_tokens(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
+        let q = query(
+            "MATCH (mt:McpToken {user_id: $user_id})
+             RETURN mt ORDER BY mt.created_at DESC",
+        )
+        .param("user_id", user_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut tokens = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("mt")?;
+            tokens.push(crate::neo4j::models::McpTokenNode {
+                jti: node.get("jti")?,
+                user_id: node.get::<String>("user_id")?.parse()?,
+                label: node.get("label").unwrap_or_default(),
+                scope: node.get("scope").unwrap_or_default(),
+                expires_at: node
+                    .get::<String>("expires_at")?
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                created_at: node
+                    .get::<String>("created_at")?
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                revoked: node.get("revoked").unwrap_or(false),
+            });
+        }
+        Ok(tokens)
+    }
+
+    /// Permanently delete the caller's MCP token records that can no longer
+    /// grant access — revoked ones and expired ones. Active tokens are never
+    /// touched. Returns how many records were removed.
+    ///
+    /// Safe by construction: `is_mcp_token_active` answers `Ok(false)` when no
+    /// node matches a `jti` (see its `None` arm), so removing a dead token's
+    /// record keeps the corresponding JWT rejected. A purge can never
+    /// resurrect a token — which is why deletion here is acceptable at all.
+    ///
+    /// `expires_at` is stored as an RFC 3339 string, always UTC (`+00:00`), so
+    /// the lexicographic `<` below is chronologically correct: the comparison
+    /// diverges on the date/time prefix long before the fractional seconds,
+    /// whose length is the only part that varies.
+    pub async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {
+        let q = query(
+            "MATCH (mt:McpToken {user_id: $user_id})
+             WHERE mt.revoked = true OR mt.expires_at < $now
+             WITH mt, mt.jti AS doomed
+             DETACH DELETE mt
+             RETURN count(doomed) AS purged",
+        )
+        .param("user_id", user_id.to_string())
+        .param("now", chrono::Utc::now().to_rfc3339());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<i64>("purged").unwrap_or(0).max(0) as u64),
+            None => Ok(0),
+        }
+    }
+
+    /// Revoke all refresh tokens for a given user.
+    pub async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
+        let q = query(
+            "MATCH (rt:RefreshToken {user_id: $user_id, revoked: false})
+             SET rt.revoked = true
+             RETURN count(rt) as count",
+        )
+        .param("user_id", user_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => {
+                let count: i64 = row.get("count")?;
+                Ok(count as u64)
+            }
+            None => Ok(0),
+        }
+    }
+}

@@ -1,0 +1,932 @@
+//! Test helper factories and mock state builders
+//!
+//! Provides convenience functions for creating test objects with sensible defaults,
+//! and helpers for building mock AppState / Orchestrator / ToolHandler instances.
+#![allow(dead_code)]
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use crate::meilisearch::mock::MockSearchStore;
+use crate::neo4j::mock::MockGraphStore;
+use crate::neo4j::models::*;
+use crate::notes::{Note, NoteImportance, NoteScope, NoteType};
+use crate::plan::models::*;
+use crate::{AppState, AuthConfig};
+use std::sync::Arc;
+use uuid::Uuid;
+
+/// A no-op trajectory store for tests.
+pub struct NoopStore;
+#[async_trait::async_trait]
+impl neural_routing_runtime::TrajectoryStore for NoopStore {
+    async fn store_trajectory(
+        &self,
+        _t: &neural_routing_runtime::Trajectory,
+    ) -> neural_routing_runtime::routing_error::Result<()> {
+        Ok(())
+    }
+    async fn get_trajectory(
+        &self,
+        _id: &uuid::Uuid,
+    ) -> neural_routing_runtime::routing_error::Result<Option<neural_routing_runtime::Trajectory>>
+    {
+        Ok(None)
+    }
+    async fn list_trajectories(
+        &self,
+        _filter: &neural_routing_runtime::TrajectoryFilter,
+    ) -> neural_routing_runtime::routing_error::Result<Vec<neural_routing_runtime::Trajectory>>
+    {
+        Ok(vec![])
+    }
+    async fn search_similar(
+        &self,
+        _embedding: &[f32],
+        _top_k: usize,
+        _min_sim: f32,
+    ) -> neural_routing_runtime::routing_error::Result<Vec<(neural_routing_runtime::Trajectory, f64)>>
+    {
+        Ok(vec![])
+    }
+    async fn get_stats(
+        &self,
+    ) -> neural_routing_runtime::routing_error::Result<neural_routing_runtime::TrajectoryStats>
+    {
+        Ok(neural_routing_runtime::TrajectoryStats {
+            total_count: 0,
+            avg_reward: 0.0,
+            avg_step_count: 0.0,
+            avg_duration_ms: 0.0,
+            reward_distribution: Default::default(),
+        })
+    }
+    async fn count(&self) -> neural_routing_runtime::routing_error::Result<usize> {
+        Ok(0)
+    }
+    async fn delete_trajectory(
+        &self,
+        _id: &uuid::Uuid,
+    ) -> neural_routing_runtime::routing_error::Result<bool> {
+        Ok(false)
+    }
+}
+
+/// Create a mock trajectory store for tests.
+pub fn mock_trajectory_store() -> Arc<dyn neural_routing_runtime::TrajectoryStore> {
+    Arc::new(NoopStore)
+}
+
+/// Create a mock neural router for tests (disabled by default, no real store).
+pub fn mock_neural_router() -> Arc<tokio::sync::RwLock<neural_routing_runtime::DualTrackRouter>> {
+    let store: Arc<dyn neural_routing_runtime::TrajectoryStore> = Arc::new(NoopStore);
+    let config = neural_routing_runtime::NeuralRoutingConfig {
+        enabled: false, // disabled in tests by default
+        ..Default::default()
+    };
+    let router = neural_routing_runtime::DualTrackRouter::new(store, config);
+    Arc::new(tokio::sync::RwLock::new(router))
+}
+
+// ============================================================================
+// Mock state builders
+// ============================================================================
+
+/// Create a mock AppState with empty in-memory backends
+pub fn mock_app_state() -> AppState {
+    AppState {
+        neo4j: Arc::new(MockGraphStore::new()),
+        meili: Arc::new(MockSearchStore::new()),
+        parser: Arc::new(crate::parser::CodeParser::new().expect("parser init")),
+        config: Arc::new(crate::Config {
+            setup_completed: true,
+            neo4j_uri: "bolt://mock:7687".to_string(),
+            neo4j_user: "neo4j".to_string(),
+            neo4j_password: "mock".to_string(),
+            meilisearch_url: "http://mock:7700".to_string(),
+            meilisearch_key: "mock-key".to_string(),
+            nats_url: None,
+            workspace_path: ".".to_string(),
+            server_port: 0,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
+            chat_permissions: None,
+            chat_default_model: None,
+            chat_max_sessions: None,
+            chat_max_turns: None,
+            chat_session_timeout_secs: None,
+            chat_process_path: None,
+            chat_claude_cli_path: None,
+            chat_auto_update_cli: None,
+            chat_auto_update_app: None,
+            chat_native_turn_timeout_secs: None,
+            chat_native_session_max_tokens: None,
+            chat_obscura_path: None,
+            chat_obscura_browser: None,
+            // Never the local fastembed default in tests: it loads (or downloads, 1.1 GB) the
+            // ONNX model in every Orchestrator::new — measured 3.4 s per test cached, 16 s cold.
+            embedding_provider: Some("disabled".to_string()),
+            embedding_fastembed_model: None,
+            embedding_fastembed_cache_dir: None,
+            embedding_fastembed_batch_size: None,
+            embedding_url: None,
+            embedding_model: None,
+            embedding_api_key: None,
+            embedding_dimensions: None,
+            anthropic_api_key: None,
+            registry_remote_url: None,
+            documents_storage_dir: None,
+            storage_backend: crate::storage::DEFAULT_BACKEND.to_string(),
+            log: Default::default(),
+            neural_routing: Default::default(),
+            config_yaml_path: None,
+        }),
+        neural_router: mock_neural_router(),
+        trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
+        trajectory_store: mock_trajectory_store(),
+        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+    }
+}
+
+/// Create a mock AppState with pre-seeded backends
+pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> AppState {
+    AppState {
+        neo4j: Arc::new(graph),
+        meili: Arc::new(search),
+        parser: Arc::new(crate::parser::CodeParser::new().expect("parser init")),
+        config: Arc::new(crate::Config {
+            setup_completed: true,
+            neo4j_uri: "bolt://mock:7687".to_string(),
+            neo4j_user: "neo4j".to_string(),
+            neo4j_password: "mock".to_string(),
+            meilisearch_url: "http://mock:7700".to_string(),
+            meilisearch_key: "mock-key".to_string(),
+            nats_url: None,
+            workspace_path: ".".to_string(),
+            server_port: 0,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
+            chat_permissions: None,
+            chat_default_model: None,
+            chat_max_sessions: None,
+            chat_max_turns: None,
+            chat_session_timeout_secs: None,
+            chat_process_path: None,
+            chat_claude_cli_path: None,
+            chat_auto_update_cli: None,
+            chat_auto_update_app: None,
+            chat_native_turn_timeout_secs: None,
+            chat_native_session_max_tokens: None,
+            chat_obscura_path: None,
+            chat_obscura_browser: None,
+            // Never the local fastembed default in tests: it loads (or downloads, 1.1 GB) the
+            // ONNX model in every Orchestrator::new — measured 3.4 s per test cached, 16 s cold.
+            embedding_provider: Some("disabled".to_string()),
+            embedding_fastembed_model: None,
+            embedding_fastembed_cache_dir: None,
+            embedding_fastembed_batch_size: None,
+            embedding_url: None,
+            embedding_model: None,
+            embedding_api_key: None,
+            embedding_dimensions: None,
+            anthropic_api_key: None,
+            registry_remote_url: None,
+            documents_storage_dir: None,
+            storage_backend: crate::storage::DEFAULT_BACKEND.to_string(),
+            log: Default::default(),
+            neural_routing: Default::default(),
+            config_yaml_path: None,
+        }),
+        neural_router: mock_neural_router(),
+        trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
+        trajectory_store: mock_trajectory_store(),
+        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+    }
+}
+
+/// Create a mock AppState with a shared Arc<MockGraphStore> (allows direct access in tests)
+pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
+    AppState {
+        neo4j: graph,
+        meili: Arc::new(MockSearchStore::new()),
+        parser: Arc::new(crate::parser::CodeParser::new().expect("parser init")),
+        config: Arc::new(crate::Config {
+            setup_completed: true,
+            neo4j_uri: "bolt://mock:7687".to_string(),
+            neo4j_user: "neo4j".to_string(),
+            neo4j_password: "mock".to_string(),
+            meilisearch_url: "http://mock:7700".to_string(),
+            meilisearch_key: "mock-key".to_string(),
+            nats_url: None,
+            workspace_path: ".".to_string(),
+            server_port: 0,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
+            chat_permissions: None,
+            chat_default_model: None,
+            chat_max_sessions: None,
+            chat_max_turns: None,
+            chat_session_timeout_secs: None,
+            chat_process_path: None,
+            chat_claude_cli_path: None,
+            chat_auto_update_cli: None,
+            chat_auto_update_app: None,
+            chat_native_turn_timeout_secs: None,
+            chat_native_session_max_tokens: None,
+            chat_obscura_path: None,
+            chat_obscura_browser: None,
+            // Never the local fastembed default in tests: it loads (or downloads, 1.1 GB) the
+            // ONNX model in every Orchestrator::new — measured 3.4 s per test cached, 16 s cold.
+            embedding_provider: Some("disabled".to_string()),
+            embedding_fastembed_model: None,
+            embedding_fastembed_cache_dir: None,
+            embedding_fastembed_batch_size: None,
+            embedding_url: None,
+            embedding_model: None,
+            embedding_api_key: None,
+            embedding_dimensions: None,
+            anthropic_api_key: None,
+            registry_remote_url: None,
+            documents_storage_dir: None,
+            storage_backend: crate::storage::DEFAULT_BACKEND.to_string(),
+            log: Default::default(),
+            neural_routing: Default::default(),
+            config_yaml_path: None,
+        }),
+        neural_router: mock_neural_router(),
+        trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
+        trajectory_store: mock_trajectory_store(),
+        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+    }
+}
+
+/// Create a mock AppState with shared access to BOTH graph and search stores.
+///
+/// Returns (AppState, Arc<MockGraphStore>, Arc<MockSearchStore>) so tests can
+/// inspect both stores after operations.
+pub fn mock_app_state_with_stores() -> (AppState, Arc<MockGraphStore>, Arc<MockSearchStore>) {
+    let graph = Arc::new(MockGraphStore::new());
+    let meili = Arc::new(MockSearchStore::new());
+    let state = AppState {
+        neo4j: graph.clone(),
+        meili: meili.clone(),
+        parser: Arc::new(crate::parser::CodeParser::new().expect("parser init")),
+        config: Arc::new(crate::Config {
+            setup_completed: true,
+            neo4j_uri: "bolt://mock:7687".to_string(),
+            neo4j_user: "neo4j".to_string(),
+            neo4j_password: "mock".to_string(),
+            meilisearch_url: "http://mock:7700".to_string(),
+            meilisearch_key: "mock-key".to_string(),
+            nats_url: None,
+            workspace_path: ".".to_string(),
+            server_port: 0,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
+            chat_permissions: None,
+            chat_default_model: None,
+            chat_max_sessions: None,
+            chat_max_turns: None,
+            chat_session_timeout_secs: None,
+            chat_process_path: None,
+            chat_claude_cli_path: None,
+            chat_auto_update_cli: None,
+            chat_auto_update_app: None,
+            chat_native_turn_timeout_secs: None,
+            chat_native_session_max_tokens: None,
+            chat_obscura_path: None,
+            chat_obscura_browser: None,
+            // Never the local fastembed default in tests: it loads (or downloads, 1.1 GB) the
+            // ONNX model in every Orchestrator::new — measured 3.4 s per test cached, 16 s cold.
+            embedding_provider: Some("disabled".to_string()),
+            embedding_fastembed_model: None,
+            embedding_fastembed_cache_dir: None,
+            embedding_fastembed_batch_size: None,
+            embedding_url: None,
+            embedding_model: None,
+            embedding_api_key: None,
+            embedding_dimensions: None,
+            anthropic_api_key: None,
+            registry_remote_url: None,
+            documents_storage_dir: None,
+            storage_backend: crate::storage::DEFAULT_BACKEND.to_string(),
+            log: Default::default(),
+            neural_routing: Default::default(),
+            config_yaml_path: None,
+        }),
+        neural_router: mock_neural_router(),
+        trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
+        trajectory_store: mock_trajectory_store(),
+        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+    };
+    (state, graph, meili)
+}
+
+/// Create a test AuthConfig suitable for integration tests.
+///
+/// Uses a fixed JWT secret and disables domain restriction.
+/// Tests that use `create_router()` should pass `Some(test_auth_config())`
+/// as `auth_config` so requests are authenticated with a real JWT instead of falling into anonymous (open) mode.
+pub fn test_auth_config() -> AuthConfig {
+    AuthConfig {
+        jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
+        access_token_expiry_secs: 900,
+        refresh_token_expiry_secs: 604800,
+        allowed_email_domain: None,
+        allowed_emails: None,
+        frontend_url: None,
+        additional_origins: vec![],
+        allow_registration: false,
+        root_account: None,
+        oidc: None,
+        google_client_id: Some("test-client-id".to_string()),
+        google_client_secret: Some("test-client-secret".to_string()),
+        google_redirect_uri: Some("http://localhost:3000/auth/callback".to_string()),
+    }
+}
+
+/// Generate a valid Bearer token string for test requests.
+///
+/// Returns the full header value: `"Bearer eyJ..."`.
+/// Uses the same secret as `test_auth_config()`.
+pub fn test_bearer_token() -> String {
+    let token = crate::auth::jwt::encode_jwt(
+        Uuid::new_v4(),
+        "test@ffs.holdings",
+        "Test User",
+        "test-secret-key-minimum-32-chars!!",
+        28800,
+    )
+    .expect("test token encoding should succeed");
+    format!("Bearer {}", token)
+}
+
+// ============================================================================
+// Test data factories
+// ============================================================================
+
+/// Create a test project with sensible defaults
+pub fn test_project() -> ProjectNode {
+    ProjectNode {
+        id: Uuid::new_v4(),
+        name: "test-project".to_string(),
+        slug: "test-project".to_string(),
+        root_path: "/tmp/test-project".to_string(),
+        description: Some("A test project".to_string()),
+        created_at: chrono::Utc::now(),
+        last_synced: None,
+        analytics_computed_at: None,
+        last_co_change_computed_at: None,
+        default_note_energy: None,
+        scaffolding_override: None,
+        sharing_policy: None,
+        watch_enabled: true,
+        profile: Default::default(),
+    }
+}
+
+/// Create a test project with a specific name/slug
+pub fn test_project_named(name: &str) -> ProjectNode {
+    ProjectNode {
+        id: Uuid::new_v4(),
+        name: name.to_string(),
+        slug: name.to_lowercase().replace(' ', "-"),
+        root_path: format!("/tmp/{}", name.to_lowercase().replace(' ', "-")),
+        description: Some(format!("Test project: {}", name)),
+        created_at: chrono::Utc::now(),
+        last_synced: None,
+        analytics_computed_at: None,
+        last_co_change_computed_at: None,
+        default_note_energy: None,
+        scaffolding_override: None,
+        watch_enabled: true,
+        sharing_policy: None,
+        profile: Default::default(),
+    }
+}
+
+/// Create a test plan with sensible defaults
+pub fn test_plan() -> PlanNode {
+    PlanNode::new(
+        "Test Plan".to_string(),
+        "A test plan for unit testing".to_string(),
+        "test-agent".to_string(),
+        5,
+    )
+}
+
+/// Create a test plan linked to a project
+pub fn test_plan_for_project(project_id: Uuid) -> PlanNode {
+    PlanNode::new_for_project(
+        "Test Plan".to_string(),
+        "A test plan for unit testing".to_string(),
+        "test-agent".to_string(),
+        5,
+        project_id,
+    )
+}
+
+/// Create a test task with sensible defaults
+pub fn test_task() -> TaskNode {
+    TaskNode {
+        id: Uuid::new_v4(),
+        title: Some("Test Task".to_string()),
+        description: "Implement test functionality".to_string(),
+        status: TaskStatus::Pending,
+        assigned_to: None,
+        interrupted_at: None,
+        interrupted_reason: None,
+        priority: Some(5),
+        tags: vec!["test".to_string()],
+        acceptance_criteria: vec!["Tests pass".to_string()],
+        affected_files: vec![],
+        estimated_complexity: Some(3),
+        due_date: None,
+        estimated_minutes: None,
+        actual_complexity: None,
+        created_at: chrono::Utc::now(),
+        updated_at: None,
+        started_at: None,
+        completed_at: None,
+        frustration_score: 0.0,
+        execution_context: None,
+        persona: None,
+        prompt_cache: None,
+    }
+}
+
+/// Create a test task with a specific title
+pub fn test_task_titled(title: &str) -> TaskNode {
+    let mut task = test_task();
+    task.title = Some(title.to_string());
+    task.description = format!("Task: {}", title);
+    task
+}
+
+/// Create a test step
+pub fn test_step(order: u32, description: &str) -> StepNode {
+    StepNode::new(order, description.to_string(), None)
+}
+
+/// Create a test decision
+pub fn test_decision(description: &str, rationale: &str) -> DecisionNode {
+    DecisionNode {
+        id: Uuid::new_v4(),
+        description: description.to_string(),
+        rationale: rationale.to_string(),
+        alternatives: vec![],
+        chosen_option: None,
+        decided_by: "test-agent".to_string(),
+        decided_at: chrono::Utc::now(),
+        status: DecisionStatus::Accepted,
+        embedding: None,
+        embedding_model: None,
+        scar_intensity: 0.0,
+        sharing_consent: Default::default(),
+    }
+}
+
+/// Create a test constraint
+pub fn test_constraint(constraint_type: ConstraintType, description: &str) -> ConstraintNode {
+    ConstraintNode {
+        id: Uuid::new_v4(),
+        constraint_type,
+        description: description.to_string(),
+        enforced_by: None,
+    }
+}
+
+/// Create a test workspace
+pub fn test_workspace() -> WorkspaceNode {
+    WorkspaceNode {
+        id: Uuid::new_v4(),
+        name: "Test Workspace".to_string(),
+        slug: "test-workspace".to_string(),
+        description: Some("A test workspace".to_string()),
+        created_at: chrono::Utc::now(),
+        updated_at: None,
+        metadata: serde_json::json!({}),
+    }
+}
+
+/// Create a test note
+pub fn test_note(project_id: Uuid, note_type: NoteType, content: &str) -> Note {
+    Note::new_full(
+        Some(project_id),
+        note_type,
+        NoteImportance::Medium,
+        NoteScope::Project,
+        content.to_string(),
+        vec![],
+        "test-agent".to_string(),
+    )
+}
+
+/// Create a test commit
+pub fn test_commit(hash: &str, message: &str) -> CommitNode {
+    CommitNode {
+        hash: hash.to_string(),
+        message: message.to_string(),
+        author: "test-author".to_string(),
+        timestamp: chrono::Utc::now(),
+    }
+}
+
+/// Create a test release
+pub fn test_release(project_id: Uuid, version: &str) -> ReleaseNode {
+    ReleaseNode {
+        id: Uuid::new_v4(),
+        project_id,
+        version: version.to_string(),
+        title: Some(format!("Release {}", version)),
+        description: None,
+        status: ReleaseStatus::Planned,
+        target_date: None,
+        released_at: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+/// Create a test chat session
+pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
+    ChatSessionNode {
+        file_scope_lifted: false,
+        mirror_of: None,
+        routing_pool: None,
+        routing_mode: None,
+        id: Uuid::new_v4(),
+        cli_session_id: None,
+        project_slug: project_slug.map(|s| s.to_string()),
+        workspace_slug: None,
+        cwd: "/tmp/test".to_string(),
+        title: None,
+        model: "claude-opus-4-6".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        message_count: 0,
+        total_cost_usd: None,
+        conversation_id: None,
+        preview: None,
+        permission_mode: None,
+        add_dirs: None,
+        spawned_by: None,
+        provider_id: None,
+        routed_by: None,
+        capabilities: None,
+        engine: None,
+        resume_token: None,
+        execution_place: Default::default(),
+        project_inferred: false,
+        access: Default::default(),
+        owner: None,
+    }
+}
+
+/// Create a test user (OIDC provider)
+pub fn test_user() -> UserNode {
+    UserNode {
+        id: Uuid::new_v4(),
+        email: "test@ffs.holdings".to_string(),
+        name: "Test User".to_string(),
+        picture_url: Some("https://lh3.googleusercontent.com/test".to_string()),
+        auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+        external_id: Some("google-id-123456".to_string()),
+        password_hash: None,
+        created_at: chrono::Utc::now(),
+        last_login_at: chrono::Utc::now(),
+    }
+}
+
+/// Create a test milestone
+pub fn test_milestone(project_id: Uuid, title: &str) -> MilestoneNode {
+    MilestoneNode {
+        id: Uuid::new_v4(),
+        project_id,
+        title: title.to_string(),
+        description: None,
+        status: MilestoneStatus::Open,
+        target_date: None,
+        closed_at: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+/// A plan "Plan mid" with a task "Task mid" next to it in the neighborhood graph,
+/// both owned by `project`; returns the id of the plan.
+pub async fn seed_plan_with_task(
+    mock: &crate::neo4j::mock::MockGraphStore,
+    project: Uuid,
+) -> String {
+    use crate::graph::neighborhood::RawNode;
+    let node = |id: String, ty: &str, label: &str| RawNode {
+        id,
+        node_type: ty.into(),
+        label: label.into(),
+        subtitle: None,
+        weight: 1.0,
+    };
+    let plan = Uuid::new_v4().to_string();
+    let task = Uuid::new_v4().to_string();
+    for n in [
+        node(plan.clone(), "plan", "Plan mid"),
+        node(task.clone(), "task", "Task mid"),
+    ] {
+        mock.neighborhood_ownership
+            .write()
+            .await
+            .project_of
+            .insert(n.id.clone(), project.to_string());
+        mock.neighborhood_graph.write().await.add_node(n);
+    }
+    mock.neighborhood_graph
+        .write()
+        .await
+        .add_edge(&plan, &task, "RELATES_TO", 0.9);
+    plan
+}
+
+/// A global persona called `name`, naming `model_preference` (free text) or none.
+pub fn test_persona(name: &str, model_preference: Option<&str>) -> PersonaNode {
+    PersonaNode {
+        id: Uuid::new_v4(),
+        project_id: None,
+        name: name.to_string(),
+        description: format!("Expert in {name}"),
+        status: PersonaStatus::Emerging,
+        complexity_default: None,
+        timeout_secs: None,
+        max_cost_usd: None,
+        model_preference: model_preference.map(str::to_string),
+        system_prompt_override: None,
+        energy: 0.5,
+        cohesion: 0.0,
+        activation_count: 0,
+        success_rate: 0.0,
+        avg_duration_secs: 0.0,
+        last_activated: None,
+        energy_boost_accumulated: 0.0,
+        energy_history: vec![],
+        origin: PersonaOrigin::Manual,
+        created_at: chrono::Utc::now(),
+        updated_at: None,
+    }
+}
+
+/// The `ServerState` [`serve_chat`] builds — no-auth, chat served by `manager`
+/// over `graph` — WITHOUT starting a server: what a test hands to a handler it
+/// calls directly instead of going over HTTP.
+pub async fn server_state_with_chat(
+    manager: Arc<crate::chat::manager::ChatManager>,
+    graph: Arc<MockGraphStore>,
+) -> Arc<crate::api::handlers::ServerState> {
+    use crate::api::handlers::ServerState;
+    use crate::orchestrator::watcher::FileWatcher;
+    use crate::orchestrator::Orchestrator;
+
+    let app_state = mock_app_state_with_graph(graph);
+    let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+    let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+        orchestrator.clone(),
+    )));
+    Arc::new(ServerState {
+        orchestrator,
+        watcher,
+        chat_manager: Some(manager),
+        event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        ))),
+        nats_emitter: None,
+        auth_config: None,
+        serve_frontend: false,
+        frontend_path: "./dist".to_string(),
+        setup_completed: true,
+        server_port: 0,
+        public_url: None,
+        remote_mcp: crate::RemoteMcpConfig::default(),
+        ingress: Default::default(),
+        ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        registry_remote_url: None,
+        oidc_client: None,
+        neural_router: mock_neural_router(),
+        trajectory_collector: std::sync::RwLock::new(None),
+        trajectory_store: None,
+        identity: None,
+        reactor_counters: std::sync::OnceLock::new(),
+        confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+        model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+        vault: crate::vault::VaultService::ephemeral(),
+    })
+}
+
+/// The real router (no-auth mode) on a loopback port, its chat served by
+/// `manager` over `graph`: what a WebSocket client of `/ws/chat/{id}` talks to
+/// in the tests.
+pub async fn serve_chat(
+    manager: Arc<crate::chat::manager::ChatManager>,
+    graph: Arc<MockGraphStore>,
+) -> std::net::SocketAddr {
+    let state = server_state_with_chat(manager, graph).await;
+    let app = crate::api::routes::create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    addr
+}
+
+/// The real router over `graph`, with authentication ON ([`test_auth_config`]):
+/// what a test that carries a signed token — a person's, or a chat session's —
+/// talks to. [`serve_chat`] is the no-auth variant used by the WebSocket tests.
+pub async fn router_with_auth(graph: Arc<MockGraphStore>) -> axum::Router {
+    router_with_auth_and_events(graph).await.0
+}
+
+/// [`router_with_auth`], with the event bus its handlers emit on: what a test
+/// that checks the CRUD events of `/ws/events` subscribes to.
+pub async fn router_with_auth_and_events(
+    graph: Arc<MockGraphStore>,
+) -> (axum::Router, Arc<crate::events::HybridEmitter>) {
+    use crate::api::handlers::ServerState;
+    use crate::orchestrator::watcher::FileWatcher;
+    use crate::orchestrator::Orchestrator;
+
+    let app_state = mock_app_state_with_graph(graph);
+    let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+    let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+        orchestrator.clone(),
+    )));
+    let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+        crate::events::EventBus::default(),
+    )));
+    let state = Arc::new(ServerState {
+        orchestrator,
+        watcher,
+        chat_manager: None,
+        event_bus: event_bus.clone(),
+        nats_emitter: None,
+        auth_config: Some(test_auth_config()),
+        serve_frontend: false,
+        frontend_path: "./dist".to_string(),
+        setup_completed: true,
+        server_port: 0,
+        public_url: None,
+        remote_mcp: crate::RemoteMcpConfig::default(),
+        ingress: Default::default(),
+        ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        registry_remote_url: None,
+        oidc_client: None,
+        neural_router: mock_neural_router(),
+        trajectory_collector: std::sync::RwLock::new(None),
+        trajectory_store: None,
+        identity: None,
+        reactor_counters: std::sync::OnceLock::new(),
+        confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+        model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+        vault: crate::vault::VaultService::ephemeral(),
+    });
+    (crate::api::routes::create_router(state), event_bus)
+}
+
+/// A throwaway git repository holding ONE commit that touches `a.rs`, with its path.
+///
+/// The `TempDir` is returned so the caller keeps it alive: dropping it deletes the
+/// repository, and a test that only kept the path would then read a directory that no
+/// longer exists. Shared by the episode collector and the enricher, which must read the
+/// SAME window from the SAME working tree (RM-4).
+pub fn git_repo_with_one_commit() -> (tempfile::TempDir, String) {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&path)
+            .output()
+            .expect("git must be installed for this test");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.invalid"]);
+    git(&["config", "user.name", "test"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(path.join("a.rs"), "fn a() {}\n").expect("write a.rs");
+    git(&["add", "."]);
+    // The commit is dated TWO HOURS AGO on purpose: a window can then be chosen to
+    // include it or to exclude it, without relying on how git reads a future date (it
+    // does not filter on one, which made the first version of this helper useless for
+    // testing an empty window).
+    let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    let out = Command::new("git")
+        .args(["commit", "-q", "-m", "feat: a"])
+        .env("GIT_AUTHOR_DATE", &two_hours_ago)
+        .env("GIT_COMMITTER_DATE", &two_hours_ago)
+        .current_dir(&path)
+        .output()
+        .expect("git commit");
+    assert!(
+        out.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cwd = path.to_string_lossy().to_string();
+    (dir, cwd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    #[test]
+    fn test_mock_app_state_creation() {
+        let state = mock_app_state();
+        assert_eq!(state.config.neo4j_uri, "bolt://mock:7687");
+    }
+
+    #[test]
+    fn test_factory_functions_produce_valid_objects() {
+        let project = test_project();
+        assert!(!project.name.is_empty());
+
+        let plan = test_plan();
+        assert_eq!(plan.status, PlanStatus::Draft);
+
+        let task = test_task();
+        assert_eq!(task.status, TaskStatus::Pending);
+
+        let step = test_step(0, "First step");
+        assert_eq!(step.order, 0);
+
+        let workspace = test_workspace();
+        assert!(!workspace.slug.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mock_state_can_create_plan_manager() {
+        let state = mock_app_state();
+        let pm = crate::plan::PlanManager::new(state.neo4j.clone(), state.meili.clone());
+
+        let plan = test_plan();
+        let req = CreatePlanRequest {
+            title: plan.title.clone(),
+            description: plan.description.clone(),
+            project_id: None,
+            priority: Some(5),
+            constraints: None,
+        };
+
+        let result = pm.create_plan(req, "test-agent").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mock_state_can_create_note_manager() {
+        let state = mock_app_state();
+        let nm = crate::notes::NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        let project = test_project();
+        // Store project first so note_to_document can find it
+        state.neo4j.create_project(&project).await.unwrap();
+
+        let req = crate::notes::CreateNoteRequest {
+            sharing_consent: None,
+            project_id: Some(project.id),
+            note_type: NoteType::Tip,
+            content: "Test note content".to_string(),
+            importance: Some(NoteImportance::Medium),
+            scope: None,
+            tags: None,
+            anchors: None,
+            assertion_rule: None,
+            run_id: None,
+        };
+
+        let result = nm.create_note(req, "test-agent").await;
+        assert!(result.is_ok());
+    }
+}

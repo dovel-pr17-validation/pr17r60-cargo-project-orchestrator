@@ -1,0 +1,409 @@
+# Providers: connecting a model other than Claude Code
+
+Claude Code is built in and needs nothing. Any other model is a **provider instance**
+you register, allow per project, and (when it needs a key) grant a key to.
+
+## Which engine runs what
+
+| Provider | Engine | Notes |
+|---|---|---|
+| `claude-code` (built in) | the **agent engine** (default), or the historical engine with `CHAT_PROVIDER_PATH=legacy` | hooks, message queue, auto-continue, retry, compaction, NATS and images work on both |
+| a registered instance (OpenAI-compatible, Codex, ACP) | the **agent engine** | always, whatever `CHAT_PROVIDER_PATH` says |
+
+Since M2 the agent engine is the default for Claude Code too: the parity matrix
+(`docs/parity/engines.md`) measures it on the same transcript as the historical engine.
+`CHAT_PROVIDER_PATH=legacy` keeps Claude Code on the historical engine.
+The compaction instructions the knowledge graph builds (`PreCompact`) reach the CLI on both
+engines, as the hook answer's `systemMessage`: the CLI appends it to the summary's
+instructions and **also shows it to the user** in its "Compacted…" line. It ignores `reason`
+(measured on Claude Code 2.1.295, task M2c; re-checked on each CLI bump, see
+`docs/parity/engines.md`).
+The agent engine ports hooks, message queue, auto-continue, retry, compaction and NATS.
+Every `system_init` of an agent session carries `engine: "agent"` and `degraded_features`,
+the list of what that session does not do, for instance:
+
+- `subagents`: an ACP agent has no sub-agents, and the backend runs `Agent` calls as child
+  sessions for the native harness only;
+- `compaction`: a native model whose context window is unknown (the endpoint's probe and
+  catalogue give none) is never compacted: the native harness compacts against that window;
+- `images`, `project_orchestrator_tools`, `nexus_tools`: what the model, the provider or the
+  installation lacks.
+
+For a Claude Code session the server logs a warning naming that list, and nothing when it is
+empty.
+The engine is frozen when a conversation opens, like its provider: a conversation resumes on
+the engine it was opened on, whatever `CHAT_PROVIDER_PATH` says now. A conversation opened
+on the historical engine before the switch keeps it, and moving back to `legacy` breaks no
+conversation opened on the agent engine.
+A Claude Code turn cut by a server restart is closed, not resumed at boot: nobody would be
+there to watch the tools it runs. Send the message again.
+
+**Rollback.** `CHAT_PROVIDER_PATH=legacy` applies to new conversations only: the ones already
+opened on the agent engine stay there. Downgrading the server to v0.0.17 needs
+`CHAT_PROVIDER_PATH=agent` for them, or they answer `409 engine_unavailable`.
+
+## Before the first connection
+
+1. **Authentication must be on.** A third-party provider is refused (`409 security_gate_closed`)
+   on a server running without authentication: session tokens cannot be bound to a signing key.
+2. A person (not an agent) does every step below. An agent session token gets `403`.
+
+## First connection, step by step
+
+1. **Open `/providers`** (or call `POST /api/chat/providers`). Body, references only:
+   `{ "id": "deepseek", "kind": "openai_compatible", "preset": "deepseek", "label": "DeepSeek",
+   "base_url": "https://api.deepseek.com/v1", "default_model": "deepseek-chat",
+   "cost_source": "priced", "credential_ref": "vault:deepseek" }`.
+   No field takes a secret value; an unknown field (an `api_key`) is refused.
+   - `credential_ref` is `none`, `vault:<name>` or `env:<VAR>`. `env:` is refused unless
+     `<VAR>` is declared in `CHAT_PROVIDER_ENV_CREDENTIALS` (comma separated, empty by default).
+   - `kind: "codex"` runs the `codex` program of the server's PATH. `kind: "acp"` names, with
+     `preset`, an agent declared in `CHAT_PROVIDER_ACP_COMMANDS`
+     (`{"opencode": ["opencode", "acp"]}`). A request never carries a command line.
+2. **Store the key in the vault** (unlock it first) under the name the instance's `credential_ref` gives.
+3. **Grant the key to the instance**: `POST /api/vault/grants` with
+   `{"secrets": {"kind":"names","names":["deepseek"]}, "scope": {"kind":"provider","value":"deepseek"}}`
+   plus the unlock proof. It must name exactly the instance's key.
+4. **Test the connection**: `POST /api/chat/providers/test` with the same body (a draft that carries a
+   key is tested only after it is saved). The verdict says whether the endpoint is reachable, the
+   model lists, **can call a tool**, and how large its context window is.
+5. **Allow the project**: `PUT /api/projects/{slug}/llm-consent` with `{provider_id, origin}`, the origin
+   you were shown. The consent is tied to the origin **and** the credential reference: change either
+   and it stops holding. A project never inherits another scope's consent.
+   For the conversations outside any project (the welcome chat, a chat with no `project_slug` and
+   no project cwd), the **root account** allows the instance for those: `PUT /api/chat/llm-consents/{provider_id}`
+   with `{origin}` (same rules; list with `GET /api/chat/llm-consents`, withdraw with `DELETE`; any
+   other person gets `403 root_required`, since it decides for every user's chats). The global pilot
+   role (`PUT /api/chat/roles`) is root-only for the same reason.
+   A refused opening says which consent is missing (`403 endpoint_not_allowed`, `consent_scope`:
+   `project` or `no_project`; none when the endpoint guard refused the URL).
+6. **Open a session** with `provider: "deepseek"`, or set a role (`/api/chat/roles`,
+   `/api/projects/{slug}/llm-roles`) so the project uses it by default.
+
+To edit an instance, `GET /api/chat/providers/{id}` returns what was stored: the full `base_url`
+(path included), `default_model`, `preset`, `cost_source` and the `credential_ref` reference, never a
+secret value. It is for a signed-in person only (an agent token gets `403`, an unknown id `404`).
+`GET /api/chat/providers` stays the safe listing: it shows the origin, never a path.
+
+What was sent where is readable at `GET /api/chat/send-journal` (who, project, origin, model; never the content).
+
+## OpenClaw (delegating a conversation to an OpenClaw agent)
+
+OpenClaw speaks ACP through its bridge, `openclaw acp`, which connects to an OpenClaw Gateway.
+Declare it on the server, then register an ACP instance that names it:
+
+```sh
+CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway.example:18789","--token-file","/etc/po/openclaw.token"]}'
+```
+
+```json
+{ "id": "openclaw", "kind": "acp", "preset": "openclaw", "label": "OpenClaw",
+  "default_model": "openclaw", "cost_source": "unknown", "credential_ref": "none" }
+```
+
+- **Use `--token-file`, never `--token`**: a token on the command line is visible to every user of
+  the machine in the process list (and an argument that looks like a secret is refused anyway).
+  The file belongs to the server's user, mode `0600`.
+- **No project-orchestrator tools in the session.** The bridge refuses MCP servers given per
+  session (`session/new` answers "ACP bridge mode does not support per-session MCP servers";
+  older versions **ignored them without a word**). The session is opened **without** the
+  project-orchestrator MCP server and says so: `degraded_features` carries
+  `project_orchestrator_tools` (the same banner as a remote Claude Code). How the server knows:
+  - **the declaration**, which wins over the name and the learned refusal for **every new
+    session** (a resumed one: see below): an entry may be an object,
+    `{"openclaw": {"argv": ["npx", "openclaw", "acp", "--token-file", "/etc/po/openclaw.token"], "per_session_mcp": false}}`.
+    Declare it for an older OpenClaw (nothing to learn: it says nothing) and for any agent
+    that takes no MCP server. `"per_session_mcp": true` forces the other way. An entry with
+    an unknown or misspelt field is left out, never half-read, with a warning naming it in the
+    server log (its instance then answers that the agent is not declared);
+  - **the name**, as a convenience: the PROGRAM the command runs is `openclaw` (file name, a
+    package version and one extension removed): `argv[0]` (`openclaw`, `/usr/bin/openclaw`,
+    `OpenClaw.cmd`), or what a known launcher runs, its options skipped (`npx [--yes]
+    openclaw[@version]`, `pnpx openclaw`, `npm exec|x [--] openclaw`, `pnpm [-C <dir>]
+    dlx|exec openclaw`, `yarn dlx|exec openclaw`, `bunx openclaw`, `node …/openclaw.mjs`,
+    `env [VAR=…] openclaw`), or the first word of a command line a launcher is given
+    (`npx -c "openclaw acp"`, `pnpm -c exec "openclaw acp"`, `env -S "openclaw acp"`).
+    An option value, another argument or a URL is never read
+    (`--config ~/.openclaw/openclaw.json`, `--profile openclaw`, `wss://gw/openclaw` leave the
+    agent its servers): a wrapper script of another name needs `"per_session_mcp": false`.
+    So does a command run through a shell or a wrapper the name is not read through: `sh -c`,
+    `bash -lc`, `timeout`, `nohup`, `sudo`, `bun x`, and the implicit launches
+    `yarn openclaw` / `pnpm openclaw`. Missing one is not a security gap, only a
+    round-trip: the agent refuses the servers, nexus opens the session again without them,
+    and the PO token that went out in the refused request is revoked (next point). The
+    options of a launcher that take a value (`--registry <url>`, `--prefix <dir>`,
+    `-p <package>`, …) are skipped;
+  - **the refusal, learned**: an agent that refuses the servers is asked again once without
+    them (the session says so on the thread, `system:mcp_servers_refused`), and the next
+    sessions of that instance are opened without them. Learned **in memory**: a restart of the
+    server, or any change to the instance, forgets it (one more refused round-trip); a
+    resumed session keeps what its first opening found (its frozen capabilities, which a resume
+    never turns back to "takes servers", however many restarts later).
+
+  **A resumed session keeps what its opening found, whatever the declaration says now.** A
+  session opened without the servers (declared, named, refused) is resumed without them even
+  after the entry is changed to `"per_session_mcp": true` (an OpenClaw upgraded to take them):
+  the declaration applies to the sessions opened after it; open a new conversation to get the
+  PO tools. Chosen over letting the declaration win: its frozen capabilities are what the agent
+  actually did, and a wrong `true` would send the session's PO token, once more, to an agent
+  that refuses the servers.
+
+  **The PO token never outlives a refusal.** The project-orchestrator server of a session carries
+  a token bound to it. When the session comes out without its servers, whoever dropped them
+  (the server asking again, or nexus doing it inside `session/new` / `session/load`, which the
+  session's capabilities then say with `per_session_mcp: false`), that token was sent in the
+  refused request: it is revoked at once. An opening or a resume that fails before the session
+  is live revokes it too, and leaves no per-turn router behind. The resumes of one session run
+  one at a time on a given server instance (the lock is local to the process; two instances of
+  a cluster resuming the same session at once are not covered). A message that arrives while
+  another resume of that session on the same instance is opening it, or that was still asking
+  the other instances (up to the NATS RPC timeout) when that resume succeeded, is delivered to
+  the session it opened. It does not resume the session a second time, so no second token
+  supersedes the first one. If that session has died in the meantime, the message resumes it.
+
+  To give OpenClaw the PO tools, configure them on the OpenClaw side
+  (`openclaw mcp set project-orchestrator '<json>'`: a stdio `command`, or the server's `/mcp`
+  over Streamable HTTP when `remote_mcp.enabled`, with its authentication).
+- **Other limits of the bridge**: no `fs/*` or `terminal/*` requests (the agent uses its own
+  tools), no model choice (the model name is a label), no system prompt, no knowledge-graph
+  hooks, no compaction signal, images not sent; permissions are relayed only while a turn is
+  running. Each session is an isolated OpenClaw session (`acp-bridge:<uuid>`) unless the
+  command targets one (`--session agent:main:main`).
+
+
+## Files, shell and web of a native session (`nexus-tools`)
+
+A native session (an OpenAI-compatible instance) has no tool of its own: `Read`, `Bash`, `WebFetch`…
+come from the `nexus-tools` executable, attached to each session. Without it the session has none of
+them and its `system_init.degraded_features` lists `nexus_tools`.
+
+**Where it is.** Every release ships it **next to the `orchestrator` executable**, built at the nexus
+revision the server pins, with https:
+
+| Channel | Path |
+|---|---|
+| archives (`orchestrator[-full]-<v>-<os>-<arch>`) and `install.sh` / `install.ps1` | beside `orchestrator`, `nexus-tools` (`nexus-tools.exe` on Windows) |
+| Homebrew | `$(brew --prefix)/bin/nexus-tools` |
+| `.deb` / `.rpm` | `/usr/bin/nexus-tools` |
+| Docker image | `/app/nexus-tools` |
+| desktop app | a resource of the app; the app sets `NEXUS_TOOLS_PATH` to it |
+
+The server looks, in order: `NEXUS_TOOLS_PATH` (an operator's choice, taken as is), next to its own
+executable, then the `PATH`. To build it yourself: `scripts/build-nexus-tools.sh <root>` (same
+revision, `--features tls`; without `tls`, `WebFetch` over https fails).
+
+**What a project agrees to.** File and shell tools are bounded by the session's directories and
+policy. The network tools follow the project's consent, per **origin** (scheme, host, non-default port):
+
+1. `PUT /api/projects/{slug}/network-tools/origins` with `{"origin": "https://docs.rs"}`. Once a project
+   has consented to one origin, its native sessions are offered `WebFetch`; each call is still refused
+   for an origin that was not consented (`tool_origin_not_allowed`). Revoke with
+   `DELETE /api/projects/{slug}/network-tools/origins?origin=https://docs.rs`.
+2. `WebSearch` needs a **search engine**: `POST /api/chat/search-engines` with
+   `{"id": "brave", "engine": "brave", "credential_ref": "vault:brave"}` (or
+   `{"id": "home", "engine": "searxng", "base_url": "http://localhost:8888"}`). The key is a vault
+   reference, never a value. Grant it with `POST /api/vault/grants`, scope
+   `{"kind":"provider","value":"tool:brave"}`, naming exactly that secret. The project then consents to
+   the engine's origin (`https://api.search.brave.com` for Brave). A locked vault or a missing grant
+   leaves the engine out of the session; no fallback.
+   Several engines are tried in order, falling back down the list: the order is chosen with
+   `PUT /api/chat/search-engines` `{"order": ["home", "brave"]}` (Settings → Network tools); without
+   a choice, by id.
+
+   **Keyless: Obscura.** `{"id": "obscura", "engine": "obscura", "credential_ref": "none"}` (no
+   `base_url`, no key). Each query runs `<obscura> serp --max-results N -- <query>` (the
+   `dsh-obscura-nav` build of the Obscura headless browser, an external executable,
+   never linked in). The server takes the executable from `chat.obscura_path` (config.yaml) or
+   `OBSCURA_BIN` (the variable wins), an absolute path only: a relative one is ignored, with a warning at
+   startup. Without one, the engine runs in nexus-tools itself when that build embeds Obscura (the
+   default of release builds); only a nexus-tools without it falls back to the server's `PATH`
+   (`dsh-obscura-nav`, then `obscura`). A request never names it. The project consents
+   to `https://html.duckduckgo.com`, the page Obscura reads the results from. With none of these the
+   engine is left out (`tool_engine_not_installed`) and `WebSearch` with it.
+
+   **Built in (release builds).** The nexus-tools shipped with every release embeds Obscura
+   (`--features tls,obscura`, `nexus-tools --capabilities` says `"obscura": true`). Then an `obscura`
+   engine exists without being declared: `GET /api/chat/search-engines` lists it as `obscura-builtin`
+   (`"builtin": true`, not deletable; declaring an `obscura` engine replaces it), and a native session
+   whose project has no other engine attached gets a keyless `WebSearch`. The project still consents
+   to its origin like to any other: until it does, each search is refused with
+   `tool_origin_not_allowed: https://html.duckduckgo.com`, naming what to allow. It is never added
+   next to another engine (nexus-tools would fall back to an origin nobody chose).
+3. The browser: `PUT /api/projects/{slug}/network-tools/browser` with `{"allowed": true}`. It is attached
+   only once its executable is also found: `obscura` on the server's `PATH`, the Obscura executable
+   above (else `dsh-obscura-nav` on the `PATH`) with `chat.obscura_browser: true` (or `OBSCURA_BROWSER`:
+   `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`, any case; another value is ignored and the YAML
+   applies), started as `<path> mcp`, or else the
+   browser embedded in nexus-tools (`nexus-tools obscura mcp`, release builds). Its
+   `browser_*` tools then go through the same permission gate as the other MCP tools; navigation needs the
+   destination's origin to be consented too.
+
+`GET /api/projects/{slug}/network-tools` shows all three. Only a signed-in person changes them (an agent
+token gets `403`).
+
+## Routing, roles, aliases, policy
+
+Resolution order: existing session (frozen) > explicit request > task alias > run > project role >
+global role (or an enforced policy rule) > default > Claude Code **when its CLI is on the server** >
+the only other instance allowed here (`routed_by: sole_instance`; never a remote machine). Without the
+Claude Code CLI and with several instances allowed, the opening is refused (`409 provider_not_chosen`,
+`candidates`): name one, or set the pilot role. A request that names `claude-code` is never swapped.
+The level that decided is stored as `routed_by` on the session and the execution. The model policy ships `off`; `shadow` records what it
+would have chosen without applying it; `enforce` applies it.
+
+### The context window: declared, or unknown
+
+A candidate enters the router's pool with what is **known** about it, and three things are never
+guessed: its tools, its window, its price. `/v1/models` publishes a window only when the endpoint
+names it (`context_length`, `max_model_len`, `context_window`, `max_context_length`,
+`meta.n_ctx_train`); NVIDIA NIM answers `id`, `object`, `created`, `owned_by` and nothing else.
+
+Without a window a candidate is rejected **before any scoring** (`context_too_small`, `have: null`):
+it never competes, whatever its price. And the sessions it opens carry
+`degraded_features: [compaction]`, because nothing can decide when to compact — the same absence,
+paid twice.
+
+So an instance may DECLARE that window (`context_window`, in tokens, on create/update; the provider
+form and the `provider` MCP tool both carry it). It is a **floor the operator states**, reported
+back with the source `configured` so it is never mistaken for a measured number. `null` clears it.
+Nothing declared means unknown — exactly the behaviour before the field existed — and unknown is
+refused rather than filled in. The value itself is refused below the router's floor (`8000`, the
+smallest context any turn is assumed to need) and above `100000000`.
+
+## Cost
+
+Two counters: *marginal* (reported or priced: real spend, the only one that can stop a run) and
+*notional* (subscription or free). An unknown price is never a zero. `GET /api/chat/runs/{run_id}/costs`.
+The run totals also carry `cache_read_tokens` and `cache_write_tokens`.
+
+The runner keeps both counters on its run state (`cost_usd` is the marginal one, `notional_usd` the
+other, `tokens_used` the tokens of every attempt) and holds only the marginal one against
+`runner.max_cost_usd`. A provider that states no price (`cost_source: unknown`) never moves it: such a
+run is bounded in tokens by `runner.max_tokens` (or the run's `max_tokens`), and a budgeted run named
+on such a provider without any token budget is refused at start. A task that spends more than its
+profile's `max_cost_usd` raises `task_cost_cap_exceeded` (`runner.per_task_cap: warn`, the default) or
+fails the attempt (`enforce`); a notional amount never does.
+
+Across runs: `GET /api/runner/cost-breakdown?group_by=model|provider|task_class|routed_by&from=&to=`
+(RFC 3339, `[from, to)`, the last 30 days by default) answers one row per group with `executions`,
+`cost: { marginal_usd, notional_usd, unknown_count }` — never summed together —, `tokens`,
+`verified_first_attempt_rate` and `median_duration_secs`. An execution recorded before models were
+stored is filed under `unknown`.
+
+Tokens and prompt cache of a conversation, turn by turn: `GET /api/chat/sessions/{id}/usage`. It returns:
+
+- `input_tokens`, the tokens NOT served from the cache;
+- `output_tokens`, `cache_read_tokens`, `cache_creation_tokens` and `reasoning_tokens`;
+- `cache_hit_ratio`, equal to `cache_read / (input + cache_read)`.
+
+The figures are read from the `result` events stored with the turns, for every provider.
+
+An OpenAI-compatible endpoint (DeepSeek, vLLM…) never reports a cache write, so `cache_creation_tokens` stays absent rather than zero. The native harness also writes one INFO line per model request (`native model request`, target `nexus_claude::native::request`): `host_session_id` is the conversation id, followed by `prompt_tokens`, `cached_tokens`, `latency_ms` and the prefix fingerprint.
+
+## Quotas (how much is left, and until when)
+
+A quota is not health: an exhausted account **answers, and says no**. It is held per provider
+instance, with the instant it serves again, and it survives a restart (`LlmSetting`, scope `global`,
+key `quota:<instance>`).
+
+Three things can say so, and **the most recent word wins, whoever said it** — a live report
+replaces an older manual entry, and a manual entry made after the last report replaces that:
+
+- **live** — the provider's own report (`AgentEvent::Quota`): Claude Code emits `rate_limit_event`
+  at every turn (`five_hour` and `seven_day` windows, each with its utilisation and `resetsAt`),
+  Codex its own limit update. Nexus reads the wire and gives the backend windows in epoch
+  milliseconds; the backend never parses the payload itself.
+- **a refusal** — `ProviderError::RateLimited { resets_at_ms }` marks the account exhausted until
+  that instant. A 402 (out of credit) or a 429 that names neither a date nor a delay falls back to
+  a 300 s cooldown, and **only** then: a mute refusal never shortens a reset already known. Such an
+  entry is flagged `reset_known: false`, so an interface says "about 5 minutes" rather than an hour
+  it invented.
+- **manual** — what a person types for a provider that exposes nothing.
+
+### Routes
+
+| Route | Who |
+|---|---|
+| `GET /api/chat/provider-quotas` | anyone signed in — `{ now_ms, quotas: [...] }` |
+| `GET /api/chat/providers/{id}/quota` | anyone signed in — `{ now_ms, quota }`, `quota: null` when nothing is known |
+| `PUT /api/chat/providers/{id}/quota` | **a person only** (an agent token gets 403) |
+| `DELETE /api/chat/providers/{id}/quota` | **a person only** — forgets what is known |
+
+A quota decides which provider a router may use, so an agent must not write one: it would choose the
+engine it runs on. Mutations under `/api/chat/providers` are reserved to a human session by the auth
+middleware, and the handler checks again. Reads stay open.
+
+One entry of `quotas` (and the `quota` of the single-instance route):
+
+```json
+{
+  "provider_id": "claude-code",
+  "windows": [
+    { "kind": "seven_day", "utilization": 0.97, "resets_at_ms": 1792828800000, "status": "allowed_warning" }
+  ],
+  "source": "live",
+  "observed_at_ms": 1792500000000,
+  "exhausted": { "resets_at_ms": 1792828800000, "reset_known": true, "window": "seven_day", "cause": "window" }
+}
+```
+
+`exhausted` is absent when the account serves (and disappears on its own once the reset has passed —
+nothing runs in the background; the registry simply compares against its clock). `cause` is one of
+`window`, `rate_limited`, `out_of_credit`, `manual`. `now_ms` is the server's clock, so an interface
+shows the reset in the viewer's time zone without trusting its own.
+
+The body of a `PUT` says either until when the account refuses, or where a window stands:
+
+```json
+{ "exhausted_until_ms": 1792600000000 }
+{ "utilization": 0.8, "resets_at_ms": 1792828800000, "window": "seven_day" }
+```
+
+A date further than 400 days away, a utilisation outside `0..=1`, or a body that says nothing at all
+is refused with its reason.
+
+### What Auto does with it
+
+- **Exhausted is a hard exclusion**, until the reset: the candidate is rejected with
+  `quota_exhausted` carrying `resets_at_ms` and the window, and the routing reason says it in
+  words. The exclusion is tested **before** health, because "unhealthy" could not say until when.
+  The instance becomes eligible again at its reset with nobody doing anything.
+- **Near the limit is a soft preference**, not an exclusion: past `QUOTA_NEAR_LIMIT` (0.9 of a
+  window) the utility drops by `quota_weight` × how far past it is (full window = the whole
+  weight). `quota_weight` lives in the routing settings beside `cost_weight` and `latency_weight`
+  (default `0.2`, `0` disables it) — the same single source of configuration, no scattered
+  constants. An account nobody has measured pays nothing: unknown is not empty.
+- **An explicit choice is never swapped in silence.** When the provider a person pinned is
+  exhausted, the turn fails with a message naming the hour it serves again, and the options
+  (wait, switch by hand, or let it resume at the reset) — it does not quietly move the
+  conversation elsewhere.
+- A refusal by the account is **not the model failing**: a 429 or an out-of-credit turn feeds no
+  failure to the learnt arm, so a provider is not demoted for being full.
+
+### Not verified here
+
+The windows and resets were exercised against a **recorded** `rate_limit_event` of the Claude Code
+CLI 2.1.296 and against fake providers, with a simulated clock — never against a real account that
+had actually run out. The Codex and HTTP-header mappings are nexus's and are covered there, not by
+the backend suite.
+
+## Server settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CHAT_PROVIDER_PATH` | `agent` | `legacy` keeps Claude Code on the historical engine (new conversations only; an unknown non-empty value is `legacy`, with a warning) |
+| `CHAT_PROVIDER_ENV_CREDENTIALS` | empty | server variables an instance may name as `env:<VAR>` |
+| `CHAT_PROVIDER_ACP_COMMANDS` | empty | JSON object of ACP agents an instance may launch: `name: [argv]` or `name: {"argv": [...], "per_session_mcp": false}` |
+| `CHAT_CHILD_ENV_INHERIT` | empty | extra variables handed to agent processes (never the server's own secrets) |
+| `CHAT_NATIVE_TURN_TIMEOUT_SECS` (`chat.native_turn_timeout_secs`) | unset | wall-clock cap of one turn of a native session. Unset: no cap, as in Claude Code (`max_turns`, Stop and the model stream's idle deadline still bound a turn). When it fires, the UI says so (`error` frame `turn_time_limit`), the work is kept, and the model is told at the next turn |
+| `CHAT_NATIVE_SESSION_MAX_TOKENS` (`chat.native_session_max_tokens`) | unset | token budget of a native session: input not served from the cache, cache writes and output (cache reads are not counted). Unset: no budget, as in Claude Code. Once spent, every new turn stops before calling the model, and says so (`session_budget_reached`); a session resumed after a restart counts anew |
+| `CHAT_PROCESS_PATH` (`chat.process_path`) | the server's own | PATH of the Claude Code CLI and, since ISO5, of the shell of a local native session (`nexus-tools`): a server run as a service (launchd) otherwise hands it `/usr/bin:/bin:/usr/sbin:/sbin` only |
+
+### Live children cap (a runtime setting, not an environment variable)
+
+The maximum number of child sessions one parent session may keep alive at once (PLAFOND-4) is changed **while the server runs**, with no restart: `GET`/`PUT`/`DELETE /api/chat/delegation-limits` (`{ "max_live_children": N }`, `1..=32`, default `4`). Reading is open to anyone signed in; writing is reserved to the root account (never an agent: a model must not raise its own ceiling). A change applies to the next delegation; lowering it never closes a live child. The value is stored (`LlmSetting` scope `global`, key `delegation_limits`) and read again at startup. `CHAT_MAX_LIVE_CHILDREN` was removed. The compilation governor still serialises builds. A refused call gets `envelope_too_many_children` and names this route.
+
+## Not verified
+
+No real Codex `app-server`, ACP agent, https endpoint or vendor API was exercised: everything was run
+against the fake servers and executables of the test suites.

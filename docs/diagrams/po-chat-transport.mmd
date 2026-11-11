@@ -1,0 +1,95 @@
+%% name: po-chat-transport
+%% covers: backend:src/api/{ws_chat_handler,refs_ws_tests}.rs backend:src/chat/wire_contract.rs backend:src/events/transport.rs
+%% verified: 878281ca
+%% ---
+%% PROUVE : le transport WebSocket du chat — /ws/chat/{session_id} — tel que le code
+%%   le fait au sha d42312a2 (relu le 2026-10-02) : authentification avant l'upgrade,
+%%   rejeu depuis last_event, instantané de flux, boucle select!, et le routage de
+%%   chaque trame cliente vers ChatManager.
+%% ---
+%% SOURCES LUES (backend@d42312a2) :
+%%   src/api/ws_chat_handler.rs — ws_chat, handle_ws_chat_preauthed, handle_ws_chat_loop,
+%%                                WsChatQuery, WsChatClientMessage, spawn_entity_extraction
+%%   src/api/ws_auth.rs         — ws_authenticate (po-api, non couvert ici)
+%%   src/chat/manager.rs        — get_events_since, subscribe, get_streaming_snapshot,
+%%                                get_auto_continue_state, route_user_message, route_permission_response,
+%%                                try_remote_send, is_session_active (po-chat-manager)
+%%   Commandes : grep -rn session_closed src → 0 hors src/protocol (FSM) ;
+%%               grep -n 'InputResponse' src/api/ws_chat_handler.rs → « no resume for responses »
+%% ---
+%% NON ETABLI :
+%%   le chemin NATS (session sur une autre instance) n'est pas testé contre un NATS réel ;
+%%   ws_authenticate est relu dans po-api, pas ici.
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit
+%%   🔴 défaut constaté (raison dans le nœud)  ⚪ amont ou autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié : test nommé"]
+        L2["🟠 écrit, sans test / décidé non écrit"]
+        L3["🔴 défaut constaté"]
+        L4["⚪ amont / autre domaine"]
+    end
+
+    FRONT["⚪ frontend chatWebSocket.ts (po-frontend-chat)<br/>GET /ws/chat/{id}?last_event=N&ticket=T"]
+    AUTH["⚪ ws_auth.rs ws_authenticate (po-api)<br/>cookie ou ticket à usage unique, avant l'upgrade"]
+    MANAGER["⚪ ChatManager (po-chat-manager)"]
+    NATS["⚪ NATS (sessions sur une autre instance)"]
+    RESTCREATE["⚪ chat_handlers::create_session (po-api)<br/>la session naît par REST, jamais par WS"]
+
+    subgraph open["Ouverture — ws_chat → handle_ws_chat_preauthed → handle_ws_chat_loop"]
+        direction TB
+        UPGRADE["🟠 ws_chat : WsChatQuery (last_event, ticket), auth puis upgrade,<br/>trame auth_ok ou auth_error ; écrit, sans test dédié ici<br/>(l'auth est testée dans ws_auth.rs)"]
+        REPLAY["✅ rejeu : get_events_since(last_event) depuis Neo4j<br/>→ subscribe (broadcast local) ou nats.subscribe_chat_events si distante<br/>→ get_streaming_snapshot (ou nats.request_streaming_snapshot) : partial_text + streaming_status<br/>→ replay_complete → auto_continue_state_changed (état réel, gardé pour les anciens frontends)<br/><i>vérifié : test_snapshot_fingerprints_cleared_on_dormant</i>"]
+        UPGRADE --> REPLAY
+    end
+
+    CONTRACT["✅ contrat de fil au niveau des champs — src/chat/wire_contract.rs (test)<br/>docs/api/chat-contract/{server-events,client-messages,control-frames}.json + SHA256SUMS<br/>33 ChatEvent (dont session_closed ; champs additifs facultatifs : tool_use/permission_request category+canonical,<br/>result cost/usage/model/stop_reason, system_init provider/capabilities/tool_policy/policy_mode, ask_user_question synthetic,<br/>permission_mode_changed policy_mode), 9 messages clients, 5 trames de contrôle (auth_ok, partial_text,<br/>replay_complete, events_lagged, session_dormant) + enveloppe seq/replaying<br/>exemples full/minimal par variante, champs requis/optionnels dérivés<br/><i>vérifié : wire_contract_matches_committed_fixtures, every_example_roundtrips,<br/>client_examples_parse_as_their_variant</i><br/>🔴 auth_error n'est émis nulle part dans src/ (le nœud UPGRADE le cite à tort)<br/>🟠 les champs additifs ne sont émis que par le chemin agent (EventMapper) : le chemin hérité n'en porte aucun ; session_closed n'est pas encore émis par close_session<br/>🟠 les trames de contrôle sont des copies statiques, non liées au handler par un test"]
+    CONTRACT -.->|"copié par le frontend, somme de contrôle"| FRONT
+
+    FRONT --> AUTH --> UPGRADE
+    RESTCREATE -.->|"session_id"| FRONT
+
+    subgraph loop["Boucle — select! dans handle_ws_chat_loop"]
+        direction TB
+        SELECT["✅ select! : broadcast local · événements NATS · ping · trames clientes<br/><i>vérifié : test_dormant_select_skips_none_branch</i>"]
+        LAG["✅ broadcast en retard (Lagged) → trame events_lagged<br/>(le client se reconnecte et rejoue l'écart)<br/><i>vérifié : test_broadcast_close_returns_closed_error</i>"]
+        DORMANT["✅ broadcast fermé (CLI nettoyé) → trame session_dormant,<br/>re-souscription après reprise<br/><i>vérifié : test_session_dormant_json_format, test_resubscribe_after_broadcast_close,<br/>test_dormant_resume_lifecycle</i>"]
+        FRAMES["✅ trames serveur hors ChatEvent : auth_ok, partial_text, replay_complete,<br/>events_lagged, session_dormant, error<br/><i>vérifié : test_session_dormant_json_format</i>"]
+        NOCLOSED["🟠 session_closed : jamais émise ici (grep session_closed src → 0 hors FSM), et le<br/>frontend la traite comme branche RÉSERVÉE (« explicit close — future use »). Fermer une<br/>session supprime son canal → session_dormant, le client reste connecté : voulu.<br/>L'émettre serait un changement de contrat à décider à part"]
+        SELECT --> LAG
+        SELECT --> DORMANT
+        FRAMES --> NOCLOSED
+    end
+
+    REPLAY --> SELECT
+    MANAGER -->|"broadcast ChatEvent"| SELECT
+    NATS -->|"événements distants"| SELECT
+
+    subgraph client["Trames clientes — WsChatClientMessage (tag type, snake_case)"]
+        direction TB
+        USERMSG["✅ user_message : spawn_entity_extraction puis route_user_message ;<br/>re-souscription après Resumed / ResumedAfterSendFailure, abonnement NATS après Remote<br/><i>vérifié : test_client_message_deserialization, test_dormant_resume_lifecycle</i>"]
+        QUEUED["🟠 user_message avec queue: true → route_queued_user_message : session en cours de tour = message RETENU<br/>(pending_messages, held) sans interruption, livré par le drain en fin de tour, même sans client connecté ;<br/>session au repos = envoi normal. queue_op (edit, remove, prioritize, send_now, snapshot) → pending_queue_op ;<br/>chaque changement diffuse pending_queue (liste complète), aussi envoyée à la connexion<br/><i>vérifié : test_client_message_deserialization, chat::pending_queue::tests, manager::tests::queue_user_message_*,<br/>pending_queue_ops_*, send_now_* — non vérifié : relais NATS (queue_op, queued_user_message) vers une autre instance</i>"]
+        INTERRUPT["✅ interrupt → ChatManager::interrupt ; cancel_tools → cancel_running_tools<br/><i>vérifié : test_client_message_deserialization</i>"]
+        PERMRESP["✅ permission_response (id, allow) : dédoublonnée par connexion,<br/>→ route_permission_response(require_pending = false)<br/><i>vérifié : test_client_message_deserialization</i>"]
+        INPUTRESP["🟠 input_response (id, content) : local send_message, sinon try_remote_send,<br/>sinon erreur « Session not active on any instance » — pas de reprise,<br/>contrairement à user_message (asymétrie commentée dans le code)"]
+        SETTINGS["✅ set_permission_mode (PROPRIÉTAIRE seulement : may_answer_permissions, refus avant tout changement, lecture du propriétaire en échec = refus ; une PERSONNE qui passe en trust SA session (owner == Some(claims.sub) : jamais une session sans propriétaire — runner, délégation, protocole) lève le périmètre de fichiers : lifts_file_scope_on_switch → lift_file_scope, décision fce98b8a ; test : another_persons_set_permission_mode_is_refused_by_the_websocket_loop, only_a_person_switching_to_trust_lifts_the_file_scope) (session active seulement), set_model,<br/>set_auto_continue (accepté et ignoré, décision 7b95342a : répond auto_continue_state_changed avec l'état réel) → set_session_permission_mode / set_session_model<br/><i>vérifié : test_client_message_deserialization</i>"]
+    end
+
+    SELECT -->|"trame cliente"| USERMSG
+    SELECT --> QUEUED
+    SELECT --> INTERRUPT
+    SELECT --> PERMRESP
+    SELECT --> INPUTRESP
+    SELECT --> SETTINGS
+    USERMSG --> MANAGER
+    QUEUED --> MANAGER
+    INTERRUPT --> MANAGER
+    PERMRESP --> MANAGER
+    INPUTRESP --> MANAGER
+    SETTINGS --> MANAGER
+    USERMSG -.->|"Remote"| NATS
+    PERMRESP -.->|"Remote"| NATS

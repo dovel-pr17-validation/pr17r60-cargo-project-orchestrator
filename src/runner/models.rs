@@ -1,0 +1,1561 @@
+//! Runner models — types for autonomous plan execution
+//!
+//! Defines configuration, state machine, events, and result types
+//! for the PlanRunner execution engine.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use uuid::Uuid;
+
+// ============================================================================
+// RunnerConfig — configurable execution parameters
+// ============================================================================
+
+/// Configuration for the PlanRunner execution engine.
+///
+/// Deserialized from the `[runner]` section of config.yaml.
+/// All fields have sensible defaults for autonomous execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunnerConfig {
+    /// Maximum time (seconds) for a single task before timeout. Default: 10800 (3h).
+    /// Tasks involve code analysis, writing, compilation, tests, and potential retries.
+    /// The guard still injects idle reminders after idle_timeout_secs, so drift is caught early.
+    pub task_timeout_secs: u64,
+    /// Idle timeout (seconds) — if no file edits detected, inject a reminder. Default: 180 (3 min).
+    pub idle_timeout_secs: u64,
+    /// Maximum retries per task on failure. Default: 1.
+    pub max_retries: u32,
+    /// Automatically create a PR when the plan completes. Default: false.
+    pub auto_pr: bool,
+    /// Run `cargo check` / `npm run build` after each task. Default: true.
+    pub build_check: bool,
+    /// Run tests after each task (language-dependent). Default: false.
+    pub test_runner: bool,
+    /// Maximum total cost (USD) for the entire plan run. Abort if exceeded. Default: 50.0.
+    /// Only the MARGINAL counter (costs `reported` or `priced`) is held against it;
+    /// a subscription or a free endpoint never exhausts it (A21).
+    pub max_cost_usd: f64,
+    /// Maximum tokens (input + output of every attempt) for the entire plan run.
+    /// The only budget a run on a provider without a price can have: without it,
+    /// a budgeted run on such a provider is refused at start. Default: none.
+    pub max_tokens: Option<u64>,
+    /// What to do when one task costs more than its profile's `max_cost_usd`
+    /// (marginal only): `warn` (default) emits an event and goes on; `enforce`
+    /// fails the attempt.
+    pub per_task_cap: PerTaskCap,
+    /// Spawning timeout (seconds) — max time to wait for create_session() before aborting.
+    /// Prevents indefinite hangs when ChatManager/Neo4j is unresponsive. Default: 120 (2 min).
+    pub spawning_timeout_secs: u64,
+    /// CWD validation mode — controls behavior when cwd doesn't match project.root_path.
+    /// - "warn" (default): log a warning and emit CwdMismatch event, but continue
+    /// - "strict": return an error if cwd doesn't match root_path
+    pub cwd_validation: CwdValidation,
+    /// Number of consecutive "I'm done" signals before treating the agent as stuck. Default: 5.
+    pub completion_loop_threshold: usize,
+    /// Maximum message length (chars) to consider as a completion signal. Default: 200.
+    /// Messages longer than this are treated as real explanations, not completion loops.
+    pub completion_max_chars: usize,
+    /// Maximum number of auto-continue cycles before giving up. Default: 5.
+    /// Prevents infinite loops when the agent keeps hitting error_max_turns.
+    pub max_auto_continues: u32,
+    /// Maximum number of tasks executed concurrently within a single wave. Default: 4.
+    /// A wave can contain many independent tasks; without a cap the runner would spawn
+    /// one Claude Code session per task simultaneously (unbounded fan-out → cost spikes,
+    /// API rate limits, host saturation). Tasks beyond the cap queue on a semaphore and
+    /// start as permits free up. Set to `0` for unlimited (legacy behaviour, not advised).
+    /// This is also the prerequisite for safely hosting intra-task Dynamic Workflows,
+    /// which themselves fan out up to 16 sub-agents per session.
+    pub max_parallel_tasks: usize,
+}
+
+/// What the runner does with a task whose marginal cost went past its profile's cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerTaskCap {
+    /// Emit `RunnerEvent::TaskCostCapExceeded` and a log, keep the result.
+    #[default]
+    Warn,
+    /// Fail the attempt.
+    Enforce,
+}
+
+/// CWD validation mode for the runner.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CwdValidation {
+    /// Log a warning on mismatch but continue execution
+    #[default]
+    Warn,
+    /// Return an error on mismatch — blocks execution
+    Strict,
+}
+
+/// Wall-clock cap of one task, in seconds (3 h). The ONE source of this default: the
+/// PlanRunner reads it through [`RunnerConfig::default`], and `plan(delegate_task)` through
+/// [`DelegationLimits::default`] (PYSR-3) — never a second constant.
+pub const DEFAULT_TASK_TIMEOUT_SECS: u64 = 10800;
+
+/// Spend cap in USD (marginal cost) — the ONE source, as [`DEFAULT_TASK_TIMEOUT_SECS`].
+pub const DEFAULT_MAX_COST_USD: f64 = 50.0;
+
+/// The delay and the budget of ONE delegation (`plan(delegate_task)`) or sub-agent: its own,
+/// not its parent's turn. Defaults are the PlanRunner's (same constants); `max_tokens` is
+/// `None` like the runner's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DelegationLimits {
+    /// Wall-clock cap, seconds. `0` = unlimited.
+    pub timeout_secs: u64,
+    /// Marginal spend cap, USD. `0` or negative = unlimited.
+    pub max_cost_usd: f64,
+    /// Token cap. `None` = unlimited.
+    pub max_tokens: Option<u64>,
+}
+
+impl DelegationLimits {
+    /// The limits a runner configuration gives one of its tasks.
+    pub fn of_runner(config: &RunnerConfig) -> Self {
+        Self {
+            timeout_secs: config.task_timeout_secs,
+            max_cost_usd: config.max_cost_usd,
+            max_tokens: config.max_tokens,
+        }
+    }
+
+    /// The caps a session request carries (`ChatRequest::max_tokens` / `max_cost_usd`, then
+    /// `SessionLimits`): `None` for an unlimited one.
+    pub fn request_caps(&self) -> (Option<u64>, Option<f64>) {
+        (
+            self.max_tokens,
+            (self.max_cost_usd > 0.0).then_some(self.max_cost_usd),
+        )
+    }
+
+    /// These limits once `spent_usd` of the spend cap is used (PYSR-3b): what a resumed
+    /// delegation, or a sub-agent opened under it, may still spend. A spend cap used up is
+    /// [`EXHAUSTED_USD`], never `0` (which reads "unlimited"): the engine stops at its first
+    /// priced request. The delay and the token cap are left as they are.
+    pub fn after_spending(self, spent_usd: f64) -> Self {
+        if self.max_cost_usd <= 0.0 || !spent_usd.is_finite() || spent_usd <= 0.0 {
+            return self;
+        }
+        Self {
+            max_cost_usd: (self.max_cost_usd - spent_usd).max(EXHAUSTED_USD),
+            ..self
+        }
+    }
+}
+
+/// The spend cap of a delegation whose budget is used up: the smallest cap an engine still
+/// holds as a cap (`0` would read "unlimited").
+pub const EXHAUSTED_USD: f64 = 1e-6;
+
+impl Default for DelegationLimits {
+    fn default() -> Self {
+        Self::of_runner(&RunnerConfig::default())
+    }
+}
+
+impl Default for RunnerConfig {
+    fn default() -> Self {
+        Self {
+            task_timeout_secs: DEFAULT_TASK_TIMEOUT_SECS,
+            idle_timeout_secs: 180,
+            max_retries: 1,
+            auto_pr: false,
+            build_check: true,
+            test_runner: false,
+            max_cost_usd: DEFAULT_MAX_COST_USD,
+            max_tokens: None,
+            per_task_cap: PerTaskCap::default(),
+            spawning_timeout_secs: 480,
+            cwd_validation: CwdValidation::default(),
+            completion_loop_threshold: 5,
+            completion_max_chars: 200,
+            max_auto_continues: 5,
+            max_parallel_tasks: 4,
+        }
+    }
+}
+
+// ============================================================================
+// TaskRunStatus — state machine for individual task execution
+// ============================================================================
+
+/// Status of a task within the runner's execution pipeline.
+///
+/// Transitions are validated by `TaskStateMachine::transition()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunStatus {
+    /// Waiting to be executed
+    Pending,
+    /// Agent session is being created
+    Spawning,
+    /// Agent is actively working
+    Running,
+    /// Post-task verification in progress (build check, step validation)
+    Verifying,
+    /// Task completed successfully
+    Completed,
+    /// Task failed after retries exhausted
+    Failed,
+    /// Task exceeded its time limit
+    Timeout,
+    /// Task is blocked by an unresolved dependency
+    Blocked,
+}
+
+impl fmt::Display for TaskRunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Spawning => write!(f, "spawning"),
+            Self::Running => write!(f, "running"),
+            Self::Verifying => write!(f, "verifying"),
+            Self::Completed => write!(f, "completed"),
+            Self::Failed => write!(f, "failed"),
+            Self::Timeout => write!(f, "timeout"),
+            Self::Blocked => write!(f, "blocked"),
+        }
+    }
+}
+
+// ============================================================================
+// TaskStateMachine — validates state transitions
+// ============================================================================
+
+/// Validates task status transitions within the runner.
+///
+/// The runner owns all status transitions — the LLM agent must NOT
+/// update task/step statuses via MCP.
+pub struct TaskStateMachine;
+
+impl TaskStateMachine {
+    /// Attempt a state transition. Returns Ok(()) if valid, Err with reason if not.
+    pub fn transition(from: TaskRunStatus, to: TaskRunStatus) -> Result<(), String> {
+        use TaskRunStatus::*;
+
+        let valid = matches!(
+            (from, to),
+            // Normal flow
+            (Pending, Spawning)
+                | (Spawning, Running)
+                | (Running, Verifying)
+                | (Verifying, Completed)
+                // Failure paths
+                | (Spawning, Failed)
+                | (Spawning, Timeout)
+                | (Running, Failed)
+                | (Running, Timeout)
+                | (Verifying, Failed)
+                // Retry: failed verification goes back to spawning
+                | (Verifying, Spawning)
+                // Blocking
+                | (Pending, Blocked)
+                | (Blocked, Pending)
+                // Direct completion (e.g., already done or skipped)
+                | (Pending, Completed)
+        );
+
+        if valid {
+            Ok(())
+        } else {
+            Err(format!("Invalid task transition: {} → {}", from, to))
+        }
+    }
+}
+
+// ============================================================================
+// TaskResult — outcome of a single task execution
+// ============================================================================
+
+/// Result of executing a single task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskResult {
+    /// Task completed successfully
+    Success {
+        /// Cost in USD for this task
+        cost_usd: f64,
+        /// Duration in seconds
+        duration_secs: f64,
+    },
+    /// Task failed after retries
+    Failed {
+        /// Error message or reason
+        reason: String,
+        /// Number of attempts made
+        attempts: u32,
+        /// Cost accumulated before failure
+        cost_usd: f64,
+    },
+    /// Task exceeded its time limit
+    Timeout {
+        /// How long it ran before being killed
+        duration_secs: f64,
+        /// Cost accumulated before timeout
+        cost_usd: f64,
+    },
+    /// Task was blocked by dependencies
+    Blocked {
+        /// IDs of blocking tasks
+        blocked_by: Vec<Uuid>,
+    },
+    /// Plan budget exceeded during this task
+    BudgetExceeded {
+        /// Cumulative MARGINAL cost at the point of exceeding
+        cumulated_cost_usd: f64,
+        /// Configured USD limit
+        limit_usd: f64,
+        /// Tokens of the run at the point of exceeding, when the run is cut
+        /// on its token budget (a provider without a price).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cumulated_tokens: Option<u64>,
+        /// Configured token limit, when the run is cut on it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit_tokens: Option<u64>,
+    },
+}
+
+// ============================================================================
+// TaskExecutionReport — structured post-execution feedback
+// ============================================================================
+
+/// Breakdown of step statuses for a task — used by the step completion guard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StepBreakdown {
+    /// Number of steps completed successfully
+    pub completed: usize,
+    /// Number of steps skipped
+    pub skipped: usize,
+    /// Number of steps still pending
+    pub pending: usize,
+    /// Total number of steps defined for this task
+    pub total: usize,
+}
+
+/// Structured report generated after a sub-agent completes a task.
+///
+/// Captures tool usage metrics from ChatEvents and git-derived data
+/// (commits, files modified) to compute a confidence score. Persisted
+/// in `AgentExecution.report_json` for analysis and used by the retry
+/// logic to inject error context on re-attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskExecutionReport {
+    /// Total number of tool_use events the agent emitted
+    pub tool_use_count: u32,
+    /// Breakdown of tool uses by tool name (e.g. {"Edit": 5, "Bash": 3})
+    pub tool_use_breakdown: std::collections::HashMap<String, u32>,
+    /// Number of tool_result events that contained errors
+    pub error_count: u32,
+    /// Last error message (if any) — useful for retry context
+    pub last_error: Option<String>,
+    /// Files modified (from git diff)
+    pub files_modified: Vec<String>,
+    /// Commit SHAs produced during this task
+    pub commits: Vec<String>,
+    /// Whether the task ended with agent-reported success
+    pub agent_success: bool,
+    /// Cost in USD
+    pub cost_usd: f64,
+    /// Duration in seconds
+    pub duration_secs: f64,
+    /// Computed confidence score (0.0 - 1.0)
+    ///
+    /// Formula: starts at 1.0, penalized by:
+    /// - error_ratio (errors / tool_uses): -0.3 * ratio
+    /// - zero commits: -0.3
+    /// - zero files modified: -0.2
+    /// - agent failure: -0.4
+    pub confidence_score: f64,
+}
+
+impl TaskExecutionReport {
+    /// Compute the confidence score based on the report's metrics.
+    pub fn compute_confidence(&mut self) {
+        let mut score = 1.0_f64;
+
+        // Penalize by error ratio
+        if self.tool_use_count > 0 {
+            let error_ratio = self.error_count as f64 / self.tool_use_count as f64;
+            score -= 0.3 * error_ratio;
+        }
+
+        // Penalize for no commits
+        if self.commits.is_empty() {
+            score -= 0.3;
+        }
+
+        // Penalize for no file modifications
+        if self.files_modified.is_empty() {
+            score -= 0.2;
+        }
+
+        // Penalize for agent failure
+        if !self.agent_success {
+            score -= 0.4;
+        }
+
+        self.confidence_score = score.clamp(0.0, 1.0);
+    }
+}
+
+// ============================================================================
+// RunStatus — overall plan run status
+// ============================================================================
+
+/// Status of an entire plan run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanRunStatus {
+    /// Run is currently executing
+    Running,
+    /// All tasks completed successfully
+    Completed,
+    /// Run finished but some tasks failed, were blocked, or remain pending
+    CompletedWithErrors,
+    /// One or more tasks failed and the run was aborted
+    Failed,
+    /// Run was cancelled by the user
+    Cancelled,
+    /// Run was aborted because the budget was exceeded
+    BudgetExceeded,
+    /// Run was left `running` by a process that no longer exists (server
+    /// restart, crash) and could not be resumed safely. Whether the work
+    /// finished is unknown: this is neither `completed` nor `failed`.
+    Interrupted,
+}
+
+impl fmt::Display for PlanRunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Running => write!(f, "running"),
+            Self::Completed => write!(f, "completed"),
+            Self::CompletedWithErrors => write!(f, "completed_with_errors"),
+            Self::Failed => write!(f, "failed"),
+            Self::Cancelled => write!(f, "cancelled"),
+            Self::BudgetExceeded => write!(f, "budget_exceeded"),
+            Self::Interrupted => write!(f, "interrupted"),
+        }
+    }
+}
+
+// ============================================================================
+// RunnerEvent — events emitted during plan execution
+// ============================================================================
+
+/// Events emitted by the PlanRunner for real-time frontend updates.
+///
+/// Broadcasted via the existing `tokio::sync::broadcast` channel
+/// and filterable by `entity_type=runner` on the WebSocket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum RunnerEvent {
+    /// A plan run has started
+    PlanStarted {
+        run_id: Uuid,
+        plan_id: Uuid,
+        plan_title: String,
+        total_tasks: usize,
+        total_waves: usize,
+        /// Prediction based on historical runs (None if first run)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prediction: Option<crate::runner::vector::RunPrediction>,
+    },
+    /// A new wave of tasks has started
+    WaveStarted {
+        run_id: Uuid,
+        wave_number: usize,
+        task_count: usize,
+    },
+    /// A task has started executing
+    TaskStarted {
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: String,
+        wave_number: usize,
+    },
+    /// A task has completed successfully
+    TaskCompleted {
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: String,
+        /// What the provider stated; meaningful with `cost_basis` (0 when the
+        /// provider stated no amount).
+        cost_usd: f64,
+        duration_secs: f64,
+        /// Basis of `cost_usd`: `reported`, `priced`, `free`, `subscription` or
+        /// `unknown` (absent when the provider stated none).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_basis: Option<String>,
+    },
+    /// One task's MARGINAL cost went past its profile's `max_cost_usd`. Emitted
+    /// whatever `RunnerConfig::per_task_cap` says; `enforced` tells whether the
+    /// attempt was failed for it.
+    TaskCostCapExceeded {
+        run_id: Uuid,
+        task_id: Uuid,
+        cost_usd: f64,
+        cap_usd: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_basis: Option<String>,
+        enforced: bool,
+    },
+    /// A task has failed
+    TaskFailed {
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: String,
+        reason: String,
+        attempts: u32,
+    },
+    /// A task has timed out
+    TaskTimeout {
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: String,
+        duration_secs: f64,
+    },
+    /// A wave of tasks has completed
+    WaveCompleted {
+        run_id: Uuid,
+        wave_number: usize,
+        tasks_completed: usize,
+        tasks_failed: usize,
+    },
+    /// The entire plan run has completed
+    PlanCompleted {
+        run_id: Uuid,
+        plan_id: Uuid,
+        status: PlanRunStatus,
+        total_cost_usd: f64,
+        total_duration_secs: f64,
+        tasks_completed: usize,
+        tasks_failed: usize,
+        /// PR URL if auto-PR was created
+        pr_url: Option<String>,
+    },
+    /// Task marked completed but no steps were actually completed (all skipped)
+    TaskCompletedWithoutSteps {
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: String,
+        steps_skipped: usize,
+        steps_total: usize,
+    },
+    /// CWD doesn't match the project's root_path
+    CwdMismatch {
+        run_id: Uuid,
+        cwd: String,
+        root_path: String,
+    },
+    /// Agent spawning timed out — create_session() took too long
+    TaskSpawningTimeout {
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: String,
+        timeout_secs: u64,
+    },
+    /// No provider can run this task (B18): the opening was refused before any session
+    /// existed, and nothing was substituted. `code` is the stable code of the refusal
+    /// (`no_provider`, `provider_unknown`, `endpoint_not_allowed`, `provider_unavailable`,
+    /// or the kind of the provider's own error: `endpoint_unreachable`, `auth_required`...).
+    TaskProviderRefused {
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: String,
+        code: String,
+        /// The instance the refusal is about, when it names one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+    },
+    /// The provider the run named failed its health check when the task's session
+    /// opened (B18): the task runs on the project's default instead, and the run says so
+    /// (this event, a warning in the log, `fallback_reason` on the AgentExecution).
+    TaskProviderFallback {
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: String,
+        /// The instance the run named, which failed.
+        from_provider: String,
+        /// The instance the task runs on instead.
+        to_provider: String,
+        /// Why: the kind of the health failure (`endpoint_unreachable`, `auth_required`...).
+        reason: String,
+    },
+    /// A runner error occurred (non-fatal)
+    RunnerError { run_id: Uuid, message: String },
+    /// Budget limit exceeded — plan execution aborted
+    BudgetExceeded {
+        run_id: Uuid,
+        plan_id: Uuid,
+        /// Marginal counter of the run.
+        cumulated_cost_usd: f64,
+        limit_usd: f64,
+        /// Tokens of the run and the token limit, when the run has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cumulated_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit_tokens: Option<u64>,
+    },
+    /// Worktree commits were recovered after a wave
+    WorktreeRecovery {
+        run_id: Uuid,
+        wave_number: usize,
+        commits_recovered: usize,
+        conflicts: usize,
+        worktrees_cleaned: usize,
+    },
+    /// Lifecycle protocol FSM transition fired (for FSM Viewer)
+    LifecycleTransition {
+        run_id: Uuid,
+        lifecycle_run_id: Uuid,
+        from_state: String,
+        to_state: String,
+        trigger: String,
+    },
+}
+
+// ============================================================================
+// TriggerSource — tracks how a run was initiated
+// ============================================================================
+
+/// How a plan run was triggered.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerSource {
+    /// Manually started via API or MCP
+    #[default]
+    Manual,
+    /// Started from a chat conversation (LLM called plan(run))
+    Chat { session_id: Option<String> },
+    /// Started by a cron schedule
+    Schedule { trigger_id: Uuid },
+    /// Started by an external webhook (e.g., GitHub)
+    Webhook {
+        trigger_id: Uuid,
+        payload_hash: Option<String>,
+    },
+    /// Started by an internal event (e.g., another plan completing)
+    Event {
+        trigger_id: Uuid,
+        source_event: String,
+        /// How many event-triggered runs lead to this one: 1 when the event
+        /// did not come from an event-triggered run. Refused beyond
+        /// `runner::dispatch::MAX_EVENT_CHAIN_DEPTH` (plans that trigger each
+        /// other never loop forever).
+        #[serde(default)]
+        chain_depth: u32,
+    },
+}
+
+// ============================================================================
+// SpawnedBy — origin tracking for agent sessions
+// ============================================================================
+
+/// Describes what spawned an agent session.
+///
+/// Serialized as a tagged enum in JSON (e.g. `{"type":"pipeline", ...}`).
+/// Stored as a JSON string in Neo4j `ChatSession.spawned_by`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpawnedBy {
+    /// Spawned by the PlanRunner for a specific task
+    Runner { run_id: Uuid, plan_id: Uuid },
+    /// Spawned as a sub-conversation from another session
+    Conversation { session_id: Uuid },
+    /// Spawned by the pipeline executor (wave-based execution)
+    Pipeline {
+        run_id: Uuid,
+        plan_id: Uuid,
+        wave: usize,
+        task_id: Option<Uuid>,
+    },
+    /// Spawned by a quality gate retry
+    Gate {
+        run_id: Uuid,
+        gate_type: String,
+        retry_count: u32,
+    },
+    /// Spawned by an external trigger (webhook, cron, event)
+    Trigger {
+        trigger_id: Uuid,
+        event_type: String,
+    },
+}
+
+// ============================================================================
+// ActiveAgent — tracks a currently running agent for a task
+// ============================================================================
+
+/// Represents an active agent working on a task within the runner.
+///
+/// Multiple agents can be active simultaneously when tasks run in parallel waves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveAgent {
+    /// The task this agent is working on
+    pub task_id: Uuid,
+    /// Human-readable title of the task
+    pub task_title: String,
+    /// Chat session ID for this agent (set after spawning)
+    pub session_id: Option<Uuid>,
+    /// When this agent started working
+    pub started_at: DateTime<Utc>,
+    /// Accumulated cost in USD for this agent
+    pub cost_usd: f64,
+    /// Current status of the task
+    pub status: TaskRunStatus,
+}
+
+// ============================================================================
+// ActiveAgentSnapshot — serializable snapshot for status endpoints
+// ============================================================================
+
+/// A snapshot of an active agent for the status endpoint.
+///
+/// Contains derived fields (elapsed_secs) computed at snapshot time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveAgentSnapshot {
+    pub task_id: Uuid,
+    pub task_title: String,
+    pub session_id: Option<Uuid>,
+    pub elapsed_secs: f64,
+    pub cost_usd: f64,
+    pub status: TaskRunStatus,
+}
+
+impl ActiveAgent {
+    /// Create a new ActiveAgent for a task.
+    pub fn new(task_id: Uuid, task_title: String) -> Self {
+        Self {
+            task_id,
+            task_title,
+            session_id: None,
+            started_at: Utc::now(),
+            cost_usd: 0.0,
+            status: TaskRunStatus::Spawning,
+        }
+    }
+
+    /// Create a snapshot of this agent at the current point in time.
+    pub fn snapshot(&self) -> ActiveAgentSnapshot {
+        let elapsed_secs = (Utc::now() - self.started_at).num_milliseconds() as f64 / 1000.0;
+        ActiveAgentSnapshot {
+            task_id: self.task_id,
+            task_title: self.task_title.clone(),
+            session_id: self.session_id,
+            elapsed_secs,
+            cost_usd: self.cost_usd,
+            status: self.status,
+        }
+    }
+}
+
+// ============================================================================
+// RunSnapshot — status snapshot for the /status endpoint
+// ============================================================================
+
+/// A snapshot of the current run status, returned by PlanRunner::status().
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunSnapshot {
+    pub run_id: Uuid,
+    pub plan_id: Uuid,
+    pub status: PlanRunStatus,
+    pub current_wave: usize,
+    pub total_waves: usize,
+    /// Deprecated: use `active_agents` instead. Kept for backward compatibility.
+    /// Returns the task_id of the first active agent (if exactly one).
+    pub current_task_id: Option<Uuid>,
+    /// Deprecated: use `active_agents` instead. Kept for backward compatibility.
+    /// Returns the task_title of the first active agent (if exactly one).
+    pub current_task_title: Option<String>,
+    /// All currently active agents (may be multiple in parallel waves).
+    pub active_agents: Vec<ActiveAgentSnapshot>,
+    pub tasks_completed: usize,
+    pub tasks_failed: usize,
+    pub tasks_total: usize,
+    pub cumulated_cost_usd: f64,
+    pub elapsed_secs: f64,
+    pub started_at: DateTime<Utc>,
+    pub triggered_by: TriggerSource,
+}
+
+// ============================================================================
+// Trigger — automatic plan execution triggers
+// ============================================================================
+
+/// Type of trigger that can start a plan run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerType {
+    /// Cron-based schedule (e.g., "0 2 * * *")
+    Schedule,
+    /// External webhook (e.g., GitHub push)
+    Webhook,
+    /// Internal event (e.g., another plan completed)
+    Event,
+    /// Chat intent (LLM calls plan(run))
+    Chat,
+}
+
+impl fmt::Display for TriggerType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Schedule => write!(f, "schedule"),
+            Self::Webhook => write!(f, "webhook"),
+            Self::Event => write!(f, "event"),
+            Self::Chat => write!(f, "chat"),
+        }
+    }
+}
+
+/// A trigger node persisted in Neo4j, linked to a Plan via (:Trigger)-[:TRIGGERS]->(:Plan).
+///
+/// `Debug` is written by hand: it masks `config.secret` (a legacy `/api/webhooks`
+/// trigger may still hold one), so a `{:?}` never prints it.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Trigger {
+    pub id: Uuid,
+    pub plan_id: Uuid,
+    pub trigger_type: TriggerType,
+    /// Type-specific configuration (cron expression, webhook secret, event filter, etc.)
+    pub config: serde_json::Value,
+    /// Whether this trigger is active.
+    pub enabled: bool,
+    /// Minimum seconds between firings (0 = no cooldown).
+    pub cooldown_secs: u64,
+    /// Last time this trigger fired.
+    pub last_fired: Option<DateTime<Utc>>,
+    /// Total number of times this trigger has fired.
+    pub fire_count: u64,
+    pub created_at: DateTime<Utc>,
+    /// Who created (or last enabled) the trigger: the identity a `schedule` or
+    /// `event` run is started as, since no caller is behind those signals.
+    /// `None` for a trigger written before authors were recorded: such a
+    /// schedule or event trigger never starts a run (see
+    /// `runner::dispatch::TriggerDispatcher::dispatch`).
+    #[serde(default)]
+    pub author: Option<TriggerAuthor>,
+    /// Why the system disabled the trigger (`no_author`: written before
+    /// authors were recorded; `author_revoked`: its author is no longer a
+    /// user). `None` when enabled, or disabled by someone. Cleared when the
+    /// trigger is enabled again.
+    #[serde(default)]
+    pub disabled_reason: Option<String>,
+    /// The plan's third-party mark (`third_party_written_at`) when the trigger
+    /// was approved (created or enabled), read in the same graph write: the
+    /// plan as approved. A firing that finds another mark runs restricted.
+    /// Compared as a value, never against a clock (`author.recorded_at` is
+    /// the application's clock, the mark the database's). Written by the store
+    /// at create and enable; any value passed in is ignored.
+    #[serde(default)]
+    pub approved_mark: Option<DateTime<Utc>>,
+}
+
+impl Trigger {
+    /// A copy whose `config.secret` is masked: what the API returns.
+    pub fn redacted(&self) -> Self {
+        Self {
+            config: crate::ingress::rule::redact_config(&self.config),
+            ..self.clone()
+        }
+    }
+}
+
+impl std::fmt::Debug for Trigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Trigger")
+            .field("id", &self.id)
+            .field("plan_id", &self.plan_id)
+            .field("trigger_type", &self.trigger_type)
+            .field("config", &crate::ingress::rule::redact_config(&self.config))
+            .field("enabled", &self.enabled)
+            .field("cooldown_secs", &self.cooldown_secs)
+            .field("last_fired", &self.last_fired)
+            .field("fire_count", &self.fire_count)
+            .field("created_at", &self.created_at)
+            .field("author", &self.author)
+            .field("disabled_reason", &self.disabled_reason)
+            .field("approved_mark", &self.approved_mark)
+            .finish()
+    }
+}
+
+/// The caller that created or enabled a [`Trigger`], recorded so a run the
+/// trigger starts with no caller behind it (schedule, event) gets exactly the
+/// identity, the third-party lineage and the permission ceiling that
+/// `plan(action: "run")` would give that caller.
+///
+/// `token_type` and `scope` are the caller's, verbatim: the scope of an
+/// `agent_session` token is what signs its session, ceiling, tool profile and
+/// lineage, and what [`TriggerAuthor::claims`] hands back to the run. The
+/// other fields are read from it, for whoever lists the trigger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TriggerAuthor {
+    pub sub: String,
+    pub email: String,
+    pub name: String,
+    /// `None`: a person's JWT; `agent_session`, `mcp`...: an agent's token.
+    #[serde(default)]
+    pub token_type: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// The chat session of an `agent_session` author.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// The author's session runs on a third-party provider, or descends from
+    /// one: the run's agents get the restricted profile.
+    #[serde(default)]
+    pub third_party: bool,
+    /// Permission mode signed into the author's token (its policy ceiling).
+    #[serde(default)]
+    pub ceiling: Option<String>,
+    /// MCP tool profile signed into the author's token (`None`: full).
+    #[serde(default)]
+    pub tool_profile: Option<String>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl TriggerAuthor {
+    /// The author of a trigger created or enabled with `claims`.
+    pub fn from_claims(claims: &crate::auth::jwt::Claims) -> Self {
+        let binding = crate::auth::jwt::agent_session_binding(claims);
+        Self {
+            sub: claims.sub.clone(),
+            email: claims.email.clone(),
+            name: claims.name.clone(),
+            token_type: claims.token_type.clone(),
+            scope: claims.scope.clone(),
+            session_id: binding.as_ref().map(|b| b.session_id.clone()),
+            third_party: binding.as_ref().is_some_and(|b| b.third_party),
+            ceiling: binding.as_ref().and_then(|b| b.ceiling.clone()),
+            tool_profile: binding.and_then(|b| b.tool_profile),
+            recorded_at: Utc::now(),
+        }
+    }
+
+    /// The claims a run started by this trigger is given: the author's
+    /// identity, token type and scope (so lineage and ceiling), freshly dated.
+    /// Never presented over HTTP: the runner mints each agent's own session
+    /// token from them, as it does from a `plan(run)` caller's claims.
+    pub fn claims(&self) -> crate::auth::jwt::Claims {
+        let now = Utc::now().timestamp();
+        crate::auth::jwt::Claims {
+            sub: self.sub.clone(),
+            email: self.email.clone(),
+            name: self.name.clone(),
+            iat: now,
+            exp: now + 86400,
+            token_type: self.token_type.clone(),
+            scope: self.scope.clone(),
+            jti: None,
+        }
+    }
+}
+
+/// Something a plan run executes or reads as its instructions: the plan, or
+/// one of its tasks, steps, constraints or decisions (by id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanContent {
+    Plan(Uuid),
+    Task(Uuid),
+    Step(Uuid),
+    Constraint(Uuid),
+    Decision(Uuid),
+}
+
+/// What the reservation of a trigger signal decided (see
+/// `GraphStore::reserve_trigger_signal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalReservation {
+    /// This caller holds the signal: it may start the run. The trigger's
+    /// `last_fired` was moved to now in the same write.
+    Reserved,
+    /// The signal was already reserved (here, on another instance, or
+    /// earlier: a redelivery), or the trigger does not exist.
+    Duplicate,
+    /// The trigger fired less than its cooldown ago: nothing reserved.
+    Cooldown,
+}
+
+/// A firing record — one entry per trigger activation.
+/// Persisted as (:TriggerFiring)-[:FIRED_BY]->(:Trigger).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerFiring {
+    pub id: Uuid,
+    pub trigger_id: Uuid,
+    /// The PlanRun that was created by this firing.
+    pub plan_run_id: Option<Uuid>,
+    pub fired_at: DateTime<Utc>,
+    /// Optional payload from the trigger source (webhook body, event data, etc.)
+    pub source_payload: Option<serde_json::Value>,
+    /// Why no run started although the trigger fired (plan without tasks,
+    /// active run, plan without a project or directory...). `None` when the
+    /// run started (`plan_run_id` is set).
+    #[serde(default)]
+    pub start_error: Option<String>,
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    #[test]
+    fn test_runner_config_defaults() {
+        let config = RunnerConfig::default();
+        assert_eq!(config.task_timeout_secs, 10800);
+        assert_eq!(config.idle_timeout_secs, 180);
+        assert_eq!(config.max_retries, 1);
+        assert!(!config.auto_pr);
+        assert!(config.build_check);
+        assert!(!config.test_runner);
+        assert!((config.max_cost_usd - 50.0).abs() < f64::EPSILON);
+        assert_eq!(config.spawning_timeout_secs, 480);
+    }
+
+    /// PYSR-3b — what is left of a delegation's budget: the spend is taken off the spend cap,
+    /// a used-up cap stays a cap (never `0`, which reads "unlimited"), an unlimited one stays
+    /// unlimited, and the delay and the token cap are untouched.
+    #[test]
+    fn a_delegations_budget_after_spending_is_what_is_left_of_it() {
+        let limits = DelegationLimits {
+            timeout_secs: 60,
+            max_cost_usd: 10.0,
+            max_tokens: Some(7),
+        };
+        assert_eq!(limits.after_spending(4.0).max_cost_usd, 6.0);
+        assert_eq!(limits.after_spending(4.0).timeout_secs, 60);
+        assert_eq!(limits.after_spending(4.0).max_tokens, Some(7));
+        assert_eq!(limits.after_spending(0.0), limits);
+        assert_eq!(limits.after_spending(25.0).max_cost_usd, EXHAUSTED_USD);
+        assert_eq!(
+            limits.after_spending(25.0).request_caps(),
+            (Some(7), Some(EXHAUSTED_USD)),
+            "a used-up budget is still a cap"
+        );
+        let unlimited = DelegationLimits {
+            max_cost_usd: 0.0,
+            ..limits
+        };
+        assert_eq!(unlimited.after_spending(25.0), unlimited);
+        assert_eq!(unlimited.request_caps(), (Some(7), None));
+    }
+
+    #[test]
+    fn test_runner_config_deserialize_with_defaults() {
+        let yaml = r#"
+            task_timeout_secs: 600
+            auto_pr: true
+        "#;
+        let config: RunnerConfig = crate::yaml::from_str(yaml).unwrap();
+        assert_eq!(config.task_timeout_secs, 600);
+        assert!(config.auto_pr);
+        // Defaults applied for missing fields
+        assert_eq!(config.idle_timeout_secs, 180);
+        assert_eq!(config.max_retries, 1);
+    }
+
+    #[test]
+    fn test_task_state_machine_valid_transitions() {
+        use TaskRunStatus::*;
+
+        // Normal flow
+        assert!(TaskStateMachine::transition(Pending, Spawning).is_ok());
+        assert!(TaskStateMachine::transition(Spawning, Running).is_ok());
+        assert!(TaskStateMachine::transition(Running, Verifying).is_ok());
+        assert!(TaskStateMachine::transition(Verifying, Completed).is_ok());
+
+        // Failure paths
+        assert!(TaskStateMachine::transition(Spawning, Failed).is_ok());
+        assert!(TaskStateMachine::transition(Spawning, Timeout).is_ok());
+        assert!(TaskStateMachine::transition(Running, Failed).is_ok());
+        assert!(TaskStateMachine::transition(Running, Timeout).is_ok());
+        assert!(TaskStateMachine::transition(Verifying, Failed).is_ok());
+
+        // Retry
+        assert!(TaskStateMachine::transition(Verifying, Spawning).is_ok());
+
+        // Blocking
+        assert!(TaskStateMachine::transition(Pending, Blocked).is_ok());
+        assert!(TaskStateMachine::transition(Blocked, Pending).is_ok());
+
+        // Direct completion
+        assert!(TaskStateMachine::transition(Pending, Completed).is_ok());
+    }
+
+    #[test]
+    fn test_task_state_machine_invalid_transitions() {
+        use TaskRunStatus::*;
+
+        assert!(TaskStateMachine::transition(Completed, Running).is_err());
+        assert!(TaskStateMachine::transition(Failed, Running).is_err());
+        assert!(TaskStateMachine::transition(Timeout, Pending).is_err());
+        assert!(TaskStateMachine::transition(Running, Pending).is_err());
+        assert!(TaskStateMachine::transition(Completed, Pending).is_err());
+        assert!(TaskStateMachine::transition(Blocked, Running).is_err());
+    }
+
+    #[test]
+    fn test_task_result_serialization() {
+        let result = TaskResult::Success {
+            cost_usd: 0.42,
+            duration_secs: 120.5,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"type\":\"success\""));
+        assert!(json.contains("0.42"));
+
+        let result = TaskResult::BudgetExceeded {
+            cumulated_cost_usd: 10.5,
+            limit_usd: 10.0,
+            cumulated_tokens: None,
+            limit_tokens: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"type\":\"budget_exceeded\""));
+        assert!(
+            !json.contains("cumulated_tokens"),
+            "a USD cut carries no token figure: {json}"
+        );
+
+        // A run cut on its tokens says so, and reads back.
+        let result = TaskResult::BudgetExceeded {
+            cumulated_cost_usd: 0.0,
+            limit_usd: 50.0,
+            cumulated_tokens: Some(1_200),
+            limit_tokens: Some(1_000),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"cumulated_tokens\":1200"), "{json}");
+        let back: TaskResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            TaskResult::BudgetExceeded {
+                limit_tokens: Some(1_000),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_completed_task_event_carries_the_basis_of_its_cost() {
+        let event = RunnerEvent::TaskCompleted {
+            run_id: Uuid::nil(),
+            task_id: Uuid::nil(),
+            task_title: "t".into(),
+            cost_usd: 0.3,
+            duration_secs: 1.0,
+            cost_basis: Some("subscription".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"cost_basis\":\"subscription\""), "{json}");
+        // The pre-A21 shape (no basis) still reads.
+        let old = serde_json::json!({"event": "task_completed", "run_id": Uuid::nil(),
+            "task_id": Uuid::nil(), "task_title": "t", "cost_usd": 0.3, "duration_secs": 1.0});
+        let back: RunnerEvent = serde_json::from_value(old).unwrap();
+        assert!(matches!(
+            back,
+            RunnerEvent::TaskCompleted {
+                cost_basis: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_per_task_cap_is_warn_unless_configured_and_a_token_budget_is_optional() {
+        let config = RunnerConfig::default();
+        assert_eq!(config.per_task_cap, PerTaskCap::Warn);
+        assert_eq!(config.max_tokens, None);
+        let config: RunnerConfig = crate::yaml::from_str(
+            r#"
+            max_tokens: 250000
+            per_task_cap: enforce
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.max_tokens, Some(250_000));
+        assert_eq!(config.per_task_cap, PerTaskCap::Enforce);
+        assert!(crate::yaml::from_str::<RunnerConfig>("per_task_cap: abort").is_err());
+    }
+
+    #[test]
+    fn test_runner_event_serialization() {
+        let event = RunnerEvent::PlanStarted {
+            run_id: Uuid::nil(),
+            plan_id: Uuid::nil(),
+            plan_title: "Test Plan".into(),
+            total_tasks: 5,
+            total_waves: 3,
+            prediction: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event\":\"plan_started\""));
+        assert!(json.contains("\"total_tasks\":5"));
+    }
+
+    #[test]
+    fn test_trigger_source_default() {
+        let source = TriggerSource::default();
+        assert_eq!(source, TriggerSource::Manual);
+    }
+
+    #[test]
+    fn test_plan_run_status_display() {
+        assert_eq!(PlanRunStatus::Running.to_string(), "running");
+        assert_eq!(PlanRunStatus::BudgetExceeded.to_string(), "budget_exceeded");
+    }
+
+    // ========================================================================
+    // TaskExecutionReport tests
+    // ========================================================================
+
+    fn make_report() -> TaskExecutionReport {
+        TaskExecutionReport {
+            tool_use_count: 10,
+            tool_use_breakdown: std::collections::HashMap::from([
+                ("Edit".to_string(), 5),
+                ("Bash".to_string(), 5),
+            ]),
+            error_count: 0,
+            last_error: None,
+            files_modified: vec!["src/main.rs".to_string()],
+            commits: vec!["abc123".to_string()],
+            agent_success: true,
+            cost_usd: 0.5,
+            duration_secs: 60.0,
+            confidence_score: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_report_perfect_confidence() {
+        let mut report = make_report();
+        report.compute_confidence();
+        assert!(
+            (report.confidence_score - 1.0).abs() < f64::EPSILON,
+            "Perfect report should have confidence 1.0, got {}",
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_error_ratio_penalty() {
+        let mut report = make_report();
+        report.error_count = 5; // 50% error ratio → -0.15
+        report.compute_confidence();
+        let expected = 1.0 - 0.3 * 0.5;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_no_commits_penalty() {
+        let mut report = make_report();
+        report.commits = vec![];
+        report.compute_confidence();
+        let expected = 1.0 - 0.3;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_no_files_modified_penalty() {
+        let mut report = make_report();
+        report.files_modified = vec![];
+        report.compute_confidence();
+        let expected = 1.0 - 0.2;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_agent_failure_penalty() {
+        let mut report = make_report();
+        report.agent_success = false;
+        report.compute_confidence();
+        let expected = 1.0 - 0.4;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_all_penalties_clamped_to_zero() {
+        let mut report = TaskExecutionReport {
+            tool_use_count: 10,
+            tool_use_breakdown: std::collections::HashMap::new(),
+            error_count: 10, // 100% errors → -0.3
+            last_error: Some("boom".to_string()),
+            files_modified: vec![], // -0.2
+            commits: vec![],        // -0.3
+            agent_success: false,   // -0.4
+            cost_usd: 1.0,
+            duration_secs: 300.0,
+            confidence_score: 0.0,
+        };
+        // Total penalty = 0.3 + 0.3 + 0.2 + 0.4 = 1.2 → clamped to 0.0
+        report.compute_confidence();
+        assert!(
+            report.confidence_score.abs() < f64::EPSILON,
+            "Should be clamped to 0.0, got {}",
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_zero_tool_uses_no_error_penalty() {
+        let mut report = make_report();
+        report.tool_use_count = 0;
+        report.error_count = 5; // should be ignored when tool_use_count == 0
+        report.compute_confidence();
+        assert!(
+            (report.confidence_score - 1.0).abs() < f64::EPSILON,
+            "Zero tool uses should skip error ratio penalty, got {}",
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_serialization_roundtrip() {
+        let mut report = make_report();
+        report.compute_confidence();
+        let json = serde_json::to_string(&report).unwrap();
+        let deserialized: TaskExecutionReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.tool_use_count, 10);
+        assert_eq!(deserialized.error_count, 0);
+        assert!(deserialized.agent_success);
+        assert_eq!(deserialized.commits, vec!["abc123"]);
+        assert_eq!(deserialized.files_modified, vec!["src/main.rs"]);
+        assert!((deserialized.confidence_score - 1.0).abs() < f64::EPSILON,);
+    }
+
+    #[test]
+    fn test_report_combined_penalties() {
+        let mut report = make_report();
+        report.error_count = 2; // 20% error ratio → -0.06
+        report.commits = vec![]; // -0.3
+        report.agent_success = true;
+        report.compute_confidence();
+        let expected = 1.0 - (0.3 * 0.2) - 0.3;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    // ========================================================================
+    // SpawnedBy tests
+    // ========================================================================
+
+    #[test]
+    fn test_spawned_by_runner_roundtrip() {
+        let spawned = SpawnedBy::Runner {
+            run_id: Uuid::nil(),
+            plan_id: Uuid::nil(),
+        };
+        let json = serde_json::to_string(&spawned).unwrap();
+        assert!(json.contains("\"type\":\"runner\""));
+        let back: SpawnedBy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spawned);
+    }
+
+    #[test]
+    fn test_spawned_by_pipeline_roundtrip() {
+        let spawned = SpawnedBy::Pipeline {
+            run_id: Uuid::nil(),
+            plan_id: Uuid::nil(),
+            wave: 3,
+            task_id: Some(Uuid::nil()),
+        };
+        let json = serde_json::to_string(&spawned).unwrap();
+        assert!(json.contains("\"type\":\"pipeline\""));
+        assert!(json.contains("\"wave\":3"));
+        let back: SpawnedBy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spawned);
+    }
+
+    #[test]
+    fn test_spawned_by_gate_roundtrip() {
+        let spawned = SpawnedBy::Gate {
+            run_id: Uuid::nil(),
+            gate_type: "cargo-check".into(),
+            retry_count: 2,
+        };
+        let json = serde_json::to_string(&spawned).unwrap();
+        assert!(json.contains("\"type\":\"gate\""));
+        assert!(json.contains("\"gate_type\":\"cargo-check\""));
+        let back: SpawnedBy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spawned);
+    }
+
+    #[test]
+    fn test_spawned_by_trigger_roundtrip() {
+        let spawned = SpawnedBy::Trigger {
+            trigger_id: Uuid::nil(),
+            event_type: "webhook".into(),
+        };
+        let json = serde_json::to_string(&spawned).unwrap();
+        assert!(json.contains("\"type\":\"trigger\""));
+        let back: SpawnedBy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spawned);
+    }
+
+    #[test]
+    fn test_spawned_by_conversation_roundtrip() {
+        let spawned = SpawnedBy::Conversation {
+            session_id: Uuid::nil(),
+        };
+        let json = serde_json::to_string(&spawned).unwrap();
+        assert!(json.contains("\"type\":\"conversation\""));
+        let back: SpawnedBy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spawned);
+    }
+
+    // ========================================================================
+    // Spawning timeout tests
+    // ========================================================================
+
+    #[test]
+    fn test_spawning_timeout_event_serialization() {
+        let event = RunnerEvent::TaskSpawningTimeout {
+            run_id: Uuid::nil(),
+            task_id: Uuid::nil(),
+            task_title: "Test task".into(),
+            timeout_secs: 120,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event\":\"task_spawning_timeout\""));
+        assert!(json.contains("\"timeout_secs\":120"));
+    }
+
+    /// B18: the two provider events of a task have stable wire names, and the refusal
+    /// carries the stable code of what refused it.
+    #[test]
+    fn provider_refusal_and_fallback_events_have_stable_wire_names() {
+        let refused = RunnerEvent::TaskProviderRefused {
+            run_id: Uuid::nil(),
+            task_id: Uuid::nil(),
+            task_title: "t".into(),
+            code: "no_provider".into(),
+            provider_id: None,
+        };
+        let json = serde_json::to_string(&refused).unwrap();
+        assert!(
+            json.contains("\"event\":\"task_provider_refused\""),
+            "{json}"
+        );
+        assert!(json.contains("\"code\":\"no_provider\""), "{json}");
+        assert!(!json.contains("provider_id"), "absent when unknown: {json}");
+
+        let fallback = RunnerEvent::TaskProviderFallback {
+            run_id: Uuid::nil(),
+            task_id: Uuid::nil(),
+            task_title: "t".into(),
+            from_provider: "deepseek".into(),
+            to_provider: "claude-code".into(),
+            reason: "endpoint_unreachable".into(),
+        };
+        let json = serde_json::to_string(&fallback).unwrap();
+        assert!(
+            json.contains("\"event\":\"task_provider_fallback\""),
+            "{json}"
+        );
+        let back: RunnerEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            RunnerEvent::TaskProviderFallback { ref from_provider, ref to_provider, ref reason, .. }
+                if from_provider == "deepseek" && to_provider == "claude-code" && reason == "endpoint_unreachable"
+        ));
+    }
+
+    #[test]
+    fn test_spawning_timeout_secs_in_config() {
+        // Default
+        let config = RunnerConfig::default();
+        assert_eq!(config.spawning_timeout_secs, 480);
+
+        // Custom via YAML
+        let yaml = r#"
+            spawning_timeout_secs: 30
+        "#;
+        let config: RunnerConfig = crate::yaml::from_str(yaml).unwrap();
+        assert_eq!(config.spawning_timeout_secs, 30);
+        // Other defaults still applied
+        assert_eq!(config.task_timeout_secs, 10800);
+    }
+
+    #[test]
+    fn test_guard_config_spawning_timeout_default() {
+        let config = crate::runner::guard::GuardConfig::default();
+        assert_eq!(config.spawning_timeout, std::time::Duration::from_secs(480));
+    }
+
+    #[test]
+    fn test_spawning_to_timeout_transition() {
+        use TaskRunStatus::*;
+        assert!(
+            TaskStateMachine::transition(Spawning, Timeout).is_ok(),
+            "Spawning → Timeout should be a valid transition for spawning timeout"
+        );
+    }
+
+    // ========================================================================
+    // CWD validation tests
+    // ========================================================================
+
+    #[test]
+    fn test_cwd_validation_default_is_warn() {
+        let config = RunnerConfig::default();
+        assert_eq!(config.cwd_validation, CwdValidation::Warn);
+    }
+
+    #[test]
+    fn test_cwd_validation_strict_deserialize() {
+        let yaml = r#"
+            cwd_validation: strict
+        "#;
+        let config: RunnerConfig = crate::yaml::from_str(yaml).unwrap();
+        assert_eq!(config.cwd_validation, CwdValidation::Strict);
+    }
+
+    #[test]
+    fn test_cwd_mismatch_event_serialization() {
+        let event = RunnerEvent::CwdMismatch {
+            run_id: Uuid::nil(),
+            cwd: "/wrong/path".into(),
+            root_path: "/correct/path".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event\":\"cwd_mismatch\""));
+        assert!(json.contains("/wrong/path"));
+        assert!(json.contains("/correct/path"));
+    }
+}

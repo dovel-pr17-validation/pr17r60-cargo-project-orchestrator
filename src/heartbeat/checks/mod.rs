@@ -1,0 +1,18 @@
+//! Concrete HeartbeatCheck implementations.
+//!
+//! Each check runs at its own interval and operates on the shared GraphStore.
+//! Checks MUST NOT block the Axum server — they run in a separate tokio::spawn.
+//! Any check exceeding 5s is automatically skipped by the engine.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+pub mod architecture_drift;
+pub mod belief_revision;
+pub mod consolidation;
+pub mod convention_guard;
+pub mod git_drift;
+pub mod homeostasis;
+pub mod maintenance;
+pub mod staleness;
+pub mod synapse_decay;
+pub mod synapse_replenish;

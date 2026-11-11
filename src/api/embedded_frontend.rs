@@ -1,0 +1,148 @@
+//! Embedded frontend serving via rust-embed.
+//!
+//! When compiled with `--features embedded-frontend`, the React SPA's dist/
+//! directory is baked into the binary at compile time. This module provides
+//! an Axum handler that serves those embedded assets with correct Content-Type
+//! and SPA fallback (index.html for unmatched routes).
+//!
+//! # Build requirements
+//!
+//! The `dist/` directory must exist at compile time (can be empty — a `.gitkeep`
+//! is sufficient). For a functional build, run `npm run build` in the frontend
+//! project first, then copy the output to `dist/` before `cargo build`.
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! // In create_router():
+//! #[cfg(feature = "embedded-frontend")]
+//! router.fallback(embedded_frontend::serve_embedded)
+//! ```
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use axum::{
+    body::Body,
+    http::{header, StatusCode, Uri},
+    response::{IntoResponse, Response},
+};
+use rust_embed::RustEmbed;
+
+/// Embedded frontend assets compiled from the dist/ directory.
+///
+/// The `folder` path is resolved relative to the crate root at compile time.
+/// If dist/ is empty, the struct will have no files (serve_embedded returns 404).
+#[derive(RustEmbed)]
+#[folder = "dist/"]
+struct FrontendAssets;
+
+/// Axum handler that serves embedded frontend assets.
+///
+/// - If the requested path matches a file in dist/, serves it with the correct MIME type.
+/// - Otherwise, falls back to index.html for SPA client-side routing.
+/// - Returns 404 only if index.html itself is missing (dist/ was empty at compile time).
+pub async fn serve_embedded(uri: Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/');
+
+    // Try to serve the exact file first
+    if !path.is_empty() {
+        if let Some(file) = FrontendAssets::get(path) {
+            return serve_file(path, &file.data);
+        }
+        // A missing static asset must 404 — serving index.html here would
+        // return text/html for a *.js/*.css request and the browser rejects it
+        // (Strict MIME checking), masking the real "frontend out of sync" cause
+        // as a cryptic module-load failure.
+        if crate::api::routes::is_static_asset(path) {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("Not found"))
+                .unwrap();
+        }
+    }
+
+    // Fallback to index.html for SPA routing
+    match FrontendAssets::get("index.html") {
+        Some(file) => serve_file("index.html", &file.data),
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from(
+                "Frontend not embedded (dist/ was empty at build time)",
+            ))
+            .unwrap(),
+    }
+}
+
+/// Build an HTTP response with the correct Content-Type and Cache-Control for the given file path.
+///
+/// - `assets/*` (Vite content-hashed files): cached forever (immutable).
+/// - Everything else (`index.html`, SPA fallback): never cached — ensures version
+///   updates are picked up immediately by WKWebView/browsers.
+fn serve_file(path: &str, data: &[u8]) -> Response {
+    let mime = mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string();
+
+    let cache_control = if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache, no-store, must-revalidate"
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(Body::from(data.to_vec()))
+        .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    /// A missing static asset must 404, not fall back to index.html: serving
+    /// index.html (text/html) for a *.js request makes the browser fail module
+    /// loading with "MIME type text/html", masking the real frontend mismatch.
+    #[tokio::test]
+    async fn missing_static_asset_returns_404_not_index() {
+        let uri: Uri = "/assets/definitely-missing-abc.js".parse().unwrap();
+        let resp = serve_embedded(uri).await.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Regression test: intelligence dashboard grids must NOT use inline
+    /// `gridTemplateColumns: repeat(auto-fill, minmax(...))` which overflows
+    /// on mobile viewports < 320px. They should use Tailwind responsive classes
+    /// (grid-cols-1 sm:grid-cols-2) instead.
+    #[test]
+    fn embedded_js_has_no_inline_autofill_grid() {
+        let problematic_patterns = [
+            "auto-fill, minmax(280px", // IntelLayerCards old pattern
+            "auto-fill, minmax(240px", // IntelAttention old pattern
+            "auto-fill, minmax(200px", // IntelQuickActions old pattern
+        ];
+
+        for file in FrontendAssets::iter() {
+            let filename = file.as_ref();
+            if !filename.ends_with(".js") {
+                continue;
+            }
+            if let Some(asset) = FrontendAssets::get(filename) {
+                let content = String::from_utf8_lossy(&asset.data);
+                for pattern in &problematic_patterns {
+                    assert!(
+                        !content.contains(pattern),
+                        "Embedded JS file '{}' still contains inline grid pattern '{}' — \
+                         intelligence dashboard cards will overflow on mobile. \
+                         Replace with Tailwind responsive grid classes.",
+                        filename,
+                        pattern,
+                    );
+                }
+            }
+        }
+    }
+}

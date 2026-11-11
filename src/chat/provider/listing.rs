@@ -1,0 +1,621 @@
+//! Body of `GET /api/chat/providers` (decision A42): the instances, their
+//! health and the capabilities of each model, known BEFORE a session exists.
+//!
+//! The shape is fixed by `docs/api/chat-contract/provider-additions.json`.
+//! Pure: the handler gathers the facts (health, catalogue), this module only
+//! shapes them, so a secret can never reach the body: an instance carries a
+//! credential REFERENCE and the origin of its endpoint, nothing else.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use nexus_claude::agent::{Capabilities, HealthStatus, ProviderError, ProviderHealth};
+use serde::Serialize;
+use serde_json::Value;
+
+use super::cognitive::{LearningStage, ProviderRoutingMode, RoutingScope, RoutingSettings};
+use super::resolver::CLAUDE_CODE;
+
+/// One model of an instance and what it can do.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelEntry {
+    /// Model identifier.
+    pub id: String,
+    /// Alias (`fast`, `default`, `deep`, `utility`) that points at it, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// Capabilities of THIS model (A4).
+    pub capabilities: Value,
+}
+
+impl ModelEntry {
+    /// A model entry from nexus `Capabilities`.
+    pub fn new(id: impl Into<String>, alias: Option<String>, caps: &Capabilities) -> Self {
+        Self {
+            id: id.into(),
+            alias,
+            capabilities: serde_json::to_value(caps).unwrap_or(Value::Null),
+        }
+    }
+}
+
+/// Health of an instance, in the vocabulary of the frontend.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HealthEntry {
+    /// `ok | auth_required | unreachable | cli_not_found | unknown`.
+    pub state: &'static str,
+    /// Error code (`cli_not_found`, `auth_required`, ...) when not ok.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+    /// Command a human should run (never run by PO, A27).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// RFC 3339 time of the check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
+    /// A fixed readable sentence saying why the instance cannot be used (set for
+    /// a remote machine only: "the host key does not match the pinned key"...).
+    /// Never the raw output of a client, never a path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl HealthEntry {
+    /// Health nobody measured yet.
+    pub fn unknown() -> Self {
+        Self {
+            state: "unknown",
+            code: None,
+            action: None,
+            checked_at: None,
+            reason: None,
+        }
+    }
+
+    /// The reason a REMOTE machine is unavailable, from what nexus reported.
+    /// Nexus answers fixed sentences; anything that looks like a path is dropped
+    /// anyway (defence in depth: an identity file path must never leave).
+    pub fn with_remote_reason(mut self, health: &ProviderHealth) -> Self {
+        if health.status != HealthStatus::Unavailable {
+            return self;
+        }
+        let text = match &health.error {
+            Some(ProviderError::EndpointUnreachable { detail }) => detail.clone(),
+            Some(ProviderError::CliNotFound { program }) => {
+                format!("the CLI is not installed on the machine ({program})")
+            }
+            Some(ProviderError::CredentialsLocked) => {
+                "the vault is locked: the SSH key cannot be read".to_string()
+            }
+            // The cause is not always the SSH key: a remote machine can also need its
+            // own `claude login`, or an env variable. Say what the hint says (a fixed
+            // sentence written by PO), never a guessed cause.
+            Some(ProviderError::AuthRequired { login_hint }) => match login_hint {
+                Some(hint) => hint.clone(),
+                None => "the machine needs a sign-in before it can be used".to_string(),
+            },
+            _ => return self,
+        };
+        self.reason = Some(if text.contains(['/', '\\']) || text.len() > 300 {
+            "the machine cannot be used".to_string()
+        } else {
+            text
+        });
+        self
+    }
+
+    /// From the health nexus reports.
+    pub fn from_nexus(health: &ProviderHealth) -> Self {
+        let checked_at = (health.checked_at_ms > 0)
+            .then(|| chrono::DateTime::from_timestamp_millis(health.checked_at_ms as i64))
+            .flatten()
+            .map(|t| t.to_rfc3339());
+        let (state, code) = match (&health.status, &health.error) {
+            (HealthStatus::Ok, _) => ("ok", None),
+            (HealthStatus::Degraded, _) => ("ok", None),
+            (_, Some(ProviderError::CliNotFound { .. })) => {
+                ("cli_not_found", Some("cli_not_found"))
+            }
+            (_, Some(ProviderError::AuthRequired { .. })) => {
+                ("auth_required", Some("auth_required"))
+            }
+            (_, Some(ProviderError::Unauthorized)) => ("auth_required", Some("unauthorized")),
+            (_, Some(ProviderError::CredentialsLocked)) => {
+                ("auth_required", Some("credentials_locked"))
+            }
+            (_, Some(ProviderError::EndpointUnreachable { .. })) => {
+                ("unreachable", Some("endpoint_unreachable"))
+            }
+            _ => ("unknown", None),
+        };
+        Self {
+            state,
+            code,
+            action: health.login_hint.clone(),
+            checked_at,
+            reason: None,
+        }
+    }
+}
+
+/// One provider instance of the listing.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderEntry {
+    /// Instance identifier.
+    pub id: String,
+    /// `claude_code | openai_compatible | anthropic | codex | acp | claude_code_remote`.
+    pub kind: &'static str,
+    /// Display label.
+    pub label: String,
+    /// Built into PO (not removable).
+    pub builtin: bool,
+    /// Is the configured default.
+    pub is_default: bool,
+    /// Consent given in the asked scope: the project, or with no project the chats outside
+    /// any project (`/api/chat/llm-consents`). Always set by the listing route; `None` only
+    /// for an entry built without a scope.
+    pub allowed_for_project: Option<bool>,
+    /// Origin (scheme, host, port) of the endpoint, never a path or a credential.
+    pub endpoint_origin: Option<String>,
+    /// Credential REFERENCE (`vault:<name>`, `env:<VAR>`, `none`), never the value.
+    pub credential: String,
+    /// Health.
+    pub health: HealthEntry,
+    /// Models and their capabilities.
+    pub models: Vec<ModelEntry>,
+    /// What the instance does whatever the model (permission prompts, sandbox,
+    /// live model switch...), as its provider declares it. Used by the interface
+    /// when a model carries none, and for an instance that lists no model yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Value>,
+    /// Where a `claude_code_remote` instance runs; absent for every other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteEntry>,
+}
+
+/// The machine of a `claude_code_remote` instance, as the listing shows it:
+/// the pinned key's FINGERPRINT (public), never the key file or its vault name.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RemoteEntry {
+    /// Host name or address.
+    pub host: String,
+    /// Remote user, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_user: Option<String>,
+    /// ssh port (22 when none was set).
+    pub ssh_port: u16,
+    /// `SHA256:...` fingerprint of the pinned host key.
+    pub host_key_fingerprint: Option<String>,
+    /// Working directory on the machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_cwd: Option<String>,
+    /// The no-confirmation mode is allowed on that machine.
+    pub allow_trust: bool,
+}
+
+/// The routing mode that applies to the asked project (decision R2), so the
+/// interface knows who chooses before any session exists.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RoutingSummary {
+    /// `primary | executors_only | full` (the settings; a conversation's own choice is
+    /// [`super::cognitive::ConversationRoutingMode`]).
+    pub mode: ProviderRoutingMode,
+    /// `shadow | advisory | auto`.
+    pub stage: LearningStage,
+    /// `project | global | default`: where the settings come from.
+    pub scope: RoutingScope,
+}
+
+impl RoutingSummary {
+    /// The summary of the effective settings.
+    pub fn new(settings: &RoutingSettings, scope: RoutingScope) -> Self {
+        Self {
+            mode: settings.mode,
+            stage: settings.stage,
+            scope,
+        }
+    }
+}
+
+/// The listing.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderListing {
+    /// Identifier of the default instance, or `null`.
+    pub default_provider: Option<String>,
+    /// The instances, the built-in one first.
+    pub providers: Vec<ProviderEntry>,
+    /// The routing mode in force for the asked project (additive: the handler
+    /// fills it from the stored settings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingSummary>,
+}
+
+/// The built-in Claude Code instance. Always consented (it is the historical
+/// path) and always listed first.
+pub fn builtin_claude_code(
+    health: HealthEntry,
+    models: Vec<ModelEntry>,
+    asked_project: bool,
+) -> ProviderEntry {
+    ProviderEntry {
+        id: CLAUDE_CODE.to_string(),
+        kind: "claude_code",
+        label: "Claude Code".to_string(),
+        builtin: true,
+        is_default: false,
+        allowed_for_project: asked_project.then_some(true),
+        endpoint_origin: None,
+        credential: "none".to_string(),
+        health,
+        models,
+        capabilities: None,
+        remote: None,
+    }
+}
+
+/// Assembles the listing. With no configured default, the default is what a chat that
+/// names nothing opens (the resolver's last levels, A16 and B2): Claude Code when its CLI
+/// is on the server (`claude_cli`, what the resolver is told), else the only instance
+/// usable here (`usable_here`: the instances the asked scope — a project, or no project —
+/// has consented to), else none.
+pub fn assemble(
+    mut providers: Vec<ProviderEntry>,
+    configured_default: Option<&str>,
+    claude_cli: bool,
+    usable_here: &[String],
+) -> ProviderListing {
+    let default = configured_default
+        .filter(|d| providers.iter().any(|p| p.id == *d))
+        .map(str::to_string)
+        .or_else(|| {
+            providers
+                .iter()
+                .find(|p| p.id == CLAUDE_CODE && claude_cli)
+                .map(|p| p.id.clone())
+        })
+        .or_else(|| {
+            let mut sole = providers
+                .iter()
+                .filter(|p| !p.builtin && p.remote.is_none() && usable_here.contains(&p.id));
+            match (sole.next(), sole.next()) {
+                (Some(only), None) => Some(only.id.clone()),
+                _ => None,
+            }
+        });
+    for p in &mut providers {
+        p.is_default = default.as_deref() == Some(p.id.as_str());
+    }
+    ProviderListing {
+        default_provider: default,
+        providers,
+        routing: None,
+    }
+}
+
+pub use super::endpoint_guard::origin_of;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    fn caps() -> Capabilities {
+        Capabilities::none()
+    }
+
+    #[test]
+    fn the_builtin_instance_is_the_default_when_nothing_is_configured() {
+        let l = assemble(
+            vec![builtin_claude_code(HealthEntry::unknown(), vec![], false)],
+            None,
+            true,
+            &[],
+        );
+        assert_eq!(l.default_provider.as_deref(), Some("claude-code"));
+        assert!(l.providers[0].is_default);
+        assert_eq!(l.providers[0].allowed_for_project, None);
+    }
+
+    #[test]
+    fn a_configured_default_that_does_not_exist_is_ignored() {
+        let l = assemble(
+            vec![builtin_claude_code(HealthEntry::unknown(), vec![], true)],
+            Some("ghost"),
+            true,
+            &[],
+        );
+        assert_eq!(l.default_provider.as_deref(), Some("claude-code"));
+        assert_eq!(l.providers[0].allowed_for_project, Some(true));
+    }
+
+    #[test]
+    fn a_missing_claude_cli_is_never_the_default_the_only_usable_instance_is() {
+        let missing =
+            HealthEntry::from_nexus(&ProviderHealth::unavailable(ProviderError::CliNotFound {
+                program: "claude".into(),
+            }));
+        let other = |id: &str| ProviderEntry {
+            id: id.into(),
+            kind: "openai_compatible",
+            label: id.into(),
+            builtin: false,
+            ..builtin_claude_code(HealthEntry::unknown(), vec![], false)
+        };
+        // B2: the CLI is missing, one instance is usable here: it is the default.
+        let l = assemble(
+            vec![
+                builtin_claude_code(missing.clone(), vec![], false),
+                other("local"),
+                other("not-allowed"),
+            ],
+            None,
+            false,
+            &["local".to_string()],
+        );
+        assert_eq!(l.default_provider.as_deref(), Some("local"));
+        assert!(!l.providers[0].is_default && l.providers[1].is_default);
+        // Two usable, or none: no default rather than a missing CLI.
+        let l = assemble(
+            vec![
+                builtin_claude_code(missing.clone(), vec![], false),
+                other("a"),
+                other("b"),
+            ],
+            None,
+            false,
+            &["a".to_string(), "b".to_string()],
+        );
+        assert_eq!(l.default_provider, None);
+        assert!(l.providers.iter().all(|p| !p.is_default));
+        let l = assemble(
+            vec![builtin_claude_code(missing, vec![], false)],
+            None,
+            false,
+            &[],
+        );
+        assert_eq!(l.default_provider, None);
+    }
+
+    #[test]
+    fn health_maps_to_the_frontend_states() {
+        let ok = HealthEntry::from_nexus(&ProviderHealth::ok(Some("2.1".into())));
+        assert_eq!((ok.state, ok.code), ("ok", None));
+        let missing =
+            HealthEntry::from_nexus(&ProviderHealth::unavailable(ProviderError::CliNotFound {
+                program: "/secret/path/claude".into(),
+            }));
+        assert_eq!(
+            (missing.state, missing.code),
+            ("cli_not_found", Some("cli_not_found"))
+        );
+        let body = serde_json::to_string(&missing).unwrap();
+        assert!(!body.contains("/secret/path"), "{body}");
+        let auth =
+            HealthEntry::from_nexus(&ProviderHealth::unavailable(ProviderError::AuthRequired {
+                login_hint: Some("claude login".into()),
+            }));
+        assert_eq!(auth.state, "auth_required");
+    }
+
+    #[test]
+    fn an_endpoint_origin_never_carries_userinfo_path_or_query() {
+        assert_eq!(
+            origin_of("https://user:hunter2@api.example.com:8443/v1/chat?key=abc").as_deref(),
+            Some("https://api.example.com:8443")
+        );
+        assert_eq!(
+            origin_of("http://localhost:8080/v1").as_deref(),
+            Some("http://localhost:8080")
+        );
+        assert_eq!(origin_of("not a url"), None);
+    }
+
+    #[test]
+    fn the_listing_body_has_the_documented_field_names() {
+        let entry = builtin_claude_code(
+            HealthEntry::unknown(),
+            vec![ModelEntry::new(
+                "claude-sonnet-5",
+                Some("default".into()),
+                &caps(),
+            )],
+            true,
+        );
+        let v = serde_json::to_value(assemble(vec![entry], None, true, &[])).unwrap();
+        let p = &v["providers"][0];
+        for k in [
+            "id",
+            "kind",
+            "label",
+            "builtin",
+            "is_default",
+            "allowed_for_project",
+            "endpoint_origin",
+            "credential",
+            "health",
+            "models",
+        ] {
+            assert!(p.get(k).is_some(), "missing {k}");
+        }
+        assert_eq!(p["models"][0]["alias"], "default");
+        assert!(p["models"][0]["capabilities"].is_object());
+        assert_eq!(v["default_provider"], "claude-code");
+    }
+
+    #[test]
+    fn the_listing_carries_the_routing_mode_stage_and_scope() {
+        let mut l = assemble(
+            vec![builtin_claude_code(HealthEntry::unknown(), vec![], false)],
+            None,
+            true,
+            &[],
+        );
+        let v = serde_json::to_value(&l).unwrap();
+        assert!(v.get("routing").is_none(), "additive: absent until filled");
+        let settings = RoutingSettings {
+            mode: ProviderRoutingMode::ExecutorsOnly,
+            stage: LearningStage::Advisory,
+            ..Default::default()
+        };
+        l.routing = Some(RoutingSummary::new(&settings, RoutingScope::Project));
+        let v = serde_json::to_value(&l).unwrap();
+        assert_eq!(
+            v["routing"],
+            serde_json::json!({"mode": "executors_only", "stage": "advisory", "scope": "project"})
+        );
+        assert_eq!(
+            RoutingSummary::new(&RoutingSettings::default(), RoutingScope::Default),
+            RoutingSummary {
+                mode: ProviderRoutingMode::Primary,
+                stage: LearningStage::Shadow,
+                scope: RoutingScope::Default
+            }
+        );
+    }
+
+    /// The contract file the frontend vendors: every `routed_by` level the
+    /// resolver can produce is listed there, the routing summary and the
+    /// session fields of R2 are documented.
+    #[test]
+    fn the_provider_additions_contract_lists_every_routed_by_level_and_the_routing_fields() {
+        use super::super::resolver::RoutedBy;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/api/chat-contract/provider-additions.json");
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let contract: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        // Exhaustive on purpose: a new RoutedBy variant does not compile until
+        // it is listed here, and then the contract must name it too.
+        let every_level = [
+            RoutedBy::Session,
+            RoutedBy::Request,
+            RoutedBy::Task,
+            RoutedBy::Persona,
+            RoutedBy::Run,
+            RoutedBy::ProjectRule,
+            RoutedBy::GlobalRule,
+            RoutedBy::ConfiguredDefault,
+            RoutedBy::BuiltinClaudeCode,
+            RoutedBy::SoleInstance,
+            RoutedBy::Fallback,
+            RoutedBy::Auto,
+        ];
+        for level in every_level {
+            match level {
+                RoutedBy::Session
+                | RoutedBy::Request
+                | RoutedBy::Task
+                | RoutedBy::Persona
+                | RoutedBy::Run
+                | RoutedBy::ProjectRule
+                | RoutedBy::GlobalRule
+                | RoutedBy::ConfiguredDefault
+                | RoutedBy::BuiltinClaudeCode
+                | RoutedBy::SoleInstance
+                | RoutedBy::Fallback
+                | RoutedBy::Auto => {}
+            }
+        }
+        let mut documented: Vec<&str> = contract["rest"]["ChatSession"]["routed_by"]["enum"]
+            .as_array()
+            .expect("ChatSession.routed_by.enum")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        documented.sort_unstable();
+        let mut produced: Vec<&str> = every_level.iter().map(|l| l.as_str()).collect();
+        produced.sort_unstable();
+        assert_eq!(documented, produced, "routed_by enum of the contract");
+
+        // Decision R-S4: a conversation's mode (`mixed` = among its pool) and the settings'
+        // mode (`executors_only`) are named apart in the contract too.
+        for dto in ["ChatSession", "CreateSessionRequest"] {
+            let modes: Vec<&str> = contract["rest"][dto]["routing_mode"]["enum"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{dto}.routing_mode.enum"))
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(
+                modes,
+                super::super::cognitive::ConversationRoutingMode::ALL.map(|m| m.as_str()),
+                "{dto}.routing_mode enum of the contract"
+            );
+        }
+        assert_eq!(
+            contract["rest"]["GET /api/chat/providers"]["response"]["routing"]["mode"],
+            ProviderRoutingMode::ALL.map(|m| m.as_str()).join(" | "),
+            "the settings' mode in the contract"
+        );
+        assert_eq!(
+            contract["rest"]["ChatSession"]["route_reason"]["type"],
+            "string | null"
+        );
+        let routing = &contract["rest"]["GET /api/chat/providers"]["response"]["routing"];
+        for key in ["mode", "stage", "scope"] {
+            assert!(
+                routing.get(key).is_some(),
+                "ProvidersResponse.routing.{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_reason_is_a_fixed_sentence_and_a_path_never_leaves() {
+        let unreachable = |detail: &str| {
+            let h = ProviderHealth::unavailable(ProviderError::unreachable(detail));
+            HealthEntry::from_nexus(&h).with_remote_reason(&h)
+        };
+        let ok = unreachable("deploy@box:22: the host key does not match the pinned key");
+        assert_eq!(
+            ok.reason.as_deref(),
+            Some("deploy@box:22: the host key does not match the pinned key")
+        );
+        // Whatever a lower layer puts in the text, a path is replaced.
+        let leaked = unreachable("identity file /tmp/nexus-1234/id_ssh must be owner-only");
+        assert_eq!(leaked.reason.as_deref(), Some("the machine cannot be used"));
+        let long = unreachable(&"x".repeat(400));
+        assert_eq!(long.reason.as_deref(), Some("the machine cannot be used"));
+        // A healthy instance has no reason, and no other kind gets one from the plain mapping.
+        let h = ProviderHealth::ok(None);
+        assert!(HealthEntry::from_nexus(&h)
+            .with_remote_reason(&h)
+            .reason
+            .is_none());
+        assert!(
+            HealthEntry::from_nexus(&ProviderHealth::unavailable(ProviderError::unreachable(
+                "x"
+            )))
+            .reason
+            .is_none()
+        );
+        let json = serde_json::to_value(HealthEntry::unknown()).unwrap();
+        assert!(json.get("reason").is_none(), "additive: absent unless set");
+    }
+
+    #[test]
+    fn an_auth_required_reason_follows_its_hint_not_the_ssh_key() {
+        let auth = |hint: Option<&str>| {
+            let h = ProviderHealth::unavailable(ProviderError::AuthRequired {
+                login_hint: hint.map(str::to_string),
+            });
+            HealthEntry::from_nexus(&h).with_remote_reason(&h)
+        };
+        // A remote machine that is not logged in: the reason says so, not the vault.
+        let login = auth(Some("claude login"));
+        assert_eq!(login.reason.as_deref(), Some("claude login"));
+        // A vault grant missing: that one really is about the key.
+        let grant = auth(Some(
+            "store the provider key in the vault and grant it to provider instance 'box'",
+        ));
+        assert!(grant.reason.as_deref().unwrap().contains("vault"));
+        // No hint at all: a generic sentence, never a guessed SSH cause.
+        let none = auth(None);
+        assert_eq!(
+            none.reason.as_deref(),
+            Some("the machine needs a sign-in before it can be used")
+        );
+        assert!(!none.reason.unwrap().contains("SSH"));
+    }
+}

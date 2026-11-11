@@ -1,0 +1,82 @@
+//! Neo4j client and models for the knowledge graph
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+pub(crate) mod agent_execution;
+mod alert;
+mod analytics;
+pub(crate) mod batch;
+pub mod beliefs;
+mod chat;
+pub mod client;
+mod code;
+mod commit;
+mod constraint;
+pub mod data_migrations;
+mod day_plan;
+mod decision;
+pub mod document;
+mod environment;
+mod event_trigger;
+mod execution_place;
+mod feature_graph;
+/// Identité de fichier indépendante du point de montage (T7) : `file_uid`
+/// (identité), `declared_path` (écriture sous la racine déclarée) et
+/// `realpath_within_root` (périmètre du scan).
+pub mod file_uid;
+pub mod graph_sampler;
+pub mod graph_schema;
+mod impl_graph_store;
+mod ingress;
+mod lifecycle_hook;
+mod mcp_federation;
+mod milestone;
+pub mod models;
+mod neighborhood;
+mod note;
+pub mod path_migration;
+mod persona;
+pub mod plan;
+mod plan_run;
+mod profile;
+mod project;
+mod protocol;
+pub(crate) mod reasoning;
+mod registry;
+mod release;
+pub mod routing;
+pub mod segment;
+mod sharing;
+mod skill;
+mod step;
+pub mod symbol_key;
+mod synapse_shadow;
+mod task;
+mod topology;
+pub mod traits;
+pub mod trajectory;
+pub mod trajectory_migration;
+pub mod trajectory_store;
+mod trigger;
+mod user;
+mod workspace;
+
+pub use agent_execution::{AgentExecutionNode, AgentExecutionStatus};
+pub use chat::{AgentEdgeCount, AgentEdgeMigration, AGENT_SELF_MIGRATION_KEY};
+pub use client::Neo4jClient;
+pub use document::{Document, DocumentChunk, DocumentChunkHit};
+pub use models::*;
+pub use segment::Neo4jSegmentStore;
+pub use traits::{
+    AnalyticsStore, AuthStore, ChatStore, CodeStore, CommitStore, DecisionStore, FeatureGraphStore,
+    FederationStore, GraphStore, NoteStore, PersonaStore, PlanRunStore, PlanStore, ProjectStore,
+    ProtocolRunStore, ProtocolStore, ReleaseStore, SharingStore, SkillStore, StoreCapabilities,
+    TriggerStore, WorkspaceStore,
+};
+
+// The in-memory store. Unit tests get it through `cfg(test)`; the integration
+// test targets (tests/store_conformance.rs runs the same checks against it and
+// against Neo4j) get it through the `mock-store` feature, which the dev-dependency
+// of the crate on itself enables for every test build and no binary.
+#[cfg(any(test, feature = "mock-store"))]
+pub mod mock;

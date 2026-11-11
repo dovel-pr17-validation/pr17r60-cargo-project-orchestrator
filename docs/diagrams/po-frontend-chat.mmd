@@ -1,0 +1,222 @@
+%% name: po-frontend-chat
+%% covers: frontend:src/services/{chatWebSocket,chat,wsAdapter}.ts frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree,useEffectiveCapabilities}.ts frontend:src/hooks/runner/useConversationWs.ts frontend:src/atoms/{chat,modelCatalog}.ts frontend:src/utils/chatAssembly.ts frontend:src/types/chat.ts frontend:src/constants/models.ts frontend:src/components/chat/{ChatPanel,ChatInput,ActivityBar,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx frontend:src/components/chat/{messageQueue,inputAction,runningActivity,chatUrlState,sessionListUtils,sessionActivity}.ts frontend:src/components/chat/tools/** frontend:src/components/chat/{SecretRequestTray,ExecPlaceConfirmTray}.tsx frontend:src/atoms/execConfirm.ts frontend:src/services/executionPlace.ts frontend:src/utils/executionPlace.ts
+%% verified: 5573620a
+%% ---
+%% PROUVE : le harness de chat côté navigateur — du socket /ws/chat/{id} au rendu
+%%   des blocs et à la réponse aux demandes de permission — tel que le code le fait
+%%   au sha frontend 575bce1 (relu le 2026-10-02), puis recoupé avec frontend 7e664ea (#198, #199) ; le sha `verified` ci-dessus est
+%%   celui du dépôt backend qui porte cet index).
+%% ---
+%% SOURCES LUES (frontend@575bce1) :
+%%   src/services/chatWebSocket.ts   — ChatWebSocket.connect, openSocket, scheduleReconnect,
+%%                                     forceReconnect, startStallWatchdog, send*, SKIP_REPLAY_THRESHOLD
+%%   src/services/wsAdapter.ts        — createWebSocket (BrowserWebSocket, TauriWebSocket)
+%%   src/services/chat.ts             — chatApi (createSession, getMessages, interruptSession,
+%%                                     cancelTools, getModelCatalog, getCliStatus, installCli, detectPath)
+%%   src/hooks/useChat.ts             — useChat, handleEvent, resyncFromRest, fetchRenderableTail,
+%%                                     reconcileReplayedText, respondPermission, respondInput, interrupt
+%%   src/hooks/useChatUrlSync.ts      — useChatUrlSync ; src/hooks/useSessionTree.ts — useSessionTree
+%%   src/hooks/runner/useConversationWs.ts — useConversationWs (lecture seule)
+%%   src/utils/chatAssembly.ts        — historyEventsToMessages, workflowEventToTick,
+%%                                     attachToParentToolUse, appendBackgroundActivity
+%%   src/types/chat.ts                — ChatEvent (33 variantes, discriminant `type`), PermissionMode,
+%%                                     WsChatClientMessage, ClientMessage, ContentBlock
+%%   src/atoms/chat.ts                — chatPermissionInteractiveAtom, chatAutoApprovedToolsAtom, …
+%%   src/atoms/modelCatalog.ts, src/constants/models.ts — modelCatalogAtom, parseModelFamily, DEFAULT_MODEL_ID
+%%   src/components/chat/ChatPanel.tsx, ChatInput.tsx, ChatMessages.tsx, ChatMessageBubble.tsx
+%%     (groupBlocksByAgent), ChatSessionContext.tsx, PermissionRequestBlock.tsx (classifyTool),
+%%     PermissionSettingsPanel.tsx, SessionList.tsx (SessionRow, RenameInput, fetchSessions
+%%     modes initial/more/reconcile), messageQueue.ts, inputAction.ts
+%%     (deriveInputAction), chatUrlState.ts, sessionListUtils.ts, sessionActivity.ts
+%%     (describeActivity, applySnapshot, applyWindow, applyStreamingEvent, anyLive),
+%%     tools/index.tsx (TOOL_REGISTRY)
+%%   src/components/chat/runningActivity.ts (collectRunning, countByKind), ActivityBar.tsx — lus à frontend@de44980 (#215)
+%%   Commandes : grep -rn 'function useConversationWs' src  → 1 définition (frontend@7e664ea ; 3 avant #199)
+%%               grep -n 'session_error\|tools_cancelled' src/hooks/useChat.ts src/utils/chatAssembly.ts → 0
+%%               grep -rn 'ClientMessage\b' src | grep -v WsChatClientMessage → 0 (type supprimé, frontend#198)
+%% ---
+%% CONVENTION : « 🟠 écrit, sans test » = le code existe et a été lu, mais aucun test ne le
+%%   prouve ; la vérification est décidée et pas écrite (tâche 3.3 du plan). Un ✅ nomme son test.
+%% ---
+%% CORRIGE LE 2026-10-03 (frontend fix/session-list-no-remount, backend feat/chat-live-activity) :
+%%   1. un événement CRUD `chat_session` passait par le chemin de CHARGEMENT INITIAL
+%%      (setLoading(true) + offsetRef=0) : la liste entière cédait la place au spinner
+%%      « Loading... », donc le sous-arbre était DEMONTE — lignes dépliées refermées,
+%%      un useDetachedRuns relancé par rangée — et les pages scrollées étaient perdues.
+%%      Changer d'état repeignait tout. Mode `reconcile` ajouté : même fenêtre, sans
+%%      spinner, mêmes rangées rendues à React.
+%%   2. l'indicateur « working » ne venait QUE des événements reçus pendant que la liste
+%%      était montée : après un rechargement, toute conversation en train de travailler
+%%      paraissait inactive, et rien ne disait ce qu'une session vivante mais muette
+%%      attendait. L'activité est désormais estampillée par le serveur (voir po-chat-manager).
+%% ---
+%% NON ETABLI :
+%%   le backend émet-il réellement session_error et tools_cancelled ? (voir po-chat-manager)
+%%   wsAdapter.ts (TauriWebSocket) : aucun test trouvé, comportement non reproduit ici
+%%   aucune mesure navigateur du non-repeint : les preuves ci-dessus sont des tests JSDOM
+%%     (identité du nœud DOM conservée, absence de « Loading... », fenêtre relue entière)
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 décidé non écrit / écrit sans test
+%%   🔴 défaut constaté (raison dans le nœud)  ⚪ hors de ce dépôt
+%%   ⚓ = point de couplage avec Claude Code (noms d'outils, de modes, de modèles, du CLI)
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié : test nommé"]
+        L2["🟠 écrit, sans test / décidé non écrit"]
+        L3["🔴 défaut constaté"]
+        L4["⚪ hors dépôt"]
+        L5["⚓ couplage Claude Code"]
+    end
+
+    BACKEND_WS["⚪ backend ws_chat_handler.rs<br/>/ws/chat/{id}?last_event=N"]
+    BACKEND_REST["⚪ backend chat_handlers.rs<br/>/api/chat/*"]
+
+    subgraph transport["Transport — services/chatWebSocket.ts, wsAdapter.ts"]
+        direction TB
+        CONNECT["✅ ChatWebSocket.connect → openSocket<br/>jeton de génération contre les sockets périmés ;<br/>ticket WS en Tauri, cookie HttpOnly en navigateur ;<br/>trame texte #quot;ready#quot; à l'ouverture<br/><i>vérifié : __tests__/chatWebSocket.test (socket périmé jeté, socket sain réutilisé)</i>"]
+        AUTH["✅ premier message auth_ok / auth_error<br/>auth_error → stop + forceLogout si auth requise<br/><i>vérifié : chatWebSocket.test (connected after auth_ok)</i>"]
+        REPLAY["✅ rejeu : last_event=N, replay_complete → onReplayComplete<br/>SKIP_REPLAY_THRESHOLD (1e12) → pas de rejeu, onResync<br/><i>vérifié : __tests__/chatWebSocket.test (skip-replay fires onResync)</i>"]
+        RECONNECT["✅ scheduleReconnect : 1 s → 30 s, 10 essais<br/>forceReconnect sur events_lagged, envoi sur socket mort,<br/>retour au premier plan après 45 s, événement online,<br/>garde-fou 60 s si le serveur streame sans rien envoyer<br/><i>vérifié : chatWebSocket.test (events_lagged, dead socket, foreground)</i>"]
+        CONSUMED["✅ trames consommées, jamais transmises à onEvent :<br/>auth_ok, auth_error, replay_complete, events_lagged,<br/>session_dormant (reste connecté), session_closed (arrêt)<br/><i>vérifié : chatWebSocket.test (session_dormant / session_closed)</i>"]
+        SEND["✅ WsChatClientMessage : user_message (queue: true = retenu par la session<br/>jusqu'à la fin du tour), queue_op, interrupt,<br/>permission_response, input_response, set_permission_mode,<br/>set_model (plus de set_auto_continue : toujours actif côté backend) ; faux si socket mort<br/><i>vérifié : chatWebSocket.test (send on a dead socket returns false)</i>"]
+        ADAPTER["🟠 wsAdapter.createWebSocket<br/>BrowserWebSocket ou TauriWebSocket<br/>écrit, sans test"]
+        DEADTYPE["✅ types/chat.ts ClientMessage supprimé (type mort, champs divergents<br/>de WsChatClientMessage)<br/><i>vérifié : grep -rn 'ClientMessage\b' src | grep -v WsChatClientMessage → 0 ; tsc propre (frontend#198)</i>"]
+        NOCLOSED["🟠 session_closed : branche RÉSERVÉE (le code dit « explicit close — future use »),<br/>testée ici (chatWebSocket.test) mais sans producteur : le backend ferme une session<br/>en supprimant son canal → session_dormant, le client reste connecté (voulu).<br/>Décision : la garder ; l'émettre serait un changement de contrat à part<br/><i>vérifié : grep session_closed backend/src → 0 hors FSM</i>"]
+        CONNECT --> AUTH --> REPLAY
+        CONNECT --> ADAPTER
+        RECONNECT --> CONNECT
+        AUTH --> CONSUMED
+        CONSUMED --> NOCLOSED
+    end
+
+    BACKEND_WS <--> CONNECT
+
+    subgraph reducer["Réducteur — hooks/useChat.ts"]
+        direction TB
+        EFFECT["✅ effet sur sessionId : connect(sid, MAX_SAFE_INTEGER)<br/>+ REST fetchRenderableTail élargi ×4 jusqu'à 800 événements ;<br/>repli : rejeu WS complet (last_event=0) si le REST échoue<br/><i>vérifié : useChat.renderableTail.test</i>"]
+        GATES["✅ handleEvent — tampons : pendingEventsRef tant que<br/>l'historique n'est pas chargé, pendingTailEventsRef hors queue<br/><i>vérifié : useChat.resync.test (buffered live events after history)</i>"]
+        REDUCE["✅ réduction en blocs : stream_delta, assistant_text, thinking,<br/>tool_use, tool_result, permission_request, result, compact_boundary…<br/>reconcileReplayedText : append-only, jamais destructif<br/><i>vérifié : useChat.resync.test (NEVER deletes already-rendered content)</i>"]
+        RESYNC["✅ resyncFromRest : idempotent sur deux reconnexions,<br/>ignoré pendant un chargement, jeté après un changement de session<br/><i>vérifié : useChat.resync.test</i>"]
+        AUTOAPPROVE["✅ permission_request d'un outil mémorisé →<br/>sendPermissionResponse(id, true) ; pas d'auto_approved<br/>si l'envoi n'est pas parti<br/><i>vérifié : useChat.sendResult.test</i>"]
+        ACTIONS["✅ respondPermission / respondInput / sendContinue<br/>ne mutent l'état que si le socket a accepté l'envoi<br/><i>vérifié : useChat.sendResult.test</i>"]
+        INTERRUPT["🟠 interrupt() : ws.sendInterrupt, sinon REST<br/>chatApi.interruptSession(sid) ; isStreaming=false si non livré<br/>écrit, sans test"]
+        OUTBOX["🟠 pendingSendRef : messages tombés sur un socket mort,<br/>rejoués à replay_complete — écrit, sans test"]
+        UNHANDLED["✅ session_error : rendu en bloc d'erreur « message (raison) » par handleEvent,<br/>historyEventsToMessages et les deux parseurs privés ; isStreaming remis à faux en live<br/><i>vérifié : chatAssembly.sessionError.test — 2 échecs sur main, 2 passes avec le correctif (frontend#198)</i>"]
+        TOOLSCANCEL["🟠 tools_cancelled : volontairement non rendu — chaque outil reçoit déjà son<br/>tool_cancelled ; un second bloc ferait doublon (décision prise, rien à écrire)"]
+        ASKQ["🟠 ⚓ branche toolName === #quot;AskUserQuestion#quot;<br/>→ bloc ask_user_question (useChat ET chatAssembly)<br/>nom d'outil Claude Code codé en dur ; sans test dédié"]
+        EFFECT --> GATES --> REDUCE
+        REDUCE --> RESYNC
+        REDUCE --> AUTOAPPROVE
+        REDUCE --> UNHANDLED
+        REDUCE --> TOOLSCANCEL
+        REDUCE --> ASKQ
+    end
+
+    CONSUMED -->|"tout autre type → onEvent"| GATES
+    REPLAY -->|"onResync"| RESYNC
+    REPLAY -->|"onReplayComplete"| OUTBOX
+    ACTIONS --> SEND
+    INTERRUPT --> SEND
+    INTERRUPT -.->|"repli"| REST
+
+    subgraph assembly["Assemblage — utils/chatAssembly.ts"]
+        direction TB
+        HIST["✅ historyEventsToMessages : événements bruts REST →<br/>messages user/assistant, blocs par type, métriques du result<br/><i>vérifié : chatAssembly.test</i>"]
+        BG["✅ workflowEventToTick → attachToParentToolUse,<br/>sinon appendBackgroundActivity (orphelins pliés, 20 entrées max)<br/><i>vérifié : chatAssembly.test (orphan folded, keyed by tool_use_id)</i>"]
+        HIST --> BG
+    end
+
+    EFFECT -->|"REST getMessages"| HIST
+    BG --> REDUCE
+
+    subgraph readonly["Lecteurs seuls — hooks/runner/useConversationWs.ts"]
+        direction TB
+        RO["🟠 useConversationWs : last_event=0, rejeu complet,<br/>n'envoie que #quot;ready#quot;, reconstruit historyEventsToMessages<br/>à chaque événement — écrit, sans test"]
+        DUP["✅ UNE seule implémentation de useConversationWs : hooks/runner/useConversationWs.ts (assembleur partagé<br/>historyEventsToMessages + ChatMessageBubble), utilisée par runner/InlineConversation, ChatSessionPage et<br/>discussions/InlineConversationPanel ; le ConversationPanel du runner, que personne n'importait, est supprimé<br/><i>vérifié : grep -rn 'function useConversationWs' src → 1 ; InlineConversationPanel.events.test (rouge sur l'ancien panneau : tool_use lu par .name au lieu de .tool) ; frontend#199</i>"]
+        RO --> DUP
+    end
+
+    BACKEND_WS --> RO
+    RO --> HIST
+
+    subgraph state["État — atoms/chat.ts, atoms/modelCatalog.ts, constants/models.ts, types/chat.ts"]
+        direction TB
+        ATOMS["🟠 jotai : chatSessionIdAtom, chatStreamingAtom, chatWsStatusAtom,<br/>chatAutoApprovedToolsAtom, chatSessionModelAtom, chatMessageQueueAtom,<br/>chatBackgroundTasksAtom, chatSecretRequestsAtom…<br/>écrit, sans test"]
+        MODES["🟠 ⚓ PermissionMode = default · acceptEdits · plan · bypassPermissions<br/>chatPermissionInteractiveAtom = mode !== bypassPermissions<br/>valeurs du CLI Claude (doc-comment : « supported by Claude CLI via Nexus SDK »)"]
+        MODELS["✅ ⚓ constants/models : parseModelFamily, getModelShortLabel<br/>retirent le préfixe claude- ; DEFAULT_MODEL_ID = claude-sonnet-5 ;<br/>familles opus · fable · sonnet · haiku · mythos<br/><i>vérifié : ModelFamilyPicker.test (picker) — parseModelFamily sans test dédié</i>"]
+        EVENTS["🟠 ⚓ ChatEvent : 33 variantes ; propres au CLI Claude :<br/>system_init, compact_boundary, compaction_started, thinking,<br/>tool_use_input_resolved, workflow, background_output (Monitor),<br/>result.subtype error_max_turns — écrit, parse vérifié pour 2 variantes<br/><i>types/chat.test : active_tasks_update, background_output</i>"]
+        ATOMS --> MODES
+        ATOMS --> MODELS
+    end
+
+    REDUCE --> ATOMS
+    EVENTS --> REDUCE
+
+    subgraph rest["REST — services/chat.ts"]
+        direction TB
+        REST["🟠 chatApi : createSession, listSessions, getMessages,<br/>interruptSession(scope), cancelTools, getBackgroundTasks,<br/>getModelCatalog, config permissions ; pas d'endpoint resume :<br/>une user_message WS sur une session dormante relance le CLI<br/>écrit, sans test"]
+        CLI["🟠 ⚓ chatApi.detectPath, getCliStatus, installCli<br/>/chat/detect-path, /chat/cli/status, /chat/cli/install :<br/>gestion du binaire Claude Code depuis le navigateur"]
+        REST --> CLI
+    end
+
+    BACKEND_REST <--> REST
+
+    subgraph render["Rendu — components/chat/*"]
+        direction TB
+        PANEL["🟠 ChatPanel : useChat + useChatUrlSync + ChatSessionProvider ;<br/>handleSend → chat.sendMessage ; handleStopRun → interruptSession(enfant)<br/>écrit, jamais couvert (docs/COVERAGE.md)"]
+        MSGS["✅ ChatMessages : ancrage bas pendant le flux,<br/>scroll inversé (onLoadOlder / onLoadNewer), badge « nouveaux »<br/><i>vérifié : ChatMessages.streaming.test</i>"]
+        BUBBLE["✅ ChatMessageBubble.groupBlocksByAgent :<br/>blocs portant parent_tool_use_id repliés sous leur tool_use (sous-agent),<br/>tool_use consécutifs groupés, tool_result rendus dans leur outil<br/><i>vérifié : BackgroundActivityIntegration.test (regroupement d'activité)</i>"]
+        INPUT["✅ ChatInput : file d'attente chatMessageQueueAtom,<br/>un message par tour, « envoyer maintenant » = second clic + interruption ;<br/>deriveInputAction → send · stop · stopping · waiting · idle<br/><i>vérifié : ChatInput.queue.test, inputAction.test, messageQueue.test</i>"]
+        RUNNING["✅ ⚓ runningActivity.collectRunning : UNE liste de ce qui tourne dans la session —<br/>Monitor / Bash depuis le registre backend SEUL (jamais devinés depuis le fil),<br/>workflows (progression du fan-out) et sous-agents depuis les tool_use ;<br/>un sous-agent au premier plan ne compte que pendant le flux de SON tour ;<br/>runs détachés (useDetachedRuns) listés seulement tant qu'ils streament (frontend #216)<br/><i>vérifié : runningActivity.test (17 cas ; rouge si la règle du registre est retirée)</i>"]
+        ACTIVITY["✅ ActivityBar : compteur par type au-dessus du composeur, liste dépliable,<br/>saut vers le bloc du fil (data-tool-call-id / data-activity-anchors),<br/>Stop = cancel-task, réservé aux tâches que le backend sait arrêter seules ;<br/>remplace la pastille BackgroundTasksIndicator (supprimée) ;<br/>ligne d'un run : ouvrir sa conversation, tableau de bord du runner, arrêter (frontend #216)<br/><i>vérifié : ActivityBar.test, ChatInput.activity.test ; jamais essayé dans un navigateur</i>"]
+        RUNSPANEL["✅ ChatPanel : un run qui streame n'est montré QUE dans la barre ;<br/>DetachedRunsPanel ne reçoit que les runs terminés ; AgenticModeBanner / AgenticModePill<br/>ne sont plus montés ici (restent sur ChatSessionPage) — plus de polling runner depuis le chat<br/><i>vérifié : ChatPanel.runs.test (rouge si le filtre est retiré) ; frontend #216</i>"]
+        INPUTMODES["🟠 ⚓ ChatInput MODE_LABELS / PermissionSettingsPanel MODES et presets<br/>Bash(git *), Read(.env*), mcp__project-orchestrator__* :<br/>syntaxe des règles d'outils de Claude Code — sans test"]
+        PERM["✅ ⚓ PermissionRequestBlock.classifyTool<br/>Bash · Read/Glob/Grep · Edit/Write/NotebookEdit · mcp__ · WebFetch/WebSearch ;<br/>Allow / Deny / Remember → onRespond ; « Not sent » si le socket a refusé<br/><i>vérifié : ResponseBlocks.sendFailure.test</i>"]
+        TOOLS["🟠 ⚓ tools/index.tsx TOOL_REGISTRY : Bash, Edit, Read, Write, Glob, Grep,<br/>WebFetch, WebSearch, TodoWrite → tools/*Renderer.tsx ; préfixe<br/>mcp__project-orchestrator__ ou input.action → McpToolRenderer → tools/mcp/*Renderer.tsx<br/>(classifyAction : list · entity · chat · code · progress) ; sinon DefaultToolRenderer ;<br/>summaries.ts, syntax.ts, types.ts — écrit, sans test"]
+        SESSIONS["✅ SessionList + sessionListUtils (shortModelName retire claude-,<br/>PERMISSION_MODE_META, groupSessionsByDate)<br/>rangées mémoïsées (SessionRow) ; un événement d'état ne repeint pas la liste :<br/>reconcile silencieux sur la fenêtre chargée, jamais setLoading(true)<br/><i>vérifié : SessionList.test, sessionListUtils.test, SessionList.liveState.test</i>"]
+        ACTIVITY["✅ sessionActivity : describeActivity → Working… · Waiting for your approval ·<br/>Watching N targets · N background tasks running · Idle — waiting for you<br/>applySnapshot remplace la carte en entier (un « Working… » figé ne survit pas),<br/>applyWindow ne parle que des sessions listées, applyStreamingEvent accélère<br/><i>vérifié : sessionActivity.test (19 cas)</i>"]
+        LIVEACT["✅ GET /api/chat/live-activity (chatApi.getLiveActivity), relu toutes les 5 s<br/>TANT QU'une session est vivante, jamais sinon, pause onglet caché<br/><i>vérifié : SessionList.liveState.test — « ne sonde pas quand tout est calme »</i>"]
+        URL["✅ chatUrlState parseChatUrl / writeChatUrl (?chat=&chatView=)<br/>via useChatUrlSync<br/><i>vérifié : chatUrlState.test</i>"]
+        TRAYS["✅ Plateaux du dock du composeur (ComposerDock, aux deux sites de ChatPanel) :<br/>SecretRequestTray — carte de saisie sécurisée d'un secret (vault request_secret) ;<br/>ExecPlaceConfirmTray (EXEC-CONFIRM, frontend #418 / backend #923 / EXEC-CONFIRM-suite) — « Exécuter dans X ? » Autoriser / Refuser :<br/>déclenchée par un CrudEvent d'entity_type task dont payload.event = execution_place_confirmation_required (utils/executionPlace.execConfirmFromEvent : entity_type snake_case, placement_id et path requis, sinon ignoré ; l'ACTION n'est pas filtrée côté client — le backend émet Updated, emit_question) ;<br/>le CHEMIN vient de l'événement (asserté par le harnais), lecture seule, renvoyé tel quel à POST /api/execution-places/{id}/confirm {path} ; Refuser → …/reject ; expires_at relu par GET …/{id} ;<br/>états confirmée · refusée · expirée (410) ; 403 / 409 lisibles, carte conservée ; session HUMAINE seulement (ni spawnedBy ni mirrorOf) ; dédoublonnage par placement_id ; atoms/execConfirm = état d'affichage SEUL, le consentement vit chez le serveur (place_confirmation, un seul store) ; en bypassPermissions le serveur confirme seul → aucun événement, aucune carte ;<br/>RÉ-HYDRATATION (EXEC-CONFIRM-suite) : au montage d'une session humaine, GET /api/execution-places?status=pending relit les placements en attente de la personne (le serveur filtre par owner, le client filtre en défense en profondeur par currentUserAtom.id) ; dédoublonnage par placement_id avec les cartes déjà reçues par CrudEvent ; les événements pour un autre owner sont ignorés côté client quand l'identité est connue<br/><i>vérifié : ExecPlaceConfirmTray.test (14 cas : événement → carte + chemin, confirm(chemin exact), reject, doublon, session enfant, 403, 410, expires_at passé, annonce invalide, ré-hydratation après rechargement, dédoublonnage ré-hydratation/événement, filtre owner ré-hydratation, filtre owner événement, pas d'appel en session non humaine)</i>"]
+        PANEL --> MSGS --> BUBBLE
+        PANEL -->|"dock : au-dessus du composeur"| TRAYS
+        BUBBLE --> PERM
+        BUBBLE --> TOOLS
+        PANEL --> INPUT --> INPUTMODES
+        PANEL -->|"collectRunning(messages, tâches de fond, isStreaming)"| RUNNING
+        RUNNING --> ACTIVITY
+        PANEL --> RUNSPANEL
+        INPUT -->|"une seule carte : activité au-dessus, file dessous"| ACTIVITY
+        PANEL --> SESSIONS
+        SESSIONS --> ACTIVITY
+        LIVEACT --> ACTIVITY
+        PANEL --> URL
+        EFFCAPS["✅ F-R4 — capacités EFFECTIVES (décision 11cefdb2) : useChat monte useEffectiveCapabilities, qui relit GET /api/chat/sessions/{id}.effective_capabilities à chaque system_init, changement de routage (chatSessionRoutingAtom) et fin de tour → chatSessionEffectiveCapabilitiesStateAtom (clé = session : jamais celle d'une autre conversation) ; la réponse de PUT …/routing (RoutingSelectionMenu.sendRouting) l'écrit directement ;<br/>composeur : chatSessionCapabilitiesAtom.images = effective.value quand source = routing_pool ET (value vrai OU le modèle lui-même déclare images:false) — le routage n'ELARGIT que, (l'image est acceptée si UN candidat la lit ; le tour est routé vers lui côté serveur) ; refus dit par cause (chatSessionImagesCauseAtom : model · harness · routing · routing_unprobed, i18n routing.capabilities.composer.*) ;<br/>bandeau ET icône repliée (#339, gapItems → CapabilityGapsButton) : ChatPanel lit chatSessionEngineFactsAtom / chatSessionDeclaredFactsAtom = constants/engine withEffectiveImages (pool qui lit les images → aucune ligne images ; pool sans vision → routing_images ; pool non construit → images_pool_unbuilt, cause model, i18n routing.capabilities.banner.*) ; primary / aucun routeur / rien dit = inchangé<br/><i>vérifié : ChatInput.effectiveCapabilities.test (le composeur rouge sans la prise en compte du pool), ChatPanel.capabilityBanner.test (icône), RoutingSelectionMenu.test (réponse du PUT)</i>"]
+        PANEL --> EFFCAPS
+        EFFCAPS --> INPUT
+    end
+
+    PANEL --> EFFECT
+    REDUCE -->|"messages[]"| MSGS
+    PERM -->|"onRespond(toolCallId, allow, remember)"| ACTIONS
+    INPUT -->|"onInterrupt"| INTERRUPT
+    INPUT -->|"set_permission_mode / set_model"| SEND
+    MODES --> INPUTMODES
+    MODELS --> INPUT
+    DEADTYPE -.-> SEND
+
+    subgraph coupling["⚓ Relevé du couplage Claude Code (entrée de la RFC multi-provider)"]
+        direction TB
+        C1["✅ modes de permission : 5 fichiers<br/>ChatInput, ChatPanel, PermissionSettingsPanel, sessionListUtils, atoms/chat<br/><i>vérifié : grep bypassPermissions src</i>"]
+        C2["✅ noms d'outils : tools/index (registre), PermissionRequestBlock.classifyTool,<br/>useChat + chatAssembly (AskUserQuestion), utils/backgroundActivity,<br/>AgentGroup (subagent_type)<br/><i>vérifié : grep AskUserQuestion src</i>"]
+        C3["✅ identifiants de modèle : constants/models (claude-, familles),<br/>sessionListUtils.shortModelName, modelCatalog (Models API Anthropic)<br/><i>vérifié : grep 'claude-' src</i>"]
+        C4["✅ événements et endpoints du CLI : system_init, compact_boundary,<br/>cli_session_id, add_dirs (--add-dir), /chat/cli/*, /chat/detect-path<br/><i>vérifié : grep cli_session_id src</i>"]
+    end
+
+    INPUTMODES -.-> C1
+    TOOLS -.-> C2
+    MODELS -.-> C3
+    CLI -.-> C4

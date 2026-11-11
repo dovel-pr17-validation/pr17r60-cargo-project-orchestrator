@@ -1,0 +1,1388 @@
+//! Neo4j client for interacting with the knowledge graph
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
+
+use crate::neo4j::traits::StoreCapabilities;
+use anyhow::{Context, Result};
+use neo4rs::{query, ConfigBuilder, Graph, Query};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+/// Names of the uniqueness constraints `create_schema` must leave in place.
+const EXPECTED_CONSTRAINTS: &[&str] = &[
+    "project_id",
+    "project_slug",
+    "file_path",
+    "file_uid",
+    "function_id",
+    "struct_id",
+    "trait_id",
+    "enum_id",
+    "impl_id",
+    "import_id",
+    "commit_hash",
+    "plan_id",
+    "task_id",
+    "step_id",
+    "decision_id",
+    "constraint_id",
+    "day_plan_key",
+    "agent_id",
+    "note_id",
+    "document_id",
+    "document_chunk_id",
+    "workspace_id",
+    "workspace_slug",
+    "workspace_milestone_id",
+    "resource_id",
+    "component_id",
+    "chat_session_id",
+    "chat_event_id",
+    "session_episode_session",
+    "agent_identity_root_key",
+    "milestone_id",
+    "release_id",
+    "environment_id",
+    "deployment_id",
+    "feature_graph_id",
+    "user_id",
+    "refresh_token_hash",
+    // GraIL node labels
+    "topology_rule_id",
+    "predicted_link_id",
+    "analysis_profile_id",
+    // Chat anchors
+    "anchor_id",
+    "anchor_session_target",
+    "anchor_event_id",
+    // Execution-place audit (T5)
+    "execution_place_event_id",
+    // Synaptic layer in shadow mode (T8)
+    "synapse_shadow_trace_id",
+    // Skills, protocols, personas, alerts, routing
+    "skill_id",
+    "protocol_id",
+    "protocol_state_id",
+    "protocol_transition_id",
+    "protocol_run_id",
+    "persona_id",
+    "alert_dedup_key",
+    "routing_arm_key",
+    "routing_decision_id",
+    // Plan triggers
+    "trigger_signal_key",
+    // External event ingestion: one claimed delivery per (trigger, delivery key)
+    "external_delivery_key",
+    // Conversation segments (episodic memory, S4)
+    "conversation_segment_key",
+    "conversation_boundary_key",
+];
+
+/// Client for Neo4j operations
+pub struct Neo4jClient {
+    pub(crate) graph: Arc<Graph>,
+    /// TTL cache for pairwise coupling scores between projects.
+    /// Key: (min(project_a, project_b), max(project_a, project_b)) — sorted for symmetry.
+    /// Value: (coupling_score, cached_at).
+    /// Entries expire after `COUPLING_CACHE_TTL` (5 minutes).
+    pub(crate) coupling_cache: RwLock<HashMap<(Uuid, Uuid), (f64, Instant)>>,
+    /// The agent identity root, once read (`agent_identity_namespace`): it never changes
+    /// after its creation, so one round trip per process.
+    pub(crate) agent_identity_root: tokio::sync::OnceCell<Uuid>,
+}
+
+/// Convert PascalCase to snake_case (e.g., "InProgress" -> "in_progress")
+pub(crate) fn pascal_to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('_');
+            }
+            result.push(c.to_ascii_lowercase());
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Both on-disk spellings of a status, snake_case first (canonical) then
+/// PascalCase (legacy rows written with `{:?}`). Characters other than
+/// `[A-Za-z0-9_]` are dropped so the result is safe to embed in Cypher text.
+///
+/// Canonical encoding: Release, Milestone and WorkspaceMilestone store
+/// snake_case (`in_progress`); Plan, Task and Step still store PascalCase
+/// (`InProgress`). Reads must accept both (see `pascal_to_snake_case`).
+pub(crate) fn status_variants(s: &str) -> Vec<String> {
+    let clean: String = s
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let snake = pascal_to_snake_case(&clean);
+    let pascal = snake_to_pascal_case(&snake);
+    if snake == pascal {
+        vec![snake]
+    } else {
+        vec![snake, pascal]
+    }
+}
+
+/// Convert snake_case to PascalCase (e.g., "in_progress" -> "InProgress")
+pub(crate) fn snake_to_pascal_case(s: &str) -> String {
+    s.split('_')
+        .map(|word| {
+            let mut c = word.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().chain(c).collect(),
+            }
+        })
+        .collect()
+}
+
+/// A value bound to a Cypher parameter by [`WhereBuilder`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum WhereParam {
+    Str(String),
+    StrList(Vec<String>),
+}
+
+/// Builder for dynamic WHERE clauses in Cypher queries.
+///
+/// User-supplied values are never interpolated into the Cypher text: they are
+/// referenced as `$wb_N` parameters and must be bound on the query with
+/// [`WhereBuilder::bind`] (or [`WhereBuilder::params`]).
+#[derive(Default)]
+pub struct WhereBuilder {
+    conditions: Vec<String>,
+    params: Vec<(String, WhereParam)>,
+}
+
+impl WhereBuilder {
+    /// Create a new empty WhereBuilder
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a parameter and return its `$name` reference.
+    fn push_param(&mut self, value: WhereParam) -> String {
+        let name = format!("wb_{}", self.params.len());
+        self.params.push((name.clone(), value));
+        format!("${}", name)
+    }
+
+    /// Parameters collected so far (name without the `$`, value).
+    pub fn params(&self) -> &[(String, WhereParam)] {
+        &self.params
+    }
+
+    /// Bind every collected parameter onto a query.
+    pub fn bind(&self, mut q: neo4rs::Query) -> neo4rs::Query {
+        for (name, value) in &self.params {
+            q = match value {
+                WhereParam::Str(s) => q.param(name.as_str(), s.clone()),
+                WhereParam::StrList(l) => q.param(name.as_str(), l.clone()),
+            };
+        }
+        q
+    }
+
+    /// Add a status filter (converts snake_case to PascalCase for Neo4j)
+    pub fn add_status_filter(&mut self, alias: &str, statuses: Option<Vec<String>>) -> &mut Self {
+        if let Some(statuses) = statuses {
+            if !statuses.is_empty() {
+                let pascal_statuses: Vec<String> =
+                    statuses.iter().map(|s| snake_to_pascal_case(s)).collect();
+                let p = self.push_param(WhereParam::StrList(pascal_statuses));
+                self.conditions.push(format!("{}.status IN {}", alias, p));
+            }
+        }
+        self
+    }
+
+    /// Status filter matching both snake_case (canonical) and legacy PascalCase
+    /// rows. Use for entities migrated to snake_case (Release, Milestone).
+    pub fn add_status_filter_any_case(
+        &mut self,
+        alias: &str,
+        statuses: Option<Vec<String>>,
+    ) -> &mut Self {
+        if let Some(statuses) = statuses {
+            if !statuses.is_empty() {
+                let all: Vec<String> = statuses.iter().flat_map(|s| status_variants(s)).collect();
+                let p = self.push_param(WhereParam::StrList(all));
+                self.conditions.push(format!("{}.status IN {}", alias, p));
+            }
+        }
+        self
+    }
+
+    /// Add a priority range filter
+    pub fn add_priority_filter(
+        &mut self,
+        alias: &str,
+        min: Option<i32>,
+        max: Option<i32>,
+    ) -> &mut Self {
+        if let Some(min) = min {
+            self.conditions
+                .push(format!("COALESCE({}.priority, 0) >= {}", alias, min));
+        }
+        if let Some(max) = max {
+            self.conditions
+                .push(format!("COALESCE({}.priority, 0) <= {}", alias, max));
+        }
+        self
+    }
+
+    /// Add a tags filter (all specified tags must be present)
+    pub fn add_tags_filter(&mut self, alias: &str, tags: Option<Vec<String>>) -> &mut Self {
+        if let Some(tags) = tags {
+            for tag in tags {
+                let p = self.push_param(WhereParam::Str(tag));
+                self.conditions.push(format!("{} IN {}.tags", p, alias));
+            }
+        }
+        self
+    }
+
+    /// Add an assigned_to filter
+    pub fn add_assigned_to_filter(&mut self, alias: &str, assigned_to: Option<&str>) -> &mut Self {
+        if let Some(assigned) = assigned_to {
+            let p = self.push_param(WhereParam::Str(assigned.to_string()));
+            self.conditions
+                .push(format!("{}.assigned_to = {}", alias, p));
+        }
+        self
+    }
+
+    /// Add a search filter (case-insensitive CONTAINS on title and description)
+    pub fn add_search_filter(&mut self, alias: &str, search: Option<&str>) -> &mut Self {
+        if let Some(search) = search {
+            if !search.trim().is_empty() {
+                let p = self.push_param(WhereParam::Str(search.to_lowercase()));
+                self.conditions.push(format!(
+                    "(toLower({0}.title) CONTAINS {1} OR toLower({0}.description) CONTAINS {1})",
+                    alias, p
+                ));
+            }
+        }
+        self
+    }
+
+    /// Add a raw condition containing a `{}` marker that is replaced by a
+    /// freshly bound `$wb_N` parameter holding `value`. The template itself
+    /// must be a trusted constant; the value is never spliced into the Cypher.
+    pub fn add_bound(&mut self, template: &str, value: WhereParam) -> &mut Self {
+        let p = self.push_param(value);
+        self.conditions.push(template.replacen("{}", &p, 1));
+        self
+    }
+
+    /// Add a verbatim condition that carries no user data (constants only).
+    pub fn add_static(&mut self, condition: &str) -> &mut Self {
+        self.conditions.push(condition.to_string());
+        self
+    }
+
+    /// Build the WHERE clause (returns empty string if no conditions)
+    pub fn build(&self) -> String {
+        if self.conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", self.conditions.join(" AND "))
+        }
+    }
+
+    /// Build an AND clause to append to existing WHERE (returns empty string if no conditions)
+    pub fn build_and(&self) -> String {
+        if self.conditions.is_empty() {
+            String::new()
+        } else {
+            format!("AND {}", self.conditions.join(" AND "))
+        }
+    }
+
+    /// Check if any conditions have been added
+    pub fn has_conditions(&self) -> bool {
+        !self.conditions.is_empty()
+    }
+}
+
+impl Neo4jClient {
+    /// Manifest of the capabilities this adapter actually provides.
+    ///
+    /// Each value is proven by the code cited in the adjacent comment: the
+    /// schema built by `init_schema` (constraints, indexes, vector indexes) and
+    /// the Cypher the adapter actually runs. Static so callers can inspect it
+    /// without opening a connection.
+    pub fn storage_capabilities() -> StoreCapabilities {
+        StoreCapabilities {
+            // client.rs:664-700 — HNSW vector indexes (Note/File/Function/
+            // DocumentChunk/Decision embeddings); note.rs:2300 — the search runs
+            // `CALL db.index.vector.queryNodes(...)`.
+            vector_search: true,
+            // note.rs:2293 + note.rs:2300-2308 — the vector index returns the
+            // nearest neighbours by similarity alone; the project/status filter
+            // is applied afterwards on the yielded nodes, not inside the index.
+            vector_filter: false,
+            // client.rs:396-430 — `CREATE CONSTRAINT ... REQUIRE x IS UNIQUE`.
+            unique_constraints: true,
+            // client.rs:435 (anchor_session_target) and client.rs:468
+            // (day_plan_key) — `REQUIRE (a, b) IS UNIQUE` over several properties.
+            composite_unique: true,
+            // code.rs:4163 (`[:IMPORTS|CALLS*1..5]`), topology.rs:376
+            // (`[:IMPORTS*..10]`) — variable-length path patterns.
+            variable_length_paths: true,
+            // code.rs:4163 and topology.rs:376 — `shortestPath(...)`.
+            shortest_path: true,
+            // code.rs:1475, code.rs:1802, persona.rs:909, neighborhood.rs:130 —
+            // `CALL { ... }` subqueries.
+            subqueries: true,
+            // persona.rs:1228 (`datetime() - duration('P7D')`), trigger.rs:317
+            // (`t.last_fired + duration({seconds: ...})`), note.rs:2072
+            // (`duration.between(...).days`) — datetime arithmetic in queries.
+            datetime_arithmetic: true,
+            // client.rs:582 and client.rs:584 — `FOR ()-[r:REL]-() ON (r.prop)`
+            // relationship property indexes.
+            relationship_property_index: true,
+            // chat.rs:2529 (`start_txn`), chat.rs:2642 (`commit`), chat.rs:2646
+            // (`rollback`) — explicit transactions.
+            explicit_transactions: true,
+        }
+    }
+
+    /// Create a new Neo4j client
+    ///
+    /// Pool sizing is configurable via env vars, falling back to defaults well
+    /// above neo4rs' built-ins (16 connections / fetch_size 200), which starve
+    /// under concurrent fan-out — e.g. the workspace intelligence summary fires
+    /// ~14 queries per project in parallel, multiplied by the number of tabs:
+    /// - `NEO4J_MAX_CONNECTIONS` (default 50)
+    /// - `NEO4J_FETCH_SIZE` (default 500)
+    pub async fn new(uri: &str, user: &str, password: &str) -> Result<Self> {
+        let max_connections = std::env::var("NEO4J_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(50);
+        let fetch_size = std::env::var("NEO4J_FETCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(500);
+
+        let config = ConfigBuilder::new()
+            .uri(uri)
+            .user(user)
+            .password(password)
+            .max_connections(max_connections)
+            .fetch_size(fetch_size)
+            .build()
+            .context("Failed to build Neo4j config")?;
+
+        tracing::info!(
+            max_connections,
+            fetch_size,
+            "Connecting to Neo4j with configured pool"
+        );
+
+        let graph = Graph::connect(config)
+            .await
+            .context("Failed to connect to Neo4j")?;
+
+        let client = Self {
+            graph: Arc::new(graph),
+            coupling_cache: RwLock::new(HashMap::new()),
+            agent_identity_root: tokio::sync::OnceCell::new(),
+        };
+
+        // Initialize schema
+        client.init_schema().await?;
+
+        Ok(client)
+    }
+
+    // ========================================================================
+    // Query performance monitoring
+    // ========================================================================
+
+    /// Log a warning if a Neo4j query exceeded the slow query threshold.
+    ///
+    /// Usage:
+    /// ```rust,ignore
+    /// let start = std::time::Instant::now();
+    /// let mut result = self.graph.execute(q).await?;
+    /// self.log_slow_query("my_query_label", start);
+    /// ```
+    ///
+    /// Threshold is configurable via env `NEO4J_SLOW_QUERY_THRESHOLD_MS` (default 100ms).
+    pub fn log_slow_query(&self, label: &str, start: std::time::Instant) {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        let threshold: u64 = std::env::var("NEO4J_SLOW_QUERY_THRESHOLD_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+
+        if elapsed_ms > threshold {
+            tracing::warn!(
+                query_ms = elapsed_ms,
+                threshold_ms = threshold,
+                label,
+                "Slow Neo4j query detected"
+            );
+        } else {
+            tracing::trace!(query_ms = elapsed_ms, label, "Neo4j query completed");
+        }
+    }
+
+    /// Initialize the graph schema with constraints and indexes
+    async fn init_schema(&self) -> Result<()> {
+        let constraints = vec![
+            // Project constraints
+            "CREATE CONSTRAINT project_id IF NOT EXISTS FOR (p:Project) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT project_slug IF NOT EXISTS FOR (p:Project) REQUIRE p.slug IS UNIQUE",
+            // Code structure constraints
+            "CREATE CONSTRAINT file_path IF NOT EXISTS FOR (f:File) REQUIRE f.path IS UNIQUE",
+            // A file is identified by (project, path relative to the project
+            // root) — see `neo4j::file_uid`. The path stays unique too: one node
+            // per mount, and two mounts of the same file are one node whose
+            // `path` follows the last writer (the VFS is a later subject).
+            "CREATE CONSTRAINT file_uid IF NOT EXISTS FOR (f:File) REQUIRE f.uid IS UNIQUE",
+            "CREATE CONSTRAINT function_id IF NOT EXISTS FOR (f:Function) REQUIRE f.id IS UNIQUE",
+            "CREATE CONSTRAINT struct_id IF NOT EXISTS FOR (s:Struct) REQUIRE s.id IS UNIQUE",
+            "CREATE CONSTRAINT trait_id IF NOT EXISTS FOR (t:Trait) REQUIRE t.id IS UNIQUE",
+            "CREATE CONSTRAINT enum_id IF NOT EXISTS FOR (e:Enum) REQUIRE e.id IS UNIQUE",
+            "CREATE CONSTRAINT impl_id IF NOT EXISTS FOR (i:Impl) REQUIRE i.id IS UNIQUE",
+            "CREATE CONSTRAINT import_id IF NOT EXISTS FOR (i:Import) REQUIRE i.id IS UNIQUE",
+            // Commit constraint
+            "CREATE CONSTRAINT commit_hash IF NOT EXISTS FOR (c:Commit) REQUIRE c.hash IS UNIQUE",
+            // Plan constraints
+            "CREATE CONSTRAINT plan_id IF NOT EXISTS FOR (p:Plan) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT task_id IF NOT EXISTS FOR (t:Task) REQUIRE t.id IS UNIQUE",
+            "CREATE CONSTRAINT step_id IF NOT EXISTS FOR (s:Step) REQUIRE s.id IS UNIQUE",
+            "CREATE CONSTRAINT decision_id IF NOT EXISTS FOR (d:Decision) REQUIRE d.id IS UNIQUE",
+            "CREATE CONSTRAINT constraint_id IF NOT EXISTS FOR (c:Constraint) REQUIRE c.id IS UNIQUE",
+            "CREATE CONSTRAINT agent_id IF NOT EXISTS FOR (a:Agent) REQUIRE a.id IS UNIQUE",
+            // Knowledge Note constraints
+            "CREATE CONSTRAINT note_id IF NOT EXISTS FOR (n:Note) REQUIRE n.id IS UNIQUE",
+            // Document constraints — a Document is a first-class knowledge node,
+            // so it gets the same id guarantee every other citizen of the graph has.
+            // Its chunks too: MERGE on DocumentChunk.id is the ingestion hot path.
+            "CREATE CONSTRAINT document_id IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
+            "CREATE CONSTRAINT document_chunk_id IF NOT EXISTS FOR (c:DocumentChunk) REQUIRE c.id IS UNIQUE",
+            // Workspace constraints
+            "CREATE CONSTRAINT workspace_id IF NOT EXISTS FOR (w:Workspace) REQUIRE w.id IS UNIQUE",
+            "CREATE CONSTRAINT workspace_slug IF NOT EXISTS FOR (w:Workspace) REQUIRE w.slug IS UNIQUE",
+            "CREATE CONSTRAINT workspace_milestone_id IF NOT EXISTS FOR (wm:WorkspaceMilestone) REQUIRE wm.id IS UNIQUE",
+            "CREATE CONSTRAINT resource_id IF NOT EXISTS FOR (r:Resource) REQUIRE r.id IS UNIQUE",
+            "CREATE CONSTRAINT component_id IF NOT EXISTS FOR (c:Component) REQUIRE c.id IS UNIQUE",
+            // Chat constraints
+            "CREATE CONSTRAINT chat_session_id IF NOT EXISTS FOR (s:ChatSession) REQUIRE s.id IS UNIQUE",
+            "CREATE CONSTRAINT chat_event_id IF NOT EXISTS FOR (e:ChatEvent) REQUIRE e.id IS UNIQUE",
+            // Chat anchors: one Anchor per (session, target type, target id). The
+            // composite uniqueness form (Neo4j 5, Community included) is the one
+            // `routing_arm_key` already uses below.
+            "CREATE CONSTRAINT anchor_id IF NOT EXISTS FOR (a:Anchor) REQUIRE a.id IS UNIQUE",
+            "CREATE CONSTRAINT anchor_session_target IF NOT EXISTS FOR (a:Anchor) REQUIRE (a.session_id, a.target_type, a.target_id) IS UNIQUE",
+            "CREATE CONSTRAINT anchor_event_id IF NOT EXISTS FOR (e:AnchorEvent) REQUIRE e.id IS UNIQUE",
+            // The episode a chat session leaves at its close: one per session, the last
+            // close replacing the one before (`save_session_episode`).
+            "CREATE CONSTRAINT session_episode_session IF NOT EXISTS FOR (e:SessionEpisode) REQUIRE e.session_id IS UNIQUE",
+            // The root of the agent ids (`provenance`): one node, made once by an atomic MERGE.
+            "CREATE CONSTRAINT agent_identity_root_key IF NOT EXISTS FOR (r:AgentIdentityRoot) REQUIRE r.key IS UNIQUE",
+            // Execution-place audit (T5): append-only, one node per event.
+            "CREATE CONSTRAINT execution_place_event_id IF NOT EXISTS FOR (e:ExecutionPlaceEvent) REQUIRE e.id IS UNIQUE",
+            "CREATE CONSTRAINT synapse_shadow_trace_id IF NOT EXISTS FOR (t:SynapseShadowTrace) REQUIRE t.id IS UNIQUE",
+            // Milestone & Release constraints
+            "CREATE CONSTRAINT milestone_id IF NOT EXISTS FOR (m:Milestone) REQUIRE m.id IS UNIQUE",
+            "CREATE CONSTRAINT release_id IF NOT EXISTS FOR (r:Release) REQUIRE r.id IS UNIQUE",
+            // Environment & Deployment constraints
+            "CREATE CONSTRAINT environment_id IF NOT EXISTS FOR (e:Environment) REQUIRE e.id IS UNIQUE",
+            "CREATE CONSTRAINT deployment_id IF NOT EXISTS FOR (d:Deployment) REQUIRE d.id IS UNIQUE",
+            // FeatureGraph constraint
+            "CREATE CONSTRAINT feature_graph_id IF NOT EXISTS FOR (fg:FeatureGraph) REQUIRE fg.id IS UNIQUE",
+            // Skill constraint
+            "CREATE CONSTRAINT skill_id IF NOT EXISTS FOR (s:Skill) REQUIRE s.id IS UNIQUE",
+            // User constraint
+            "CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
+            // RefreshToken constraint
+            "CREATE CONSTRAINT refresh_token_hash IF NOT EXISTS FOR (rt:RefreshToken) REQUIRE rt.token_hash IS UNIQUE",
+            // GraIL — TopologyRule constraint
+            "CREATE CONSTRAINT topology_rule_id IF NOT EXISTS FOR (r:TopologyRule) REQUIRE r.id IS UNIQUE",
+            // GraIL — PredictedLink constraint
+            "CREATE CONSTRAINT predicted_link_id IF NOT EXISTS FOR (l:PredictedLink) REQUIRE l.id IS UNIQUE",
+            // GraIL — AnalysisProfile constraint
+            "CREATE CONSTRAINT analysis_profile_id IF NOT EXISTS FOR (p:AnalysisProfile) REQUIRE p.id IS UNIQUE",
+            // Pattern Federation — Protocol constraints
+            "CREATE CONSTRAINT protocol_id IF NOT EXISTS FOR (p:Protocol) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT protocol_state_id IF NOT EXISTS FOR (ps:ProtocolState) REQUIRE ps.id IS UNIQUE",
+            "CREATE CONSTRAINT protocol_transition_id IF NOT EXISTS FOR (pt:ProtocolTransition) REQUIRE pt.id IS UNIQUE",
+            "CREATE CONSTRAINT protocol_run_id IF NOT EXISTS FOR (r:ProtocolRun) REQUIRE r.id IS UNIQUE",
+            // Living Personas
+            "CREATE CONSTRAINT persona_id IF NOT EXISTS FOR (p:Persona) REQUIRE p.id IS UNIQUE",
+            // Day plan: one node per user per day — the natural key its MERGE uses.
+            "CREATE CONSTRAINT day_plan_key IF NOT EXISTS FOR (dp:DayPlan) REQUIRE (dp.user_id, dp.date) IS UNIQUE",
+        ];
+
+        let indexes = vec![
+            "CREATE INDEX project_name IF NOT EXISTS FOR (p:Project) ON (p.name)",
+            "CREATE INDEX file_language IF NOT EXISTS FOR (f:File) ON (f.language)",
+            "CREATE INDEX file_project IF NOT EXISTS FOR (f:File) ON (f.project_id)",
+            "CREATE INDEX function_name IF NOT EXISTS FOR (f:Function) ON (f.name)",
+            // Function.file_path — enables index seek in batch_create_call_relationships Phase 1
+            "CREATE INDEX function_file_path IF NOT EXISTS FOR (f:Function) ON (f.file_path)",
+            // Composite (name, file_path) — enables direct seek for same-file call resolution
+            "CREATE INDEX function_name_file_path IF NOT EXISTS FOR (f:Function) ON (f.name, f.file_path)",
+            "CREATE INDEX struct_name IF NOT EXISTS FOR (s:Struct) ON (s.name)",
+            "CREATE INDEX trait_name IF NOT EXISTS FOR (t:Trait) ON (t.name)",
+            "CREATE INDEX enum_name IF NOT EXISTS FOR (e:Enum) ON (e.name)",
+            // Denormalized project_id on symbols — enables direct seek without graph traversal
+            "CREATE INDEX function_project_id IF NOT EXISTS FOR (f:Function) ON (f.project_id)",
+            "CREATE INDEX struct_project_id IF NOT EXISTS FOR (s:Struct) ON (s.project_id)",
+            "CREATE INDEX trait_project_id IF NOT EXISTS FOR (t:Trait) ON (t.project_id)",
+            "CREATE INDEX enum_project_id IF NOT EXISTS FOR (e:Enum) ON (e.project_id)",
+            "CREATE INDEX impl_for_type IF NOT EXISTS FOR (i:Impl) ON (i.for_type)",
+            // Impl.file_path / Struct.file_path — the stable-key backfill finds the
+            // block that owns a legacy Function by line inclusion in the Impl and
+            // Struct nodes of ITS file (data_migrations.rs); without these two
+            // indexes that lookup is a label scan per function (60k x 490k).
+            "CREATE INDEX impl_file_path IF NOT EXISTS FOR (i:Impl) ON (i.file_path)",
+            "CREATE INDEX struct_file_path IF NOT EXISTS FOR (s:Struct) ON (s.file_path)",
+            // The same backfills page by file_path (an index-backed range seek per
+            // batch instead of a label scan per batch): every keyed label needs it.
+            "CREATE INDEX trait_file_path IF NOT EXISTS FOR (t:Trait) ON (t.file_path)",
+            "CREATE INDEX enum_file_path IF NOT EXISTS FOR (e:Enum) ON (e.file_path)",
+            "CREATE INDEX import_file_path IF NOT EXISTS FOR (i:Import) ON (i.file_path)",
+            // stable_key (symbol_key.rs): the identity T2 deduplicates on and T3
+            // switches the id to. Not unique YET — until T2 runs, the versions of
+            // one function legitimately share a key.
+            "CREATE INDEX function_stable_key IF NOT EXISTS FOR (f:Function) ON (f.stable_key)",
+            "CREATE INDEX struct_stable_key IF NOT EXISTS FOR (s:Struct) ON (s.stable_key)",
+            "CREATE INDEX trait_stable_key IF NOT EXISTS FOR (t:Trait) ON (t.stable_key)",
+            "CREATE INDEX enum_stable_key IF NOT EXISTS FOR (e:Enum) ON (e.stable_key)",
+            "CREATE INDEX impl_stable_key IF NOT EXISTS FOR (i:Impl) ON (i.stable_key)",
+            "CREATE INDEX import_stable_key IF NOT EXISTS FOR (i:Import) ON (i.stable_key)",
+            "CREATE INDEX task_status IF NOT EXISTS FOR (t:Task) ON (t.status)",
+            "CREATE INDEX task_priority IF NOT EXISTS FOR (t:Task) ON (t.priority)",
+            "CREATE INDEX step_status IF NOT EXISTS FOR (s:Step) ON (s.status)",
+            "CREATE INDEX constraint_type IF NOT EXISTS FOR (c:Constraint) ON (c.constraint_type)",
+            "CREATE INDEX plan_status IF NOT EXISTS FOR (p:Plan) ON (p.status)",
+            "CREATE INDEX plan_project IF NOT EXISTS FOR (p:Plan) ON (p.project_id)",
+            // Knowledge Note indexes
+            "CREATE INDEX note_project IF NOT EXISTS FOR (n:Note) ON (n.project_id)",
+            "CREATE INDEX note_status IF NOT EXISTS FOR (n:Note) ON (n.status)",
+            "CREATE INDEX decision_status IF NOT EXISTS FOR (d:Decision) ON (d.status)",
+            "CREATE INDEX note_type IF NOT EXISTS FOR (n:Note) ON (n.note_type)",
+            "CREATE INDEX note_importance IF NOT EXISTS FOR (n:Note) ON (n.importance)",
+            "CREATE INDEX note_staleness IF NOT EXISTS FOR (n:Note) ON (n.staleness_score)",
+            // Document indexes — sha256 is the identity of the *content*, looked
+            // up on every upload to reuse an existing ingestion instead of
+            // re-chunking and re-embedding. Deliberately NOT unique: the same
+            // bytes may legitimately be attached to two projects.
+            "CREATE INDEX document_sha256 IF NOT EXISTS FOR (d:Document) ON (d.sha256)",
+            "CREATE INDEX document_project IF NOT EXISTS FOR (d:Document) ON (d.project_id)",
+            "CREATE INDEX document_session IF NOT EXISTS FOR (d:Document) ON (d.session_id)",
+            // DocumentChunk.ordinal — every chunk read is ORDER BY ordinal.
+            "CREATE INDEX document_chunk_ordinal IF NOT EXISTS FOR (c:DocumentChunk) ON (c.ordinal)",
+            // Workspace indexes
+            "CREATE INDEX workspace_name IF NOT EXISTS FOR (w:Workspace) ON (w.name)",
+            "CREATE INDEX ws_milestone_workspace IF NOT EXISTS FOR (wm:WorkspaceMilestone) ON (wm.workspace_id)",
+            "CREATE INDEX ws_milestone_status IF NOT EXISTS FOR (wm:WorkspaceMilestone) ON (wm.status)",
+            "CREATE INDEX resource_workspace IF NOT EXISTS FOR (r:Resource) ON (r.workspace_id)",
+            "CREATE INDEX resource_project IF NOT EXISTS FOR (r:Resource) ON (r.project_id)",
+            "CREATE INDEX resource_type IF NOT EXISTS FOR (r:Resource) ON (r.resource_type)",
+            "CREATE INDEX component_workspace IF NOT EXISTS FOR (c:Component) ON (c.workspace_id)",
+            "CREATE INDEX component_type IF NOT EXISTS FOR (c:Component) ON (c.component_type)",
+            // ChatEvent indexes — critical for performance (120K+ nodes)
+            "CREATE INDEX chat_event_session IF NOT EXISTS FOR (e:ChatEvent) ON (e.session_id)",
+            "CREATE INDEX chat_event_type IF NOT EXISTS FOR (e:ChatEvent) ON (e.event_type)",
+            "CREATE INDEX chat_event_seq IF NOT EXISTS FOR (e:ChatEvent) ON (e.seq)",
+            // Composite (session_id, seq) — opening a conversation pages events
+            // with `WHERE e.session_id = $sid RETURN e ORDER BY e.seq ASC SKIP/LIMIT`.
+            // This composite lets the planner seek to the session and walk seq in
+            // order (index-backed ORDER BY + LIMIT), instead of gathering every
+            // event of the conversation via HAS_EVENT and sorting in memory.
+            "CREATE INDEX chat_event_session_seq IF NOT EXISTS FOR (e:ChatEvent) ON (e.session_id, e.seq)",
+            // AgentExecution: the cost breakdown (B35) scans a time window of
+            // closed attempts; the per-run and reconciliation reads seek by run / status.
+            "CREATE INDEX agent_execution_started_at IF NOT EXISTS FOR (ae:AgentExecution) ON (ae.started_at)",
+            "CREATE INDEX agent_execution_run IF NOT EXISTS FOR (ae:AgentExecution) ON (ae.run_id)",
+            "CREATE INDEX agent_execution_status IF NOT EXISTS FOR (ae:AgentExecution) ON (ae.status)",
+            // Anchor indexes: reverse query "sessions anchored on X", and per-session reads/journal
+            "CREATE INDEX anchor_target IF NOT EXISTS FOR (a:Anchor) ON (a.target_type, a.target_id)",
+            "CREATE INDEX anchor_session IF NOT EXISTS FOR (a:Anchor) ON (a.session_id)",
+            "CREATE INDEX session_episode_project IF NOT EXISTS FOR (e:SessionEpisode) ON (e.project_id, e.collected_at)",
+            "CREATE INDEX synapse_shadow_trace_session IF NOT EXISTS FOR (t:SynapseShadowTrace) ON (t.session_id)",
+            "CREATE INDEX anchor_event_session IF NOT EXISTS FOR (e:AnchorEvent) ON (e.session_id)",
+            "CREATE INDEX execution_place_event_task IF NOT EXISTS FOR (e:ExecutionPlaceEvent) ON (e.task_id)",
+            "CREATE INDEX anchor_event_anchor IF NOT EXISTS FOR (e:AnchorEvent) ON (e.anchor_id)",
+            // Journal order: `seq` is the per-session sequence number (see apply_anchor_op)
+            "CREATE INDEX anchor_event_session_seq IF NOT EXISTS FOR (e:AnchorEvent) ON (e.session_id, e.seq)",
+            // ChatSession indexes — queried by project_slug, workspace_slug, cli_session_id
+            "CREATE INDEX chat_session_project IF NOT EXISTS FOR (s:ChatSession) ON (s.project_slug)",
+            "CREATE INDEX chat_session_workspace IF NOT EXISTS FOR (s:ChatSession) ON (s.workspace_slug)",
+            "CREATE INDEX chat_session_cli IF NOT EXISTS FOR (s:ChatSession) ON (s.cli_session_id)",
+            // ChatSession composite index for DISCUSSED relation queries
+            "CREATE INDEX chat_session_project_id IF NOT EXISTS FOR (s:ChatSession) ON (s.project_slug, s.id)",
+            // ChatSession ordering indexes — the conversation list does
+            // `ORDER BY s.updated_at DESC SKIP/LIMIT`. Without a range index on
+            // updated_at, Neo4j scans and sorts EVERY ChatSession on each list
+            // load (cost grows with total conversation count, not page size).
+            // A range index lets the planner walk the index in reverse and stop
+            // after LIMIT rows. The composite (project_slug, updated_at) covers
+            // the project-filtered list in a single index seek + ordered scan.
+            "CREATE INDEX chat_session_updated IF NOT EXISTS FOR (s:ChatSession) ON (s.updated_at)",
+            "CREATE INDEX chat_session_project_updated IF NOT EXISTS FOR (s:ChatSession) ON (s.project_slug, s.updated_at)",
+            // ChatSession conversation_id index — search_messages resolves
+            // Meilisearch hits back to sessions by conversation_id.
+            "CREATE INDEX chat_session_conversation IF NOT EXISTS FOR (s:ChatSession) ON (s.conversation_id)",
+            // ProtocolRun indexes
+            "CREATE INDEX protocol_run_protocol IF NOT EXISTS FOR (r:ProtocolRun) ON (r.protocol_id)",
+            "CREATE INDEX protocol_run_status IF NOT EXISTS FOR (r:ProtocolRun) ON (r.status)",
+            // FeatureGraph indexes
+            "CREATE INDEX feature_graph_project IF NOT EXISTS FOR (fg:FeatureGraph) ON (fg.project_id)",
+            // User indexes — queried by email, external_id, auth_provider
+            "CREATE INDEX user_email IF NOT EXISTS FOR (u:User) ON (u.email)",
+            "CREATE INDEX user_external IF NOT EXISTS FOR (u:User) ON (u.external_id)",
+            "CREATE INDEX user_auth_provider IF NOT EXISTS FOR (u:User) ON (u.auth_provider)",
+            // RefreshToken indexes — queried by user_id
+            "CREATE INDEX refresh_token_user IF NOT EXISTS FOR (rt:RefreshToken) ON (rt.user_id)",
+            // Milestone indexes
+            "CREATE INDEX milestone_project IF NOT EXISTS FOR (m:Milestone) ON (m.project_id)",
+            // Release indexes
+            "CREATE INDEX release_project IF NOT EXISTS FOR (r:Release) ON (r.project_id)",
+            "CREATE INDEX release_version IF NOT EXISTS FOR (r:Release) ON (r.version)",
+            // Environment & Deployment indexes
+            "CREATE INDEX environment_project IF NOT EXISTS FOR (e:Environment) ON (e.project_id)",
+            "CREATE INDEX deployment_environment IF NOT EXISTS FOR (d:Deployment) ON (d.environment_id)",
+            // Knowledge Fabric — TOUCHES relationship indexes (Commit→File)
+            "CREATE INDEX touches_file_path IF NOT EXISTS FOR ()-[r:TOUCHES]-() ON (r.file_path)",
+            // Knowledge Fabric — CO_CHANGED relationship indexes (File↔File)
+            "CREATE INDEX co_changed_count IF NOT EXISTS FOR ()-[r:CO_CHANGED]-() ON (r.count)",
+            "CREATE INDEX co_changed_project IF NOT EXISTS FOR ()-[r:CO_CHANGED]-() ON (r.project_id)",
+            // Knowledge Fabric — CO_CHANGED_TRANSITIVE relationship indexes (Rolfsnes et al. 2018)
+            "CREATE INDEX co_changed_transitive_score IF NOT EXISTS FOR ()-[r:CO_CHANGED_TRANSITIVE]-() ON (r.score)",
+            "CREATE INDEX co_changed_transitive_project IF NOT EXISTS FOR ()-[r:CO_CHANGED_TRANSITIVE]-() ON (r.project_id)",
+            // Decision AFFECTS relationship index
+            "CREATE INDEX affects_rel_idx IF NOT EXISTS FOR ()-[r:AFFECTS]->() ON (r.created_at)",
+            // Decision SUPERSEDES relationship index
+            "CREATE INDEX supersedes_rel_idx IF NOT EXISTS FOR ()-[r:SUPERSEDES]->() ON (r.created_at)",
+            // IMPORTS_SYMBOL relationship index — enables fast symbol resolution lookups
+            "CREATE INDEX imports_symbol_resolved IF NOT EXISTS FOR ()-[r:IMPORTS_SYMBOL]->() ON (r.resolved)",
+            // Forward-compatible: Plan 5 (Heritage Relations)
+            "CREATE INDEX extends_rel_idx IF NOT EXISTS FOR ()-[r:EXTENDS]->() ON (r.created_at)",
+            "CREATE INDEX implements_rel_idx IF NOT EXISTS FOR ()-[r:IMPLEMENTS]->() ON (r.created_at)",
+            // Forward-compatible: Plan 6 (Process Detection)
+            "CREATE INDEX step_in_process_rel_idx IF NOT EXISTS FOR ()-[r:STEP_IN_PROCESS]->() ON (r.order)",
+            // Process node indexes (Plan 6)
+            "CREATE INDEX process_project_id IF NOT EXISTS FOR (p:Process) ON (p.project_id)",
+            "CREATE INDEX process_id IF NOT EXISTS FOR (p:Process) ON (p.id)",
+            // Skill indexes — Neural Skills system
+            "CREATE INDEX skill_project IF NOT EXISTS FOR (s:Skill) ON (s.project_id)",
+            "CREATE INDEX skill_status IF NOT EXISTS FOR (s:Skill) ON (s.status)",
+            "CREATE INDEX skill_project_status IF NOT EXISTS FOR (s:Skill) ON (s.project_id, s.status)",
+            "CREATE INDEX skill_energy IF NOT EXISTS FOR (s:Skill) ON (s.energy)",
+            // GraIL — File computed properties (Plans 2, 7, 8)
+            "CREATE INDEX file_wl_hash IF NOT EXISTS FOR (f:File) ON (f.wl_hash)",
+            "CREATE INDEX file_cc_version IF NOT EXISTS FOR (f:File) ON (f.cc_version)",
+            "CREATE INDEX file_cc_pagerank IF NOT EXISTS FOR (f:File) ON (f.cc_pagerank)",
+            "CREATE INDEX file_cc_risk_score IF NOT EXISTS FOR (f:File) ON (f.cc_risk_score)",
+            // GraIL — TopologyRule indexes (Plan 3)
+            "CREATE INDEX topology_rule_project IF NOT EXISTS FOR (r:TopologyRule) ON (r.project_id)",
+            "CREATE INDEX topology_rule_project_type IF NOT EXISTS FOR (r:TopologyRule) ON (r.project_id, r.rule_type)",
+            // GraIL — PredictedLink indexes (Plan 9)
+            "CREATE INDEX predicted_link_project IF NOT EXISTS FOR (l:PredictedLink) ON (l.project_id)",
+            "CREATE INDEX predicted_link_plausibility IF NOT EXISTS FOR (l:PredictedLink) ON (l.project_id, l.plausibility)",
+            // GraIL — AnalysisProfile indexes (Plan 6)
+            "CREATE INDEX analysis_profile_project IF NOT EXISTS FOR (p:AnalysisProfile) ON (p.project_id)",
+            // GraIL — PREDICTED_LINK relationship index (Plan 9)
+            "CREATE INDEX predicted_link_rel_idx IF NOT EXISTS FOR ()-[r:PREDICTED_LINK]->() ON (r.plausibility)",
+            // Pattern Federation — Protocol indexes
+            "CREATE INDEX protocol_project IF NOT EXISTS FOR (p:Protocol) ON (p.project_id)",
+            "CREATE INDEX protocol_category IF NOT EXISTS FOR (p:Protocol) ON (p.protocol_category)",
+            "CREATE INDEX protocol_state_protocol IF NOT EXISTS FOR (ps:ProtocolState) ON (ps.protocol_id)",
+            "CREATE INDEX protocol_transition_protocol IF NOT EXISTS FOR (pt:ProtocolTransition) ON (pt.protocol_id)",
+            // Alert deduplication: dedup_key is the identity of a *condition*.
+            // The unique constraint is what makes the MERGE in create_alert_node
+            // collapse repeat observations instead of appending a node per tick.
+            "CREATE CONSTRAINT alert_dedup_key IF NOT EXISTS FOR (a:Alert) REQUIRE a.dedup_key IS UNIQUE",
+            "CREATE INDEX alert_priority IF NOT EXISTS FOR (a:Alert) ON (a.priority)",
+            "CREATE INDEX alert_type_idx IF NOT EXISTS FOR (a:Alert) ON (a.alert_type)",
+            "CREATE INDEX alert_project IF NOT EXISTS FOR (a:Alert) ON (a.project_id)",
+            // Cognitive routing: one arm per (class, provider, model); decisions
+            // looked up by id and listed by project, session, task, run and time.
+            "CREATE CONSTRAINT routing_arm_key IF NOT EXISTS FOR (a:RoutingArm) REQUIRE (a.class, a.provider_id, a.model) IS UNIQUE",
+            "CREATE CONSTRAINT routing_decision_id IF NOT EXISTS FOR (d:RoutingDecision) REQUIRE d.id IS UNIQUE",
+            "CREATE INDEX routing_decision_project IF NOT EXISTS FOR (d:RoutingDecision) ON (d.project_slug)",
+            "CREATE INDEX routing_decision_session IF NOT EXISTS FOR (d:RoutingDecision) ON (d.session_id)",
+            "CREATE INDEX routing_decision_task IF NOT EXISTS FOR (d:RoutingDecision) ON (d.task_id)",
+            "CREATE INDEX routing_decision_run IF NOT EXISTS FOR (d:RoutingDecision) ON (d.run_id)",
+            "CREATE INDEX routing_decision_at IF NOT EXISTS FOR (d:RoutingDecision) ON (d.at)",
+            // Plan triggers: one reserved signal per (trigger, key), kept 24 h.
+            "CREATE CONSTRAINT trigger_signal_key IF NOT EXISTS FOR (s:TriggerSignal) REQUIRE (s.trigger_id, s.key) IS UNIQUE",
+            "CREATE INDEX trigger_signal_reserved_at IF NOT EXISTS FOR (s:TriggerSignal) ON (s.reserved_at)",
+            // External events (ingress): the constraint is what makes the MERGE of
+            // `claim_external_delivery` atomic (without it, 8 concurrent claims of one
+            // delivery all won: seen on the conformance suite). The journal is read by trigger.
+            "CREATE CONSTRAINT external_delivery_key IF NOT EXISTS FOR (d:ExternalDelivery) REQUIRE (d.trigger_id, d.delivery_key) IS UNIQUE",
+            "CREATE INDEX external_event_trigger IF NOT EXISTS FOR (e:ExternalEvent) ON (e.trigger_id)",
+            // The hourly retention purge selects by age.
+            "CREATE INDEX external_event_received_at IF NOT EXISTS FOR (e:ExternalEvent) ON (e.received_at)",
+            // Conversation segments (episodic memory, S4): the store MERGEs on
+            // (conversation, id) — never the id alone, since two conversations with the
+            // same seed derive the same segment ids. The constraint is what makes that
+            // MERGE atomic under concurrent writes (two turns of one conversation), and
+            // it carries the index the reads by conversation use.
+            "CREATE CONSTRAINT conversation_segment_key IF NOT EXISTS FOR (s:ConversationSegment) REQUIRE (s.conversation, s.id) IS UNIQUE",
+            // One boundary per (conversation, axis, turn): the natural key its MERGE uses.
+            "CREATE CONSTRAINT conversation_boundary_key IF NOT EXISTS FOR (b:ConversationBoundary) REQUIRE (b.conversation, b.dimension, b.at_turn) IS UNIQUE",
+        ];
+
+        // Vector indexes (require Neo4j 5.13+ — gracefully skip if not supported)
+        let vector_indexes = vec![
+            // HNSW vector index for cosine similarity search on Note embeddings (768d = nomic-embed-text)
+            r#"CREATE VECTOR INDEX note_embeddings IF NOT EXISTS
+               FOR (n:Note) ON (n.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
+            // HNSW vector index for cosine similarity search on File embeddings
+            r#"CREATE VECTOR INDEX file_embedding_index IF NOT EXISTS
+               FOR (f:File) ON (f.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
+            // HNSW vector index for cosine similarity search on Function embeddings
+            r#"CREATE VECTOR INDEX function_embedding_index IF NOT EXISTS
+               FOR (fn:Function) ON (fn.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
+            // HNSW vector index for cosine similarity search on DocumentChunk
+            // embeddings — chunks are searched exactly the way notes are.
+            r#"CREATE VECTOR INDEX document_chunk_embeddings IF NOT EXISTS
+               FOR (c:DocumentChunk) ON (c.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
+            // The episode a session leaves at its close, recalled by the reflex stage
+            // from the embedding of its first message (`search_episodes_by_embedding`).
+            r#"CREATE VECTOR INDEX session_episode_embeddings IF NOT EXISTS
+               FOR (e:SessionEpisode) ON (e.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
+            // HNSW vector index for cosine similarity search on Decision embeddings
+            r#"CREATE VECTOR INDEX decision_embedding IF NOT EXISTS
+               FOR (d:Decision) ON (d.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
+        ];
+
+        for constraint in constraints {
+            if let Err(e) = self.graph.run(query(constraint)).await {
+                tracing::warn!("Constraint may already exist: {}", e);
+            }
+        }
+
+        for index in indexes {
+            if let Err(e) = self.graph.run(query(index)).await {
+                tracing::warn!("Index may already exist: {}", e);
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Skill relations (not enforced by Neo4j, documented here):
+        //   (Note)-[:MEMBER_OF]->(Skill)        — member note
+        //   (Decision)-[:MEMBER_OF_SKILL]->(Skill) — member decision
+        //   (Skill)-[:BELONGS_TO]->(Project)    — project ownership
+        //   (Skill)-[:COVERS]->(File)           — files covered by member notes
+        // ---------------------------------------------------------------
+
+        // A schedule or event trigger starts its run as its author (the caller
+        // that created or enabled it). One written before authors were recorded
+        // has none: it is disabled, and starts again only once someone enables
+        // it (which records them as its author). Lock first, decide second: see
+        // `disable_authorless_triggers_impl`.
+        match self.disable_authorless_triggers_impl().await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("Disabled {n} trigger(s) written without an author"),
+            Err(e) => tracing::warn!("Trigger author migration failed (non-fatal): {e}"),
+        }
+
+        // Data migrations — idempotent, run on every startup
+        let migrations = vec![
+            // T3.2: Set default status on existing Decision nodes without one
+            r#"MATCH (d:Decision) WHERE d.status IS NULL SET d.status = 'accepted'"#,
+            // Rename ATTACHED_TO → LINKED_TO (note.rs used ATTACHED_TO for writes,
+            // but analytics.rs, project.rs, lifecycle.rs all read LINKED_TO).
+            // This migration copies any remaining ATTACHED_TO rels to LINKED_TO and deletes the old ones.
+            // Idempotent: does nothing if no ATTACHED_TO rels exist.
+            r#"MATCH (a)-[r:ATTACHED_TO]->(b)
+               WITH a, r, b LIMIT 5000
+               MERGE (a)-[r2:LINKED_TO]->(b)
+               SET r2.signature_hash = r.signature_hash,
+                   r2.body_hash = r.body_hash,
+                   r2.last_verified = r.last_verified
+               DELETE r"#,
+        ];
+        for migration in migrations {
+            if let Err(e) = self.graph.run(query(migration)).await {
+                tracing::warn!("Migration failed (non-fatal): {}", e);
+            }
+        }
+
+        // Seed built-in analysis profiles (idempotent via MERGE on id)
+        {
+            use crate::graph::models::builtin_profiles;
+            let profiles = builtin_profiles();
+            for profile in &profiles {
+                let edge_weights_json =
+                    serde_json::to_string(&profile.edge_weights).unwrap_or_default();
+                let fusion_weights_json =
+                    serde_json::to_string(&profile.fusion_weights).unwrap_or_default();
+                let q = neo4rs::query(
+                    r#"
+                    MERGE (ap:AnalysisProfile {id: $id})
+                    SET ap.name = $name,
+                        ap.description = $description,
+                        ap.project_id = "",
+                        ap.edge_weights_json = $edge_weights_json,
+                        ap.fusion_weights_json = $fusion_weights_json,
+                        ap.is_builtin = true
+                    "#,
+                )
+                .param("id", profile.id.clone())
+                .param("name", profile.name.clone())
+                .param(
+                    "description",
+                    profile.description.clone().unwrap_or_default(),
+                )
+                .param("edge_weights_json", edge_weights_json)
+                .param("fusion_weights_json", fusion_weights_json);
+
+                if let Err(e) = self.graph.run(q).await {
+                    tracing::warn!(
+                        name = %profile.name,
+                        "Failed to seed built-in profile (non-fatal): {}",
+                        e
+                    );
+                }
+            }
+            tracing::info!(count = profiles.len(), "Seeded built-in analysis profiles");
+        }
+
+        // Vector indexes — optional, don't fail startup if Neo4j doesn't support them
+        for vi in vector_indexes {
+            if let Err(e) = self.graph.run(query(vi)).await {
+                tracing::warn!(
+                    "Vector index creation skipped (Neo4j may not support vector indexes): {}",
+                    e
+                );
+            }
+        }
+
+        // Verify all constraints were created successfully
+        let expected_constraints = EXPECTED_CONSTRAINTS;
+        match self
+            .graph
+            .execute(query(
+                "SHOW CONSTRAINTS YIELD name RETURN collect(name) AS names",
+            ))
+            .await
+        {
+            Ok(mut result) => {
+                if let Ok(Some(row)) = result.next().await {
+                    let names: Vec<String> = row.get("names").unwrap_or_default();
+                    for expected in expected_constraints {
+                        if !names.iter().any(|n| n == *expected) {
+                            tracing::error!(
+                                "MISSING CONSTRAINT: {} — MERGE operations will do full label scans. \
+                                 Clean up duplicates with cleanup_sync_data and restart.",
+                                expected
+                            );
+                        }
+                    }
+                    tracing::info!(
+                        "Schema verification: {}/{} constraints present",
+                        names.len(),
+                        expected_constraints.len()
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Could not verify constraints: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute a raw Cypher query (internal use only)
+    pub(crate) async fn execute(&self, cypher: &str) -> Result<Vec<neo4rs::Row>> {
+        let mut result = self.graph.execute(query(cypher)).await?;
+        let mut rows = Vec::new();
+        while let Some(row) = result.next().await? {
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// Execute a parameterized Cypher query (internal use only)
+    pub(crate) async fn execute_with_params(&self, q: Query) -> Result<Vec<neo4rs::Row>> {
+        let mut result = self.graph.execute(q).await?;
+        let mut rows = Vec::new();
+        while let Some(row) = result.next().await? {
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// Run a read built by `op`, replaying it on a transient server error.
+    /// `cypher` decides whether replay is allowed: a query that writes runs once.
+    pub(crate) async fn read_retrying<T, F, Fut>(&self, cypher: &str, op: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        retry_transient(is_read_only_cypher(cypher), is_transient_neo4j_error, op).await
+    }
+}
+
+/// Replays a read after `Neo.TransientError.*`: three attempts in total.
+const READ_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(150),
+];
+
+/// Clauses that write. A query containing one of them is never replayed.
+const WRITE_KEYWORDS: &[&str] = &[
+    "CREATE", "MERGE", "SET", "DELETE", "DETACH", "REMOVE", "FOREACH", "CALL", "DROP",
+];
+
+/// Heuristic guard: `false` when the Cypher text contains a write keyword.
+/// A false negative only means "no replay", which is the safe default.
+pub(crate) fn is_read_only_cypher(cypher: &str) -> bool {
+    !cypher
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| WRITE_KEYWORDS.iter().any(|k| tok.eq_ignore_ascii_case(k)))
+}
+
+/// Whether a server error code is a `Neo.TransientError.*`, the only class replayed.
+pub(crate) fn is_transient_neo4j_code(code: &str) -> bool {
+    code.starts_with("Neo.TransientError.")
+}
+
+/// Whether `err` carries a neo4rs server error with a transient code.
+/// Client errors (bad query, auth, connection) return `false`.
+///
+/// A failure that arrives while the rows are being PULLed (a node deleted by an overlapping
+/// transaction after the query started) does not come back as `Error::Neo4j`: neo4rs reports
+/// it as `UnexpectedMessage("unexpected response for PULL: Ok(Failure(..))")`, with the server
+/// code only inside the text. It is the same transient error and is safe to replay.
+pub(crate) fn is_transient_neo4j_error(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<neo4rs::Error>() {
+        Some(neo4rs::Error::Neo4j(e)) => is_transient_neo4j_code(e.code()),
+        Some(neo4rs::Error::UnexpectedMessage(text)) => {
+            text.starts_with("unexpected response for PULL") && text.contains("Neo.TransientError.")
+        }
+        _ => false,
+    }
+}
+
+/// Why replay exists: a read that scans a label (e.g. `:Trigger`) can fail with
+/// `Neo.TransientError.Transaction.Outdated` when a concurrent delete touches the
+/// same data; the server says the attempt is safe to repeat. Any other error would
+/// fail again, so it is returned at once. Writes (`read_only == false`) run once.
+pub(crate) async fn retry_transient<T, E, F, Fut>(
+    read_only: bool,
+    is_transient: impl Fn(&E) -> bool,
+    mut op: F,
+) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut delays = READ_RETRY_DELAYS.iter();
+    loop {
+        let err = match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) => err,
+        };
+        match delays.next() {
+            Some(delay) if read_only && is_transient(&err) => {
+                tracing::warn!(
+                    delay_ms = delay.as_millis() as u64,
+                    error = %err,
+                    "transient Neo4j error on a read, replaying"
+                );
+                tokio::time::sleep(*delay).await;
+            }
+            _ => return Err(err),
+        }
+    }
+}
+
+#[cfg(test)]
+mod read_retry_tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    use std::cell::Cell;
+
+    #[derive(Debug, PartialEq)]
+    struct FakeErr {
+        transient: bool,
+    }
+
+    impl std::fmt::Display for FakeErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fake error (transient: {})", self.transient)
+        }
+    }
+
+    fn transient(e: &FakeErr) -> bool {
+        e.transient
+    }
+
+    #[tokio::test]
+    async fn transient_read_error_is_replayed_then_succeeds() {
+        let calls = Cell::new(0);
+        let out = retry_transient(true, transient, || async {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(FakeErr { transient: true })
+            } else {
+                Ok(7)
+            }
+        })
+        .await;
+        assert_eq!(out, Ok(7));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn transient_read_error_gives_up_after_three_attempts() {
+        let calls = Cell::new(0);
+        let out: Result<(), FakeErr> = retry_transient(true, transient, || async {
+            calls.set(calls.get() + 1);
+            Err(FakeErr { transient: true })
+        })
+        .await;
+        assert_eq!(out, Err(FakeErr { transient: true }));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn client_error_is_not_replayed() {
+        let calls = Cell::new(0);
+        let out: Result<(), FakeErr> = retry_transient(true, transient, || async {
+            calls.set(calls.get() + 1);
+            Err(FakeErr { transient: false })
+        })
+        .await;
+        assert_eq!(out, Err(FakeErr { transient: false }));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_write_error_is_never_replayed() {
+        let calls = Cell::new(0);
+        let out: Result<(), FakeErr> = retry_transient(false, transient, || async {
+            calls.set(calls.get() + 1);
+            Err(FakeErr { transient: true })
+        })
+        .await;
+        assert_eq!(out, Err(FakeErr { transient: true }));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn read_only_guard_rejects_write_keywords() {
+        assert!(is_read_only_cypher(
+            "MATCH (t:Trigger) WHERE t.trigger_type = $trigger_type RETURN t ORDER BY t.created_at DESC"
+        ));
+        assert!(is_read_only_cypher(
+            "MATCH (t:Trigger {created_at: 1}) RETURN t"
+        ));
+        assert!(!is_read_only_cypher(
+            "MATCH (t:Trigger) SET t.enabled = false RETURN t"
+        ));
+        assert!(!is_read_only_cypher("MATCH (n) DETACH DELETE n"));
+        assert!(!is_read_only_cypher("MERGE (x:Trigger {id: $id}) RETURN x"));
+        assert!(!is_read_only_cypher("CREATE (t:Trigger) RETURN t"));
+        assert!(!is_read_only_cypher("CALL db.clearQueryCaches()"));
+    }
+
+    #[test]
+    fn a_transient_failure_reported_while_pulling_rows_is_replayed() {
+        // Seen in CI (test_trigger_type_filter_is_bound_not_spliced): the code is inside the text.
+        let pull = anyhow::Error::from(neo4rs::Error::UnexpectedMessage(
+            "unexpected response for PULL: Ok(Failure(Failure { metadata: BoltMap { value: {BoltString { value: \"code\" }: String(BoltString { value: \"Neo.TransientError.Transaction.Outdated\" })} } }))".to_string(),
+        ));
+        assert!(is_transient_neo4j_error(&pull));
+        // Another PULL failure, a non-transient code, and another message are not replayed.
+        let client = anyhow::Error::from(neo4rs::Error::UnexpectedMessage(
+            "unexpected response for PULL: Ok(Failure(.. Neo.ClientError.Statement.SyntaxError ..))".to_string(),
+        ));
+        assert!(!is_transient_neo4j_error(&client));
+        let other = anyhow::Error::from(neo4rs::Error::UnexpectedMessage(
+            "unexpected response for RUN: Neo.TransientError.Transaction.Outdated".to_string(),
+        ));
+        assert!(!is_transient_neo4j_error(&other));
+    }
+
+    #[test]
+    fn only_transient_codes_are_replayed() {
+        assert!(is_transient_neo4j_code(
+            "Neo.TransientError.Transaction.Outdated"
+        ));
+        assert!(!is_transient_neo4j_code(
+            "Neo.ClientError.Statement.SyntaxError"
+        ));
+        assert!(!is_transient_neo4j_code(
+            "Neo.DatabaseError.General.UnknownError"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod where_builder_tests {
+    use super::*;
+    const EVIL: &str = "a' OR 1=1 //";
+
+    #[test]
+    fn search_filter_is_parameterized() {
+        let mut wb = WhereBuilder::new();
+        wb.add_search_filter("p", Some(EVIL));
+        let clause = wb.build();
+        assert!(!clause.contains("OR 1=1"), "{clause}");
+        assert!(!clause.contains('\''), "{clause}");
+        assert!(clause.contains("$wb_0"));
+        assert_eq!(
+            wb.params(),
+            &[("wb_0".to_string(), WhereParam::Str(EVIL.to_lowercase()))]
+        );
+    }
+
+    #[test]
+    fn status_variants_cover_both_encodings() {
+        assert_eq!(
+            status_variants("in_progress"),
+            vec!["in_progress", "InProgress"]
+        );
+        assert_eq!(
+            status_variants("InProgress"),
+            vec!["in_progress", "InProgress"]
+        );
+        assert_eq!(status_variants("planned"), vec!["planned", "Planned"]);
+        for v in status_variants("x'] OR true //") {
+            assert!(
+                v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_or_absent_status_filter_adds_no_condition() {
+        // An absent or empty status list must leave the clause untouched, not
+        // emit `status IN []` (which matches nothing and would silently empty
+        // every unfiltered listing).
+        let mut wb = WhereBuilder::new();
+        wb.add_status_filter("t", None);
+        wb.add_status_filter("t", Some(vec![]));
+        wb.add_status_filter_any_case("m", None);
+        wb.add_status_filter_any_case("m", Some(vec![]));
+        assert!(wb.build().is_empty(), "{}", wb.build());
+        assert!(wb.build_and().is_empty());
+        assert!(wb.params().is_empty());
+        assert!(!wb.has_conditions());
+    }
+
+    #[test]
+    fn status_variants_collapses_when_both_spellings_agree() {
+        // A value whose snake_case and PascalCase spellings coincide must be
+        // bound once, not twice.
+        assert_eq!(status_variants("123"), vec!["123"]);
+        assert_eq!(status_variants(""), vec![""]);
+        // and the sanitizer still strips anything that is not an identifier,
+        // so no quote or space can reach the Cypher text even in this position
+        assert_eq!(status_variants("'; DROP //"), vec!["d_r_o_p", "DROP"]);
+    }
+
+    #[test]
+    fn any_case_filter_matches_milestone_snake_case() {
+        let mut wb = WhereBuilder::new();
+        wb.add_status_filter_any_case("m", Some(vec!["in_progress".into()]));
+        assert_eq!(
+            wb.params()[0].1,
+            WhereParam::StrList(vec!["in_progress".into(), "InProgress".into()])
+        );
+    }
+
+    #[test]
+    fn tags_assigned_status_are_parameterized() {
+        let mut wb = WhereBuilder::new();
+        wb.add_status_filter(
+            "t",
+            Some(vec!["in_progress".into(), "x'] OR true //".into()]),
+        )
+        .add_tags_filter("t", Some(vec![EVIL.into(), "b\\\"".into()]))
+        .add_assigned_to_filter("t", Some(EVIL));
+        let clause = wb.build_and();
+        for bad in ["'", "\"", "\\", "OR 1=1", "OR true"] {
+            assert!(!clause.contains(bad), "{bad} in {clause}");
+        }
+        assert_eq!(wb.params().len(), 4);
+        assert_eq!(
+            wb.params()[0].1,
+            WhereParam::StrList(vec![
+                "InProgress".into(),
+                snake_to_pascal_case("x'] OR true //")
+            ])
+        );
+        assert_eq!(wb.params()[1].1, WhereParam::Str(EVIL.into()));
+        assert_eq!(wb.params()[3].1, WhereParam::Str(EVIL.into()));
+        // binding must not panic
+        let _ = wb.bind(query("RETURN 1"));
+    }
+
+    /// `$wb_N` placeholders referenced by a Cypher fragment, sorted and deduped.
+    fn referenced(cypher: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let b = cypher.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'$' {
+                let start = i + 1;
+                let mut j = start;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                out.push(cypher[start..j].to_string());
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Clause <-> params coherence: every placeholder the clause references is
+    /// carried by `params()` (which `bind` sets one-to-one), and no parameter
+    /// is bound without being referenced. No Neo4j needed.
+    fn assert_coherent(wb: &WhereBuilder, label: &str) {
+        let clause = wb.build();
+        let mut bound: Vec<String> = wb.params().iter().map(|(n, _)| n.clone()).collect();
+        bound.sort();
+        assert_eq!(referenced(&clause), bound, "{label}: {clause}");
+        assert_eq!(referenced(&wb.build_and()), bound, "{label} (and)");
+        // binding must succeed for the same set
+        let _ = wb.bind(query("RETURN 1"));
+    }
+
+    #[test]
+    fn every_builder_method_binds_exactly_what_its_clause_references() {
+        let mut wb = WhereBuilder::new();
+        assert_coherent(&wb, "empty");
+
+        wb.add_status_filter("t", Some(vec!["in_progress".into(), EVIL.into()]));
+        assert_coherent(&wb, "status");
+        wb.add_status_filter_any_case("m", Some(vec!["planned".into(), EVIL.into()]));
+        assert_coherent(&wb, "any_case");
+        wb.add_priority_filter("t", Some(1), Some(5));
+        assert_coherent(&wb, "priority");
+        wb.add_tags_filter("t", Some(vec!["a".into(), EVIL.into(), "c".into()]));
+        assert_coherent(&wb, "tags");
+        wb.add_assigned_to_filter("t", Some(EVIL));
+        assert_coherent(&wb, "assigned");
+        wb.add_search_filter("t", Some(EVIL));
+        assert_coherent(&wb, "search");
+        wb.add_bound("x.k = {}", WhereParam::Str(EVIL.into()));
+        wb.add_static("x.flag IS NULL");
+        assert_coherent(&wb, "bound+static");
+        // status 1 + any_case 1 + tags 3 + assigned 1 + search 1 + bound 1
+        assert_eq!(wb.params().len(), 8);
+    }
+
+    #[test]
+    fn note_where_binds_exactly_what_its_clause_references() {
+        use crate::notes::{NoteFilters, NoteImportance, NoteStatus, NoteType};
+        let full = NoteFilters {
+            status: Some(vec![NoteStatus::Active, NoteStatus::Stale]),
+            note_type: Some(vec![NoteType::Guideline]),
+            importance: Some(vec![NoteImportance::High]),
+            tags: Some(vec![EVIL.into(), "b".into()]),
+            search: Some(EVIL.into()),
+            min_staleness: Some(0.1),
+            max_staleness: Some(0.9),
+            ..Default::default()
+        };
+        let pid = Some(uuid::Uuid::new_v4());
+        for (label, p, ws, f) in [
+            ("none", None, None, NoteFilters::default()),
+            ("project", pid, None, full.clone()),
+            ("workspace", None, Some(EVIL), full.clone()),
+            ("project wins", pid, Some(EVIL), full.clone()),
+            (
+                "global",
+                None,
+                Some(EVIL),
+                NoteFilters {
+                    global_only: Some(true),
+                    ..full.clone()
+                },
+            ),
+        ] {
+            let wb = crate::neo4j::note::build_note_where(p, ws, &f);
+            assert_coherent(&wb, label);
+            assert!(!wb.build().contains("OR 1=1"), "{label}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod schema_expectation_tests {
+    use super::EXPECTED_CONSTRAINTS;
+    /// Every `CREATE CONSTRAINT <name>` of this file must be in the list that
+    /// `verify_schema` checks, or a constraint that silently failed to be
+    /// created (duplicates in the data) would never be reported.
+    #[test]
+    fn verify_schema_expects_every_constraint_it_creates() {
+        let src = include_str!("client.rs");
+        let created: Vec<&str> = src
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("\"CREATE CONSTRAINT "))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        assert!(
+            created.len() > 30,
+            "parsed too few constraints: {created:?}"
+        );
+        let missing: Vec<&&str> = created
+            .iter()
+            .filter(|n| !EXPECTED_CONSTRAINTS.contains(n))
+            .collect();
+        assert!(missing.is_empty(), "not verified: {missing:?}");
+        for anchor in ["anchor_id", "anchor_session_target", "anchor_event_id"] {
+            assert!(EXPECTED_CONSTRAINTS.contains(&anchor), "{anchor}");
+        }
+    }
+}

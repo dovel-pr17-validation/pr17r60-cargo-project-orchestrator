@@ -1,0 +1,89 @@
+# cargo-audit configuration — supply chain advisory exceptions.
+# https://docs.rs/cargo-audit/latest/cargo_audit/config/struct.AuditConfig.html
+#
+# Run locally: `cargo audit`
+# Run in CI:   .github/workflows/security.yml (rustsec/audit-check@v2)
+#
+# Plan e81fb4de — Dependabot security audit (T7). Mirrors the
+# `[advisories.ignore]` block in `deny.toml` since cargo-audit and
+# cargo-deny consume separate config files.
+
+[advisories]
+# When a known advisory has no actionable fix yet, document the
+# exception with an explanatory comment + RUSTSEC id below.
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel on the `rsa` crate.
+    # No upstream patch available (open since 2023-11-22); a constant-time
+    # rewrite is in progress at https://github.com/RustCrypto/RSA/issues/626.
+    #
+    # Pulled transitively via jsonwebtoken 10 + features = ["rust_crypto"]
+    # (chain: rsa ← jsonwebtoken ← meilisearch-sdk ← project-orchestrator).
+    #
+    # Justification: we use HS256 (HMAC) for JWT signing in `auth/jwt.rs`
+    # (`EncodingKey::from_secret`). RSA signing/verification is never invoked
+    # at runtime, so the timing sidechannel is unreachable in our code paths.
+    # We will revisit when RustCrypto/RSA ships a constant-time release.
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0381 — webpki-roots bundles distrusted emSign intermediates.
+    # Patched only in webpki-roots >= 1.0.10 (bumped in Cargo.lock). The 0.26.11
+    # copy is pinned by neo4rs 0.8.0 (bolt over rustls); no 0.26 patch exists.
+    # Justification: that copy only validates the Neo4j server certificate of an
+    # operator-configured endpoint. Revisit when neo4rs moves to webpki-roots 1.x.
+    "RUSTSEC-2026-0381",
+
+    # ---------------------------------------------------------------------
+    # Unmaintained transitive dependencies (informational, not vulnerabilities).
+    # Mirrored from deny.toml — see that file for per-advisory justifications.
+    # ---------------------------------------------------------------------
+    "RUSTSEC-2024-0384", # instant unmaintained
+    "RUSTSEC-2024-0436", # paste unmaintained
+    "RUSTSEC-2025-0012", # backoff unmaintained
+    "RUSTSEC-2025-0119", # number_prefix unmaintained
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
+    "RUSTSEC-2025-0141", # bincode 1.x unmaintained
+    "RUSTSEC-2026-0097", # rand unsound (custom logger via rand::rng())
+    "RUSTSEC-2026-0105", # core2 unmaintained + yanked
+
+    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195 — quick-xml DoS on untrusted XML
+    # (quadratic duplicate-attribute check and related parsing cost).
+    # Patched only in quick-xml >= 0.40; we are pinned to 0.39.4 transitively
+    # via plist 1.9.0 ← tauri (latest plist still requires quick-xml 0.39,
+    # so no `cargo update` path exists).
+    #
+    # Justification: plist/quick-xml is only used by the Tauri desktop stack
+    # to read macOS Info.plist bundle metadata — trusted, locally-generated
+    # input. We never parse untrusted XML through this chain. Revisit when
+    # plist releases with quick-xml >= 0.40.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2024-0370", # proc-macro-error unmaintained
+    "RUSTSEC-2026-0192", # ttf-parser unmaintained (behind opt-in pdf feature)
+    "RUSTSEC-2024-0429", # glib VariantStrIter unsoundness (Tauri Linux stack)
+    "RUSTSEC-2026-0370", # zvariant unmaintained
+    "RUSTSEC-2026-0371", # zbus_names unmaintained
+    "RUSTSEC-2026-0372", # zvariant_derive unmaintained
+    # Mirrored from deny.toml for the Linux-only Tauri stack and text crates.
+    "RUSTSEC-2025-0057", # fxhash unmaintained
+    "RUSTSEC-2025-0075", # unic-char-range unmaintained
+    "RUSTSEC-2025-0080", # unic-common unmaintained
+    "RUSTSEC-2025-0081", # unic-char-property unmaintained
+    "RUSTSEC-2025-0098", # unic-ucd-version unmaintained
+    "RUSTSEC-2025-0100", # unic-ucd-ident unmaintained
+    "RUSTSEC-2024-0411", # gtk-rs GTK3 unmaintained (Tauri Linux)
+    "RUSTSEC-2024-0412",
+    "RUSTSEC-2024-0413",
+    "RUSTSEC-2024-0414",
+    "RUSTSEC-2024-0415",
+    "RUSTSEC-2024-0416",
+    "RUSTSEC-2024-0417",
+    "RUSTSEC-2024-0418",
+    "RUSTSEC-2024-0419",
+    "RUSTSEC-2024-0420",
+
+    # zip: nothing ignored. The last copy below the fix line (1.1.4, through
+    # candle-core 0.8.4's npz loader) is gone — candle-core reads zip 9.1.3 from
+    # the local copy in vendor/candle-core (see its PATCH.md). RUSTSEC-2026-0367 /
+    # -0368 / -0369 and the October 2026 batch (CVE-2026-115905..909, dependabot
+    # alerts 47 to 51) no longer match anything here.
+]

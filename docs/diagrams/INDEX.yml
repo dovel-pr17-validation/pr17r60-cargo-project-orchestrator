@@ -1,0 +1,459 @@
+# Index des diagrammes du depot (voir docs/DOCUMENTATION.md). Verifie hors reseau par scripts/diagrams/check-index.mjs.
+# Sous-ensemble YAML strict : entrees "- name:", scalaires "cle: valeur", liste "covers:" de "- glob".
+# Globs prefixes par depot : backend: frontend: nexus: website:
+# status: planned = pas encore de diagramme (contenu a verifier contre le code avant export) ; verified = diagramme present et releve :
+#   - EXTERNE (regle par defaut) : publie dans le service Mermaid de l'equipe (hote nomme hors depot, depot public), l'entree porte
+#     mermaid_id et/ou external (<workspace>/<session>/<name>@<version>, sans hote), verified_at, verified_sha ; pas de .mmd ici ;
+#   - locale (historique) : docs/diagrams/<name>.mmd present, en-tete %% verified.
+# REGLE DU PROPRIETAIRE UNIQUE : deux `covers` ne doivent jamais matcher le meme fichier.
+#   Un fichier couvert par deux diagrammes n'a pas de proprietaire : personne ne repond de lui.
+#   Le script echoue sur tout recouvrement ; les arbitrages faits sont notes en commentaire ci-dessous.
+# po-carte (role: index) est la carte d'index : c'est a elle que se rattachent les entrees, y compris
+#   celles qui reprennent une carte provisoire mal nommee (champ `supersedes`).
+# Les fichiers sans proprietaire sont publies dans docs/diagrams/ORPHANS.md (--write-orphans).
+diagrams:
+  - name: po-carte
+    owner: theotime
+    status: planned
+    role: index
+    covers:
+      - "backend:docs/diagrams/INDEX.yml"
+      - "backend:docs/DOCUMENTATION.md"
+  - name: po-api
+    owner: theotime
+    status: planned
+    # Arbitrage : ws_auth.rs (authentification du socket, cookie/ticket) et ws_handlers.rs
+    # (multiplexage des flux CRUD et graphe) ne sont PAS du chat — ils restent ici.
+    covers:
+      - "backend:src/api/{mod,routes,handlers,query,ws_auth,ws_handlers,hook_handlers,auth_handlers}.rs"
+      - "backend:src/auth/{mod,middleware,extractor}.rs"
+  - name: po-autonomic
+    owner: theotime
+    status: planned
+    # Arbitrage : events/reactions.rs appartient au reacteur (EventReactor), pas au cycle des plans.
+    covers:
+      - "backend:src/heartbeat/**"
+      - "backend:src/homeostasis.rs"
+      - "backend:src/reflex/**"
+      - "backend:src/events/{mod,bus,hybrid,reactor,trigger,builtin_triggers,reactions}.rs"
+  - name: po-ingress
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-ingress.mmd
+    # Arbitrage : le modele, le journal, les garde-fous et la route publique des evenements
+    # entrants appartiennent a l'ingestion, pas a po-autonomic (cycle automatique) ni a po-api
+    # (surface administrative ; po-api liste ses fichiers un par un, sans wildcard).
+    covers:
+      - "backend:src/api/ingress_handlers.rs"
+      - "backend:src/ingress/**"
+      - "backend:src/neo4j/ingress.rs"
+  - name: po-event-ingestion
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-event-ingestion.mmd
+    # Arbitrage : l'activite d'ingestion n'appartient ni a po-autonomic (cycle automatique du
+    # PO) ni a po-api (surface HTTP). C'est un sujet propre — « le PO au travail » — qui voyage
+    # sur la taxonomie CRUD, et un seul fichier le porte : le reporter et sa cadence.
+    covers:
+      - "backend:src/events/ingestion.rs"
+  - name: po-activity-hub
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-activity-hub.mmd
+    # Arbitrage : le flux d'activite n'appartient ni a po-api (surface HTTP administrative) ni a
+    # po-autonomic (cycle automatique du PO). C'est un sujet propre — « tout ce qui tourne, vu
+    # d'un seul flux » — porte par deux fichiers de surface et l'anneau qui les alimente.
+    # Il n'emprunte pas po-api-* : ses deux handlers ne sont pas des routes d'entite.
+    covers:
+      - "backend:src/events/activity.rs"
+      - "backend:src/api/activity_handlers.rs"
+      - "backend:src/api/ws_activity_handler.rs"
+  - name: po-chat-manager
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-chat-manager.mmd
+    covers:
+      - "backend:src/chat/manager/recovery.rs"
+      - "backend:src/chat/{mod,manager,cost,anchor,anchor_resolver,eval_transverse,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue,posture,relay,refs_wiring_tests,untrusted,neutral_place,session_record,tool_clock,retrieval_trigger,segment_state,segment_tap}.rs"
+      - "backend:src/notes/coactivation.rs"
+      # Arbitrage (PR registre de recuperation) : le registre est appele par
+      # notes::manager (entree po-knowledge-notes encore `planned`, donc sans
+      # propriete). Il rejoint po-chat-manager, comme notes/coactivation.rs.
+      - "backend:src/notes/retrieval_ledger.rs"
+      # Meme arbitrage pour la politique (PR6) : elle LIT le registre et ne regle
+      # rien ; elle appartient au meme dessin que ce qu'elle lit.
+      - "backend:src/notes/retrieval_policy.rs"
+      # Arbitrage (PR croyances, T7) : la revision des croyances est appelee au demarrage
+      # (lib.rs : reverify_at_boot) et ecrit les notes ; comme le registre de recuperation,
+      # elle n'a pas de diagramme verifie (po-knowledge-notes reste `planned`). Elle rejoint
+      # po-chat-manager, comme notes/coactivation.rs. A reprendre si po-knowledge-notes est verifie.
+      - "backend:src/notes/beliefs.rs"
+      # Meme arbitrage pour son adaptateur Neo4j : sans diagramme de fonctionnalite dedie,
+      # il rejoint le diagramme qui l'appelle.
+      - "backend:src/neo4j/beliefs.rs"
+      # Arbitrage (PR provenance, #1138) : le portier de lecture decide ce qu'une note a
+      # le droit de dire dans un prompt injecte, et c'est le chat qui l'appelle
+      # (continuity::load_recent_notes). po-knowledge-notes reste `planned`, donc sans
+      # propriete : il rejoint po-chat-manager, comme notes/beliefs.rs. A reprendre si
+      # po-knowledge-notes est verifie.
+      - "backend:src/notes/{visibility,purge}.rs"
+  - name: po-spawn-envelope
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-spawn-envelope.mmd
+    # Arbitrage : auth/middleware.rs reste a po-api ; ici le jeton de session lie
+    # (jwt.rs, jwt_crypto.rs, agent_tokens.rs) et l'enveloppe d'une session enfant (chat/envelope.rs).
+    covers:
+      - "backend:src/chat/{envelope,delegation_limits,subagents,mirror,session_pool,cancelled_parents}.rs"
+      - "backend:src/auth/{agent_tokens,jwt,jwt_crypto,tool_profile}.rs"
+  - name: po-execution-place
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-execution-place.mmd
+    # T5 : « exécute dans X ». delegate_task (api/handlers.rs) reste a po-api, l'enveloppe a po-spawn-envelope.
+    covers:
+      - "backend:src/api/execution_place_handlers.rs"
+      - "backend:src/chat/place_confirmation.rs"
+      - "backend:src/runner/ephemeral_worktree.rs"
+      - "backend:src/neo4j/execution_place.rs"
+  - name: po-chat-agent-runtime
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-chat-agent-runtime.mmd
+    covers:
+      - "backend:src/chat/{agent_runtime,agent_hooks,cancel_relay,session_grants,lasting_rules,manual_compaction,spill,team,turn_admission}.rs"
+      - "backend:src/chat/provider/{transcripts,hooks}.rs"
+      - "backend:src/api/team_handlers.rs"
+      - "backend:src/chat/activation_registry.rs"
+  - name: po-provider-settings
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-provider-settings.mmd
+    # Arbitrage QUOTA : les ROUTES du quota (/api/chat/providers/{id}/quota, human-only comme les
+    # autres mutations de provider) vivent ici ; le REGISTRE lui-meme est dans po-chat-provider
+    # (src/chat/provider/quota.rs) et sa lecture par Auto est decrite dans po-cognitive-routing.
+    covers:
+      - "backend:src/api/provider_handlers.rs"
+      - "backend:src/api/network_tools_handlers.rs"
+      - "backend:src/api/quota_handlers.rs"
+  - name: po-chat-provider
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-chat-provider.mmd
+    # Resolveur backend seulement : le registre des providers et la table de prix sont dans nexus (A1).
+    # Arbitrage : src/chat/provider/cognitive/** (routage cognitif, R2) appartient a po-cognitive-routing.
+    covers:
+      - "backend:src/chat/provider/{catalog,circuit_breaker,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,oneshot,outage,policy,quota,resolver,settings,store}.rs"
+      - "backend:src/chat/provider/limits/**"
+      - "backend:src/chat/deferred_tools.rs"
+      # Arbitrage : src/logging.rs (journal persistant) existe pour garder les avis du harnais et les
+      # refus du coffre au-dela du terminal ; il est dessine ici, a cote de event_map qui les produit.
+      - "backend:src/logging.rs"
+  - name: po-cognitive-routing
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-cognitive-routing.mmd
+    # Arbitrage : src/evaluation/** appartient ici (le banc hors ligne des sept classifieurs) : ses chiffres
+    # sortent par le champ additif du rapport (classifiers) et par le heartbeat classifier_bench ; les
+    # cartes des domaines mesures (po-skills-reasoning, po-neurons-embeddings, po-autonomic) sont planned.
+    # Routage cognitif (RFC v2, decision R2) : reglages mode/stage (B-R1), puis signature, candidats,
+    # scorer, decisions, feedback, rapport (B-R2..). Les routes /api/chat/routing vivent dans routing_handlers.rs.
+    covers:
+      - "backend:src/chat/provider/cognitive/**"
+      - "backend:src/chat/routing_modes_e2e_tests.rs"
+      - "backend:src/api/routing_handlers.rs"
+      - "backend:src/neo4j/routing.rs"
+      - "backend:src/neo4j/segment.rs"
+      - "backend:src/runner/routing.rs"
+      - "backend:src/evaluation/**"
+  - name: po-chat-transport
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-chat-transport.mmd
+    covers:
+      - "backend:src/api/{ws_chat_handler,refs_ws_tests}.rs"
+      - "backend:src/chat/wire_contract.rs"
+      - "backend:src/events/transport.rs"
+  - name: po-p2p-transport
+    owner: theotime
+    status: planned
+    supersedes: po-chat-transport-2
+    covers:
+      - "backend:src/transport/**"
+      - "backend:src/reception/**"
+  - name: po-code-intelligence
+    owner: theotime
+    status: planned
+    # Arbitrage : src/graph/** (extraction depuis le code, ecriture, debounce) est ici ;
+    # po-graph-store repond de la couche de persistance src/neo4j/* et des migrations.
+    covers:
+      - "backend:src/graph/{mod,engine,algorithms,models,process,debouncer,extraction,writer,enrichment,confidence}.rs"
+      - "backend:src/analytics/{mod,hypothesis,distribution}.rs"
+      - "backend:src/analytics/stats/mod.rs"
+  - name: po-architecture-derive
+    owner: theotime
+    status: planned
+    supersedes: po-code-intelligence-2
+    covers:
+      - "backend:src/architecture/**"
+  - name: po-crates-tests
+    owner: theotime
+    status: planned
+    # Arbitrage : xtask/ (cargo xtask in-service|pins, verifications d'apres-fusion) et son alias
+    # .cargo/config.toml sont de l'outillage du depot, au meme titre que scripts/test.sh.
+    covers:
+      - "backend:Cargo.toml"
+      - "backend:xtask/**"
+      - "backend:.cargo/config.toml"
+      - "backend:crates/**"
+      - "backend:tests/*.rs"
+      - "backend:.github/workflows/{ci,security,release}.yml"
+      - "backend:.github/dependabot.yml"
+      - "backend:deny.toml"
+      - "backend:codecov.yml"
+      - "backend:rust-toolchain.toml"
+      - "backend:scripts/test.sh"
+  - name: po-documents-workspace
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/documents/**"
+      - "backend:src/api/{document,workspace,project}_handlers.rs"
+      - "backend:src/neo4j/{document,workspace,milestone,release,project}.rs"
+  - name: po-entry-deploy
+    owner: theotime
+    status: planned
+    # Arbitrage : src/bin/mcp_server.rs est le binaire du serveur MCP ; po-mcp en repond.
+    covers:
+      - "backend:src/{main,cli,setup_claude,lib}.rs"
+      - "backend:src/update/**"
+      - "backend:Dockerfile"
+      - "backend:docker-compose*.yml"
+      - "backend:config.yaml.example"
+      - "backend:packaging/**"
+      - "backend:desktop/src-tauri/{tauri.conf.json,src/**}"
+      - "backend:scripts/build-desktop.sh"
+      - "backend:scripts/third-party-licenses.sh"
+      - "backend:about.toml"
+      - "backend:licenses/**"
+  - name: po-frontend-chat
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-frontend-chat.mmd
+    covers:
+      - "frontend:src/services/{chatWebSocket,chat,wsAdapter}.ts"
+      - "frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree,useEffectiveCapabilities}.ts"
+      - "frontend:src/hooks/runner/useConversationWs.ts"
+      - "frontend:src/atoms/{chat,modelCatalog}.ts"
+      - "frontend:src/utils/chatAssembly.ts"
+      - "frontend:src/types/chat.ts"
+      - "frontend:src/constants/models.ts"
+      - "frontend:src/components/chat/{ChatPanel,ChatInput,ActivityBar,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx"
+      - "frontend:src/components/chat/{messageQueue,inputAction,runningActivity,chatUrlState,sessionListUtils,sessionActivity}.ts"
+      - "frontend:src/components/chat/tools/**"
+      - "frontend:src/components/chat/{SecretRequestTray,ExecPlaceConfirmTray}.tsx"
+      - "frontend:src/atoms/execConfirm.ts"
+      - "frontend:src/services/executionPlace.ts"
+      - "frontend:src/utils/executionPlace.ts"
+  - name: po-frontend-shell
+    owner: theotime
+    status: planned
+    covers:
+      - "frontend:src/{App,main}.tsx"
+      - "frontend:src/layouts/**"
+      - "frontend:src/components/{SetupGuard,WorkspaceRouteGuard}.tsx"
+      - "frontend:src/components/auth/ProtectedRoute.tsx"
+  - name: po-frontend-views
+    owner: theotime
+    status: planned
+    covers:
+      - "frontend:src/hooks/{useCrudEventRefresh,useCrudEventSync,useViewMode,useKanbanColumnData,usePlanGraphData}.ts"
+      - "frontend:src/components/graph/entity/{EntityGraph.tsx,useNeighborhood.ts}"
+      - "frontend:src/components/graph/UnifiedGraphSection.tsx"
+      - "frontend:src/components/kanban/UniversalKanban.tsx"
+      - "frontend:src/components/protocols/{FsmViewer,RunTreeView}.tsx"
+      - "frontend:src/components/protocols/rfcLifecycle.ts"
+      - "frontend:src/pages/{TodayPage,PlansPage,TasksPage,NotesPage,ProtocolsPage,ProtocolDetailPage}.tsx"
+      - "frontend:src/constants/nomenclature.ts"
+      - "frontend:src/services/eventBus.ts"
+  - name: po-graph-store
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/neo4j/{mod,client,traits,impl_graph_store,data_migrations,batch,registry,analytics,symbol_key,file_uid,path_migration}.rs"
+      - "backend:migrations/**"
+  - name: po-knowledge-notes
+    owner: theotime
+    status: planned
+    covers:
+      # Arbitrage : notes/coactivation.rs (regroupement des notes par projet avant renforcement
+      # synaptique, utilise par les gestionnaires du chat) appartient a po-chat-manager.
+      - "backend:src/notes/{hashing,lifecycle,manager,mod,models,witness}.rs"
+      - "backend:src/neo4j/note.rs"
+  - name: po-mcp
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/mcp/**"
+      - "backend:src/bin/mcp_server.rs"
+  - name: po-mcp-federation
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/mcp_federation/**"
+      - "backend:src/api/mcp_federation_handlers.rs"
+      - "backend:src/chat/stages/mcp_federation_stage.rs"
+  - name: po-neurons-embeddings
+    owner: theotime
+    status: planned
+    covers:
+      # Arbitrage : src/neurons/synaptic_shadow{,_tests}.rs (couche synaptique en ombre, T8) est
+      # possede par po-synaptic-shadow (verified), avec sa persistance src/neo4j/synapse_shadow.rs.
+      - "backend:src/neurons/{activation,config,intent,mod,search}.rs"
+      - "backend:src/embeddings/**"
+      - "backend:src/meilisearch/**"
+  # Arbitrage (2026-10-02) : po-nexus-sdk est RETIRE. Son perimetre (claude-code-sdk-rs/src/{lib,client,
+  # query,interactive,internal_query,message_parser,types}.rs et transport/{mod,subprocess}.rs) est possede
+  # par l'index DERIVE de nexus (nexus-sdk-client, -interactive, -types, -transport, -provider-boundary),
+  # avec des .mmd verifies. La regle du proprietaire unique vaut ENTRE les index : des que le script a su
+  # relire l'index de nexus, la reservation planned d'ici est devenue une collision sur 8 fichiers.
+  - name: po-personas-identity
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/identity/**"
+      - "backend:src/sharing/**"
+      - "backend:src/profile/**"
+      - "backend:src/api/sharing_handlers.rs"
+  - name: po-plan-lifecycle
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/plan/**"
+      - "backend:src/lifecycle/**"
+      - "backend:src/neo4j/{lifecycle_hook,step,task,plan,day_plan}.rs"
+      - "backend:src/events/types.rs"
+  - name: po-protocols
+    owner: theotime
+    status: planned
+    # validate.rs couvert par po-protocol-validation (verified)
+    covers:
+      - "backend:src/protocol/{mod,models,engine,generator,guard,hooks,routing,runner,runner_tests,seed,seed_runner}.rs"
+      - "backend:src/protocol/executor/**"
+  - name: po-protocol-validation
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-protocol-validation.mmd
+    covers:
+      - "backend:src/protocol/validate.rs"
+  - name: po-runner-orchestrator
+    owner: theotime
+    status: verified
+    mermaid_id: dc22b7048fb964b
+    external: project-orchestrator/architecture-po/po-runner-orchestrator@3
+    verified_at: 2026-10-10
+    verified_sha: 501cb0b9
+    # Arbitrage : src/orchestrator/{mod,runner}.rs scanne et synchronise le code
+    # (scan_files, init_embedding_provider, should_ignore_path) : po-sync-parser en repond.
+    covers:
+      - "backend:src/runner/{mod,runner,state,models,guard}.rs"
+  - name: po-plan-triggers
+    owner: theotime
+    status: verified
+    mermaid_id: d34a0124803e64e
+    external: project-orchestrator/architecture-po/po-plan-triggers@1
+    verified_at: 2026-10-10
+    verified_sha: 501cb0b9
+    # Scinde de po-runner-orchestrator (une question par diagramme) : un declencheur qui tire
+    # (schedule, event, webhook) passe par TriggerDispatcher et demarre le run via PlanRunnerFactory.
+    covers:
+      - "backend:src/runner/{dispatch,trigger}.rs"
+      - "backend:src/runner/providers/**"
+  - name: po-skills-reasoning
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/skills/{mod,models,detection,evolution,lifecycle,maintenance,activation,feedback}.rs"
+      - "backend:src/reasoning/**"
+      - "backend:src/feedback/**"
+      - "backend:src/episodes/{mod,models,collector,distill,anonymize}.rs"
+  - name: po-sync-parser
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/parser/{mod,ast_cache,helpers,noise_filter}.rs"
+      - "backend:src/resolver/**"
+      - "backend:src/orchestrator/{mod,runner,watcher}.rs"
+  - name: po-website-docs
+    owner: theotime
+    status: planned
+    covers:
+      - "website:{package.json,vite.config.ts,src/**,scripts/**,public/robots.txt}"
+      - "backend:{SKILL,AGENTS,CLAUDE}.md"
+      - "backend:docs/api/**"
+  - name: po-refs
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-refs.mmd
+    covers:
+      - "backend:src/refs/**"
+      - "backend:src/api/refs_handlers.rs"
+  - name: po-self-graph
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-self-graph.mmd
+    # Arbitrage : ce diagramme possede les fichiers NEUFS du soi natif (moteur de regles,
+    # catalogue du schema, marche causale, leurs preuves). src/graph/{mod,engine,...}.rs
+    # reste le perimetre de po-code-intelligence (planned), et src/neo4j/*.rs des entrees
+    # existantes : les nouveaux fichiers ne recouvrent aucun des deux.
+    covers:
+      - "backend:src/graph/{rules,schema,self_model_tests}.rs"
+      - "backend:src/neo4j/graph_schema.rs"
+  - name: po-neurons-conduction
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-neurons-conduction.mmd
+    # Arbitrage : le registre d'objectif (N1) est un neurone MOTEUR, distinct de la
+    # memoire synaptique (po-neurons-embeddings, planned) et de l'oubli/ombre
+    # (po-synaptic-forgetting, po-synaptic-shadow, verified). Fichier dedie : aucun recouvrement.
+    covers:
+      - "backend:src/neurons/conduction.rs"
+  - name: po-synaptic-forgetting
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-synaptic-forgetting.mmd
+    covers:
+      - "backend:src/neurons/forgetting.rs"
+  - name: po-synaptic-shadow
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-synaptic-shadow.mmd
+    covers:
+      - "backend:src/neurons/synaptic_shadow.rs"
+      - "backend:src/neurons/synaptic_shadow_tests.rs"
+      - "backend:src/neo4j/synapse_shadow.rs"
+  - name: po-yaml
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-yaml.mmd
+    covers:
+      - "backend:src/yaml.rs"
+      - "backend:src/yaml/**"
+  - name: po-bugs
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-bugs.mmd
+    covers:
+      - "backend:docs/BUGS.md"
+  - name: po-storage
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-storage.mmd
+    # La couche de stockage vue de l'exterieur : ce qui choisit un adaptateur et
+    # ce qui porte le pool d'un domaine. Les fichiers de src/neo4j/ restent
+    # couverts par leurs entrees existantes ; ces deux-la sont neufs.
+    covers:
+      - "backend:src/storage.rs"
+      - "backend:src/neo4j/trajectory.rs"
+      - "backend:docs/storage/**"
+      - "backend:src/neo4j/graph_sampler.rs"

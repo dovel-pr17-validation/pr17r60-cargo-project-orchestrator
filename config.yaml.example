@@ -1,0 +1,340 @@
+# =============================================================================
+# Project Orchestrator — Configuration
+# =============================================================================
+#
+# Copy this file to config.yaml and adjust values.
+# Environment variables override YAML values (priority: env > yaml > default).
+#
+# AUTHENTICATION MODES:
+# ─────────────────────
+# 1. NO-AUTH (default): Remove or comment out the entire "auth" section.
+#    All /api/* and /ws/* routes are accessible without login.
+#    Ideal for local development or single-user setups.
+#
+# 2. PASSWORD ONLY: Add "auth" with "root_account" (and optionally
+#    "allow_registration: true" to let others sign up).
+#
+# 3. OIDC (SSO): Add "auth" with "oidc" section to enable SSO via
+#    Google, Microsoft, Okta, Keycloak, or any OIDC provider.
+#
+# 4. PASSWORD + OIDC: Add both "root_account" and "oidc" sections.
+#    Users can sign in with either method.
+
+# -----------------------------------------------------------------------------
+# Server
+# -----------------------------------------------------------------------------
+server:
+  port: 8080                    # SERVER_PORT env override
+  workspace_path: "."           # WORKSPACE_PATH env override
+  # Public URL of this server (e.g. https://po.ffs.dev), used when the server is
+  # exposed behind a reverse proxy on a public domain. Single source of truth for
+  # the OAuth issuer, /.well-known/oauth-* metadata and the /mcp resource URL.
+  # public_url: "https://po.ffs.dev"   # PUBLIC_URL env override
+  # Serve the frontend React app as static files (default: true)
+  # Set to false for API-only mode (equivalent to --no-frontend CLI flag)
+  serve_frontend: true          # SERVE_FRONTEND env override
+  # Path to the frontend dist/ directory (default: "./dist")
+  # Ignored when serve_frontend is false or when embedded-frontend feature is active
+  frontend_path: "./dist"       # FRONTEND_PATH env override
+
+# -----------------------------------------------------------------------------
+# Log — persistent trace file (in addition to stdout)
+# -----------------------------------------------------------------------------
+# The backend writes the same traces as stdout to a daily-rotated file, so a past
+# incident (restart, silent turn, vault refusal) can still be investigated.
+# Files are named orchestrator.YYYY-MM-DD.log. Every line goes through the vault
+# masker: a secret value delivered to an agent is written as [secret:NAME].
+# Each restart writes an "orchestrator starting" line (version, pid, log dir).
+# Harness notices ("provider_notice") and vault refusals ("vault: access refused")
+# are logged at info/warn, so the default level keeps them.
+log:
+  file_enabled: true            # LOG_FILE_ENABLED env override
+  # Default: <app dir>/logs, next to config.yaml
+  #   macOS/Linux: ~/.config/project-orchestrator/logs  (Windows: %APPDATA%\ProjectOrchestrator\logs)
+  # dir: "~/.local/share/project-orchestrator/logs"   # LOG_DIR env override
+  level: "info"                 # LOG_LEVEL env override; RUST_LOG syntax, FILE only
+  max_files: 14                 # LOG_MAX_FILES env override; daily files kept, oldest deleted
+  # stdout is unchanged: RUST_LOG still drives it.
+
+# -----------------------------------------------------------------------------
+# Neo4j — Knowledge graph database
+# -----------------------------------------------------------------------------
+neo4j:
+  uri: "bolt://localhost:7687"  # NEO4J_URI env override
+  user: "neo4j"                 # NEO4J_USER env override
+  password: "orchestrator123"   # NEO4J_PASSWORD env override
+
+# -----------------------------------------------------------------------------
+# Meilisearch — Semantic search engine
+# -----------------------------------------------------------------------------
+meilisearch:
+  url: "http://localhost:7700"              # MEILISEARCH_URL env override
+  key: "orchestrator-meili-key-change-me"   # MEILISEARCH_KEY env override
+
+# -----------------------------------------------------------------------------
+# NATS — Message broker for inter-process event sync (optional)
+# -----------------------------------------------------------------------------
+# Enables real-time event synchronization between multiple instances
+# (e.g. dev server on port 8080 + desktop app on port 6600).
+# If absent or url is null, the system works in local-only mode.
+# nats:
+#   url: "nats://localhost:4222"     # NATS_URL env override
+
+# -----------------------------------------------------------------------------
+# Remote MCP — Streamable HTTP transport + OAuth 2.1 Authorization Server
+# -----------------------------------------------------------------------------
+# Exposes the PO MCP server to remote Claude clients (Claude Code CLI over a
+# tailnet, and Claude.ai / Desktop connectors over public HTTPS).
+#
+# OPT-IN AND OFF BY DEFAULT. When this section is absent (or enabled: false),
+# the /mcp route and the /oauth/* + /.well-known/oauth-* discovery routes are
+# NOT mounted — no remote exposure. An existing config.yaml without this block
+# upgrades cleanly to "disabled" (additive migration, no rewrite needed).
+#
+# The public issuer/domain is NOT set here — it reuses server.public_url (the
+# single source of truth for the OAuth issuer, .well-known metadata and the
+# /mcp resource URL). No remote-MCP secret is stored: DCR client_ids and MCP
+# access tokens are stateless JWTs signed with auth.jwt_secret.
+#
+# Enable env override: REMOTE_MCP_ENABLED=true
+#
+# SECURITY: /mcp must sit behind TLS (reverse proxy / tunnel). For public
+# exposure, restrict at the network layer to Anthropic egress ranges
+# (IPv4 160.79.104.0/21, IPv6 2607:6bc0::/48). Never bind 0.0.0.0 without a proxy.
+#
+# remote_mcp:
+#   enabled: false                     # master switch (default: false)
+#   bind_addr: "127.0.0.1"             # loopback/tailnet interface (never 0.0.0.0 by default)
+#   session_ttl_secs: 3600             # idle TTL for Mcp-Session-Id sessions
+#   rate_limit:
+#     window_secs: 60                  # per-token sliding window
+#     max_requests: 120                # max requests per token per window
+#   origin_allowlist:                  # browser connector origins (DNS-rebinding guard)
+#     - "https://claude.ai"
+#     - "https://claude.com"
+
+# -----------------------------------------------------------------------------
+# Ingress — public reception of external events (webhooks)
+# -----------------------------------------------------------------------------
+# OPT-IN AND OFF BY DEFAULT. When absent (or enabled: false), the public route
+# POST /hooks/events/{source}/{trigger_id} is NOT mounted: it answers 404 like
+# any unknown path.
+#
+# Enable env override: INGRESS_ENABLED=true
+#
+# The route is PUBLIC (no JWT): a webhook trigger whose config declares a
+# `source` is reached by it, and its HMAC-SHA256 secret is the only lock. That
+# secret is NEVER written in the trigger: the trigger names it by reference,
+#   config: { source: "github", secret_ref: "vault:<name>" }
+# and the vault grant that lets the server read it has the provider scope
+# `trigger:<trigger id>`. A plain `secret` on such a trigger is refused at
+# creation. Locked vault or missing grant: every delivery is refused.
+#
+# Refusals before the signature is verified write nothing to the database
+# (counted in memory, traced at debug). Accepted, replayed and disabled-trigger
+# deliveries are journaled (ExternalEvent), kept 30 days.
+#
+# DEPLOYMENT CONDITION: enable this route ONLY behind a reverse proxy (nginx,
+# Caddy, a cloud load balancer...) that enforces a read timeout on request
+# HEADERS and on request BODIES (and, ideally, a per-IP rate limit and a
+# connection limit). The server itself sets no HTTP header-read timeout (this
+# holds for the whole server, not only this route): without that proxy, a
+# slow-header client (slowloris) can hold connections open indefinitely. The
+# route's own body timeout (body_read_timeout_secs) only starts once the
+# headers have been received.
+#
+# ingress:
+#   enabled: false                     # master switch (default: false)
+#   max_body_bytes: 1048576            # 1 MiB; a larger Content-Length is refused before reading
+#   body_read_timeout_secs: 10         # a body still incomplete after this is cut (408)
+#   max_concurrent: 32                 # requests handled at once; beyond: 503 + Retry-After
+#   rate_per_minute: 60                # per trigger (token bucket), spent only by an
+#                                      # authenticated (valid HMAC) delivery; beyond: 429
+#   global_rate_per_minute: 600        # whole route, spent BEFORE any graph read,
+#                                      # authenticated or not; beyond: 429
+
+# -----------------------------------------------------------------------------
+# Embeddings — Vector embedding provider for semantic search
+# -----------------------------------------------------------------------------
+# Two providers available:
+#
+# 1. Local (default) — In-process ONNX Runtime via fastembed-rs
+#    Zero external dependency, ~3-50ms latency, works offline.
+#    Embeddings are available out of the box with no configuration needed.
+#
+# 2. HTTP (opt-in) — Any OpenAI-compatible /v1/embeddings endpoint
+#    For premium/specialized models (OpenAI, Voyage, Cohere, etc.)
+#    Set EMBEDDING_PROVIDER=http to switch to an external provider.
+#
+# Set EMBEDDING_PROVIDER=disabled to turn off embeddings entirely.
+#
+# embedding:
+#   # Provider selection: "local" (default), "http", or "disabled"
+#   provider: "local"              # EMBEDDING_PROVIDER env override
+#
+#   # ── Local provider settings (default, zero config) ────────────────
+#   # fastembed_model: "multilingual-e5-base"    # FASTEMBED_MODEL env override
+#   # fastembed_cache_dir: ".fastembed_cache"     # FASTEMBED_CACHE_DIR env override
+#   # batch_size: 8                               # EMBEDDING_BATCH_SIZE env override (texts per ONNX inference call; bounds peak memory)
+#   #
+#   # Supported local models (768d, compatible with Neo4j index):
+#   #   multilingual-e5-base (default, FR/EN/100+ languages)
+#   #   nomic-embed-text-v1.5, bge-base-en-v1.5, gte-base-en-v1.5
+#   #
+#   # Other dimensions (require Neo4j index reconfiguration):
+#   #   384d: all-minilm-l6-v2, bge-small-en-v1.5
+#   #   1024d: bge-m3 (multilingual), bge-large-en-v1.5, multilingual-e5-large
+#
+#   # ── HTTP provider settings (opt-in for premium models) ────────────
+#   # url: "https://api.openai.com/v1/embeddings"   # EMBEDDING_URL env override
+#   # model: "text-embedding-3-small"                # EMBEDDING_MODEL env override
+#   # api_key: "sk-..."                              # EMBEDDING_API_KEY env override
+#   # dimensions: 768                                # EMBEDDING_DIMENSIONS env override
+
+# -----------------------------------------------------------------------------
+# Chat — providers (optional, uses env vars)
+# -----------------------------------------------------------------------------
+# Claude Code is ONE provider among others, and optional. Pick one:
+#
+#   provider: "claude-code"   The Claude Code CLI on this machine, signed in to
+#                             your own Claude account. Uses default_model,
+#                             claude_cli_path, auto_update_cli below.
+#                             (Absent `provider` means claude-code, as before.)
+#   provider: "none"          No Claude Code: no Claude CLI is needed, nor looked
+#                             for. Remove default_model. Chat uses a provider
+#                             instance you register once the server runs.
+#
+# Provider instances (OpenAI-compatible endpoint, Codex, ACP agent) are not
+# configured in this file: they are created in Settings → Providers, or with
+# POST /api/chat/providers. Keys live in the vault, never here; the instance
+# names them by reference (credential_ref: "vault:<name>"). Example body:
+#   {"id": "deepseek", "kind": "openai_compatible", "preset": "deepseek",
+#    "label": "DeepSeek", "base_url": "https://api.deepseek.com/v1",
+#    "default_model": "deepseek-chat", "cost_source": "priced",
+#    "credential_ref": "vault:deepseek"}
+#   kind "codex": the `codex` program of the server's PATH.
+#   kind "acp":   an agent declared in CHAT_PROVIDER_ACP_COMMANDS.
+# A third-party provider needs authentication on (section `auth` below).
+# Full walk-through: docs/guides/providers.md
+chat:
+  provider: "claude-code"             # "claude-code" | "none" (see above)
+  default_model: "claude-opus-4-7"    # CHAT_DEFAULT_MODEL env override (Claude Code only)
+  max_sessions: 10                     # CHAT_MAX_SESSIONS env override
+  session_timeout_secs: 1800           # CHAT_SESSION_TIMEOUT_SECS env override
+  max_turns: 50                        # CHAT_MAX_TURNS env override
+  prompt_builder_model: "claude-opus-4-7"  # PROMPT_BUILDER_MODEL env override
+  # Obscura (dsh-obscura-nav), the keyless search engine "obscura" of native sessions
+  # (POST /api/chat/search-engines {"id":"obscura","engine":"obscura","credential_ref":"none"}).
+  # obscura_path: "/usr/local/bin/dsh-obscura-nav"   # OBSCURA_BIN env override; absolute only (a relative path is ignored with a warning)
+  #                                                   # default: the engine embedded in nexus-tools, else dsh-obscura-nav on the PATH
+  # obscura_browser: false                            # OBSCURA_BROWSER env override (true/1/yes/on, false/0/no/off, any case; other values ignored); true = also the browser (browser_* tools)
+
+# -----------------------------------------------------------------------------
+# Neural Routing — Trajectory-based route learning (optional)
+# -----------------------------------------------------------------------------
+# Always compiled (build full). Control entirely at runtime via these settings.
+# Env var overrides: NEURAL_ROUTING_ENABLED, NEURAL_ROUTING_MODE,
+#                    NEURAL_ROUTING_TRAINING_MODE, NEURAL_ROUTING_MAX_THREADS
+#
+# neural_routing:
+#   enabled: true                    # Master switch (default: true)
+#   mode: "nn"                       # "nn" (Nearest Neighbor only) | "full" (Policy Net + NN fallback)
+#   training:
+#     mode: "manual"                 # "automatic" (cron + threshold) | "manual" (MCP tool / CLI)
+#     auto_trigger_threshold: 1000   # Trajectories before auto-training (automatic mode)
+#     max_threads: 2                 # Thread pool cap for training
+#     schedule: "0 2 * * *"          # Cron for automatic training (2am daily)
+#   inference:
+#     timeout_ms: 15                 # Max inference budget in ms
+#     nn_fallback: true              # Fallback to NN Router if timeout/OOD
+#   collection:
+#     enabled: false                 # Trajectory collection (opt-in). Env: NEURAL_ROUTING_COLLECT
+#     buffer_size: 50                # Flush batch size
+#   nn:
+#     top_k: 5                       # Number of nearest neighbors
+#     min_similarity: 0.7            # Minimum cosine similarity threshold
+#     cache_capacity: 500            # moka cache entries
+#     cache_ttl_secs: 3600           # Cache TTL (1h)
+#     max_route_age_days: 30         # Ignore trajectories older than this
+#   cpu_guard:
+#     pause_threshold: 80.0          # Pause at CPU > 80%
+#     resume_threshold: 50.0         # Resume at CPU < 50%
+#     poll_interval_secs: 2          # CPU poll frequency
+
+# -----------------------------------------------------------------------------
+# Authentication — Flexible multi-provider auth
+# -----------------------------------------------------------------------------
+# Remove or comment out this entire section for NO-AUTH mode (open access).
+#
+# auth:
+#   # ── Common settings ──────────────────────────────────────────────
+#   # JWT signing secret (min 32 characters, keep private!)
+#   jwt_secret: "change-me-to-a-random-32-char-string!"
+#
+#   # Token lifetime in seconds (default: 28800 = 8 hours)
+#   jwt_expiry_secs: 28800
+#
+#   # Optional: restrict to a specific email domain (all providers)
+#   allowed_email_domain: "example.com"
+#
+#   # Frontend URL for CORS and OAuth redirects
+#   frontend_url: "http://localhost:3000"
+#
+#   # Allow new user registration via POST /auth/register (default: false)
+#   allow_registration: false
+#
+#   # ── Password auth (root account) ────────────────────────────────
+#   # The root account is always verified in-memory (no DB needed).
+#   # If password_hash is plaintext (doesn't start with $2b$), it will
+#   # be hashed with bcrypt at startup (with a warning log).
+#   root_account:
+#     email: "admin@example.com"
+#     name: "Admin"
+#     password_hash: "change-me"   # Will be hashed at startup
+#
+#   # ── OIDC auth (generic OpenID Connect) ──────────────────────────
+#   # Works with Google, Microsoft, Okta, Keycloak, Cognito, or any OIDC provider.
+#   #
+#   # Two configuration modes:
+#   #   Option A: discovery_url — auto-fetches endpoints (requires async startup)
+#   #   Option B: explicit endpoints — no network call at startup
+#   #
+#   # ── Example 1: Google (with discovery) ──────────────────────────
+#   oidc:
+#     discovery_url: "https://accounts.google.com/.well-known/openid-configuration"
+#     client_id: "YOUR_CLIENT_ID.apps.googleusercontent.com"
+#     client_secret: "YOUR_CLIENT_SECRET"
+#     redirect_uri: "http://localhost:8080/auth/callback"
+#     provider_name: "Google"          # Shown on the login button
+#     provider_key: "google"           # URL-safe identifier (optional)
+#     scopes: "openid email profile"
+#
+#   # ── Example 2: Google (with explicit endpoints) ─────────────────
+#   # oidc:
+#   #   auth_endpoint: "https://accounts.google.com/o/oauth2/v2/auth"
+#   #   token_endpoint: "https://oauth2.googleapis.com/token"
+#   #   userinfo_endpoint: "https://www.googleapis.com/oauth2/v3/userinfo"
+#   #   client_id: "YOUR_CLIENT_ID.apps.googleusercontent.com"
+#   #   client_secret: "YOUR_CLIENT_SECRET"
+#   #   redirect_uri: "http://localhost:8080/auth/callback"
+#   #   provider_name: "Google"
+#   #   provider_key: "google"
+#   #   scopes: "openid email profile"
+#
+#   # ── Example 3: AWS Cognito (with discovery) ─────────────────────
+#   # Replace ${region} and ${poolId} with your Cognito User Pool values.
+#   # Note: discovery_url requires async client creation at startup.
+#   # oidc:
+#   #   discovery_url: "https://cognito-idp.${region}.amazonaws.com/${poolId}/.well-known/openid-configuration"
+#   #   client_id: "YOUR_COGNITO_APP_CLIENT_ID"
+#   #   client_secret: "YOUR_COGNITO_APP_CLIENT_SECRET"
+#   #   redirect_uri: "http://localhost:8080/auth/callback"
+#   #   provider_name: "AWS Cognito"
+#   #   provider_key: "cognito"
+#   #   scopes: "openid email profile"
+#
+#   # ── Legacy Google OAuth (backward compatible) ───────────────────
+#   # These fields still work but are deprecated. Prefer the "oidc" section.
+#   # google_client_id: "YOUR_CLIENT_ID.apps.googleusercontent.com"
+#   # google_client_secret: "YOUR_CLIENT_SECRET"
+#   # google_redirect_uri: "http://localhost:3000/auth/callback"
